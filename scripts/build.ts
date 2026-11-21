@@ -51,8 +51,11 @@ run([
 ]);
 
 // 4. Build Go network edge & supervisor (L1) with embedded Vue SPA.
+const gitProc = Bun.spawnSync(["git", "rev-parse", "--short=12", "HEAD"], { cwd: root });
+const gitCommit = gitProc.exitCode === 0 ? new TextDecoder().decode(gitProc.stdout).trim() || "dev" : "dev";
+const ldflags = `-s -w -X main.commit=${gitCommit}`;
 run(
-  ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", join(binDir, `slipgate${ext}`), "./cmd/slipgate"],
+  ["go", "build", "-trimpath", `-ldflags=${ldflags}`, "-o", join(binDir, `slipgate${ext}`), "./cmd/slipgate"],
   join(root, "services", "net-go"),
 );
 

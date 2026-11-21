@@ -17,6 +17,8 @@ import {
   RoutePreviewResponseSchema,
   SetupInitializeRequestSchema,
   SlotSeedSnapshotSchema,
+  SystemUpdateStatusSchema,
+  TriggerUpdateSyncRequestSchema,
   UpdateAccountRequestSchema,
   UpdateApiKeyRequestSchema,
   UpdateGroupRequestSchema,
@@ -170,6 +172,39 @@ async function readJsonBody(req: Request): Promise<unknown> {
   } catch {
     throw new StoreError("bad_request", "Malformed JSON request body");
   }
+}
+
+function buildStandaloneSystemUpdateStatus() {
+  const mode = process.env.SLIPGATE_MODE === "dev" ? "dev" : "release";
+  const strategyRaw = process.env.SLIPGATE_DEV_SYNC_MODE;
+  const strategy =
+    strategyRaw === "git" || strategyRaw === "release" || strategyRaw === "auto"
+      ? strategyRaw
+      : "auto";
+  const intervalRaw = Number(process.env.SLIPGATE_DEV_SYNC_INTERVAL_SEC ?? "60");
+  const intervalSeconds =
+    Number.isFinite(intervalRaw) && intervalRaw >= 0 ? Math.floor(intervalRaw) : 60;
+
+  return SystemUpdateStatusSchema.parse({
+    mode,
+    strategy,
+    resolvedStrategy: strategy === "git" ? "git" : "release",
+    repo: process.env.SLIPGATE_UPDATE_REPO || "dreamforSh/Slipgate",
+    branch: process.env.SLIPGATE_UPDATE_BRANCH || "main",
+    version: process.env.SLIPGATE_BUILD_VERSION || "0.1.0",
+    activeCommit: process.env.SLIPGATE_BUILD_COMMIT || "dev",
+    remoteCommit: null,
+    updateAvailable: false,
+    autoSyncEnabled: mode === "dev" && intervalSeconds > 0,
+    intervalSeconds,
+    state: "idle",
+    reloadCount: 0,
+    webUiOverridden: false,
+    edgeBinaryStaged: false,
+    lastCheckedAtIso: null,
+    lastUpdatedAtIso: null,
+    lastError: null,
+  });
 }
 
 export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
@@ -440,6 +475,83 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   // Admin Console Endpoints (RBAC: admin required)
   // ---------------------------------------------------------------------------
   app.use("/api/v1/admin/*", requireAdmin(jwtSecret));
+
+  app.get("/api/v1/admin/system/update", async (c) => {
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    const internalToken = process.env.SLIPGATE_INTERNAL_TOKEN;
+    if (!internalUrl || !internalToken) {
+      return c.json(buildStandaloneSystemUpdateStatus());
+    }
+    try {
+      const res = await fetch(`${internalUrl}/internal/supervisor/update`, {
+        headers: { "X-Slipgate-Internal-Token": internalToken },
+        signal: AbortSignal.timeout(5000),
+      });
+      const payload = (await res.json()) as Record<string, unknown>;
+      if (!res.ok) {
+        return c.json(payload, 502);
+      }
+      return c.json(SystemUpdateStatusSchema.parse(payload));
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/system/update/sync", async (c) => {
+    let rawBody: unknown = {};
+    const rawText = await c.req.text();
+    if (rawText.trim().length > 0) {
+      try {
+        rawBody = JSON.parse(rawText);
+      } catch {
+        return c.json({ error: "invalid_request", message: "Malformed JSON request body" }, 400);
+      }
+    }
+    const parsed = TriggerUpdateSyncRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    const internalToken = process.env.SLIPGATE_INTERNAL_TOKEN;
+    if (!internalUrl || !internalToken) {
+      return c.json({
+        ...buildStandaloneSystemUpdateStatus(),
+        lastCheckedAtIso: new Date().toISOString(),
+      });
+    }
+
+    try {
+      const res = await fetch(`${internalUrl}/internal/supervisor/update/sync`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Slipgate-Internal-Token": internalToken,
+        },
+        body: JSON.stringify(parsed.data),
+        signal: AbortSignal.timeout(120_000),
+      });
+      const payload = (await res.json()) as Record<string, unknown>;
+      if (!res.ok) {
+        return c.json(payload, 502);
+      }
+      return c.json(SystemUpdateStatusSchema.parse(payload));
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
 
   app.get("/api/v1/admin/groups", async (c) => {
     const groups = await store.listGroups(false);

@@ -20,11 +20,13 @@ const procs = [
       "./cmd/slipgate",
       "--standalone",
       "--allow-degraded",
+      "--dev",
     ],
     {
       cwd: join(root, "services", "net-go"),
       env: {
         ...process.env,
+        SLIPGATE_MODE: "dev",
         SLIPGATE_DEV_UI_URL: "http://127.0.0.1:5173",
       },
       stdout: "inherit",

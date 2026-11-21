@@ -41,7 +41,28 @@ Slipgate/
 
 ## 快速开始
 
-### 方式一：单服务容器一键启动（推荐）
+### 方式一：拉取预构建生产镜像一键部署（免源码编译）
+
+```bash
+cd deploy
+cp .env.example .env
+# 默认拉取 ghcr.io/dreamforsh/slipgate:latest
+docker compose -f docker-compose.prod.yml up -d
+# 若需启用 dev 仓库自动热更新通道：
+# SLIPGATE_IMAGE_TAG=dev SLIPGATE_MODE=dev docker compose -f docker-compose.prod.yml up -d
+```
+
+### 方式二：Linux 预编译二进制一键安装
+
+```bash
+# Release 稳定通道：
+curl -fsSL https://raw.githubusercontent.com/dreamforSh/Slipgate/main/deploy/install.sh | sudo bash
+
+# Dev 自动热更新通道（自动跟踪 dreamforSh/Slipgate main 最新构建）：
+curl -fsSL https://raw.githubusercontent.com/dreamforSh/Slipgate/main/deploy/install.sh | sudo bash -s -- --channel dev
+```
+
+### 方式三：本地源码 Docker Compose 构建
 
 ```bash
 cd deploy
@@ -49,6 +70,16 @@ docker compose up --build -d
 # 访问统一入口：http://127.0.0.1:8080
 # 就绪探针：curl http://127.0.0.1:8080/readyz
 ```
+
+---
+
+## Dev 模式仓库热更新（Hot-Update）
+
+以 `--dev` 或 `SLIPGATE_MODE=dev` 启动时，`slipgate` 网关会在保持 `:8080` 入口不断线的前提下自动同步仓库更新：
+
+- **`release` 通道策略（无编译器服务器 / Docker 容器默认）**：轮询 `dreamforSh/Slipgate` 的 `dev-latest` 滚动预发布与 `BUILD_META.json`，下载平台包并通过 `SHA256SUMS.txt` 严格校验 SHA-256 后，动态接管 Vue SPA 目录并用进程监管器平滑重启 `slipgate-core` 与 `slipgate-bff`。
+- **`git` 通道策略（源码工作区）**：执行 `git fetch` / `git pull --ff-only`，仅在工作区干净时重编译静态前端、`slipgate-bff` 与 `slipgate-core` 并重启子进程。
+- **管理控制台入口**：登录管理员控制台可在「版本构建与仓库热更新 (Dev Hot-Sync)」卡片中实时查看提交哈希并触发一键检查/热更新（`/api/v1/admin/system/update`）。
 
 ### 方式二：本地开发工具链
 

@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-slipgate}
+      POSTGRES_USER: ${POSTGRES_USER:-slipgate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-slipgate}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../migrations/core/0001_init_core.sql:/docker-entrypoint-initdb.d/01_core.sql:ro
+      - ../migrations/net/0001_init_net.sql:/docker-entrypoint-initdb.d/02_net.sql:ro
+      - ../migrations/commerce/0001_init_commerce.sql:/docker-entrypoint-initdb.d/03_commerce.sql:ro
+      - ../migrations/core/0002_vm_quota_and_risk.sql:/docker-entrypoint-initdb.d/04_core_vm.sql:ro
+      - ../migrations/net/0002_vm_slots_and_cluster.sql:/docker-entrypoint-initdb.d/05_net_vm.sql:ro
+      - ../migrations/commerce/0002_portal_settings.sql:/docker-entrypoint-initdb.d/06_commerce_settings.sql:ro
+      - ../migrations/core/0003_console_metadata.sql:/docker-entrypoint-initdb.d/07_core_console.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slipgate} -d ${POSTGRES_DB:-slipgate}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  slipgate:
+    image: ghcr.io/dreamforsh/slipgate:${SLIPGATE_IMAGE_TAG:-latest}
+    pull_policy: always
+    restart: unless-stopped
+    stop_grace_period: 90s
+    ports:
+      - "${SLIPGATE_PORT:-8080}:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SLIPGATE_LISTEN_ADDR: ":8080"
+      SLIPGATE_CORE_IPC: "127.0.0.1:19081"
+      SLIPGATE_BFF_ADDR: "127.0.0.1:19082"
+      SLIPGATE_MODE: "${SLIPGATE_MODE:-release}"
+      SLIPGATE_DEV_SYNC_MODE: "${SLIPGATE_DEV_SYNC_MODE:-release}"
+      SLIPGATE_DEV_SYNC_INTERVAL_SEC: "${SLIPGATE_DEV_SYNC_INTERVAL_SEC:-60}"
+      SLIPGATE_UPDATE_REPO: "${SLIPGATE_UPDATE_REPO:-dreamforSh/Slipgate}"
+      SLIPGATE_UPDATE_BRANCH: "${SLIPGATE_UPDATE_BRANCH:-main}"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-slipgate}:${POSTGRES_PASSWORD:-slipgate}@postgres:5432/${POSTGRES_DB:-slipgate}"
+      REDIS_URL: "redis://redis:6379"
+    volumes:
+      - slipgate_hotupdate:/var/run/slipgate/hotupdate
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+  redis_data:
+  slipgate_hotupdate:

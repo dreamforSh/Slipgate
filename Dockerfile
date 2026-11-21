@@ -76,13 +76,15 @@ RUN case "${TARGETARCH}" in \
 # -----------------------------------------------------------------------------
 FROM --platform=${BUILDPLATFORM} ${GOLANG_IMAGE} AS go-builder
 ARG TARGETARCH
+ARG SLIPGATE_VERSION=0.1.0
+ARG SLIPGATE_COMMIT=unknown
 
 WORKDIR /app/services/net-go
 COPY services/net-go ./
 COPY --from=web-builder /app/apps/web-vue/dist ./internal/webui/dist
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" go build \
-    -trimpath -ldflags="-s -w" \
+    -trimpath -ldflags="-s -w -X main.version=${SLIPGATE_VERSION} -X main.commit=${SLIPGATE_COMMIT}" \
     -o /out/slipgate \
     ./cmd/slipgate
 
@@ -109,7 +111,8 @@ ENV SLIPGATE_LISTEN_ADDR=":8080" \
     SLIPGATE_CORE_BIN="/usr/local/bin/slipgate-core" \
     SLIPGATE_BFF_BIN="/usr/local/bin/slipgate-bff" \
     SLIPGATE_CORE_IPC="127.0.0.1:19081" \
-    SLIPGATE_BFF_ADDR="127.0.0.1:19082"
+    SLIPGATE_BFF_ADDR="127.0.0.1:19082" \
+    SLIPGATE_HOTUPDATE_DIR="/var/run/slipgate/hotupdate"
 
 EXPOSE 8080
 USER slipgate

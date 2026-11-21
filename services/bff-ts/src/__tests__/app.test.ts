@@ -12,6 +12,9 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
 
     const unauthRes = await app.request("/api/v1/admin/vms/slots");
     expect(unauthRes.status).toBe(401);
+
+    const unauthUpdateRes = await app.request("/api/v1/admin/system/update");
+    expect(unauthUpdateRes.status).toBe(401);
   });
 
   it("enforces one-time setup, admin RBAC, encrypted account pool CRUD, and user API keys", async () => {
@@ -64,6 +67,19 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
     expect(slotsRes.status).toBe(200);
     const slotsBody = (await slotsRes.json()) as { slots: Array<{ hypervisorKind: string; maxSubagents: number }> };
     expect(slotsBody.slots[0]?.hypervisorKind).toBe("kvm_qemu");
+
+    const updateStatusRes = await app.request("/api/v1/admin/system/update", { headers: adminHeaders });
+    expect(updateStatusRes.status).toBe(200);
+    const updateStatusBody = (await updateStatusRes.json()) as { repo: string; branch: string };
+    expect(updateStatusBody.repo).toBe("dreamforSh/Slipgate");
+    expect(updateStatusBody.branch).toBe("main");
+
+    const updateSyncRes = await app.request("/api/v1/admin/system/update/sync", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({ checkOnly: true }),
+    });
+    expect(updateSyncRes.status).toBe(200);
 
     // 3. Create group + upstream account (secret encrypted & masked)
     const grpRes = await app.request("/api/v1/admin/groups", {

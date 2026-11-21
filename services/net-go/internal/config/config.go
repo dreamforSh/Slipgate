@@ -1,6 +1,9 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,10 +24,49 @@ type Config struct {
 	ClashPortMax       int
 	MaxAccountsPerExit int
 	DevUIURL           string
+	Mode               string
+	DevSyncMode        string
+	DevSyncIntervalSec int
+	UpdateRepo         string
+	UpdateBranch       string
+	GitRepoDir         string
+	HotUpdateDir       string
+	WebUIDir           string
+	GitHubToken        string
+	InternalToken      string
 }
 
 // LoadFromEnv loads configuration from SLIPGATE_* environment variables with safe defaults.
 func LoadFromEnv() Config {
+	mode := strings.ToLower(envString("SLIPGATE_MODE", "release"))
+	if mode != "dev" {
+		mode = "release"
+	}
+
+	syncMode := strings.ToLower(envString("SLIPGATE_DEV_SYNC_MODE", "auto"))
+	switch syncMode {
+	case "git", "release", "auto":
+	default:
+		syncMode = "auto"
+	}
+
+	interval := envInt("SLIPGATE_DEV_SYNC_INTERVAL_SEC", 60)
+	if interval < 0 {
+		interval = 0
+	}
+
+	ghToken := strings.TrimSpace(os.Getenv("SLIPGATE_GITHUB_TOKEN"))
+	if ghToken == "" {
+		ghToken = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	}
+
+	internalToken := strings.TrimSpace(os.Getenv("SLIPGATE_INTERNAL_TOKEN"))
+	if internalToken == "" {
+		internalToken = generateInternalToken()
+	}
+
+	defaultHotDir := filepath.Join(os.TempDir(), "slipgate-hotupdate")
+
 	return Config{
 		ListenAddr:         envString("SLIPGATE_LISTEN_ADDR", ":8080"),
 		CoreIPC:            envString("SLIPGATE_CORE_IPC", "127.0.0.1:19081"),
@@ -37,7 +79,38 @@ func LoadFromEnv() Config {
 		ClashPortMax:       envInt("SLIPGATE_CLASH_PORT_MAX", 24999),
 		MaxAccountsPerExit: envInt("SLIPGATE_MAX_ACCOUNTS_PER_EXIT_IP", 1),
 		DevUIURL:           strings.TrimSpace(os.Getenv("SLIPGATE_DEV_UI_URL")),
+		Mode:               mode,
+		DevSyncMode:        syncMode,
+		DevSyncIntervalSec: interval,
+		UpdateRepo:         envString("SLIPGATE_UPDATE_REPO", "dreamforSh/Slipgate"),
+		UpdateBranch:       envString("SLIPGATE_UPDATE_BRANCH", "main"),
+		GitRepoDir:         strings.TrimSpace(os.Getenv("SLIPGATE_GIT_REPO_DIR")),
+		HotUpdateDir:       envString("SLIPGATE_HOTUPDATE_DIR", defaultHotDir),
+		WebUIDir:           strings.TrimSpace(os.Getenv("SLIPGATE_WEBUI_DIR")),
+		GitHubToken:        ghToken,
+		InternalToken:      internalToken,
 	}
+}
+
+// LoopbackOrigin derives an internal loopback HTTP URL for slipgate-bff to call back into slipgate-net.
+func LoopbackOrigin(listenAddr string) string {
+	trimmed := strings.TrimSpace(listenAddr)
+	if trimmed == "" {
+		return "http://127.0.0.1:8080"
+	}
+	_, port, err := net.SplitHostPort(trimmed)
+	if err != nil || port == "" || port == "0" {
+		return "http://127.0.0.1:8080"
+	}
+	return "http://127.0.0.1:" + port
+}
+
+func generateInternalToken() string {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "slipgate-internal-fallback-token"
+	}
+	return hex.EncodeToString(buf)
 }
 
 // ResolveSiblingBinary searches next to the running executable before falling back to PATH.

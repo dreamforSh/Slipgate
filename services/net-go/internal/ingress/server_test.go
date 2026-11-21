@@ -2,15 +2,19 @@ package ingress
 
 import (
 	"encoding/json"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 )
 
 func TestHealthzAndDualPlaneIsolation(t *testing.T) {
@@ -126,5 +130,64 @@ func TestHealthzAndDualPlaneIsolation(t *testing.T) {
 	var dummy map[string]any
 	if json.Unmarshal(rec.Body.Bytes(), &dummy) == nil {
 		t.Fatalf("expected HTML fallback, got JSON")
+	}
+}
+
+func TestInternalSupervisorUpdateAuthAndStatus(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		ListenAddr:    ":0",
+		CoreIPC:       "127.0.0.1:19999",
+		BFFAddr:       "127.0.0.1:19998",
+		Mode:          "dev",
+		DevSyncMode:   "release",
+		UpdateRepo:    "dreamforSh/Slipgate",
+		UpdateBranch:  "main",
+		InternalToken: "super-secret-internal-token",
+	}
+	srv, err := NewServer(cfg, "0.1.0-test", clashpool.NewManager(20000, 24999, 1), nil)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	srv.WithCommit("c08e679")
+	srv.WithHotUpdater(hotupdate.NewManager(hotupdate.Options{
+		Config:        cfg,
+		Version:       "0.1.0-test",
+		InitialCommit: "c08e679",
+		Logger:        log.New(io.Discard, "", 0),
+	}))
+	handler := srv.Handler()
+
+	// Missing token -> 403
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/supervisor/update", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without internal token, got %d", rec.Code)
+	}
+
+	// Wrong token -> 403
+	reqBad := httptest.NewRequest(http.MethodPost, "/internal/supervisor/update/sync", strings.NewReader(`{"checkOnly":true}`))
+	reqBad.Header.Set("X-Slipgate-Internal-Token", "wrong-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqBad)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 with wrong internal token, got %d", rec.Code)
+	}
+
+	// Valid token -> 200 JSON status
+	reqOk := httptest.NewRequest(http.MethodGet, "/internal/supervisor/update", nil)
+	reqOk.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqOk)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid internal token, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var snapshot hotupdate.StatusSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode update snapshot: %v", err)
+	}
+	if snapshot.Mode != "dev" || snapshot.ActiveCommit != "c08e679" {
+		t.Fatalf("unexpected snapshot: %+v", snapshot)
 	}
 }

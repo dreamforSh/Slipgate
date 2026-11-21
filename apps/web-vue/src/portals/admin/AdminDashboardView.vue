@@ -4,6 +4,7 @@ import type {
   ClashExitNode,
   RiskBanEvent,
   RoutePreviewResponse,
+  SystemUpdateStatus,
   VmSlotSummary,
 } from "@slipgate/contracts";
 import { useAuthStore } from "../../stores/auth";
@@ -29,18 +30,22 @@ const clashNodes = ref<ClashExitNode[]>([]);
 const vmSlots = ref<VmSlotSummary[]>([]);
 const riskEvents = ref<RiskBanEvent[]>([]);
 const readiness = ref<ReadinessState | null>(null);
+const updateStatus = ref<SystemUpdateStatus | null>(null);
+const updateBusy = ref(false);
+const updateError = ref<string | null>(null);
 const previewModel = ref("claude-sonnet-4-5");
 const previewResult = ref<RoutePreviewResponse | null>(null);
 const previewError = ref<string | null>(null);
 
 async function loadOverview() {
   try {
-    const [archRes, clashRes, vmRes, riskRes, readyRes] = await Promise.all([
+    const [archRes, clashRes, vmRes, riskRes, readyRes, updRes] = await Promise.all([
       fetch("/api/v1/system/architecture"),
       auth.apiFetch("/api/v1/admin/clash/nodes"),
       auth.apiFetch("/api/v1/admin/vms/slots"),
       auth.apiFetch("/api/v1/admin/risk/events"),
       fetch("/readyz"),
+      auth.apiFetch("/api/v1/admin/system/update"),
     ]);
     if (archRes.ok) {
       const archData = (await archRes.json()) as { layers: ArchitectureLayer[] };
@@ -61,8 +66,45 @@ async function loadOverview() {
     if (readyRes.ok || readyRes.status === 503) {
       readiness.value = (await readyRes.json()) as ReadinessState;
     }
+    if (updRes.ok) {
+      updateStatus.value = (await updRes.json()) as SystemUpdateStatus;
+    }
   } catch {
     // Allow standalone preview when backend is offline.
+  }
+}
+
+async function triggerRepoSync(checkOnly: boolean) {
+  updateBusy.value = true;
+  updateError.value = null;
+  try {
+    const res = await auth.apiFetch("/api/v1/admin/system/update/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ checkOnly }),
+    });
+    const data = (await res.json()) as SystemUpdateStatus & {
+      error?: string;
+      message?: string;
+      status?: SystemUpdateStatus;
+    };
+    if (!res.ok) {
+      if (data.status) {
+        updateStatus.value = data.status;
+      }
+      updateError.value = data.message ?? data.error ?? "仓库热更新请求失败";
+      return;
+    }
+    updateStatus.value = data;
+    if (!checkOnly) {
+      window.setTimeout(() => {
+        void loadOverview();
+      }, 1200);
+    }
+  } catch (err) {
+    updateError.value = err instanceof Error ? err.message : "仓库同步失败";
+  } finally {
+    updateBusy.value = false;
   }
 }
 
@@ -116,6 +158,64 @@ onMounted(() => {
           {{ readiness?.planes.bff ?? "unknown" }}
         </p>
       </div>
+    </section>
+
+    <section class="rounded-xl border border-slate-800 bg-slate-900 p-6">
+      <div class="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <div class="flex items-center gap-2">
+            <h2 class="text-base font-semibold text-white">版本构建与仓库热更新 (Dev Hot-Sync)</h2>
+            <span
+              :class="
+                updateStatus?.mode === 'dev'
+                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                  : 'bg-slate-800 text-slate-300 border-slate-700'
+              "
+              class="rounded-full border px-2.5 py-0.5 text-xs font-medium"
+            >
+              {{ updateStatus?.mode === "dev" ? "DEV 仓库自动热更新" : "RELEASE 生产锁定" }}
+            </span>
+          </div>
+          <p class="mt-1 font-mono text-xs text-slate-400">
+            仓库: {{ updateStatus?.repo ?? "dreamforSh/Slipgate" }} ({{ updateStatus?.branch ?? "main" }}) ·
+            版本: {{ updateStatus?.version ?? "0.1.0" }} ·
+            提交: {{ (updateStatus?.activeCommit ?? "dev").slice(0, 12) }}
+            <template v-if="updateStatus?.remoteCommit">
+              → 远端: {{ updateStatus.remoteCommit.slice(0, 12) }}
+            </template>
+          </p>
+          <p class="mt-1 font-mono text-xs text-slate-500">
+            同步方式: {{ updateStatus?.resolvedStrategy ?? "release" }} ·
+            热重载次数: {{ updateStatus?.reloadCount ?? 0 }} ·
+            前端热替换: {{ updateStatus?.webUiOverridden ? "已接管" : "内嵌" }} ·
+            状态: {{ updateStatus?.state ?? "idle" }}
+          </p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button
+            type="button"
+            :disabled="updateBusy"
+            class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-sky-500 hover:text-white disabled:opacity-50"
+            @click="triggerRepoSync(true)"
+          >
+            检查仓库更新
+          </button>
+          <button
+            type="button"
+            :disabled="updateBusy"
+            class="rounded-lg bg-sky-500 px-3 py-2 text-xs font-medium text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
+            @click="triggerRepoSync(false)"
+          >
+            立即热更新同步
+          </button>
+        </div>
+      </div>
+      <p
+        v-if="updateError || updateStatus?.lastError"
+        class="mt-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 font-mono text-xs text-rose-300"
+      >
+        {{ updateError ?? updateStatus?.lastError }}
+      </p>
     </section>
 
     <section class="rounded-xl border border-slate-800 bg-slate-900 p-6">

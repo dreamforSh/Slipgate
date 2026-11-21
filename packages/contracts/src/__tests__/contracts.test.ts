@@ -8,6 +8,8 @@ import {
   NANO_PER_USD,
   parseUsdToNano,
   SetupInitializeRequestSchema,
+  SystemUpdateStatusSchema,
+  TriggerUpdateSyncRequestSchema,
 } from "../index.ts";
 
 describe("nano-USD fixed-point helpers", () => {
@@ -87,5 +89,33 @@ describe("IAM, Pool and API Key contracts", () => {
     });
     expect(apiKey.rpmLimit).toBe(60);
     expect(apiKey.ipAllowlist).toEqual([]);
+  });
+
+  it("validates SystemUpdateStatusSchema and TriggerUpdateSyncRequestSchema defaults", () => {
+    const syncReq = TriggerUpdateSyncRequestSchema.parse({});
+    expect(syncReq.checkOnly).toBe(false);
+
+    const status = SystemUpdateStatusSchema.parse({
+      mode: "dev",
+      strategy: "auto",
+      resolvedStrategy: "release",
+      repo: "dreamforSh/Slipgate",
+      branch: "main",
+      version: "0.1.0-dev",
+      activeCommit: "c08e679",
+      remoteCommit: null,
+      updateAvailable: false,
+      autoSyncEnabled: true,
+      intervalSeconds: 60,
+      state: "idle",
+      reloadCount: 0,
+      webUiOverridden: false,
+      edgeBinaryStaged: false,
+      lastCheckedAtIso: null,
+      lastUpdatedAtIso: null,
+      lastError: null,
+    });
+    expect(status.mode).toBe("dev");
+    expect(status.autoSyncEnabled).toBe(true);
   });
 });

@@ -14,21 +14,26 @@ import (
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/ingress"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 )
 
-const version = "0.1.0"
+var (
+	version = "0.1.0"
+	commit  = "dev"
+)
 
 func main() {
 	showVersion := flag.Bool("version", false, "print slipgate version and exit")
 	standalone := flag.Bool("standalone", false, "run slipgate-net without spawning child processes")
 	allowDegraded := flag.Bool("allow-degraded", false, "continue running even if core or bff binaries are unavailable")
+	devMode := flag.Bool("dev", false, "enable dev mode with repo-synced hot updates")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("slipgate %s\n", version)
+		fmt.Printf("slipgate %s (%s)\n", version, commit)
 		return
 	}
 
@@ -40,6 +45,9 @@ func main() {
 	if *allowDegraded {
 		cfg.AllowDegraded = true
 	}
+	if *devMode {
+		cfg.Mode = "dev"
+	}
 
 	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
@@ -47,6 +55,7 @@ func main() {
 	pool := clashpool.NewManager(cfg.ClashPortMin, cfg.ClashPortMax, cfg.MaxAccountsPerExit)
 	vmSlots := vmslot.NewManager(pool)
 	sup := supervisor.New(logger)
+	internalURL := config.LoopbackOrigin(cfg.ListenAddr)
 
 	if cfg.Supervise {
 		specs := []supervisor.ChildSpec{
@@ -57,9 +66,20 @@ func main() {
 				AllowDegraded: cfg.AllowDegraded,
 			},
 			{
-				Name:          "bff",
-				Binary:        cfg.BFFBin,
-				Env:           []string{"SLIPGATE_BFF_ADDR=" + cfg.BFFAddr},
+				Name:   "bff",
+				Binary: cfg.BFFBin,
+				Env: []string{
+					"SLIPGATE_BFF_ADDR=" + cfg.BFFAddr,
+					"SLIPGATE_MODE=" + cfg.Mode,
+					"SLIPGATE_DEV_SYNC_MODE=" + cfg.DevSyncMode,
+					fmt.Sprintf("SLIPGATE_DEV_SYNC_INTERVAL_SEC=%d", cfg.DevSyncIntervalSec),
+					"SLIPGATE_BUILD_VERSION=" + version,
+					"SLIPGATE_BUILD_COMMIT=" + commit,
+					"SLIPGATE_UPDATE_REPO=" + cfg.UpdateRepo,
+					"SLIPGATE_UPDATE_BRANCH=" + cfg.UpdateBranch,
+					"SLIPGATE_INTERNAL_TOKEN=" + cfg.InternalToken,
+					"SLIPGATE_NET_INTERNAL_URL=" + internalURL,
+				},
 				AllowDegraded: cfg.AllowDegraded,
 			},
 		}
@@ -77,12 +97,32 @@ func main() {
 	if err != nil {
 		logger.Fatalf("failed to initialize edge ingress: %v", err)
 	}
+	edge.WithCommit(commit)
 	edge.WithVmSlotManager(vmSlots)
+
+	updater := hotupdate.NewManager(hotupdate.Options{
+		Config:        cfg,
+		Version:       version,
+		InitialCommit: commit,
+		Supervisor:    sup,
+		Logger:        logger,
+		OnWebUIDir:    edge.SetWebUIOverrideDir,
+	})
+	edge.WithHotUpdater(updater)
+	updater.StartAutoSync(rootCtx)
 
 	httpSrv := ingress.NewHTTPServer(cfg.ListenAddr, edge.Handler())
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Printf("[net] Slipgate unified edge listening on %s (core=%s bff=%s)", cfg.ListenAddr, cfg.CoreIPC, cfg.BFFAddr)
+		logger.Printf(
+			"[net] Slipgate unified edge listening on %s (mode=%s version=%s commit=%s core=%s bff=%s)",
+			cfg.ListenAddr,
+			cfg.Mode,
+			version,
+			commit,
+			cfg.CoreIPC,
+			cfg.BFFAddr,
+		)
 		if serveErr := httpSrv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			errCh <- serveErr
 			return

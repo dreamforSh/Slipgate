@@ -2,8 +2,10 @@ package ingress
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -15,6 +17,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/webui"
@@ -24,13 +27,33 @@ import (
 type Server struct {
 	cfg        config.Config
 	version    string
+	commit     string
 	pool       *clashpool.Manager
 	vmSlots    *vmslot.Manager
 	sup        *supervisor.Supervisor
+	updater    *hotupdate.Manager
 	httpClient *http.Client
 	bffProxy   *httputil.ReverseProxy
+	uiDynamic  *webui.DynamicHandler
 	uiHandler  http.Handler
 	streamSeq  atomic.Uint32
+}
+
+// WithCommit sets the build commit hash reported in health/readiness endpoints.
+func (s *Server) WithCommit(commit string) {
+	s.commit = commit
+}
+
+// WithHotUpdater attaches the dev-mode hot-update manager exposed via internal endpoints.
+func (s *Server) WithHotUpdater(updater *hotupdate.Manager) {
+	s.updater = updater
+}
+
+// SetWebUIOverrideDir swaps the active frontend directory served by the embedded UI handler.
+func (s *Server) SetWebUIOverrideDir(dir string) {
+	if s.uiDynamic != nil {
+		s.uiDynamic.SetOverrideDir(dir)
+	}
 }
 
 // WithVmSlotManager attaches the VM full-emulation slot manager for readiness observability.
@@ -53,7 +76,12 @@ func NewServer(cfg config.Config, version string, pool *clashpool.Manager, sup *
 		})
 	}
 
-	uiHandler := webui.Handler()
+	uiDynamic := webui.Handler()
+	if cfg.WebUIDir != "" {
+		uiDynamic.SetOverrideDir(cfg.WebUIDir)
+	}
+
+	var uiHandler http.Handler = uiDynamic
 	if cfg.DevUIURL != "" {
 		devURL, devErr := url.Parse(cfg.DevUIURL)
 		if devErr != nil {
@@ -65,12 +93,14 @@ func NewServer(cfg config.Config, version string, pool *clashpool.Manager, sup *
 	return &Server{
 		cfg:     cfg,
 		version: version,
+		commit:  "dev",
 		pool:    pool,
 		sup:     sup,
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 		},
 		bffProxy:  bffProxy,
+		uiDynamic: uiDynamic,
 		uiHandler: uiHandler,
 	}, nil
 }
@@ -80,6 +110,10 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
+
+	// Token-authenticated internal supervisor bridge for slipgate-bff admin actions.
+	mux.HandleFunc("GET /internal/supervisor/update", s.handleInternalUpdateStatus)
+	mux.HandleFunc("POST /internal/supervisor/update/sync", s.handleInternalUpdateSync)
 
 	// DataPlane AI hot paths strictly bypass the TypeScript BFF.
 	mux.HandleFunc("/v1/", s.handleDataPlane)
@@ -101,6 +135,8 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		"status":  "ok",
 		"service": "slipgate-net",
 		"version": s.version,
+		"commit":  s.commit,
+		"mode":    s.cfg.Mode,
 	})
 }
 
@@ -135,6 +171,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, map[string]any{
 		"ready":    ready,
 		"degraded": !ready,
+		"version":  s.version,
+		"commit":   s.commit,
+		"mode":     s.cfg.Mode,
 		"planes": map[string]string{
 			"net":  "up",
 			"core": upDown(coreUp),
@@ -144,6 +183,70 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		"vm_slots":    vmSlotCount,
 		"children":    children,
 	})
+}
+
+func (s *Server) requireInternalAuth(w http.ResponseWriter, r *http.Request) bool {
+	expected := s.cfg.InternalToken
+	provided := r.Header.Get("X-Slipgate-Internal-Token")
+	if expected == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":   "forbidden",
+			"message": "invalid or missing internal supervisor token",
+		})
+		return false
+	}
+	return true
+}
+
+func (s *Server) handleInternalUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.updater == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "hotupdate_unavailable",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.updater.Status())
+}
+
+func (s *Server) handleInternalUpdateSync(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.updater == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "hotupdate_unavailable",
+		})
+		return
+	}
+
+	var body struct {
+		CheckOnly bool `json:"checkOnly"`
+	}
+	if r.Body != nil {
+		raw, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		if len(strings.TrimSpace(string(raw))) > 0 {
+			if err := json.Unmarshal(raw, &body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error":   "invalid_request",
+					"message": err.Error(),
+				})
+				return
+			}
+		}
+	}
+
+	status, err := s.updater.Sync(r.Context(), body.CheckOnly, true)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":  err.Error(),
+			"status": status,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) handleDataPlane(w http.ResponseWriter, r *http.Request) {

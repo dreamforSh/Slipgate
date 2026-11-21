@@ -90,3 +90,65 @@ func TestSupervisorDegradedMissingBinary(t *testing.T) {
 		t.Fatalf("expected degraded child snapshot, got %+v", snaps)
 	}
 }
+
+func TestSupervisorRestartChildAndUpdateBinary(t *testing.T) {
+	t.Parallel()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable failed: %v", err)
+	}
+
+	sup := New(log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = sup.Stop(2 * time.Second)
+	}()
+
+	specs := []ChildSpec{
+		{
+			Name:   "core",
+			Binary: exe,
+			Args:   []string{"-test.run=TestHelperProcess"},
+			Env:    []string{"GO_WANT_HELPER_PROCESS=1"},
+		},
+		{
+			Name:   "bff",
+			Binary: exe,
+			Args:   []string{"-test.run=TestHelperProcess"},
+			Env:    []string{"GO_WANT_HELPER_PROCESS=1"},
+		},
+	}
+
+	if err := sup.StartAll(ctx, specs); err != nil {
+		t.Fatalf("StartAll failed: %v", err)
+	}
+
+	before := sup.Snapshots()
+	oldCorePID := before[0].PID
+	oldBffPID := before[1].PID
+
+	if err := sup.UpdateChildBinary("bff", exe); err != nil {
+		t.Fatalf("UpdateChildBinary failed: %v", err)
+	}
+	if err := sup.RestartChild(ctx, "bff", 500*time.Millisecond); err != nil {
+		t.Fatalf("RestartChild failed: %v", err)
+	}
+
+	mid := sup.Snapshots()
+	if mid[0].PID != oldCorePID || mid[0].Status != StatusRunning {
+		t.Fatalf("expected core PID %d untouched during bff restart, got %+v", oldCorePID, mid[0])
+	}
+	if mid[1].PID == oldBffPID || mid[1].Status != StatusRunning {
+		t.Fatalf("expected new bff PID after RestartChild, old=%d got %+v", oldBffPID, mid[1])
+	}
+
+	if err := sup.RestartAll(ctx, 500*time.Millisecond); err != nil {
+		t.Fatalf("RestartAll failed: %v", err)
+	}
+	after := sup.Snapshots()
+	if after[0].PID == oldCorePID || after[1].PID == mid[1].PID {
+		t.Fatalf("expected new PIDs after RestartAll, mid=%+v after=%+v", mid, after)
+	}
+}
