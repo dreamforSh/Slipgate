@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package slipgate.dataplane.v1;
+
+// Fast-path DataPlane IPC binary frame header (10 bytes, network byte order):
+//   [0..3] stream_id   : uint32 big-endian (multiplexed request stream identifier)
+//   [4]    frame_type  : uint8 (0x01=Ping, 0x02=Pong, 0x10=ReqHeaders, 0x11=ReqBodyChunk,
+//                               0x12=DispatchDirective, 0x13=UpstreamChunk, 0x14=StreamEnd,
+//                               0x20=ExitHealth)
+//   [5]    flags       : uint8 (bit 0: END_STREAM, bit 1: PASSTHROUGH, bit 2: ERROR)
+//   [6..9] payload_len : uint32 big-endian (max 16 MiB)
+
+enum ExitHealthStatus {
+  EXIT_HEALTH_STATUS_UNSPECIFIED = 0;
+  EXIT_HEALTH_STATUS_HEALTHY = 1;
+  EXIT_HEALTH_STATUS_DEGRADED = 2;
+  EXIT_HEALTH_STATUS_CIRCUIT_OPEN = 3;
+}
+
+enum ProtocolCodec {
+  PROTOCOL_CODEC_UNSPECIFIED = 0;
+  PROTOCOL_CODEC_OPENAI_CHAT = 1;
+  PROTOCOL_CODEC_OPENAI_RESPONSES = 2;
+  PROTOCOL_CODEC_ANTHROPIC_MESSAGES = 3;
+  PROTOCOL_CODEC_GEMINI_V1BETA = 4;
+  PROTOCOL_CODEC_GROK = 5;
+  PROTOCOL_CODEC_MCP = 6;
+}
+
+message HeaderEntry {
+  string name = 1;
+  string value = 2;
+}
+
+message DispatchDirective {
+  string target_url = 1;
+  string proxy_slot_id = 2;
+  string utls_profile_id = 3;
+  ProtocolCodec ingress_codec = 4;
+  ProtocolCodec egress_codec = 5;
+  bool passthrough_mode = 6;
+  repeated HeaderEntry headers = 7;
+  string hold_id = 8;
+  string account_id = 9;
+  string resolved_model = 10;
+}
+
+message UsageSettlement {
+  string hold_id = 1;
+  int64 input_tokens = 2;
+  int64 output_tokens = 3;
+  int64 cache_read_tokens = 4;
+  int64 cache_write_tokens = 5;
+  string cost_nano_usd = 6;
+  bool client_aborted = 7;
+}
+
+message HandshakeRequest {
+  string peer_name = 1;
+  string protocol_version = 2;
+  repeated ProtocolCodec supported_codecs = 3;
+}
+
+message HandshakeResponse {
+  string engine_version = 1;
+  bool accepted = 2;
+  uint32 max_frame_bytes = 3;
+}
+
+message NotifyExitHealthRequest {
+  string node_id = 1;
+  string proxy_slot_id = 2;
+  string exit_ip = 3;
+  ExitHealthStatus status = 4;
+  string reason = 5;
+  int64 observed_at_unix_ms = 6;
+}
+
+message NotifyExitHealthResponse {
+  bool acknowledged = 1;
+  uint32 paused_accounts = 2;
+}
+
+service DataPlaneControlService {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc NotifyExitHealth(NotifyExitHealthRequest) returns (NotifyExitHealthResponse);
+}

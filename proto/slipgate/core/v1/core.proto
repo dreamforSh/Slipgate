@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package slipgate.core.v1;
+
+enum RouteMatchType {
+  ROUTE_MATCH_TYPE_UNSPECIFIED = 0;
+  ROUTE_MATCH_TYPE_EXACT = 1;
+  ROUTE_MATCH_TYPE_PREFIX = 2;
+}
+
+enum RouteEndpoint {
+  ROUTE_ENDPOINT_UNSPECIFIED = 0;
+  ROUTE_ENDPOINT_ANY = 1;
+  ROUTE_ENDPOINT_MESSAGES = 2;
+  ROUTE_ENDPOINT_COUNT_TOKENS = 3;
+  ROUTE_ENDPOINT_RESPONSES = 4;
+  ROUTE_ENDPOINT_CHAT_COMPLETIONS = 5;
+  ROUTE_ENDPOINT_EMBEDDINGS = 6;
+  ROUTE_ENDPOINT_IMAGES = 7;
+  ROUTE_ENDPOINT_GEMINI = 8;
+}
+
+message CreditWalletRequest {
+  string idempotency_key = 1;
+  string user_id = 2;
+  string amount_nano_usd = 3;
+  string source_order_id = 4;
+  string reason = 5;
+}
+
+message CreditWalletResponse {
+  string ledger_entry_id = 1;
+  string balance_nano_usd = 2;
+  string held_nano_usd = 3;
+  bool deduplicated = 4;
+}
+
+message GetWalletSummaryRequest {
+  string user_id = 1;
+}
+
+message GetWalletSummaryResponse {
+  string user_id = 1;
+  string balance_nano_usd = 2;
+  string held_nano_usd = 3;
+  string available_nano_usd = 4;
+  int64 updated_at_unix_ms = 5;
+}
+
+message CompositeRouteRule {
+  string route_id = 1;
+  string group_id = 2;
+  string public_model = 3;
+  RouteMatchType match_type = 4;
+  string target_platform = 5;
+  string upstream_model = 6;
+  RouteEndpoint endpoint = 7;
+  int32 priority = 8;
+  bool enabled = 9;
+}
+
+message UpsertCompositeRouteRequest {
+  CompositeRouteRule rule = 1;
+}
+
+message UpsertCompositeRouteResponse {
+  CompositeRouteRule rule = 1;
+  uint64 catalog_revision = 2;
+}
+
+message ResolveModelRouteRequest {
+  string group_id = 1;
+  string public_model = 2;
+  RouteEndpoint endpoint = 3;
+}
+
+message ResolveModelRouteResponse {
+  bool matched = 1;
+  string target_platform = 2;
+  string upstream_model = 3;
+  string matched_route_id = 4;
+  string resolution_source = 5;
+}
+
+service CoreControlService {
+  rpc CreditWallet(CreditWalletRequest) returns (CreditWalletResponse);
+  rpc GetWalletSummary(GetWalletSummaryRequest) returns (GetWalletSummaryResponse);
+  rpc UpsertCompositeRoute(UpsertCompositeRouteRequest) returns (UpsertCompositeRouteResponse);
+  rpc ResolveModelRoute(ResolveModelRouteRequest) returns (ResolveModelRouteResponse);
+}

@@ -1,0 +1,44 @@
+# Slipgate Unified Configuration Example
+# 环境变量可通过 SLIPGATE_* 覆盖（参见 deploy/.env.example）
+
+server:
+  listen_addr: ":8080"
+  mode: "release"
+  trusted_proxies:
+    - "127.0.0.1/32"
+
+supervisor:
+  enabled: true
+  allow_degraded: false
+  core_ipc: "127.0.0.1:19081"   # Linux 生产推荐 unix:///run/slipgate/dataplane.sock
+  bff_addr: "127.0.0.1:19082"
+
+dataplane:
+  max_frame_bytes: 16777216
+  idle_stream_timeout_sec: 120
+  fail_closed_unknown_model: true
+
+clash_pool:
+  enabled: true
+  port_min: 20000
+  port_max: 24999
+  max_accounts_per_exit_ip: 1
+  drop_guard_threshold: 0.50
+  fail_closed: true
+
+database:
+  host: "127.0.0.1"
+  port: 5432
+  dbname: "slipgate"
+  # 单写者 Schema 划分：
+  # - core.*     -> slipgate-core (Zig)
+  # - net.*      -> slipgate-net (Go)
+  # - commerce.* -> slipgate-bff (Bun TS)
+
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  namespaces:
+    core: "sg:core"
+    net: "sg:net"
+    bff: "sg:bff"

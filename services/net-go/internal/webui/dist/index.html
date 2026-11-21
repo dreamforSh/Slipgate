@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Slipgate Gateway Console</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #090d16; color: #e2e8f0; }
+    main { max-width: 640px; padding: 2rem; border-radius: 16px; background: #111827; border: 1px solid #1e293b; }
+    h1 { margin: 0 0 0.5rem; font-size: 1.5rem; color: #38bdf8; }
+    p { line-height: 1.6; color: #94a3b8; }
+    code { padding: 0.15rem 0.4rem; border-radius: 6px; background: #1e293b; color: #f8fafc; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Slipgate Unified Edge</h1>
+    <p>Go Network Ingress (<code>slipgate-net</code>) 已就绪。当前展示为占位页；运行 <code>bun run build</code> 或通过 Docker 打包完整镜像后，此处将自动嵌入 <code>apps/web-vue</code> 控制台。</p>
+    <p>探针端点：<code>GET /healthz</code> · <code>GET /readyz</code></p>
+  </main>
+</body>
+</html>

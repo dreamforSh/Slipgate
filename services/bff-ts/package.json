@@ -1,0 +1,22 @@
+{
+  "name": "@slipgate/bff",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@slipgate/contracts": "workspace:*",
+    "@slipgate/plugin-sdk": "workspace:*",
+    "hono": "^4.7.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.2",
+    "typescript": "~5.7.3"
+  }
+}

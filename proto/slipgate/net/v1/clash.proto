@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package slipgate.net.v1;
+
+import "slipgate/dataplane/v1/dataplane.proto";
+
+message ClashExitNode {
+  string node_id = 1;
+  string subscription_id = 2;
+  string name = 3;
+  string proxy_slot_id = 4;
+  uint32 listener_port = 5;
+  string exit_ip = 6;
+  uint32 latency_ms = 7;
+  slipgate.dataplane.v1.ExitHealthStatus health_status = 8;
+  bool drift_unconfirmed = 9;
+  uint32 bound_accounts = 10;
+  uint32 max_accounts = 11;
+}
+
+message SyncSubscriptionRequest {
+  string subscription_id = 1;
+  bool force_override_drop_guard = 2;
+}
+
+message SyncSubscriptionResponse {
+  string subscription_id = 1;
+  uint32 total_nodes = 2;
+  uint32 added_nodes = 3;
+  uint32 removed_nodes = 4;
+  bool skipped_by_drop_guard = 5;
+  string message = 6;
+}
+
+message ListExitNodesRequest {
+  string subscription_id = 1;
+  bool healthy_only = 2;
+}
+
+message ListExitNodesResponse {
+  repeated ClashExitNode nodes = 1;
+}
+
+message ProbeExitNodesRequest {
+  repeated string node_ids = 1;
+  bool verify_exit_ip = 2;
+}
+
+message ProbeExitNodeResult {
+  string node_id = 1;
+  string exit_ip = 2;
+  uint32 latency_ms = 3;
+  slipgate.dataplane.v1.ExitHealthStatus health_status = 4;
+  bool ip_drifted = 5;
+  string error_message = 6;
+}
+
+message ProbeExitNodesResponse {
+  repeated ProbeExitNodeResult results = 1;
+}
+
+message BindAccountExitRequest {
+  string account_id = 1;
+  string node_id = 2;
+  bool is_shadow_follower = 3;
+  string utls_profile_id = 4;
+}
+
+message BindAccountExitResponse {
+  string account_id = 1;
+  string node_id = 2;
+  string proxy_slot_id = 3;
+  string exit_ip = 4;
+}
+
+message UnbindAccountExitRequest {
+  string account_id = 1;
+  bool pause_account_scheduling = 2;
+}
+
+message UnbindAccountExitResponse {
+  string account_id = 1;
+  bool scheduling_paused = 2;
+}
+
+message ProxyOAuthRequest {
+  string account_id = 1;
+  string method = 2;
+  string target_url = 3;
+  repeated slipgate.dataplane.v1.HeaderEntry headers = 4;
+  bytes body = 5;
+}
+
+message ProxyOAuthResponse {
+  uint32 status_code = 1;
+  repeated slipgate.dataplane.v1.HeaderEntry headers = 2;
+  bytes body = 3;
+  string traversed_exit_ip = 4;
+}
+
+service ClashPoolService {
+  rpc SyncSubscription(SyncSubscriptionRequest) returns (SyncSubscriptionResponse);
+  rpc ListExitNodes(ListExitNodesRequest) returns (ListExitNodesResponse);
+  rpc ProbeExitNodes(ProbeExitNodesRequest) returns (ProbeExitNodesResponse);
+  rpc BindAccountExit(BindAccountExitRequest) returns (BindAccountExitResponse);
+  rpc UnbindAccountExit(UnbindAccountExitRequest) returns (UnbindAccountExitResponse);
+  rpc ProxyOAuth(ProxyOAuthRequest) returns (ProxyOAuthResponse);
+}

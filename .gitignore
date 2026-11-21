@@ -1,0 +1,42 @@
+# Build outputs
+/bin/
+/dist/
+zig-out/
+.zig-cache/
+services/core-zig/zig-out/
+services/core-zig/.zig-cache/
+services/bff-ts/dist/
+apps/web-vue/dist/
+services/net-go/internal/webui/dist/assets/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+
+# Keep embedded placeholder HTML so go:embed compiles before frontend build
+!services/net-go/internal/webui/dist/index.html
+
+# Dependencies
+**/node_modules/
+.pnpm-store/
+
+# Local environment & runtime data
+.env
+.env.*
+!.env.example
+!deploy/.env.example
+config/slipgate.yaml
+data/
+logs/
+tmp/
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

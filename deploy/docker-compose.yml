@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-slipgate}
+      POSTGRES_USER: ${POSTGRES_USER:-slipgate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-slipgate}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../migrations/core/0001_init_core.sql:/docker-entrypoint-initdb.d/01_core.sql:ro
+      - ../migrations/net/0001_init_net.sql:/docker-entrypoint-initdb.d/02_net.sql:ro
+      - ../migrations/commerce/0001_init_commerce.sql:/docker-entrypoint-initdb.d/03_commerce.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slipgate} -d ${POSTGRES_DB:-slipgate}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  slipgate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 90s
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env.example
+    environment:
+      SLIPGATE_LISTEN_ADDR: ":8080"
+      SLIPGATE_CORE_IPC: "127.0.0.1:19081"
+      SLIPGATE_BFF_ADDR: "127.0.0.1:19082"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-slipgate}:${POSTGRES_PASSWORD:-slipgate}@postgres:5432/${POSTGRES_DB:-slipgate}"
+      REDIS_URL: "redis://redis:6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+  redis_data:

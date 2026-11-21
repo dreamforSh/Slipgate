@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  proto-lint:
+    name: Proto Contracts (Buf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Lint proto schemas
+        run: buf lint
+
+  net-go:
+    name: L1 Network & Supervisor (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/net-go
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: services/net-go/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: services/net-go/go.*
+      - name: Go vet
+        run: go vet ./...
+      - name: Go race tests
+        run: go test -race -v ./...
+      - name: Build and verify CLI
+        run: |
+          go build -o /tmp/slipgate ./cmd/slipgate
+          /tmp/slipgate --version
+
+  core-zig:
+    name: L2 Core Engine (Zig)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/core-zig
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+      - name: Run Zig unit tests
+        run: zig build test --summary all
+      - name: Build and verify CLI
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          ./zig-out/bin/slipgate-core --version
+
+  bun-workspace:
+    name: L3/L4 Contracts, BFF & Vue Console (Bun)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install workspace dependencies
+        run: |
+          if [ -f bun.lock ]; then
+            bun install --frozen-lockfile
+          else
+            bun install
+          fi
+      - name: Typecheck TS & Vue workspaces
+        run: bun run typecheck
+      - name: Run Bun tests
+        run: bun run test
+      - name: Build Vue console
+        run: bun run --cwd apps/web-vue build
+      - name: Compile BFF standalone binary
+        run: |
+          bun build --compile services/bff-ts/src/index.ts --outfile /tmp/slipgate-bff
+          /tmp/slipgate-bff --version
+
+  docker-smoke:
+    name: Single-Service Container Smoke Test
+    needs: [proto-lint, net-go, core-zig, bun-workspace]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Build unified single-service image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: slipgate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify embedded plane binaries
+        run: |
+          docker run --rm slipgate:ci --version
+          docker run --rm --entrypoint /usr/local/bin/slipgate-core slipgate:ci --version
+          docker run --rm --entrypoint /usr/local/bin/slipgate-bff slipgate:ci --version
+      - name: Verify single-service 3-plane boot & dual-plane routing
+        run: |
+          docker run -d --name sg-smoke -p 18080:8080 slipgate:ci
+          trap 'docker logs sg-smoke || true; docker rm -f sg-smoke >/dev/null 2>&1 || true' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/readyz >/tmp/readyz.json 2>/dev/null; then
+              cat /tmp/readyz.json
+              break
+            fi
+            sleep 0.5
+          done
+
+          curl -fsS http://127.0.0.1:18080/readyz | grep -q '"ready":true'
+          curl -fsS http://127.0.0.1:18080/api/v1/system/architecture | grep -q 'slipgate-bff'
+          curl -fsS -D /tmp/dp.headers -X POST http://127.0.0.1:18080/v1/chat/completions | grep -q 'slipgate-core'
+          grep -qi 'X-Slipgate-Plane: dataplane-direct' /tmp/dp.headers

@@ -1,0 +1,16 @@
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/dreamforSh/slipgate/services/net-go/internal/gen
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: services/net-go/internal/gen
+    opt: paths=source_relative
+  - remote: buf.build/connectrpc/go
+    out: services/net-go/internal/gen
+    opt: paths=source_relative
+  - remote: buf.build/bufbuild/es
+    out: packages/contracts/src/gen
+    opt: target=ts

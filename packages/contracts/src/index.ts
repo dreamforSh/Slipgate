@@ -1,0 +1,125 @@
+import { z } from "zod";
+
+export const NANO_PER_USD = 1_000_000_000n;
+
+export const ExitHealthStatusSchema = z.enum([
+  "unknown",
+  "healthy",
+  "degraded",
+  "circuit_open",
+]);
+export type ExitHealthStatus = z.infer<typeof ExitHealthStatusSchema>;
+
+export const PlaneHealthSchema = z.object({
+  status: z.enum(["ok", "degraded", "down"]),
+  service: z.string(),
+  version: z.string(),
+  runtime: z.string(),
+  uptimeSeconds: z.number().nonnegative(),
+  planes: z.object({
+    net: z.enum(["up", "down", "unknown"]),
+    core: z.enum(["up", "down", "unknown"]),
+    bff: z.enum(["up", "down"]),
+  }),
+});
+export type PlaneHealth = z.infer<typeof PlaneHealthSchema>;
+
+export const ClashExitNodeSchema = z.object({
+  nodeId: z.string().min(1),
+  subscriptionId: z.string().min(1),
+  name: z.string().min(1),
+  proxySlotId: z.string().min(1),
+  listenerPort: z.number().int().min(1024).max(65535),
+  exitIp: z.string(),
+  latencyMs: z.number().int().nonnegative(),
+  healthStatus: ExitHealthStatusSchema,
+  driftUnconfirmed: z.boolean(),
+  boundAccounts: z.number().int().nonnegative(),
+  maxAccounts: z.number().int().positive(),
+});
+export type ClashExitNode = z.infer<typeof ClashExitNodeSchema>;
+
+export const ProviderSchema = z.enum([
+  "anthropic",
+  "openai",
+  "gemini",
+  "antigravity",
+  "grok",
+  "deepseek",
+  "glm",
+  "kimi",
+  "minimax",
+]);
+export type Provider = z.infer<typeof ProviderSchema>;
+
+export const RouteEndpointSchema = z.enum([
+  "any",
+  "messages",
+  "count_tokens",
+  "responses",
+  "chat_completions",
+  "embeddings",
+  "images",
+  "gemini",
+]);
+export type RouteEndpoint = z.infer<typeof RouteEndpointSchema>;
+
+export const CompositeRouteRuleSchema = z.object({
+  routeId: z.string().min(1),
+  groupId: z.string().min(1),
+  publicModel: z.string().min(1),
+  matchType: z.enum(["exact", "prefix"]),
+  targetPlatform: ProviderSchema,
+  upstreamModel: z.string(),
+  endpoint: RouteEndpointSchema,
+  priority: z.number().int().default(100),
+  enabled: z.boolean().default(true),
+});
+export type CompositeRouteRule = z.infer<typeof CompositeRouteRuleSchema>;
+
+export const RoutePreviewRequestSchema = z.object({
+  groupId: z.string().min(1),
+  publicModel: z.string().min(1),
+  endpoint: RouteEndpointSchema.default("any"),
+  rules: z.array(CompositeRouteRuleSchema).default([]),
+});
+export type RoutePreviewRequest = z.infer<typeof RoutePreviewRequestSchema>;
+
+export const RoutePreviewResponseSchema = z.object({
+  matched: z.boolean(),
+  targetPlatform: ProviderSchema.nullable(),
+  upstreamModel: z.string().nullable(),
+  matchedRuleId: z.string().nullable(),
+  resolutionSource: z.enum(["explicit_rule", "builtin_detector", "none"]),
+});
+export type RoutePreviewResponse = z.infer<typeof RoutePreviewResponseSchema>;
+
+export const WalletSummarySchema = z.object({
+  userId: z.string().min(1),
+  balanceNanoUsd: z.string().regex(/^-?\d+$/),
+  heldNanoUsd: z.string().regex(/^\d+$/),
+  availableNanoUsd: z.string().regex(/^-?\d+$/),
+  formattedAvailableUsd: z.string(),
+});
+export type WalletSummary = z.infer<typeof WalletSummarySchema>;
+
+export function formatNanoUsd(nano: bigint): string {
+  const negative = nano < 0n;
+  const abs = negative ? -nano : nano;
+  const whole = abs / NANO_PER_USD;
+  const frac = (abs % NANO_PER_USD).toString().padStart(9, "0").replace(/0+$/, "");
+  const sign = negative ? "-" : "";
+  return frac.length > 0 ? `${sign}$${whole}.${frac}` : `${sign}$${whole}.00`;
+}
+
+export function parseUsdToNano(input: string): bigint {
+  const trimmed = input.trim().replace(/^\$/, "");
+  if (!/^-?\d+(?:\.\d{1,9})?$/.test(trimmed)) {
+    throw new Error(`Invalid USD decimal string: "${input}"`);
+  }
+  const negative = trimmed.startsWith("-");
+  const unsigned = negative ? trimmed.slice(1) : trimmed;
+  const [wholePart, fracPart = ""] = unsigned.split(".");
+  const nano = BigInt(wholePart) * NANO_PER_USD + BigInt(fracPart.padEnd(9, "0"));
+  return negative ? -nano : nano;
+}
