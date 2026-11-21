@@ -15,6 +15,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashcore"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/dataplane"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/ingress"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
@@ -164,6 +165,7 @@ func main() {
 					"SLIPGATE_UPDATE_BRANCH=" + cfg.UpdateBranch,
 					"SLIPGATE_INTERNAL_TOKEN=" + cfg.InternalToken,
 					"SLIPGATE_NET_INTERNAL_URL=" + internalURL,
+					"SLIPGATE_VAULT_SECRET=" + cfg.VaultSecret,
 				},
 				AllowDegraded: cfg.AllowDegraded,
 			},
@@ -178,6 +180,18 @@ func main() {
 		}()
 	}
 
+	dpCoord := dataplane.NewCoordinator(dataplane.CoordinatorOptions{
+		CoreIPC:       cfg.CoreIPC,
+		BFFOrigin:     cfg.BFFAddr,
+		InternalToken: cfg.InternalToken,
+		VaultSecret:   cfg.VaultSecret,
+		ClashPool:     pool,
+		StealthDialer: stealthDialer,
+		VMSlots:       vmSlots,
+		Logger:        logger,
+	})
+	dpCoord.StartBackgroundSync(rootCtx)
+
 	edge, err := ingress.NewServer(cfg, version, pool, sup)
 	if err != nil {
 		logger.Fatalf("failed to initialize edge ingress: %v", err)
@@ -186,6 +200,7 @@ func main() {
 	edge.WithClashCoordinator(clashCoord)
 	edge.WithVmSlotManager(vmSlots)
 	edge.WithVmCoordinator(vmCoord)
+	edge.WithDataPlaneCoordinator(dpCoord)
 
 	updater := hotupdate.NewManager(hotupdate.Options{
 		Config:        cfg,

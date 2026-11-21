@@ -3,6 +3,9 @@ import { z } from "zod";
 export const ClusterNodeDriverKindSchema = z.enum(["local", "ssh"]);
 export type ClusterNodeDriverKind = z.infer<typeof ClusterNodeDriverKindSchema>;
 
+export const VmRuntimeProfileSchema = z.enum(["claude_code", "codex_cli", "antigravity"]);
+export type VmRuntimeProfile = z.infer<typeof VmRuntimeProfileSchema>;
+
 export const ClusterNodeSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -40,6 +43,7 @@ export const ProvisionVmSlotRequestSchema = z.object({
   clusterNodeId: z.string().trim().min(1).max(64).default("local-node"),
   accountId: z.string().trim().min(1).max(128),
   clashNodeId: z.string().trim().min(1).max(128).optional(),
+  runtimeProfile: VmRuntimeProfileSchema.default("claude_code"),
   hypervisorKind: z.enum(["kvm_qemu", "docker_hardened", "macos_native"]).optional(),
   maxSubagents: z.number().int().min(1).max(64).default(20),
   memoryMiB: z.number().int().min(512).max(131072).default(2048),
@@ -55,6 +59,7 @@ export type ProvisionVmSlotRequest = z.infer<typeof ProvisionVmSlotRequestSchema
 export const UpdateVmSeedRequestSchema = z.object({
   settingsJsonRaw: z.string().optional(),
   customSettingRaw: z.string().optional(),
+  authJsonRaw: z.string().optional(),
   proxyEnvRaw: z.string().optional(),
   bootstrapScriptRaw: z.string().optional(),
   rejectClientSettings: z.boolean().optional(),

@@ -11,7 +11,11 @@ pub const FrameType = enum(u8) {
     dispatch_directive = 0x12,
     upstream_chunk = 0x13,
     stream_end = 0x14,
+    settle_report = 0x15,
+    settle_ack = 0x16,
     exit_health = 0x20,
+    sync_state = 0x30,
+    sync_ack = 0x31,
     _,
 };
 
@@ -54,6 +58,12 @@ pub const Header = struct {
     }
 };
 
+pub const FrameReply = struct {
+    frame_type: FrameType,
+    flags: u8,
+    payload: []const u8,
+};
+
 pub const Endpoint = struct {
     host: []const u8,
     port: u16,
@@ -70,6 +80,20 @@ pub fn parseEndpoint(raw: []const u8, default_port: u16) !Endpoint {
     return .{ .host = host, .port = port };
 }
 
+pub fn writeFrame(writer: anytype, stream_id: u32, reply: FrameReply) !void {
+    const resp_hdr = try (Header{
+        .stream_id = stream_id,
+        .frame_type = reply.frame_type,
+        .flags = reply.flags,
+        .payload_len = @intCast(reply.payload.len),
+    }).encode();
+    try writer.writeAll(&resp_hdr);
+    if (reply.payload.len > 0) {
+        try writer.writeAll(reply.payload);
+    }
+}
+
+/// Static directive server used by slipgate-guestd and baseline frame tests.
 pub fn serveConnection(
     allocator: std.mem.Allocator,
     conn: std.net.Server.Connection,
@@ -101,35 +125,25 @@ pub fn serveConnection(
 
         switch (hdr.frame_type) {
             .ping => {
-                const resp_hdr = (Header{
-                    .stream_id = hdr.stream_id,
+                writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .pong,
                     .flags = FLAG_END_STREAM,
-                    .payload_len = hdr.payload_len,
-                }).encode() catch return;
-                writer.writeAll(&resp_hdr) catch return;
-                if (payload.len > 0) writer.writeAll(payload) catch return;
+                    .payload = payload,
+                }) catch return;
             },
             .req_headers => {
-                const resp_hdr = (Header{
-                    .stream_id = hdr.stream_id,
+                writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .dispatch_directive,
                     .flags = FLAG_END_STREAM | FLAG_PASSTHROUGH,
-                    .payload_len = @intCast(directive_json.len),
-                }).encode() catch return;
-                writer.writeAll(&resp_hdr) catch return;
-                writer.writeAll(directive_json) catch return;
+                    .payload = directive_json,
+                }) catch return;
             },
             else => {
-                const err_body = "{\"error\":\"unsupported_frame\"}";
-                const resp_hdr = (Header{
-                    .stream_id = hdr.stream_id,
+                writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .stream_end,
                     .flags = FLAG_END_STREAM | FLAG_ERROR,
-                    .payload_len = @intCast(err_body.len),
-                }).encode() catch return;
-                writer.writeAll(&resp_hdr) catch return;
-                writer.writeAll(err_body) catch return;
+                    .payload = "{\"error\":\"unsupported_frame\"}",
+                }) catch return;
             },
         }
     }

@@ -1,9 +1,9 @@
 const std = @import("std");
 const core = @import("slipgate_core");
 const frame = core.frame;
+const gateway = core.gateway;
 
-const VERSION = "0.1.0";
-const DIRECTIVE_JSON = "{\"engine\":\"slipgate-core\",\"mode\":\"stub-dispatch\"}";
+const VERSION = "0.2.0";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -19,6 +19,9 @@ pub fn main() !void {
             return;
         }
     }
+
+    var engine = gateway.GatewayEngine.init(allocator);
+    defer engine.deinit();
 
     const raw_addr = std.process.getEnvVarOwned(allocator, "SLIPGATE_CORE_ADDR") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => try allocator.dupe(u8, "127.0.0.1:19081"),
@@ -38,7 +41,7 @@ pub fn main() !void {
             std.log.err("accept error: {s}", .{@errorName(err)});
             continue;
         };
-        const thread = std.Thread.spawn(.{}, frame.serveConnection, .{ allocator, conn, DIRECTIVE_JSON }) catch |err| {
+        const thread = std.Thread.spawn(.{}, gateway.serveEngineConnection, .{ allocator, conn, &engine }) catch |err| {
             std.log.err("thread spawn error: {s}", .{@errorName(err)});
             conn.stream.close();
             continue;

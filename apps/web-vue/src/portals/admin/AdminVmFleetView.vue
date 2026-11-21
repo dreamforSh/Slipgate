@@ -6,6 +6,7 @@ import type {
   SlotSeedSnapshot,
   UpstreamAccount,
   VmFleetOverview,
+  VmRuntimeProfile,
   VmSlotSummary,
   VmTerminalTicketResponse,
 } from "@slipgate/contracts";
@@ -36,6 +37,7 @@ const provAccountId = ref("");
 const provClashNodeId = ref("");
 const provClusterNodeId = ref("local-node");
 const provHypervisor = ref<"docker_hardened" | "kvm_qemu" | "macos_native">("docker_hardened");
+const provRuntimeProfile = ref<VmRuntimeProfile>("claude_code");
 const provMemoryMiB = ref(2048);
 const provMaxSubagents = ref(20);
 const provCleanse = ref<"zero" | "official" | "template">("zero");
@@ -47,6 +49,7 @@ const activeSlotId = ref<string | null>(null);
 const activeSeed = ref<SlotSeedSnapshot | null>(null);
 const seedSettingsJson = ref("{}");
 const seedCustomEnv = ref("");
+const seedAuthJson = ref("");
 const seedRejectSettings = ref(true);
 const seedRejectIdentity = ref(true);
 
@@ -91,6 +94,7 @@ async function loadFleet() {
       accounts.value = accData.accounts ?? [];
       if (!provAccountId.value && accounts.value[0]) {
         provAccountId.value = accounts.value[0].id;
+        syncRuntimeFromAccount();
       }
     }
   } catch (err) {
@@ -151,6 +155,18 @@ async function deleteNode(id: string) {
   }
 }
 
+function syncRuntimeFromAccount() {
+  const acc = accounts.value.find((a) => a.id === provAccountId.value.trim());
+  if (!acc) return;
+  if (acc.platform === "antigravity") {
+    provRuntimeProfile.value = "antigravity";
+  } else if (acc.platform === "codex" || acc.platform === "openai") {
+    provRuntimeProfile.value = "codex_cli";
+  } else {
+    provRuntimeProfile.value = "claude_code";
+  }
+}
+
 async function provisionSlot() {
   busy.value = true;
   errorMessage.value = null;
@@ -165,6 +181,7 @@ async function provisionSlot() {
         accountId: provAccountId.value.trim(),
         clashNodeId: provClashNodeId.value.trim() || undefined,
         hypervisorKind: provHypervisor.value,
+        runtimeProfile: provRuntimeProfile.value,
         memoryMiB: provMemoryMiB.value,
         maxSubagents: provMaxSubagents.value,
         cleanseMode: provCleanse.value,
@@ -225,8 +242,74 @@ async function inspectSlotSeed(slot: VmSlotSummary) {
   activeSeed.value = snap;
   seedSettingsJson.value = snap.settingsJsonRaw;
   seedCustomEnv.value = snap.customSettingRaw;
+  seedAuthJson.value = snap.authJsonRaw ?? "";
   seedRejectSettings.value = snap.rejectClientSettings;
   seedRejectIdentity.value = snap.rejectClientIdentity;
+}
+
+function fillRuntimeSeedTemplate(runtime: VmRuntimeProfile) {
+  if (runtime === "antigravity") {
+    seedSettingsJson.value = JSON.stringify(
+      {
+        "antigravity.telemetry": "isolated",
+        "antigravity.cloudCodeEndpoint": "https://cloudcode-pa.googleapis.com",
+      },
+      null,
+      2,
+    );
+    seedAuthJson.value = JSON.stringify(
+      {
+        accessToken: "ya29.replace-me",
+        refreshToken: "1//replace-me",
+        projectId: "rising-fact-p41fc",
+      },
+      null,
+      2,
+    );
+    return;
+  }
+  if (runtime === "codex_cli") {
+    seedSettingsJson.value = JSON.stringify(
+      {
+        model: "gpt-5-codex",
+        approval_policy: "never",
+        sandbox_mode: "workspace-write",
+      },
+      null,
+      2,
+    );
+    seedAuthJson.value = JSON.stringify(
+      {
+        tokens: {
+          access_token: "eyJhbGciOi-replace-me",
+          refresh_token: "rt_replace_me",
+          account_id: "acct_chatgpt_replace_me",
+        },
+      },
+      null,
+      2,
+    );
+    return;
+  }
+  seedSettingsJson.value = JSON.stringify(
+    {
+      cleanupPeriodDays: 30,
+      includeCoAuthoredBy: false,
+      permissions: { allow: [], deny: [] },
+    },
+    null,
+    2,
+  );
+  seedAuthJson.value = JSON.stringify(
+    {
+      claudeAiOauth: {
+        accessToken: "sk-ant-oat01-replace-me",
+        refreshToken: "sk-ant-ort01-replace-me",
+      },
+    },
+    null,
+    2,
+  );
 }
 
 async function saveSlotSeed() {
@@ -242,6 +325,7 @@ async function saveSlotSeed() {
         body: JSON.stringify({
           settingsJsonRaw: seedSettingsJson.value,
           customSettingRaw: seedCustomEnv.value,
+          authJsonRaw: seedAuthJson.value,
           rejectClientSettings: seedRejectSettings.value,
           rejectClientIdentity: seedRejectIdentity.value,
         }),
@@ -441,13 +525,22 @@ onBeforeUnmount(() => {
             </select>
           </div>
           <div class="grid gap-3 sm:grid-cols-2">
-            <input
-              v-model="provAccountId"
-              type="text"
-              required
-              placeholder="上游账号 ID（需已绑定健康 Clash 出口）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-            />
+            <div>
+              <input
+                v-model="provAccountId"
+                type="text"
+                list="vm-account-options"
+                required
+                placeholder="上游账号 ID（需已绑定健康 Clash 出口）"
+                class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
+                @change="syncRuntimeFromAccount"
+              />
+              <datalist id="vm-account-options">
+                <option v-for="acc in accounts" :key="acc.id" :value="acc.id">
+                  {{ acc.name }} ({{ acc.platform }})
+                </option>
+              </datalist>
+            </div>
             <select
               v-model="provClashNodeId"
               class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
@@ -458,7 +551,15 @@ onBeforeUnmount(() => {
               </option>
             </select>
           </div>
-          <div class="grid gap-3 sm:grid-cols-4">
+          <div class="grid gap-3 sm:grid-cols-5">
+            <select
+              v-model="provRuntimeProfile"
+              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
+            >
+              <option value="claude_code">Runtime: claude_code</option>
+              <option value="codex_cli">Runtime: codex_cli</option>
+              <option value="antigravity">Runtime: antigravity (反重力)</option>
+            </select>
             <select
               v-model="provHypervisor"
               class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
@@ -614,7 +715,21 @@ onBeforeUnmount(() => {
           <tbody class="divide-y divide-slate-800/70">
             <tr v-for="slot in slotList()" :key="slot.slotId">
               <td class="px-3 py-3">
-                <p class="font-mono font-semibold text-sky-300">{{ slot.slotId }}</p>
+                <p class="font-mono font-semibold text-sky-300">
+                  {{ slot.slotId }}
+                  <span
+                    class="ml-1 rounded px-1.5 py-0.5 text-[10px]"
+                    :class="
+                      slot.runtimeProfile === 'antigravity'
+                        ? 'bg-violet-500/20 text-violet-300'
+                        : slot.runtimeProfile === 'codex_cli'
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : 'bg-amber-500/20 text-amber-300'
+                    "
+                  >
+                    {{ slot.runtimeProfile }}
+                  </span>
+                </p>
                 <p class="text-slate-400">{{ slot.clusterNodeId }} · {{ slot.hypervisorKind }} · {{ slot.memoryMiB }} MiB</p>
               </td>
               <td class="px-3 py-3 font-mono">
@@ -691,21 +806,41 @@ onBeforeUnmount(() => {
     <!-- Seed Editor + KVM Migration -->
     <section v-if="activeSlotId" class="grid gap-6 lg:grid-cols-2">
       <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
-        <h3 class="text-sm font-semibold text-white">
-          Seed 热同步编辑器 · {{ activeSlotId }}
-          <span class="ml-2 font-mono text-xs font-normal text-slate-400">
-            (synced: {{ activeSeed?.syncedAtUnixMs ?? "-" }})
-          </span>
-        </h3>
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h3 class="text-sm font-semibold text-white">
+            Seed 热同步编辑器 · {{ activeSlotId }}
+            <span class="ml-2 font-mono text-xs font-normal text-sky-300">
+              [{{ activeSeed?.runtimeProfile ?? "claude_code" }}]
+            </span>
+            <span class="ml-1 font-mono text-xs font-normal text-slate-400">
+              (synced: {{ activeSeed?.syncedAtUnixMs ?? "-" }})
+            </span>
+          </h3>
+          <button
+            type="button"
+            class="rounded border border-slate-700 px-2 py-1 text-[11px] text-sky-300 hover:border-sky-500"
+            @click="fillRuntimeSeedTemplate(activeSeed?.runtimeProfile ?? 'claude_code')"
+          >
+            填充当前运行时模板
+          </button>
+        </div>
         <div class="mt-3 space-y-3">
           <textarea
             v-model="seedSettingsJson"
-            rows="6"
+            rows="5"
+            placeholder="settings.json / config.toml 映射 JSON"
             class="w-full rounded-lg border border-slate-700 bg-slate-950 p-3 font-mono text-xs text-slate-200"
           />
           <textarea
+            v-model="seedAuthJson"
+            rows="4"
+            placeholder="运行时 OAuth 种子 JSON (.credentials.json / .codex/auth.json / .antigravity/oauth_creds.json，AES-GCM 加密落盘)"
+            class="w-full rounded-lg border border-slate-700 bg-slate-950 p-3 font-mono text-xs text-emerald-200"
+          />
+          <textarea
             v-model="seedCustomEnv"
-            rows="3"
+            rows="2"
+            placeholder="自定义环境变量 / runtime flag"
             class="w-full rounded-lg border border-slate-700 bg-slate-950 p-3 font-mono text-xs text-slate-200"
           />
           <div class="flex flex-wrap gap-4 text-xs text-slate-300">
@@ -768,7 +903,7 @@ onBeforeUnmount(() => {
         </h3>
         <div class="flex gap-2 text-xs">
           <button
-            v-for="quick in ['help', 'status', 'machine-id', 'persona', 'ping', 'ls']"
+            v-for="quick in ['help', 'status', 'runtime', 'machine-id', 'persona', 'ping', 'ls']"
             :key="quick"
             type="button"
             class="rounded border border-slate-700 px-2 py-1 font-mono text-slate-300 hover:border-sky-500"

@@ -7,6 +7,8 @@ export const ClientHelloPresetSchema = z.enum([
   "auto",
   "custom_wire",
   "claude_bun_21",
+  "codex_rustls",
+  "antigravity_ide",
   "bun_default",
   "chrome_auto",
   "chrome_131",

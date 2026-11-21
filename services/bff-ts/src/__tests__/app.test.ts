@@ -238,6 +238,8 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
     expect(tlsListRes.status).toBe(200);
     const tlsListBody = (await tlsListRes.json()) as { profiles: Array<{ id: string }> };
     expect(tlsListBody.profiles.some((p) => p.id === "claude-bun-21")).toBe(true);
+    expect(tlsListBody.profiles.some((p) => p.id === "codex-rustls-01")).toBe(true);
+    expect(tlsListBody.profiles.some((p) => p.id === "antigravity-electron-15")).toBe(true);
     expect(tlsListBody.profiles.some((p) => p.id === "auto")).toBe(true);
 
     const putLocked = await app.request("/api/v1/admin/tls-profiles/claude-bun-21", {
@@ -246,6 +248,13 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
       body: JSON.stringify({ name: "Cannot Mutate Builtin" }),
     });
     expect(putLocked.status).toBe(403);
+
+    const putAgLocked = await app.request("/api/v1/admin/tls-profiles/antigravity-electron-15", {
+      method: "PUT",
+      headers: adminHeaders,
+      body: JSON.stringify({ name: "Cannot Mutate Antigravity Builtin" }),
+    });
+    expect(putAgLocked.status).toBe(403);
 
     const putCustom = await app.request("/api/v1/admin/tls-profiles/custom-bun-1", {
       method: "PUT",
@@ -269,5 +278,235 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
       body: JSON.stringify({ accountId: "acc-unbound" }),
     });
     expect(vmBadCreate.status).toBe(503);
+  });
+
+  it("synchronizes DataPlane snapshots, composite routes, idempotent nano-USD settlements, and risk events", async () => {
+    const internalToken = "internal-dp-bridge-secret";
+    const app = createBffApp({
+      jwtSecret: "dp-test-jwt-secret-32-bytes-minimum",
+      vaultSecret: "dp-test-vault-secret-32-bytes-minimum",
+      internalToken,
+    });
+
+    const setupRes = await app.request("/api/v1/setup/initialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        siteName: "Slipgate DataPlane Test",
+        adminEmail: "admin@dp.test",
+        adminPassword: "StrongPassword123!",
+      }),
+    });
+    expect(setupRes.status).toBe(201);
+    const { accessToken, user } = (await setupRes.json()) as {
+      accessToken: string;
+      user: { id: string };
+    };
+    const adminHeaders = {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "application/json",
+    };
+
+    // Credit $10.000000000 -> 10_000_000_000 nano-USD
+    const creditRes = await app.request(`/api/v1/admin/users/${user.id}/credit`, {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({ amountUsd: "10.00" }),
+    });
+    expect(creditRes.status).toBe(200);
+
+    // Create direct_api mock account + user API key
+    const accRes = await app.request("/api/v1/admin/accounts", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: "mock-anthropic-01",
+        groupId: "grp_default",
+        platform: "anthropic",
+        executionMode: "direct_api",
+        authKind: "api_key",
+        credentialSecret: "mock://ok",
+      }),
+    });
+    expect(accRes.status).toBe(201);
+    const { account } = (await accRes.json()) as { account: { id: string } };
+
+    const keyRes = await app.request("/api/v1/user/api-keys", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: "dp-smoke-key",
+        groupId: "grp_default",
+      }),
+    });
+    expect(keyRes.status).toBe(201);
+    const { item: apiKey } = (await keyRes.json()) as { item: { id: string } };
+
+    // Create composite route rule and verify persisted preview
+    const routeCreate = await app.request("/api/v1/admin/routes", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        groupId: "grp_default",
+        publicModel: "sonnet-fast",
+        matchType: "exact",
+        targetPlatform: "anthropic",
+        upstreamModel: "claude-sonnet-4-5",
+        endpoint: "any",
+        priority: 10,
+      }),
+    });
+    expect(routeCreate.status).toBe(201);
+    const { route } = (await routeCreate.json()) as { route: { id: string } };
+
+    const previewPersisted = await app.request("/api/v1/admin/routes/preview", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        groupId: "grp_default",
+        publicModel: "sonnet-fast",
+        endpoint: "chat_completions",
+      }),
+    });
+    expect(previewPersisted.status).toBe(200);
+    const previewBody = (await previewPersisted.json()) as {
+      matchedRuleId: string;
+      upstreamModel: string;
+      resolutionSource: string;
+    };
+    expect(previewBody.matchedRuleId).toBe(route.id);
+    expect(previewBody.upstreamModel).toBe("claude-sonnet-4-5");
+    expect(previewBody.resolutionSource).toBe("explicit_rule");
+
+    // Verify built-in detector for Codex and Antigravity models
+    const previewCodex = await app.request("/api/v1/admin/routes/preview", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        groupId: "grp_default",
+        publicModel: "gpt-5-codex",
+        endpoint: "responses",
+      }),
+    });
+    expect(previewCodex.status).toBe(200);
+    const codexPreviewBody = (await previewCodex.json()) as { targetPlatform: string; resolutionSource: string };
+    expect(codexPreviewBody.targetPlatform).toBe("codex");
+    expect(codexPreviewBody.resolutionSource).toBe("builtin_detector");
+
+    const previewAg = await app.request("/api/v1/admin/routes/preview", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        groupId: "grp_default",
+        publicModel: "antigravity/claude-sonnet-4-5",
+        endpoint: "chat_completions",
+      }),
+    });
+    expect(previewAg.status).toBe(200);
+    const agPreviewBody = (await previewAg.json()) as { targetPlatform: string };
+    expect(agPreviewBody.targetPlatform).toBe("antigravity");
+
+    // Internal snapshot requires X-Slipgate-Internal-Token
+    const forbiddenSnap = await app.request("/api/v1/internal/dataplane/snapshot");
+    expect(forbiddenSnap.status).toBe(403);
+
+    const internalHeaders = {
+      "content-type": "application/json",
+      "X-Slipgate-Internal-Token": internalToken,
+    };
+    const snapRes = await app.request("/api/v1/internal/dataplane/snapshot", { headers: internalHeaders });
+    expect(snapRes.status).toBe(200);
+    const snap = (await snapRes.json()) as {
+      accounts: Array<{ id: string; credentialsEncHex: string }>;
+      apiKeys: Array<{ id: string; keyHashHex: string }>;
+      routes: Array<{ id: string }>;
+    };
+    expect(snap.accounts.some((a) => a.id === account.id && a.credentialsEncHex.length > 24)).toBe(true);
+    expect(snap.apiKeys.some((k) => k.id === apiKey.id && k.keyHashHex.length === 64)).toBe(true);
+    expect(snap.routes.some((r) => r.id === route.id)).toBe(true);
+
+    // Post turn settlement (210,000 nano-USD = $0.00021) twice to verify idempotency
+    const settlePayload = {
+      requestId: "req_test_settle_001",
+      userId: user.id,
+      apiKeyId: apiKey.id,
+      accountId: account.id,
+      groupId: "grp_default",
+      platform: "anthropic",
+      publicModel: "sonnet-fast",
+      upstreamModel: "claude-sonnet-4-5",
+      ingressCodec: "openai_chat",
+      egressCodec: "anthropic_messages",
+      inputTokens: 20,
+      outputTokens: 10,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costNanoUsd: "210000",
+      window5hUsedBps: 4250,
+      window7dUsedBps: 1500,
+      ttftMs: 42,
+      durationMs: 115,
+      statusCode: 200,
+    };
+    const settle1 = await app.request("/api/v1/internal/dataplane/settlement", {
+      method: "POST",
+      headers: internalHeaders,
+      body: JSON.stringify(settlePayload),
+    });
+    expect(settle1.status).toBe(200);
+    const settle2 = await app.request("/api/v1/internal/dataplane/settlement", {
+      method: "POST",
+      headers: internalHeaders,
+      body: JSON.stringify(settlePayload),
+    });
+    expect(settle2.status).toBe(200);
+
+    const walletRes = await app.request("/api/v1/user/wallet", { headers: adminHeaders });
+    expect(walletRes.status).toBe(200);
+    const { wallet } = (await walletRes.json()) as { wallet: { balanceNanoUsd: string } };
+    expect(wallet.balanceNanoUsd).toBe("9999790000");
+
+    const usageRes = await app.request("/api/v1/user/usage", { headers: adminHeaders });
+    expect(usageRes.status).toBe(200);
+    const usageBody = (await usageRes.json()) as { items: Array<{ requestId: string; publicModel: string }> };
+    expect(usageBody.items.length).toBe(1);
+    expect(usageBody.items[0]?.publicModel).toBe("sonnet-fast");
+
+    const accountsAfterRes = await app.request("/api/v1/admin/accounts", { headers: adminHeaders });
+    expect(accountsAfterRes.status).toBe(200);
+    const accountsAfterBody = (await accountsAfterRes.json()) as {
+      accounts: Array<{ id: string; window5hUsedBps: number; window7dUsedBps: number }>;
+    };
+    const updatedAcc = accountsAfterBody.accounts.find((a) => a.id === account.id);
+    expect(updatedAcc?.window5hUsedBps).toBe(4250);
+    expect(updatedAcc?.window7dUsedBps).toBe(1500);
+
+    // Post risk ban event and verify admin visibility
+    const riskPost = await app.request("/api/v1/internal/dataplane/risk-events", {
+      method: "POST",
+      headers: internalHeaders,
+      body: JSON.stringify({
+        subjectKind: "api_key",
+        subjectHash: apiKey.id,
+        strikeLevel: 1,
+        banDuration: "10m",
+        reason: "prompt_distillation_signature",
+        sourceRequestId: "req_risk_001",
+      }),
+    });
+    expect(riskPost.status).toBe(200);
+
+    const riskList = await app.request("/api/v1/admin/risk/events", { headers: adminHeaders });
+    expect(riskList.status).toBe(200);
+    const riskBody = (await riskList.json()) as { events: Array<{ reason: string; banDuration: string }> };
+    expect(riskBody.events.some((e) => e.reason === "prompt_distillation_signature" && e.banDuration === "10m")).toBe(
+      true,
+    );
+
+    const delRoute = await app.request(`/api/v1/admin/routes/${route.id}`, {
+      method: "DELETE",
+      headers: adminHeaders,
+    });
+    expect(delRoute.status).toBe(200);
   });
 });

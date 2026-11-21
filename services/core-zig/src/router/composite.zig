@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Provider = enum {
     anthropic,
     openai,
+    codex,
     gemini,
     antigravity,
     grok,
@@ -113,9 +114,15 @@ pub fn resolveRoute(rules: []const RouteRule, endpoint: EndpointKind, public_mod
 }
 
 fn detectBuiltinProvider(model: []const u8) ?Provider {
+    if (std.mem.startsWith(u8, model, "antigravity/") or std.mem.startsWith(u8, model, "ag-")) return .antigravity;
+    if (std.mem.startsWith(u8, model, "codex-") or
+        std.mem.startsWith(u8, model, "codex/") or
+        std.mem.startsWith(u8, model, "gpt-5-codex") or
+        std.mem.startsWith(u8, model, "o3-codex") or
+        std.mem.startsWith(u8, model, "o4-mini-codex")) return .codex;
     if (std.mem.startsWith(u8, model, "claude-") or std.mem.startsWith(u8, model, "anthropic/")) return .anthropic;
     if (std.mem.startsWith(u8, model, "gemini-") or std.mem.startsWith(u8, model, "google/")) return .gemini;
-    if (std.mem.startsWith(u8, model, "gpt-") or std.mem.startsWith(u8, model, "codex-") or std.mem.startsWith(u8, model, "openai/")) return .openai;
+    if (std.mem.startsWith(u8, model, "gpt-") or std.mem.startsWith(u8, model, "o1-") or std.mem.startsWith(u8, model, "o3-") or std.mem.startsWith(u8, model, "o4-") or std.mem.startsWith(u8, model, "openai/")) return .openai;
     if (std.mem.startsWith(u8, model, "grok-") or std.mem.startsWith(u8, model, "xai/")) return .grok;
     if (std.mem.startsWith(u8, model, "deepseek-")) return .deepseek;
     if (std.mem.startsWith(u8, model, "glm-")) return .glm;
@@ -154,4 +161,12 @@ test "explicit exact route beats prefix and builtin detection" {
 
 test "unknown model fails closed" {
     try std.testing.expectError(error.UnknownModel, resolveRoute(&.{}, .chat_completions, "totally-unknown-model"));
+}
+
+test "builtin detector distinguishes codex and antigravity models" {
+    const codex_match = try resolveRoute(&.{}, .responses, "gpt-5-codex");
+    try std.testing.expectEqual(Provider.codex, codex_match.provider);
+
+    const ag_match = try resolveRoute(&.{}, .messages, "antigravity/claude-sonnet-4-5");
+    try std.testing.expectEqual(Provider.antigravity, ag_match.provider);
 }

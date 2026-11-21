@@ -6,15 +6,19 @@ import {
   CreateAccountRequestSchema,
   CreateApiKeyRequestSchema,
   CreateClashSubscriptionRequestSchema,
+  CreateCompositeRouteRequestSchema,
   CreateTlsProfileRequestSchema,
+  DataPlaneSyncSnapshotSchema,
   formatNanoUsd,
   HardwarePersonaSchema,
   NANO_PER_USD,
   parseUsdToNano,
   ProvisionVmSlotRequestSchema,
+  RecordRiskBanInputSchema,
   SetupInitializeRequestSchema,
   SystemUpdateStatusSchema,
   TriggerUpdateSyncRequestSchema,
+  TurnSettlementEventSchema,
   UpdateTlsProfileRequestSchema,
   VmFleetOverviewSchema,
   VmTerminalTicketResponseSchema,
@@ -212,5 +216,54 @@ describe("IAM, Pool and API Key contracts", () => {
       nodeId: "node-1",
     });
     expect(bindReq.isShadowFollower).toBe(false);
+
+    const routeCreate = CreateCompositeRouteRequestSchema.parse({
+      publicModel: "claude-sonnet-4-5",
+      targetPlatform: "anthropic",
+    });
+    expect(routeCreate.groupId).toBe("grp_default");
+
+    const dpSnap = DataPlaneSyncSnapshotSchema.parse({
+      revisionUnixMs: 1700000000000,
+      groups: [],
+      routes: [],
+      accounts: [],
+      apiKeys: [],
+      wallets: [{ userId: "usr_1", balanceNanoUsd: "5000000000", heldNanoUsd: "0" }],
+    });
+    expect(dpSnap.wallets[0]?.balanceNanoUsd).toBe("5000000000");
+
+    const settle = TurnSettlementEventSchema.parse({
+      requestId: "req_1",
+      userId: "usr_1",
+      apiKeyId: "key_1",
+      accountId: "acc_1",
+      groupId: "grp_default",
+      platform: "anthropic",
+      publicModel: "claude-sonnet-4-5",
+      upstreamModel: "claude-sonnet-4-5",
+      ingressCodec: "openai_chat",
+      egressCodec: "anthropic_messages",
+      inputTokens: 120,
+      outputTokens: 80,
+      costNanoUsd: "1560000",
+      statusCode: 200,
+    });
+    expect(settle.cacheReadTokens).toBe(0);
+
+    const riskIn = RecordRiskBanInputSchema.parse({
+      subjectKind: "api_key",
+      subjectHash: "key_1",
+      strikeLevel: 1,
+      banDuration: "10m",
+      reason: "prompt_distillation_signature",
+    });
+    expect(riskIn.banDuration).toBe("10m");
+
+    const codexRoute = CreateCompositeRouteRequestSchema.parse({
+      publicModel: "gpt-5-codex",
+      targetPlatform: "codex",
+    });
+    expect(codexRoute.targetPlatform).toBe("codex");
   });
 });

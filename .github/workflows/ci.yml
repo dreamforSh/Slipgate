@@ -139,6 +139,7 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"siteName":"Slipgate CI","adminEmail":"ci@slipgate.dev","adminPassword":"CiPassword123!"}')
           TOKEN=$(printf '%s' "$SETUP_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["accessToken"])')
+          USER_ID=$(printf '%s' "$SETUP_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["user"]["id"])')
 
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/vms/overview | grep -q '"local-node"'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/vms/overview | grep -q '"oneSlotOneEgress":true'
@@ -147,6 +148,8 @@ jobs:
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/clash/overview | grep -q '"mode":"embedded"'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q 'chrome-131'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q 'claude-bun-21'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q 'codex-rustls-01'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q 'antigravity-electron-15'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q '"auto"'
           BAD_TLS_CODE=$(curl -s -o /tmp/bad_tls.json -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
             -d '{"name":"CI Bad KeyShare","curves":[23],"keyShareGroups":[29],"extensions":[0,10,16,43,51]}' \
@@ -160,12 +163,81 @@ jobs:
           curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
             -d '{"name":"CI Inline Sub","sourceKind":"inline","sourceUrl":"proxies:\n  - name: Tokyo-CI\n    type: socks5\n    server: 198.51.100.10\n    port: 1080","autoSync":true}' \
             http://127.0.0.1:18080/api/v1/admin/clash/subscriptions | grep -q '"activeListeners":1'
-          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-            -d '{"name":"ci-smoke-key","groupId":"grp_default"}' \
-            http://127.0.0.1:18080/api/v1/user/api-keys | grep -q 'sk-sg-'
+          # DataPlane Mainline 1 E2E: unauthenticated 401 -> wallet credit + mock account + composite route -> unary/SSE/transcode -> settlement -> risk gate
+          UNAUTH_DP_CODE=$(curl -s -D /tmp/dp_unauth.headers -o /tmp/dp_unauth.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:18080/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}')
+          [ "$UNAUTH_DP_CODE" = "401" ]
+          grep -qi 'X-Slipgate-Plane: dataplane-direct' /tmp/dp_unauth.headers
 
-          curl -fsS -D /tmp/dp.headers -X POST http://127.0.0.1:18080/v1/chat/completions | grep -q 'slipgate-core'
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"amountUsd":"10.00","reason":"ci_smoke_credit"}' \
+            "http://127.0.0.1:18080/api/v1/admin/users/$USER_ID/credit" | grep -q '"10000000000"'
+
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"ci-mock-anthropic","groupId":"grp_default","platform":"anthropic","executionMode":"direct_api","authKind":"oauth","credentialSecret":"mock://ok"}' \
+            http://127.0.0.1:18080/api/v1/admin/accounts | grep -q '"direct_api"'
+
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"ci-mock-codex","groupId":"grp_default","platform":"codex","executionMode":"direct_api","authKind":"oauth","credentialSecret":"mock://ok"}' \
+            http://127.0.0.1:18080/api/v1/admin/accounts | grep -q '"codex"'
+
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"ci-mock-antigravity","groupId":"grp_default","platform":"antigravity","executionMode":"direct_api","authKind":"vm_cli_seed","credentialSecret":"mock://ok"}' \
+            http://127.0.0.1:18080/api/v1/admin/accounts | grep -q '"antigravity"'
+
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"groupId":"grp_default","publicModel":"sonnet-ci","matchType":"exact","targetPlatform":"anthropic","upstreamModel":"claude-sonnet-4-5","priority":10}' \
+            http://127.0.0.1:18080/api/v1/admin/routes | grep -q '"sonnet-ci"'
+
+          KEY_JSON=$(curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"ci-smoke-key","groupId":"grp_default"}' \
+            http://127.0.0.1:18080/api/v1/user/api-keys)
+          API_KEY=$(printf '%s' "$KEY_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["plaintextKey"])')
+
+          curl -fsS -H "Authorization: Bearer $API_KEY" http://127.0.0.1:18080/v1/models | grep -q 'claude-sonnet-4-5'
+          curl -fsS -H "Authorization: Bearer $API_KEY" http://127.0.0.1:18080/v1/models | grep -q 'gpt-5-codex'
+          curl -fsS -H "Authorization: Bearer $API_KEY" http://127.0.0.1:18080/v1/models | grep -q 'antigravity/claude-sonnet-4-5'
+
+          curl -fsS -D /tmp/dp.headers -X POST http://127.0.0.1:18080/v1/chat/completions \
+            -H "Authorization: Bearer $API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"sonnet-ci","stream":false,"messages":[{"role":"user","content":"Hello Slipgate"}]}' >/tmp/dp_unary.json
           grep -qi 'X-Slipgate-Plane: dataplane-direct' /tmp/dp.headers
+          grep -q 'Slipgate verified response from claude-sonnet-4-5' /tmp/dp_unary.json
+
+          curl -fsS -N -X POST http://127.0.0.1:18080/v1/chat/completions \
+            -H "Authorization: Bearer $API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"Stream test"}]}' >/tmp/dp_stream.txt
+          grep -q 'chat.completion.chunk' /tmp/dp_stream.txt
+          grep -q '\[DONE\]' /tmp/dp_stream.txt
+
+          curl -fsS -X POST "http://127.0.0.1:18080/v1beta/models/claude-sonnet-4-5:generateContent?key=$API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"contents":[{"role":"user","parts":[{"text":"Cross-protocol Gemini to Anthropic"}]}]}' | grep -q '"candidates"'
+
+          curl -fsS -X POST http://127.0.0.1:18080/v1/chat/completions \
+            -H "Authorization: Bearer $API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"gpt-5-codex","stream":false,"messages":[{"role":"user","content":"Hello Codex"}]}' | grep -q 'Slipgate verified response from gpt-5-codex'
+
+          curl -fsS -X POST http://127.0.0.1:18080/v1/chat/completions \
+            -H "Authorization: Bearer $API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"antigravity/claude-sonnet-4-5","stream":false,"messages":[{"role":"user","content":"Hello Antigravity"}]}' | grep -q 'Slipgate verified response'
+
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/user/usage | grep -q '"sonnet-ci"'
+          WALLET_JSON=$(curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/user/wallet)
+          printf '%s' "$WALLET_JSON" | python3 -c 'import sys,json; bal=int(json.load(sys.stdin)["wallet"]["balanceNanoUsd"]); assert 0 < bal < 10_000_000_000, bal'
+
+          RISK_CODE=$(curl -s -o /tmp/dp_risk.json -w '%{http_code}' -X POST http://127.0.0.1:18080/v1/chat/completions \
+            -H "Authorization: Bearer $API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"__slipgate_risk_probe__"}]}')
+          [ "$RISK_CODE" = "403" ]
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/risk/events | grep -q 'prompt_distillation_signature'
 
   publish-dev:
     name: Publish Rolling Dev Container & Deployable Bundles

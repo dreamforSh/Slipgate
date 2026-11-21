@@ -2,14 +2,21 @@ import type {
   ApiKeyItem,
   CreateAccountRequest,
   CreateApiKeyRequest,
+  CreateCompositeRouteRequest,
   CreateGroupRequest,
+  DataPlaneSyncSnapshot,
   GroupItem,
+  RecordRiskBanInput,
+  RiskBanEvent,
   SetupInitializeRequest,
   SetupStatus,
+  StoredCompositeRoute,
+  TurnSettlementEvent,
   UpdateAccountRequest,
   UpdateApiKeyRequest,
   UpdateGroupRequest,
   UpstreamAccount,
+  UsageLogItem,
   UserProfile,
   WalletSummary,
 } from "@slipgate/contracts";
@@ -93,4 +100,15 @@ export interface ControlStore {
   ): Promise<ApiKeyItem>;
   updateUserApiKey(userId: string, keyId: string, req: UpdateApiKeyRequest): Promise<ApiKeyItem>;
   deleteUserApiKey(userId: string, keyId: string): Promise<void>;
+
+  listCompositeRoutes(groupId?: string): Promise<StoredCompositeRoute[]>;
+  createCompositeRoute(req: CreateCompositeRouteRequest): Promise<StoredCompositeRoute>;
+  deleteCompositeRoute(routeId: string): Promise<void>;
+
+  exportDataPlaneSnapshot(): Promise<DataPlaneSyncSnapshot>;
+  recordTurnSettlement(ev: TurnSettlementEvent): Promise<UsageLogItem>;
+  listUsageLogs(filter?: { userId?: string; limit?: number }): Promise<UsageLogItem[]>;
+
+  recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent>;
+  listRiskBanEvents(limit?: number): Promise<RiskBanEvent[]>;
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/dataplane"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
@@ -32,6 +33,7 @@ type Server struct {
 	clashCoord *clashpool.Coordinator
 	vmSlots    *vmslot.Manager
 	vmCoord    *vmslot.Coordinator
+	dpCoord    *dataplane.Coordinator
 	sup        *supervisor.Supervisor
 	updater    *hotupdate.Manager
 	httpClient *http.Client
@@ -71,6 +73,11 @@ func (s *Server) WithVmSlotManager(vmSlots *vmslot.Manager) {
 // WithVmCoordinator attaches the VM fleet coordinator for /internal/net/vms/* and WebSocket terminal routes.
 func (s *Server) WithVmCoordinator(coord *vmslot.Coordinator) {
 	s.vmCoord = coord
+}
+
+// WithDataPlaneCoordinator attaches the L1/L2 AI DataPlane coordinator for /v1/*, /v1beta/*, /mcp/*, and /internal/net/dataplane/sync.
+func (s *Server) WithDataPlaneCoordinator(coord *dataplane.Coordinator) {
+	s.dpCoord = coord
 }
 
 // NewServer builds the unified ingress handler separating DataPlane (/v1/*) from ControlPlane (/api/*).
@@ -126,6 +133,7 @@ func (s *Server) Handler() http.Handler {
 	// Token-authenticated internal supervisor & net-plane bridges for slipgate-bff admin actions.
 	mux.HandleFunc("GET /internal/supervisor/update", s.handleInternalUpdateStatus)
 	mux.HandleFunc("POST /internal/supervisor/update/sync", s.handleInternalUpdateSync)
+	mux.HandleFunc("POST /internal/net/dataplane/sync", s.handleInternalDataPlaneSync)
 	s.registerClashInternalRoutes(mux)
 	s.registerVmInternalRoutes(mux)
 
@@ -272,7 +280,44 @@ func (s *Server) handleInternalUpdateSync(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, status)
 }
 
+func (s *Server) handleInternalDataPlaneSync(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.dpCoord == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "dataplane_coordinator_unavailable",
+		})
+		return
+	}
+	var snap dataplane.SyncSnapshot
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024*1024)).Decode(&snap); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":   "invalid_request",
+			"message": err.Error(),
+		})
+		return
+	}
+	ack, err := s.dpCoord.SyncSnapshot(r.Context(), snap)
+	if err != nil {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"ok":               true,
+			"degradedCoreSync": true,
+			"warning":          err.Error(),
+			"vaultAccounts":    ack.VaultAccounts,
+			"revisionUnixMs":   ack.RevisionUnixMs,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, ack)
+}
+
 func (s *Server) handleDataPlane(w http.ResponseWriter, r *http.Request) {
+	if s.dpCoord != nil {
+		s.dpCoord.HandleHTTP(w, r)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 

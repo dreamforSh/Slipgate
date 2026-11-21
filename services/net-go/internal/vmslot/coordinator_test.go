@@ -171,4 +171,53 @@ func TestCoordinatorLifecycleFailClosedSeedTerminalAndMigration(t *testing.T) {
 	if _, statErr := os.Stat(slot.RootDir); !os.IsNotExist(statErr) {
 		t.Fatalf("expected slot directory %q to be deleted cleanly, statErr=%v", slot.RootDir, statErr)
 	}
+
+	// 9. Provision Antigravity and Codex CLI VM slots and verify materialized runtime workspaces & cleanup.
+	pool.UnbindAccount("acc-1")
+	if err := pool.BindAccount("acc-ag", "node-exit-1", false); err != nil {
+		t.Fatalf("BindAccount acc-ag failed: %v", err)
+	}
+	if err := pool.BindAccount("acc-codex", "node-exit-2", false); err != nil {
+		t.Fatalf("BindAccount acc-codex failed: %v", err)
+	}
+
+	agSlot, err := coord.ProvisionSlot(ctx, ProvisionSlotInput{
+		ID:             "vm-antigravity-1",
+		AccountID:      "acc-ag",
+		RuntimeProfile: RuntimeAntigravity,
+	})
+	if err != nil {
+		t.Fatalf("ProvisionSlot Antigravity failed: %v", err)
+	}
+	if agSlot.RuntimeProfile != RuntimeAntigravity {
+		t.Fatalf("expected runtimeProfile=antigravity, got %q", agSlot.RuntimeProfile)
+	}
+	agMachineBytes, err := os.ReadFile(filepath.Join(agSlot.RootDir, "home", "runner", ".antigravity", "machineid"))
+	if err != nil || strings.TrimSpace(string(agMachineBytes)) != agSlot.Persona.GuestMachineID {
+		t.Fatalf("antigravity machineid mismatch: %q err=%v", string(agMachineBytes), err)
+	}
+	agRes, err := coord.ExecSlotCommand(ctx, agSlot.ID, "ci-admin", "runtime")
+	if err != nil || !strings.Contains(agRes.Stdout, "cloudcode-pa.googleapis.com") {
+		t.Fatalf("unexpected antigravity runtime inspection: %+v err=%v", agRes, err)
+	}
+
+	codexSlot, err := coord.ProvisionSlot(ctx, ProvisionSlotInput{
+		ID:             "vm-codex-1",
+		AccountID:      "acc-codex",
+		RuntimeProfile: RuntimeCodexCLI,
+	})
+	if err != nil {
+		t.Fatalf("ProvisionSlot Codex failed: %v", err)
+	}
+	codexRes, err := coord.ExecSlotCommand(ctx, codexSlot.ID, "ci-admin", "runtime")
+	if err != nil || !strings.Contains(codexRes.Stdout, "gpt-5-codex") || !strings.Contains(codexRes.Stdout, `exporter = "none"`) {
+		t.Fatalf("unexpected codex runtime inspection: %+v err=%v", codexRes, err)
+	}
+
+	if err := coord.DeleteSlot(ctx, agSlot.ID); err != nil {
+		t.Fatalf("DeleteSlot Antigravity (read-only machineid) failed: %v", err)
+	}
+	if err := coord.DeleteSlot(ctx, codexSlot.ID); err != nil {
+		t.Fatalf("DeleteSlot Codex failed: %v", err)
+	}
 }

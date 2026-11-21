@@ -5,6 +5,7 @@ import {
   type ApiKeyItem,
   type CreatedApiKeyResponse,
   type GroupItem,
+  type UsageLogItem,
 } from "@slipgate/contracts";
 import { useAuthStore } from "../../stores/auth";
 
@@ -12,6 +13,7 @@ const auth = useAuthStore();
 
 const groups = ref<GroupItem[]>([]);
 const apiKeys = ref<ApiKeyItem[]>([]);
+const usageLogs = ref<UsageLogItem[]>([]);
 const keyName = ref("");
 const selectedGroupId = ref("");
 const rpmLimit = ref(60);
@@ -28,9 +30,10 @@ const formattedAvailable = computed(() => auth.wallet?.formattedAvailableUsd ?? 
 async function loadData() {
   errorMessage.value = null;
   await auth.hydrateSession();
-  const [gRes, kRes] = await Promise.all([
+  const [gRes, kRes, uRes] = await Promise.all([
     auth.apiFetch("/api/v1/user/groups"),
     auth.apiFetch("/api/v1/user/api-keys"),
+    auth.apiFetch("/api/v1/user/usage?limit=25"),
   ]);
   if (gRes.ok) {
     const data = (await gRes.json()) as { groups: GroupItem[] };
@@ -42,6 +45,10 @@ async function loadData() {
   if (kRes.ok) {
     const data = (await kRes.json()) as { items: ApiKeyItem[] };
     apiKeys.value = data.items;
+  }
+  if (uRes.ok) {
+    const data = (await uRes.json()) as { items: UsageLogItem[] };
+    usageLogs.value = data.items;
   }
 }
 
@@ -218,6 +225,57 @@ onMounted(() => {
             </button>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section class="rounded-xl border border-slate-800 bg-slate-900 p-6">
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="text-base font-semibold text-white">最近 DataPlane 调用与 nano-USD 结算记录</h2>
+        <button
+          type="button"
+          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-200 hover:border-sky-500"
+          @click="loadData"
+        >
+          刷新账单
+        </button>
+      </div>
+
+      <p v-if="usageLogs.length === 0" class="mt-3 text-sm text-slate-400">
+        暂无网关调用记录。使用上方签发的 <code class="font-mono text-sky-300">sk-sg-*</code> 密钥请求下方任一端点即可实时展示。
+      </p>
+
+      <div v-else class="mt-4 overflow-x-auto">
+        <table class="min-w-full text-left text-xs text-slate-300">
+          <thead class="border-b border-slate-800 font-mono text-slate-400">
+            <tr>
+              <th class="py-2 pr-4">模型 / 协议转码</th>
+              <th class="py-2 pr-4">Tokens (In / Out)</th>
+              <th class="py-2 pr-4">结算金额</th>
+              <th class="py-2 pr-4">TTFT / 总耗时</th>
+              <th class="py-2">状态</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800/70 font-mono">
+            <tr v-for="log in usageLogs" :key="log.id">
+              <td class="py-2.5 pr-4">
+                <span class="font-semibold text-white">{{ log.publicModel }}</span>
+                <span class="ml-1 text-slate-500">→ {{ log.upstreamModel }}</span>
+                <div class="text-[11px] text-slate-500">{{ log.ingressCodec }} → {{ log.egressCodec }}</div>
+              </td>
+              <td class="py-2.5 pr-4">{{ log.inputTokens }} / {{ log.outputTokens }}</td>
+              <td class="py-2.5 pr-4 text-emerald-300">{{ log.formattedCostUsd }}</td>
+              <td class="py-2.5 pr-4">{{ log.ttftMs }}ms / {{ log.durationMs }}ms</td>
+              <td class="py-2.5">
+                <span
+                  class="rounded px-2 py-0.5"
+                  :class="log.statusCode < 400 ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'"
+                >
+                  HTTP {{ log.statusCode }}
+                </span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 

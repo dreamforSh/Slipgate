@@ -4,14 +4,21 @@ import {
   type ApiKeyItem,
   type CreateAccountRequest,
   type CreateApiKeyRequest,
+  type CreateCompositeRouteRequest,
   type CreateGroupRequest,
+  type DataPlaneSyncSnapshot,
   type GroupItem,
+  type RecordRiskBanInput,
+  type RiskBanEvent,
   type SetupInitializeRequest,
   type SetupStatus,
+  type StoredCompositeRoute,
+  type TurnSettlementEvent,
   type UpdateAccountRequest,
   type UpdateApiKeyRequest,
   type UpdateGroupRequest,
   type UpstreamAccount,
+  type UsageLogItem,
   type UserProfile,
   type WalletSummary,
 } from "@slipgate/contracts";
@@ -762,5 +769,480 @@ export class PostgresControlStore implements ControlStore {
     if (rows.length === 0) {
       throw new StoreError("not_found", `API key ${keyId} not found`);
     }
+  }
+
+  async listCompositeRoutes(groupId?: string): Promise<StoredCompositeRoute[]> {
+    const rows = await this.sql<
+      {
+        id: string;
+        group_id: string;
+        public_model: string;
+        match_type: StoredCompositeRoute["matchType"];
+        target_platform: StoredCompositeRoute["targetPlatform"];
+        upstream_model: string;
+        endpoint: StoredCompositeRoute["endpoint"];
+        priority: number;
+        enabled: boolean;
+        created_at: Date;
+      }[]
+    >`
+      SELECT
+        id,
+        group_id,
+        public_model,
+        match_type,
+        target_platform,
+        upstream_model,
+        endpoint,
+        priority,
+        enabled,
+        created_at
+      FROM core.composite_routes
+      WHERE (${groupId ?? null}::text IS NULL OR group_id = ${groupId ?? null})
+      ORDER BY priority ASC, id ASC
+    `;
+    return rows.map((r) => ({
+      id: r.id,
+      groupId: r.group_id,
+      publicModel: r.public_model,
+      matchType: r.match_type,
+      targetPlatform: r.target_platform,
+      upstreamModel: r.upstream_model,
+      endpoint: r.endpoint,
+      priority: r.priority,
+      enabled: r.enabled,
+      createdAtIso: toIso(r.created_at),
+    }));
+  }
+
+  async createCompositeRoute(req: CreateCompositeRouteRequest): Promise<StoredCompositeRoute> {
+    try {
+      const id = `rte_${crypto.randomUUID()}`;
+      const rows = await this.sql<{ created_at: Date }[]>`
+        INSERT INTO core.composite_routes (
+          id, group_id, public_model, match_type, target_platform,
+          upstream_model, endpoint, priority, enabled
+        )
+        VALUES (
+          ${id},
+          ${req.groupId},
+          ${req.publicModel},
+          ${req.matchType},
+          ${req.targetPlatform},
+          ${req.upstreamModel},
+          ${req.endpoint},
+          ${req.priority},
+          ${req.enabled}
+        )
+        RETURNING created_at
+      `;
+      return {
+        id,
+        groupId: req.groupId,
+        publicModel: req.publicModel,
+        matchType: req.matchType,
+        targetPlatform: req.targetPlatform,
+        upstreamModel: req.upstreamModel,
+        endpoint: req.endpoint,
+        priority: req.priority,
+        enabled: req.enabled,
+        createdAtIso: toIso(rows[0]?.created_at),
+      };
+    } catch (err) {
+      mapPgError(err);
+    }
+  }
+
+  async deleteCompositeRoute(routeId: string): Promise<void> {
+    const rows = await this.sql<{ id: string }[]>`
+      DELETE FROM core.composite_routes WHERE id = ${routeId} RETURNING id
+    `;
+    if (rows.length === 0) {
+      throw new StoreError("not_found", `Composite route ${routeId} not found`);
+    }
+  }
+
+  async exportDataPlaneSnapshot(): Promise<DataPlaneSyncSnapshot> {
+    const [groups, routes, accRows, keyRows, walletRows] = await Promise.all([
+      this.listGroups(false),
+      this.listCompositeRoutes(),
+      this.sql<
+        {
+          id: string;
+          group_id: string;
+          platform: UpstreamAccount["platform"];
+          execution_mode: UpstreamAccount["executionMode"];
+          auth_kind: string;
+          credentials_enc_hex: string;
+          max_concurrency: number;
+          priority: number;
+          status: string;
+          window_5h_used_bps: number | null;
+          window_7d_used_bps: number | null;
+        }[]
+      >`
+        SELECT
+          a.id,
+          a.group_id,
+          a.platform,
+          a.execution_mode,
+          a.auth_kind,
+          encode(a.credentials_enc, 'hex') AS credentials_enc_hex,
+          a.max_concurrency,
+          a.priority,
+          a.status,
+          q.window_5h_used_bps,
+          q.window_7d_used_bps
+        FROM core.accounts a
+        LEFT JOIN core.account_window_quotas q ON q.account_id = a.id
+        ORDER BY a.priority ASC, a.id ASC
+      `,
+      this.sql<
+        {
+          id: string;
+          user_id: string;
+          group_id: string;
+          key_hash_hex: string;
+          rpm_limit: number;
+          concurrency_limit: number;
+          ip_allowlist: string[];
+          enabled: boolean;
+          expires_at: Date | null;
+        }[]
+      >`
+        SELECT
+          id,
+          user_id,
+          group_id,
+          encode(key_hash_blake3, 'hex') AS key_hash_hex,
+          rpm_limit,
+          concurrency_limit,
+          ip_allowlist,
+          enabled,
+          expires_at
+        FROM core.api_keys
+      `,
+      this.sql<
+        {
+          user_id: string;
+          balance_nano_usd: string;
+          held_nano_usd: string;
+        }[]
+      >`
+        SELECT user_id, balance_nano_usd::text, held_nano_usd::text
+        FROM core.quota_wallets
+      `,
+    ]);
+
+    return {
+      revisionUnixMs: Date.now(),
+      groups: groups.map((g) => ({
+        id: g.id,
+        platform: g.platform,
+        subscriptionType: g.subscriptionType,
+        rateMultiplier: g.rateMultiplier,
+        modelAllowlist: g.modelAllowlist,
+        enabled: g.enabled,
+      })),
+      routes,
+      accounts: accRows.map((a) => ({
+        id: a.id,
+        groupId: a.group_id,
+        platform: a.platform,
+        executionMode: a.execution_mode,
+        authKind: a.auth_kind,
+        credentialsEncHex: a.credentials_enc_hex,
+        maxConcurrency: a.max_concurrency,
+        priority: a.priority,
+        status: a.status,
+        window5hUsedBps: a.window_5h_used_bps ?? 0,
+        window7dUsedBps: a.window_7d_used_bps ?? 0,
+      })),
+      apiKeys: keyRows.map((k) => ({
+        id: k.id,
+        userId: k.user_id,
+        groupId: k.group_id,
+        keyHashHex: k.key_hash_hex,
+        rpmLimit: k.rpm_limit,
+        concurrencyLimit: k.concurrency_limit,
+        ipAllowlist: Array.isArray(k.ip_allowlist) ? k.ip_allowlist : [],
+        enabled: k.enabled,
+        expiresAtIso: k.expires_at ? toIso(k.expires_at) : null,
+      })),
+      wallets: walletRows.map((w) => ({
+        userId: w.user_id,
+        balanceNanoUsd: w.balance_nano_usd,
+        heldNanoUsd: w.held_nano_usd,
+      })),
+    };
+  }
+
+  async recordTurnSettlement(ev: TurnSettlementEvent): Promise<UsageLogItem> {
+    const costNano = BigInt(ev.costNanoUsd);
+    const idemKey = `settle:${ev.requestId}`;
+
+    return await this.sql.begin(async (txRaw) => {
+      const tx = txRaw as unknown as SqlExecutor;
+      const existingRows = await tx<{ id: string; created_at: Date }[]>`
+        SELECT id, created_at
+        FROM core.usage_logs
+        WHERE request_id = ${ev.requestId}
+        LIMIT 1
+      `;
+      if (existingRows.length > 0) {
+        return {
+          ...ev,
+          id: existingRows[0]!.id,
+          formattedCostUsd: formatNanoUsd(costNano),
+          createdAtIso: toIso(existingRows[0]!.created_at),
+        };
+      }
+
+      if (costNano > 0n) {
+        const existingLedger = await tx<{ id: string }[]>`
+          SELECT id FROM core.ledger_entries WHERE idempotency_key = ${idemKey} LIMIT 1
+        `;
+        if (existingLedger.length === 0) {
+          await tx`
+            INSERT INTO core.quota_wallets (user_id, balance_nano_usd, held_nano_usd)
+            VALUES (${ev.userId}, 0, 0)
+            ON CONFLICT (user_id) DO NOTHING
+          `;
+          const updatedWallet = await tx<{ balance_nano_usd: string }[]>`
+            UPDATE core.quota_wallets
+            SET balance_nano_usd = balance_nano_usd - ${costNano.toString()}::numeric,
+                updated_at = NOW()
+            WHERE user_id = ${ev.userId}
+            RETURNING balance_nano_usd::text
+          `;
+          await tx`
+            INSERT INTO core.ledger_entries (
+              id, idempotency_key, user_id, entry_kind, delta_nano_usd,
+              balance_after_nano, reference_id, metadata
+            )
+            VALUES (
+              ${`ldg_${crypto.randomUUID()}`},
+              ${idemKey},
+              ${ev.userId},
+              'settle',
+              ${(-costNano).toString()}::numeric,
+              ${updatedWallet[0]!.balance_nano_usd}::numeric,
+              ${ev.requestId},
+              ${JSON.stringify({
+                accountId: ev.accountId,
+                publicModel: ev.publicModel,
+                upstreamModel: ev.upstreamModel,
+                inputTokens: ev.inputTokens,
+                outputTokens: ev.outputTokens,
+              })}::jsonb
+            )
+          `;
+        }
+      }
+
+      const usageId = `usg_${crypto.randomUUID()}`;
+      const inserted = await tx<{ created_at: Date }[]>`
+        INSERT INTO core.usage_logs (
+          id, request_id, user_id, api_key_id, account_id, group_id,
+          platform, public_model, upstream_model, ingress_codec, egress_codec,
+          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+          cost_nano_usd, ttft_ms, duration_ms, status_code
+        )
+        VALUES (
+          ${usageId},
+          ${ev.requestId},
+          ${ev.userId},
+          ${ev.apiKeyId},
+          ${ev.accountId},
+          ${ev.groupId},
+          ${ev.platform},
+          ${ev.publicModel},
+          ${ev.upstreamModel},
+          ${ev.ingressCodec},
+          ${ev.egressCodec},
+          ${ev.inputTokens},
+          ${ev.outputTokens},
+          ${ev.cacheReadTokens},
+          ${ev.cacheWriteTokens},
+          ${costNano.toString()}::numeric,
+          ${ev.ttftMs},
+          ${ev.durationMs},
+          ${ev.statusCode}
+        )
+        RETURNING created_at
+      `;
+
+      const totalTokens = ev.inputTokens + ev.outputTokens;
+      await tx`
+        INSERT INTO core.account_window_quotas (
+          account_id, window_5h_used_bps, window_7d_used_bps, lifetime_tokens, lifetime_cost_nano_usd, updated_at
+        )
+        VALUES (
+          ${ev.accountId},
+          ${ev.window5hUsedBps},
+          ${ev.window7dUsedBps},
+          ${totalTokens},
+          ${costNano.toString()}::numeric,
+          NOW()
+        )
+        ON CONFLICT (account_id) DO UPDATE SET
+          window_5h_used_bps = CASE
+            WHEN EXCLUDED.window_5h_used_bps > 0 THEN EXCLUDED.window_5h_used_bps
+            ELSE core.account_window_quotas.window_5h_used_bps
+          END,
+          window_7d_used_bps = CASE
+            WHEN EXCLUDED.window_7d_used_bps > 0 THEN EXCLUDED.window_7d_used_bps
+            ELSE core.account_window_quotas.window_7d_used_bps
+          END,
+          lifetime_tokens = core.account_window_quotas.lifetime_tokens + EXCLUDED.lifetime_tokens,
+          lifetime_cost_nano_usd = core.account_window_quotas.lifetime_cost_nano_usd + EXCLUDED.lifetime_cost_nano_usd,
+          updated_at = NOW()
+      `;
+
+      return {
+        ...ev,
+        id: usageId,
+        formattedCostUsd: formatNanoUsd(costNano),
+        createdAtIso: toIso(inserted[0]?.created_at),
+      };
+    });
+  }
+
+  async listUsageLogs(filter?: { userId?: string; limit?: number }): Promise<UsageLogItem[]> {
+    const limit = Math.max(1, Math.min(200, filter?.limit ?? 50));
+    const rows = await this.sql<
+      {
+        id: string;
+        request_id: string;
+        user_id: string;
+        api_key_id: string;
+        account_id: string;
+        group_id: string;
+        platform: UsageLogItem["platform"];
+        public_model: string;
+        upstream_model: string;
+        ingress_codec: string;
+        egress_codec: string;
+        input_tokens: string;
+        output_tokens: string;
+        cache_read_tokens: string;
+        cache_write_tokens: string;
+        cost_nano_usd: string;
+        ttft_ms: number | null;
+        duration_ms: number | null;
+        status_code: number;
+        created_at: Date;
+      }[]
+    >`
+      SELECT
+        id, request_id, user_id, api_key_id, account_id, group_id,
+        platform, public_model, upstream_model, ingress_codec, egress_codec,
+        input_tokens::text, output_tokens::text, cache_read_tokens::text, cache_write_tokens::text,
+        cost_nano_usd::text, ttft_ms, duration_ms, status_code, created_at
+      FROM core.usage_logs
+      WHERE (${filter?.userId ?? null}::text IS NULL OR user_id = ${filter?.userId ?? null})
+      ORDER BY created_at DESC
+      LIMIT ${limit}
+    `;
+    return rows.map((r) => {
+      const cost = BigInt(r.cost_nano_usd);
+      return {
+        id: r.id,
+        requestId: r.request_id,
+        userId: r.user_id,
+        apiKeyId: r.api_key_id,
+        accountId: r.account_id,
+        groupId: r.group_id,
+        platform: r.platform,
+        publicModel: r.public_model,
+        upstreamModel: r.upstream_model,
+        ingressCodec: r.ingress_codec,
+        egressCodec: r.egress_codec,
+        inputTokens: Number.parseInt(r.input_tokens, 10),
+        outputTokens: Number.parseInt(r.output_tokens, 10),
+        cacheReadTokens: Number.parseInt(r.cache_read_tokens, 10),
+        cacheWriteTokens: Number.parseInt(r.cache_write_tokens, 10),
+        costNanoUsd: cost.toString(),
+        formattedCostUsd: formatNanoUsd(cost),
+        ttftMs: r.ttft_ms ?? 0,
+        durationMs: r.duration_ms ?? 0,
+        statusCode: r.status_code,
+        createdAtIso: toIso(r.created_at),
+      };
+    });
+  }
+
+  async recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent> {
+    const id = `rsk_${crypto.randomUUID()}`;
+    const now = Date.now();
+    let expiresAt: Date | null = null;
+    if (ev.banDuration === "10m") {
+      expiresAt = new Date(now + 10 * 60_000);
+    } else if (ev.banDuration === "24h") {
+      expiresAt = new Date(now + 24 * 3_600_000);
+    }
+
+    const rows = await this.sql<{ created_at: Date }[]>`
+      INSERT INTO core.risk_ban_records (
+        id, subject_kind, subject_hash, strike_level,
+        ban_reason, source_request_id, expires_at
+      )
+      VALUES (
+        ${id},
+        ${ev.subjectKind},
+        ${ev.subjectHash},
+        ${ev.strikeLevel},
+        ${ev.reason},
+        ${ev.sourceRequestId ?? null},
+        ${expiresAt}
+      )
+      RETURNING created_at
+    `;
+    return {
+      eventId: id,
+      subjectKind: ev.subjectKind,
+      strikeLevel: ev.strikeLevel,
+      banDuration: ev.banDuration,
+      reason: ev.reason,
+      ordinaryUpstream400Count: ev.ordinaryUpstream400Count,
+      downgradedCount: ev.downgradedCount,
+      createdAtIso: toIso(rows[0]?.created_at),
+    };
+  }
+
+  async listRiskBanEvents(limit = 50): Promise<RiskBanEvent[]> {
+    const capped = Math.max(1, Math.min(200, limit));
+    const rows = await this.sql<
+      {
+        id: string;
+        subject_kind: RiskBanEvent["subjectKind"];
+        strike_level: number;
+        ban_reason: string;
+        expires_at: Date | null;
+        created_at: Date;
+      }[]
+    >`
+      SELECT id, subject_kind, strike_level, ban_reason, expires_at, created_at
+      FROM core.risk_ban_records
+      ORDER BY created_at DESC
+      LIMIT ${capped}
+    `;
+    return rows.map((r) => {
+      let banDuration: RiskBanEvent["banDuration"] = "permanent";
+      if (r.expires_at) {
+        const diffMs = r.expires_at.getTime() - r.created_at.getTime();
+        banDuration = diffMs > 3_600_000 ? "24h" : "10m";
+      }
+      return {
+        eventId: r.id,
+        subjectKind: r.subject_kind,
+        strikeLevel: r.strike_level,
+        banDuration,
+        reason: r.ban_reason,
+        ordinaryUpstream400Count: 0,
+        downgradedCount: 0,
+        createdAtIso: toIso(r.created_at),
+      };
+    });
   }
 }

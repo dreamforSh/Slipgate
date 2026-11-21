@@ -78,6 +78,7 @@ type ProvisionSlotInput struct {
 	ClusterNodeID  string           `json:"clusterNodeId,omitempty"`
 	AccountID      string           `json:"accountId"`
 	ClashNodeID    string           `json:"clashNodeId,omitempty"`
+	RuntimeProfile RuntimeProfile   `json:"runtimeProfile,omitempty"`
 	HypervisorKind HypervisorKind   `json:"hypervisorKind,omitempty"`
 	MaxSubagents   uint32           `json:"maxSubagents,omitempty"`
 	MemoryMiB      uint32           `json:"memoryMiB,omitempty"`
@@ -90,10 +91,11 @@ type ProvisionSlotInput struct {
 	Persona        *HardwarePersona `json:"persona,omitempty"`
 }
 
-// UpdateSeedInput updates sanitized settings/env/bootstrap artifacts pushed into a slot.
+// UpdateSeedInput updates sanitized settings/env/auth/bootstrap artifacts pushed into a slot.
 type UpdateSeedInput struct {
 	SettingsJSONRaw      *string `json:"settingsJsonRaw,omitempty"`
 	CustomSettingRaw     *string `json:"customSettingRaw,omitempty"`
+	AuthJSONRaw          *string `json:"authJsonRaw,omitempty"`
 	ProxyEnvRaw          *string `json:"proxyEnvRaw,omitempty"`
 	BootstrapScriptRaw   *string `json:"bootstrapScriptRaw,omitempty"`
 	RejectClientSettings *bool   `json:"rejectClientSettings,omitempty"`
@@ -365,18 +367,23 @@ func (c *Coordinator) ProvisionSlot(ctx context.Context, in ProvisionSlotInput) 
 		cleanse = "zero"
 	}
 
+	rp := in.RuntimeProfile
+	if rp == "" {
+		rp = RuntimeClaudeCode
+	}
 	spec := Slot{
-		ID:            slotID,
-		ClusterNodeID: node.ID,
-		AccountID:     in.AccountID,
-		ClashNodeID:   in.ClashNodeID,
-		Hypervisor:    hv,
-		State:         StateProvisioning,
-		MaxSubagents:  in.MaxSubagents,
-		MemoryMiB:     in.MemoryMiB,
-		Telemetry:     tm,
-		CleanseMode:   cleanse,
-		Persona:       persona,
+		ID:             slotID,
+		ClusterNodeID:  node.ID,
+		AccountID:      in.AccountID,
+		ClashNodeID:    in.ClashNodeID,
+		RuntimeProfile: rp,
+		Hypervisor:     hv,
+		State:          StateProvisioning,
+		MaxSubagents:   in.MaxSubagents,
+		MemoryMiB:      in.MemoryMiB,
+		Telemetry:      tm,
+		CleanseMode:    cleanse,
+		Persona:        persona,
 	}
 
 	slot, err := c.mgr.ProvisionSlot(spec)
@@ -488,6 +495,9 @@ func (c *Coordinator) GetSeed(ctx context.Context, slotID string) (SlotSeed, err
 	}
 	seed, err := c.store.GetSeed(ctx, slotID)
 	if err == nil {
+		if seed.RuntimeProfile == "" {
+			seed.RuntimeProfile = slot.RuntimeProfile
+		}
 		return seed, nil
 	}
 	if !errors.Is(err, ErrSeedNotFound) {
@@ -515,6 +525,13 @@ func (c *Coordinator) UpdateSeed(ctx context.Context, slotID string, in UpdateSe
 	}
 	if in.CustomSettingRaw != nil {
 		current.CustomSettingRaw = *in.CustomSettingRaw
+	}
+	if in.AuthJSONRaw != nil {
+		trimmedAuth := strings.TrimSpace(*in.AuthJSONRaw)
+		if trimmedAuth != "" && !json.Valid([]byte(trimmedAuth)) {
+			return SlotSeed{}, errors.New("vmslot: authJsonRaw must be valid JSON")
+		}
+		current.AuthJSONRaw = trimmedAuth
 	}
 	if in.ProxyEnvRaw != nil {
 		current.ProxyEnvRaw = *in.ProxyEnvRaw
@@ -686,18 +703,88 @@ func (c *Coordinator) driverForNode(node ClusterNode) SlotDriver {
 }
 
 func defaultSlotSeed(slot Slot, target *clashpool.DialTarget) SlotSeed {
-	settingsBytes, _ := json.MarshalIndent(map[string]any{
-		"cleanupPeriodDays":   30,
-		"includeCoAuthoredBy": false,
-		"permissions": map[string]any{
-			"allow": []string{},
-			"deny":  []string{},
-		},
-	}, "", "  ")
-	customSetting := fmt.Sprintf("cleanse_mode=%s\ntelemetry=%s\nguest_machine_id=%s\n",
+	rp := slot.RuntimeProfile
+	if rp == "" {
+		rp = RuntimeClaudeCode
+	}
+
+	var (
+		settingsMap   map[string]any
+		authMap       map[string]any
+		extraEnvLines string
+	)
+	switch rp {
+	case RuntimeCodexCLI:
+		settingsMap = map[string]any{
+			"model":                    "gpt-5-codex",
+			"approval_policy":          "never",
+			"sandbox_mode":             "workspace-write",
+			"disable_response_storage": true,
+			"telemetry": map[string]any{
+				"otel_exporter": "none",
+			},
+		}
+		authMap = map[string]any{
+			"OPENAI_API_KEY": nil,
+			"tokens": map[string]any{
+				"account_id": slot.AccountID,
+			},
+		}
+		extraEnvLines = "CODEX_UNSAFE_ALLOW_NO_SANDBOX=0\nRUST_LOG=warn\n"
+
+	case RuntimeAntigravity:
+		doh := defaultIfEmpty(slot.Persona.DoHURL, "https://dns.quad9.net/dns-query")
+		settingsMap = map[string]any{
+			"ideType":           "antigravity",
+			"cloudCodeEndpoint": "https://cloudcode-pa.googleapis.com",
+			"telemetry": map[string]any{
+				"enabled":       slot.Telemetry == TelemetryEnabled,
+				"crashReporter": false,
+			},
+			"mcp": map[string]any{
+				"isolated": true,
+			},
+			"network": map[string]any{
+				"dohUrl": doh,
+			},
+		}
+		authMap = map[string]any{
+			"type":       "authorized_user",
+			"account_id": slot.AccountID,
+			"project_id": "rising-fact-p41fc",
+		}
+		extraEnvLines = fmt.Sprintf("ANTIGRAVITY_CLI_TELEMETRY=0\nANTIGRAVITY_MACHINE_ID=%s\n", slot.Persona.GuestMachineID)
+
+	default:
+		settingsMap = map[string]any{
+			"cleanupPeriodDays":   30,
+			"includeCoAuthoredBy": false,
+			"permissions": map[string]any{
+				"allow": []string{},
+				"deny":  []string{},
+			},
+			"env": map[string]any{
+				"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+				"DISABLE_NON_ESSENTIAL_MODEL_CALLS":        "1",
+			},
+		}
+		authMap = map[string]any{
+			"claudeAiOauth": map[string]any{
+				"accountId":        slot.AccountID,
+				"subscriptionType": "max",
+			},
+		}
+		extraEnvLines = "DISABLE_TELEMETRY=1\nDISABLE_ERROR_REPORTING=1\nDISABLE_BUG_COMMAND=1\n"
+	}
+
+	settingsBytes, _ := json.MarshalIndent(settingsMap, "", "  ")
+	authBytes, _ := json.MarshalIndent(authMap, "", "  ")
+	customSetting := fmt.Sprintf("runtime_profile=%s\ncleanse_mode=%s\ntelemetry=%s\nguest_machine_id=%s\n%s",
+		rp,
 		defaultIfEmpty(slot.CleanseMode, "zero"),
 		defaultIfEmpty(string(slot.Telemetry), string(TelemetryIsolated)),
 		slot.Persona.GuestMachineID,
+		extraEnvLines,
 	)
 	proxyEnv := ""
 	if target != nil && target.SOCKSAddr != "" {
@@ -706,14 +793,16 @@ func defaultSlotSeed(slot Slot, target *clashpool.DialTarget) SlotSeed {
 	}
 	return SlotSeed{
 		SlotID:                 slot.ID,
+		RuntimeProfile:         rp,
 		SettingsJSONRaw:        string(settingsBytes),
 		CustomSettingRaw:       customSetting,
+		AuthJSONRaw:            string(authBytes),
 		RejectClientSettings:   true,
 		RejectClientIdentity:   true,
 		TelemetryMode:          slot.Telemetry,
 		TelemetryDaemonRunning: slot.Telemetry == TelemetryIsolated,
 		ProxyEnvRaw:            proxyEnv,
-		BootstrapScriptRaw:     fmt.Sprintf("#!/bin/sh\nset -e\necho \"Slipgate slot %s ready\"\n", slot.ID),
+		BootstrapScriptRaw:     fmt.Sprintf("#!/bin/sh\nset -e\necho \"Slipgate slot %s (%s) ready\"\n", slot.ID, rp),
 		SyncedAtUnixMs:         time.Now().UTC().UnixMilli(),
 	}
 }

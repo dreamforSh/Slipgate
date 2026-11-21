@@ -3,6 +3,7 @@ import { z } from "zod";
 export const ProviderSchema = z.enum([
   "anthropic",
   "openai",
+  "codex",
   "gemini",
   "antigravity",
   "grok",

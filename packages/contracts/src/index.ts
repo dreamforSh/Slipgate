@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { ProviderSchema } from "./pool.ts";
-import { ClusterNodeSchema, VmMigrationJobSchema } from "./vm.ts";
+import { ClusterNodeSchema, VmMigrationJobSchema, VmRuntimeProfileSchema } from "./vm.ts";
 
 export * from "./iam.ts";
 export * from "./pool.ts";
@@ -8,6 +8,7 @@ export * from "./apikeys.ts";
 export * from "./system.ts";
 export * from "./clash.ts";
 export * from "./vm.ts";
+export * from "./dataplane.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 
@@ -144,6 +145,7 @@ export const VmSlotSummarySchema = z.object({
   accountId: z.string().min(1),
   clashNodeId: z.string().min(1),
   exitIp: z.string().min(1),
+  runtimeProfile: VmRuntimeProfileSchema.default("claude_code"),
   hypervisorKind: HypervisorKindSchema,
   state: VmSlotStateSchema,
   activeSubagents: z.number().int().nonnegative(),
@@ -159,8 +161,10 @@ export type VmSlotSummary = z.infer<typeof VmSlotSummarySchema>;
 
 export const SlotSeedSnapshotSchema = z.object({
   slotId: z.string().min(1),
+  runtimeProfile: VmRuntimeProfileSchema.default("claude_code"),
   settingsJsonRaw: z.string(),
   customSettingRaw: z.string(),
+  authJsonRaw: z.string().optional(),
   proxyEnvRaw: z.string().optional(),
   bootstrapScriptRaw: z.string().optional(),
   rejectClientSettings: z.boolean(),

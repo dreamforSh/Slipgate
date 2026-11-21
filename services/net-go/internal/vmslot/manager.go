@@ -19,6 +19,24 @@ const (
 	HypervisorMacOS  HypervisorKind = "macos_native"
 )
 
+type RuntimeProfile string
+
+const (
+	RuntimeClaudeCode  RuntimeProfile = "claude_code"
+	RuntimeCodexCLI    RuntimeProfile = "codex_cli"
+	RuntimeAntigravity RuntimeProfile = "antigravity"
+)
+
+// ValidateRuntimeProfile checks that rp is a supported guest runtime persona.
+func ValidateRuntimeProfile(rp RuntimeProfile) error {
+	switch rp {
+	case "", RuntimeClaudeCode, RuntimeCodexCLI, RuntimeAntigravity:
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported runtimeProfile %q", ErrInvalidHardwarePersona, rp)
+	}
+}
+
 type SlotState string
 
 const (
@@ -71,6 +89,7 @@ type Slot struct {
 	AccountID       string          `json:"accountId"`
 	ClashNodeID     string          `json:"clashNodeId"`
 	ExitIP          string          `json:"exitIp"`
+	RuntimeProfile  RuntimeProfile  `json:"runtimeProfile"`
 	Hypervisor      HypervisorKind  `json:"hypervisorKind"`
 	State           SlotState       `json:"state"`
 	VsockCID        uint32          `json:"vsockCid,omitempty"`
@@ -163,6 +182,9 @@ func (m *Manager) ProvisionSlot(spec Slot) (Slot, error) {
 	if err := ValidatePersona(spec.Persona); err != nil {
 		return Slot{}, err
 	}
+	if err := ValidateRuntimeProfile(spec.RuntimeProfile); err != nil {
+		return Slot{}, err
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -214,6 +236,9 @@ func (m *Manager) ProvisionSlot(spec Slot) (Slot, error) {
 	if spec.Hypervisor == "" {
 		spec.Hypervisor = HypervisorDocker
 	}
+	if spec.RuntimeProfile == "" {
+		spec.RuntimeProfile = RuntimeClaudeCode
+	}
 	if spec.State == "" {
 		spec.State = StateReady
 	}
@@ -244,6 +269,9 @@ func (m *Manager) ProvisionSlot(spec Slot) (Slot, error) {
 func (m *Manager) UpsertRestoredSlot(s Slot) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s.RuntimeProfile == "" {
+		s.RuntimeProfile = RuntimeClaudeCode
+	}
 	m.slots[s.ID] = cloneSlot(s)
 	if s.ClashNodeID != "" {
 		m.usedNodes[s.ClashNodeID] = s.ID

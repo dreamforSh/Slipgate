@@ -44,18 +44,20 @@ type ClusterNode struct {
 	UpdatedAt     time.Time         `json:"updatedAtIso"`
 }
 
-// SlotSeed holds sanitized environment, settings, and bootstrap scripts synced into a VM slot.
+// SlotSeed holds sanitized environment, settings, auth JSON, and bootstrap scripts synced into a VM slot.
 type SlotSeed struct {
-	SlotID                 string        `json:"slotId"`
-	SettingsJSONRaw        string        `json:"settingsJsonRaw"`
-	CustomSettingRaw       string        `json:"customSettingRaw"`
-	RejectClientSettings   bool          `json:"rejectClientSettings"`
-	RejectClientIdentity   bool          `json:"rejectClientIdentity"`
-	TelemetryMode          TelemetryMode `json:"telemetryMode"`
-	TelemetryDaemonRunning bool          `json:"telemetryDaemonRunning"`
-	ProxyEnvRaw            string        `json:"proxyEnvRaw,omitempty"`
-	BootstrapScriptRaw     string        `json:"bootstrapScriptRaw,omitempty"`
-	SyncedAtUnixMs         int64         `json:"syncedAtUnixMs"`
+	SlotID                 string         `json:"slotId"`
+	RuntimeProfile         RuntimeProfile `json:"runtimeProfile"`
+	SettingsJSONRaw        string         `json:"settingsJsonRaw"`
+	CustomSettingRaw       string         `json:"customSettingRaw"`
+	AuthJSONRaw            string         `json:"authJsonRaw,omitempty"`
+	RejectClientSettings   bool           `json:"rejectClientSettings"`
+	RejectClientIdentity   bool           `json:"rejectClientIdentity"`
+	TelemetryMode          TelemetryMode  `json:"telemetryMode"`
+	TelemetryDaemonRunning bool           `json:"telemetryDaemonRunning"`
+	ProxyEnvRaw            string         `json:"proxyEnvRaw,omitempty"`
+	BootstrapScriptRaw     string         `json:"bootstrapScriptRaw,omitempty"`
+	SyncedAtUnixMs         int64          `json:"syncedAtUnixMs"`
 }
 
 // MigrationJob records one KVM slot cluster migration or memory resize event.
@@ -335,6 +337,7 @@ CREATE TABLE IF NOT EXISTS net.vm_slots (
     cluster_node_id   TEXT NOT NULL REFERENCES net.cluster_nodes(id) ON DELETE RESTRICT,
     account_id        TEXT NOT NULL UNIQUE,
     clash_node_id     TEXT NOT NULL UNIQUE REFERENCES net.clash_nodes(id) ON DELETE RESTRICT,
+    runtime_profile   TEXT NOT NULL DEFAULT 'claude_code',
     hypervisor_kind   TEXT NOT NULL,
     vsock_cid         INTEGER UNIQUE,
     guest_uds_path    TEXT,
@@ -354,6 +357,7 @@ CREATE TABLE IF NOT EXISTS net.vm_slots (
 );
 
 ALTER TABLE net.vm_slots
+    ADD COLUMN IF NOT EXISTS runtime_profile TEXT NOT NULL DEFAULT 'claude_code',
     ADD COLUMN IF NOT EXISTS exit_ip INET,
     ADD COLUMN IF NOT EXISTS root_dir TEXT NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS guest_pid INTEGER NOT NULL DEFAULT 0,
@@ -378,6 +382,7 @@ CREATE TABLE IF NOT EXISTS net.vm_slot_seeds (
     slot_id                TEXT PRIMARY KEY REFERENCES net.vm_slots(id) ON DELETE CASCADE,
     settings_json_enc      BYTEA NOT NULL,
     custom_setting_enc     BYTEA NOT NULL,
+    auth_json_enc          BYTEA,
     proxy_env_enc          BYTEA NOT NULL,
     bootstrap_script_enc   BYTEA NOT NULL,
     reject_client_settings BOOLEAN NOT NULL DEFAULT TRUE,
@@ -385,6 +390,9 @@ CREATE TABLE IF NOT EXISTS net.vm_slot_seeds (
     updated_by             TEXT NOT NULL DEFAULT 'system',
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE net.vm_slot_seeds
+    ADD COLUMN IF NOT EXISTS auth_json_enc BYTEA;
 
 CREATE TABLE IF NOT EXISTS net.vm_migration_jobs (
     id                TEXT PRIMARY KEY,
@@ -526,7 +534,8 @@ func (p *PostgresVmStore) DeleteClusterNode(ctx context.Context, nodeID string) 
 func (p *PostgresVmStore) ListSlots(ctx context.Context) ([]Slot, error) {
 	rows, err := p.db.QueryContext(ctx, `
 		SELECT s.id, s.cluster_node_id, s.account_id, s.clash_node_id,
-		       COALESCE(host(s.exit_ip), ''), s.hypervisor_kind, s.state,
+		       COALESCE(host(s.exit_ip), ''), COALESCE(s.runtime_profile, 'claude_code'),
+		       s.hypervisor_kind, s.state,
 		       COALESCE(s.vsock_cid, 0), COALESCE(s.guest_uds_path, ''),
 		       s.active_subagents, s.max_subagents, s.telemetry_mode, s.cleanse_mode,
 		       s.memory_mib, s.root_dir, s.guest_pid, s.daemon_version,
@@ -545,14 +554,14 @@ func (p *PostgresVmStore) ListSlots(ctx context.Context) ([]Slot, error) {
 	var out []Slot
 	for rows.Next() {
 		var (
-			s          Slot
-			hv, st, tm string
-			vsock      int
-			hb         sql.NullTime
+			s              Slot
+			rp, hv, st, tm string
+			vsock          int
+			hb             sql.NullTime
 		)
 		if err := rows.Scan(
 			&s.ID, &s.ClusterNodeID, &s.AccountID, &s.ClashNodeID,
-			&s.ExitIP, &hv, &st, &vsock, &s.GuestUDSPath,
+			&s.ExitIP, &rp, &hv, &st, &vsock, &s.GuestUDSPath,
 			&s.ActiveSubagents, &s.MaxSubagents, &tm, &s.CleanseMode,
 			&s.MemoryMiB, &s.RootDir, &s.GuestPID, &s.DaemonVersion,
 			&hb, &s.CreatedAt, &s.UpdatedAt,
@@ -561,6 +570,7 @@ func (p *PostgresVmStore) ListSlots(ctx context.Context) ([]Slot, error) {
 		); err != nil {
 			return nil, err
 		}
+		s.RuntimeProfile = RuntimeProfile(rp)
 		s.Hypervisor = HypervisorKind(hv)
 		s.State = SlotState(st)
 		s.Telemetry = TelemetryMode(tm)
@@ -589,19 +599,24 @@ func (p *PostgresVmStore) UpsertSlot(ctx context.Context, s Slot) error {
 	if s.LastHeartbeat != nil {
 		hbArg = *s.LastHeartbeat
 	}
+	rpStr := string(s.RuntimeProfile)
+	if rpStr == "" {
+		rpStr = string(RuntimeClaudeCode)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO net.vm_slots (
-			id, cluster_node_id, account_id, clash_node_id, exit_ip, hypervisor_kind,
+			id, cluster_node_id, account_id, clash_node_id, exit_ip, runtime_profile, hypervisor_kind,
 			vsock_cid, guest_uds_path, active_subagents, max_subagents,
 			telemetry_mode, cleanse_mode, memory_mib, state,
 			root_dir, guest_pid, daemon_version, last_heartbeat_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, $10,
-			$11, $12, $13, $14, $15, $16, $17, $18, NOW()
+			$1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11,
+			$12, $13, $14, $15, $16, $17, $18, $19, NOW()
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			cluster_node_id = EXCLUDED.cluster_node_id,
 			exit_ip = EXCLUDED.exit_ip,
+			runtime_profile = EXCLUDED.runtime_profile,
 			hypervisor_kind = EXCLUDED.hypervisor_kind,
 			vsock_cid = EXCLUDED.vsock_cid,
 			guest_uds_path = EXCLUDED.guest_uds_path,
@@ -617,7 +632,7 @@ func (p *PostgresVmStore) UpsertSlot(ctx context.Context, s Slot) error {
 			last_heartbeat_at = EXCLUDED.last_heartbeat_at,
 			updated_at = NOW()
 	`,
-		s.ID, s.ClusterNodeID, s.AccountID, s.ClashNodeID, nullInet(s.ExitIP), string(s.Hypervisor),
+		s.ID, s.ClusterNodeID, s.AccountID, s.ClashNodeID, nullInet(s.ExitIP), rpStr, string(s.Hypervisor),
 		vsockArg, s.GuestUDSPath, s.ActiveSubagents, s.MaxSubagents,
 		string(s.Telemetry), s.CleanseMode, s.MemoryMiB, string(s.State),
 		s.RootDir, s.GuestPID, s.DaemonVersion, hbArg,
@@ -655,23 +670,24 @@ func (p *PostgresVmStore) DeleteSlot(ctx context.Context, slotID string) error {
 
 func (p *PostgresVmStore) GetSeed(ctx context.Context, slotID string) (SlotSeed, error) {
 	var (
-		out                       SlotSeed
-		settingsEnc, customEnc    []byte
-		proxyEnc, bootstrapEnc    []byte
-		tm                        string
-		updatedAt                 time.Time
+		out                    SlotSeed
+		settingsEnc, customEnc []byte
+		authEnc                []byte
+		proxyEnc, bootstrapEnc []byte
+		rp, tm                 string
+		updatedAt              time.Time
 	)
 	err := p.db.QueryRowContext(ctx, `
 		SELECT sd.slot_id, sd.settings_json_enc, sd.custom_setting_enc,
-		       sd.proxy_env_enc, sd.bootstrap_script_enc,
+		       sd.auth_json_enc, sd.proxy_env_enc, sd.bootstrap_script_enc,
 		       sd.reject_client_settings, sd.reject_client_identity,
-		       sl.telemetry_mode, sd.updated_at
+		       COALESCE(sl.runtime_profile, 'claude_code'), sl.telemetry_mode, sd.updated_at
 		FROM net.vm_slot_seeds sd
 		JOIN net.vm_slots sl ON sl.id = sd.slot_id
 		WHERE sd.slot_id = $1
 	`, slotID).Scan(
-		&out.SlotID, &settingsEnc, &customEnc, &proxyEnc, &bootstrapEnc,
-		&out.RejectClientSettings, &out.RejectClientIdentity, &tm, &updatedAt,
+		&out.SlotID, &settingsEnc, &customEnc, &authEnc, &proxyEnc, &bootstrapEnc,
+		&out.RejectClientSettings, &out.RejectClientIdentity, &rp, &tm, &updatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SlotSeed{}, ErrSeedNotFound
@@ -679,6 +695,7 @@ func (p *PostgresVmStore) GetSeed(ctx context.Context, slotID string) (SlotSeed,
 	if err != nil {
 		return SlotSeed{}, err
 	}
+	out.RuntimeProfile = RuntimeProfile(rp)
 	out.TelemetryMode = TelemetryMode(tm)
 	out.TelemetryDaemonRunning = out.TelemetryMode == TelemetryIsolated
 	out.SyncedAtUnixMs = updatedAt.UTC().UnixMilli()
@@ -687,6 +704,11 @@ func (p *PostgresVmStore) GetSeed(ctx context.Context, slotID string) (SlotSeed,
 	}
 	if plain, decErr := p.vault.decrypt(customEnc); decErr == nil {
 		out.CustomSettingRaw = string(plain)
+	}
+	if len(authEnc) > 0 {
+		if plain, decErr := p.vault.decrypt(authEnc); decErr == nil {
+			out.AuthJSONRaw = string(plain)
+		}
 	}
 	if plain, decErr := p.vault.decrypt(proxyEnc); decErr == nil {
 		out.ProxyEnvRaw = string(plain)
@@ -706,6 +728,13 @@ func (p *PostgresVmStore) UpsertSeed(ctx context.Context, seed SlotSeed, updated
 	if err != nil {
 		return err
 	}
+	var authEnc []byte
+	if seed.AuthJSONRaw != "" {
+		authEnc, err = p.vault.encrypt([]byte(seed.AuthJSONRaw))
+		if err != nil {
+			return err
+		}
+	}
 	proxyEnc, err := p.vault.encrypt([]byte(seed.ProxyEnvRaw))
 	if err != nil {
 		return err
@@ -719,12 +748,13 @@ func (p *PostgresVmStore) UpsertSeed(ctx context.Context, seed SlotSeed, updated
 	}
 	_, err = p.db.ExecContext(ctx, `
 		INSERT INTO net.vm_slot_seeds (
-			slot_id, settings_json_enc, custom_setting_enc, proxy_env_enc, bootstrap_script_enc,
+			slot_id, settings_json_enc, custom_setting_enc, auth_json_enc, proxy_env_enc, bootstrap_script_enc,
 			reject_client_settings, reject_client_identity, updated_by, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
 		ON CONFLICT (slot_id) DO UPDATE SET
 			settings_json_enc = EXCLUDED.settings_json_enc,
 			custom_setting_enc = EXCLUDED.custom_setting_enc,
+			auth_json_enc = COALESCE(EXCLUDED.auth_json_enc, net.vm_slot_seeds.auth_json_enc),
 			proxy_env_enc = EXCLUDED.proxy_env_enc,
 			bootstrap_script_enc = EXCLUDED.bootstrap_script_enc,
 			reject_client_settings = EXCLUDED.reject_client_settings,
@@ -732,7 +762,7 @@ func (p *PostgresVmStore) UpsertSeed(ctx context.Context, seed SlotSeed, updated
 			updated_by = EXCLUDED.updated_by,
 			updated_at = NOW()
 	`,
-		seed.SlotID, settingsEnc, customEnc, proxyEnc, bootstrapEnc,
+		seed.SlotID, settingsEnc, customEnc, authEnc, proxyEnc, bootstrapEnc,
 		seed.RejectClientSettings, seed.RejectClientIdentity, updatedBy,
 	)
 	return err

@@ -34,6 +34,48 @@ const accSecret = ref("");
 const accMaxConc = ref(5);
 const accPriority = ref(100);
 
+function applySubscriptionTemplate(preset: "claude" | "codex" | "antigravity") {
+  if (preset === "claude") {
+    accPlatform.value = "anthropic";
+    accMode.value = "stealth_http";
+    accAuthKind.value = "oauth";
+    if (!accSecret.value.trim()) {
+      accSecret.value = JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "sk-ant-oat01-replace-me",
+          refreshToken: "sk-ant-ort01-replace-me",
+        },
+      });
+    }
+    return;
+  }
+  if (preset === "codex") {
+    accPlatform.value = "codex";
+    accMode.value = "stealth_http";
+    accAuthKind.value = "oauth";
+    if (!accSecret.value.trim()) {
+      accSecret.value = JSON.stringify({
+        tokens: {
+          access_token: "eyJhbGciOi-replace-me",
+          refresh_token: "rt_replace_me",
+          account_id: "acct_chatgpt_replace_me",
+        },
+      });
+    }
+    return;
+  }
+  accPlatform.value = "antigravity";
+  accMode.value = "vm_slot";
+  accAuthKind.value = "vm_cli_seed";
+  if (!accSecret.value.trim()) {
+    accSecret.value = JSON.stringify({
+      accessToken: "ya29.replace-me",
+      refreshToken: "1//replace-me",
+      projectId: "rising-fact-p41fc",
+    });
+  }
+}
+
 const filteredAccounts = computed(() => {
   if (modeFilter.value === "all") return accounts.value;
   return accounts.value.filter((a) => a.executionMode === modeFilter.value);
@@ -181,10 +223,11 @@ onMounted(() => {
         />
         <select v-model="groupPlatform" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white">
           <option value="composite">composite (合成路由)</option>
-          <option value="anthropic">anthropic</option>
+          <option value="anthropic">anthropic (Claude)</option>
+          <option value="codex">codex (ChatGPT Plus/Pro)</option>
+          <option value="antigravity">antigravity (反重力)</option>
           <option value="openai">openai</option>
           <option value="gemini">gemini</option>
-          <option value="antigravity">antigravity</option>
           <option value="grok">grok</option>
         </select>
         <select v-model="groupSubType" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white">
@@ -259,7 +302,32 @@ onMounted(() => {
         </div>
       </div>
 
-      <form class="mt-4 grid gap-3 sm:grid-cols-4" @submit.prevent="handleCreateAccount">
+      <div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
+        <span class="text-slate-400">订阅快速预设：</span>
+        <button
+          type="button"
+          class="rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-amber-200 hover:bg-amber-500/20"
+          @click="applySubscriptionTemplate('claude')"
+        >
+          Claude Max/Pro (.credentials.json)
+        </button>
+        <button
+          type="button"
+          class="rounded border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-emerald-200 hover:bg-emerald-500/20"
+          @click="applySubscriptionTemplate('codex')"
+        >
+          Codex Plus/Pro (.codex/auth.json)
+        </button>
+        <button
+          type="button"
+          class="rounded border border-violet-500/40 bg-violet-500/10 px-2.5 py-1 text-violet-200 hover:bg-violet-500/20"
+          @click="applySubscriptionTemplate('antigravity')"
+        >
+          Antigravity 反重力 (Cloud Code + VM)
+        </button>
+      </div>
+
+      <form class="mt-3 grid gap-3 sm:grid-cols-4" @submit.prevent="handleCreateAccount">
         <input
           v-model="accName"
           type="text"
@@ -271,12 +339,17 @@ onMounted(() => {
           <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
         </select>
         <select v-model="accPlatform" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white">
-          <option value="anthropic">anthropic</option>
+          <option value="anthropic">anthropic (Claude Code)</option>
+          <option value="codex">codex (Codex CLI Responses)</option>
+          <option value="antigravity">antigravity (反重力 v1internal)</option>
           <option value="openai">openai</option>
           <option value="gemini">gemini</option>
-          <option value="antigravity">antigravity</option>
           <option value="grok">grok</option>
           <option value="deepseek">deepseek</option>
+          <option value="glm">glm</option>
+          <option value="kimi">kimi</option>
+          <option value="minimax">minimax</option>
+          <option value="qwen">qwen</option>
         </select>
         <select v-model="accMode" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white">
           <option value="stealth_http">stealth_http (uTLS + Clash)</option>
@@ -284,17 +357,17 @@ onMounted(() => {
           <option value="direct_api">direct_api (官方密钥直连)</option>
         </select>
         <select v-model="accAuthKind" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white">
-          <option value="oauth">oauth</option>
-          <option value="setup_token">setup_token</option>
+          <option value="oauth">oauth (订阅 OAuth)</option>
+          <option value="setup_token">setup_token (sk-ant-oat*)</option>
+          <option value="vm_cli_seed">vm_cli_seed (VM 凭据种子)</option>
           <option value="api_key">api_key</option>
-          <option value="vm_cli_seed">vm_cli_seed</option>
         </select>
-        <input
+        <textarea
           v-model="accSecret"
-          type="password"
+          rows="2"
           required
-          placeholder="凭据密文 / OAuth Token / API Key"
-          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white sm:col-span-2"
+          placeholder="粘贴 .claude/.credentials.json、.codex/auth.json、Antigravity JSON 或 API Key"
+          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white sm:col-span-2"
         />
         <button
           type="submit"
@@ -315,9 +388,10 @@ onMounted(() => {
               {{ acc.name }}
               <span class="ml-2 rounded bg-slate-800 px-2 py-0.5 font-mono text-xs text-sky-300">{{ acc.platform }}</span>
               <span class="ml-1 rounded bg-indigo-500/20 px-2 py-0.5 font-mono text-xs text-indigo-300">{{ acc.executionMode }}</span>
+              <span class="ml-1 rounded bg-slate-800 px-2 py-0.5 font-mono text-xs text-amber-300">{{ acc.authKind }}</span>
             </p>
             <p class="mt-1 font-mono text-xs text-slate-400">
-              分组 {{ acc.groupName }} · 凭据摘要 {{ acc.credentialPreview }} · 并发 {{ acc.maxConcurrency }} · 优先级 {{ acc.priority }}
+              分组 {{ acc.groupName }} · 凭据 {{ acc.credentialPreview }} · 5h {{ (acc.window5hUsedBps / 100).toFixed(1) }}% · 7d {{ (acc.window7dUsedBps / 100).toFixed(1) }}% · 并发 {{ acc.maxConcurrency }} · 优先级 {{ acc.priority }}
             </p>
           </div>
           <div class="flex items-center gap-2">

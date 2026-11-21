@@ -3,18 +3,33 @@ import {
   type ApiKeyItem,
   type CreateAccountRequest,
   type CreateApiKeyRequest,
+  type CreateCompositeRouteRequest,
   type CreateGroupRequest,
+  type DataPlaneSyncSnapshot,
   type GroupItem,
+  type RecordRiskBanInput,
+  type RiskBanEvent,
   type SetupInitializeRequest,
   type SetupStatus,
+  type StoredCompositeRoute,
+  type TurnSettlementEvent,
   type UpdateAccountRequest,
   type UpdateApiKeyRequest,
   type UpdateGroupRequest,
   type UpstreamAccount,
+  type UsageLogItem,
   type UserProfile,
   type WalletSummary,
 } from "@slipgate/contracts";
 import { StoreError, type ControlStore, type StoredUserRecord } from "./types.ts";
+
+function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i]!.toString(16).padStart(2, "0");
+  }
+  return out;
+}
 
 interface InternalAccount extends Omit<UpstreamAccount, "groupName"> {
   credentialsEnc: Uint8Array;
@@ -42,6 +57,10 @@ export class MemoryControlStore implements ControlStore {
   private readonly groups = new Map<string, Omit<GroupItem, "accountCount">>();
   private readonly accounts = new Map<string, InternalAccount>();
   private readonly apiKeys = new Map<string, InternalApiKey>();
+  private readonly routes = new Map<string, StoredCompositeRoute>();
+  private readonly usageByRequestId = new Map<string, UsageLogItem>();
+  private readonly usageLogs: UsageLogItem[] = [];
+  private readonly riskEvents: RiskBanEvent[] = [];
 
   async init(): Promise<void> {}
   async close(): Promise<void> {}
@@ -258,6 +277,11 @@ export class MemoryControlStore implements ControlStore {
         throw new StoreError("conflict", "Cannot delete group referenced by active API keys");
       }
     }
+    for (const [routeId, route] of this.routes.entries()) {
+      if (route.groupId === groupId) {
+        this.routes.delete(routeId);
+      }
+    }
     this.groups.delete(groupId);
   }
 
@@ -413,5 +437,154 @@ export class MemoryControlStore implements ControlStore {
       throw new StoreError("not_found", `API key ${keyId} not found`);
     }
     this.apiKeys.delete(keyId);
+  }
+
+  async listCompositeRoutes(groupId?: string): Promise<StoredCompositeRoute[]> {
+    const out: StoredCompositeRoute[] = [];
+    for (const r of this.routes.values()) {
+      if (groupId && r.groupId !== groupId) continue;
+      out.push({ ...r });
+    }
+    return out.sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
+  }
+
+  async createCompositeRoute(req: CreateCompositeRouteRequest): Promise<StoredCompositeRoute> {
+    if (!this.groups.has(req.groupId)) {
+      throw new StoreError("not_found", `Group ${req.groupId} not found`);
+    }
+    const id = `rte_${crypto.randomUUID()}`;
+    const item: StoredCompositeRoute = {
+      id,
+      groupId: req.groupId,
+      publicModel: req.publicModel,
+      matchType: req.matchType,
+      targetPlatform: req.targetPlatform,
+      upstreamModel: req.upstreamModel,
+      endpoint: req.endpoint,
+      priority: req.priority,
+      enabled: req.enabled,
+      createdAtIso: new Date().toISOString(),
+    };
+    this.routes.set(id, item);
+    return { ...item };
+  }
+
+  async deleteCompositeRoute(routeId: string): Promise<void> {
+    if (!this.routes.delete(routeId)) {
+      throw new StoreError("not_found", `Composite route ${routeId} not found`);
+    }
+  }
+
+  async exportDataPlaneSnapshot(): Promise<DataPlaneSyncSnapshot> {
+    return {
+      revisionUnixMs: Date.now(),
+      groups: Array.from(this.groups.values()).map((g) => ({
+        id: g.id,
+        platform: g.platform,
+        subscriptionType: g.subscriptionType,
+        rateMultiplier: g.rateMultiplier,
+        modelAllowlist: [...g.modelAllowlist],
+        enabled: g.enabled,
+      })),
+      routes: await this.listCompositeRoutes(),
+      accounts: Array.from(this.accounts.values()).map((a) => ({
+        id: a.id,
+        groupId: a.groupId,
+        platform: a.platform,
+        executionMode: a.executionMode,
+        authKind: a.authKind,
+        credentialsEncHex: bytesToHex(a.credentialsEnc),
+        maxConcurrency: a.maxConcurrency,
+        priority: a.priority,
+        status: a.status,
+        window5hUsedBps: a.window5hUsedBps,
+        window7dUsedBps: a.window7dUsedBps,
+      })),
+      apiKeys: Array.from(this.apiKeys.values()).map((k) => ({
+        id: k.id,
+        userId: k.userId,
+        groupId: k.groupId,
+        keyHashHex: bytesToHex(k.keyHash),
+        rpmLimit: k.rpmLimit,
+        concurrencyLimit: k.concurrencyLimit,
+        ipAllowlist: [...k.ipAllowlist],
+        enabled: k.enabled,
+        expiresAtIso: k.expiresAtIso,
+      })),
+      wallets: Array.from(this.wallets.entries()).map(([userId, w]) => ({
+        userId,
+        balanceNanoUsd: w.balanceNano.toString(),
+        heldNanoUsd: w.heldNano.toString(),
+      })),
+    };
+  }
+
+  async recordTurnSettlement(ev: TurnSettlementEvent): Promise<UsageLogItem> {
+    const existing = this.usageByRequestId.get(ev.requestId);
+    if (existing) {
+      return { ...existing };
+    }
+
+    const costNano = BigInt(ev.costNanoUsd);
+    const idemKey = `settle:${ev.requestId}`;
+    if (!this.idempotencyKeys.has(idemKey)) {
+      this.idempotencyKeys.add(idemKey);
+      if (costNano > 0n) {
+        const w = this.wallets.get(ev.userId) ?? { balanceNano: 0n, heldNano: 0n };
+        w.balanceNano -= costNano;
+        this.wallets.set(ev.userId, w);
+      }
+      const acc = this.accounts.get(ev.accountId);
+      if (acc) {
+        if (ev.window5hUsedBps > 0) acc.window5hUsedBps = ev.window5hUsedBps;
+        if (ev.window7dUsedBps > 0) acc.window7dUsedBps = ev.window7dUsedBps;
+      }
+    }
+
+    const item: UsageLogItem = {
+      ...ev,
+      id: `usg_${crypto.randomUUID()}`,
+      formattedCostUsd: formatNanoUsd(costNano),
+      createdAtIso: new Date().toISOString(),
+    };
+    this.usageByRequestId.set(ev.requestId, item);
+    this.usageLogs.unshift(item);
+    if (this.usageLogs.length > 500) {
+      this.usageLogs.length = 500;
+    }
+    return { ...item };
+  }
+
+  async listUsageLogs(filter?: { userId?: string; limit?: number }): Promise<UsageLogItem[]> {
+    const limit = Math.max(1, Math.min(200, filter?.limit ?? 50));
+    const out: UsageLogItem[] = [];
+    for (const item of this.usageLogs) {
+      if (filter?.userId && item.userId !== filter.userId) continue;
+      out.push({ ...item });
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  async recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent> {
+    const record: RiskBanEvent = {
+      eventId: `rsk_${crypto.randomUUID()}`,
+      subjectKind: ev.subjectKind,
+      strikeLevel: ev.strikeLevel,
+      banDuration: ev.banDuration,
+      reason: ev.reason,
+      ordinaryUpstream400Count: ev.ordinaryUpstream400Count,
+      downgradedCount: ev.downgradedCount,
+      createdAtIso: new Date().toISOString(),
+    };
+    this.riskEvents.unshift(record);
+    if (this.riskEvents.length > 200) {
+      this.riskEvents.length = 200;
+    }
+    return { ...record };
+  }
+
+  async listRiskBanEvents(limit = 50): Promise<RiskBanEvent[]> {
+    return this.riskEvents.slice(0, Math.max(1, Math.min(200, limit))).map((e) => ({ ...e }));
   }
 }

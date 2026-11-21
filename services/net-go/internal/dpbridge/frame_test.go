@@ -89,3 +89,59 @@ func TestPingExchange(t *testing.T) {
 		t.Fatalf("server handler failed: %v", err)
 	}
 }
+
+func TestSyncAndSettleFrameExchange(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for range 2 {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			req, readErr := ReadFrame(conn)
+			if readErr == nil {
+				replyType := FrameSyncAck
+				if req.Type == FrameSettleReport {
+					replyType = FrameSettleAck
+				}
+				_ = WriteFrame(conn, Frame{
+					StreamID: req.StreamID,
+					Type:     replyType,
+					Flags:    FlagEndStream,
+					Payload:  []byte(`{"ok":true}`),
+				})
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	syncResp, err := Exchange(ctx, ln.Addr().String(), Frame{
+		StreamID: 10,
+		Type:     FrameSyncState,
+		Flags:    FlagEndStream,
+		Payload:  []byte(`{"groups":[]}`),
+	})
+	if err != nil || syncResp.Type != FrameSyncAck {
+		t.Fatalf("expected FrameSyncAck, got %+v err=%v", syncResp, err)
+	}
+
+	settleResp, err := Exchange(ctx, ln.Addr().String(), Frame{
+		StreamID: 11,
+		Type:     FrameSettleReport,
+		Flags:    FlagEndStream,
+		Payload:  []byte(`{"holdId":1}`),
+	})
+	if err != nil || settleResp.Type != FrameSettleAck {
+		t.Fatalf("expected FrameSettleAck, got %+v err=%v", settleResp, err)
+	}
+}

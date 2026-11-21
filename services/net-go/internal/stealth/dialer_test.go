@@ -175,19 +175,26 @@ func TestDoAccountRequestFailClosedAndUTLSHandshake(t *testing.T) {
 		t.Fatalf("expected ErrUnknownProfile, got %v", err)
 	}
 
-	// 4. Built-in chrome-131 profile negotiates HTTP/2 over authenticated Clash SOCKS5 tunnel
-	reqH2, _ := http.NewRequest(http.MethodGet, tlsSrv.URL+"/v1/test", nil)
-	resH2, err := dialer.DoAccountRequest(context.Background(), "acc-1", "chrome-131", reqH2)
-	if err != nil {
-		t.Fatalf("DoAccountRequest (chrome-131) failed: %v", err)
-	}
-	bodyH2, _ := io.ReadAll(resH2.Response.Body)
-	_ = resH2.Response.Body.Close()
-	if string(bodyH2) != "hello-utls-clash" || resH2.NegotiatedALPN != "h2" {
-		t.Fatalf("unexpected H2 uTLS result: body=%q alpn=%q tls=%q", string(bodyH2), resH2.NegotiatedALPN, resH2.TLSVersion)
+	// 4. Built-in chrome-131, codex-rustls-01, and antigravity-electron-15 negotiate HTTP/2 over authenticated Clash SOCKS5 tunnel
+	for _, profID := range []string{"chrome-131", CodexRustlsProfileID, AntigravityElectronProfileID} {
+		reqH2, _ := http.NewRequest(http.MethodGet, tlsSrv.URL+"/v1/test-"+profID, nil)
+		resH2, reqErr := dialer.DoAccountRequest(context.Background(), "acc-1", profID, reqH2)
+		if reqErr != nil {
+			t.Fatalf("DoAccountRequest (%s) failed: %v", profID, reqErr)
+		}
+		bodyH2, _ := io.ReadAll(resH2.Response.Body)
+		_ = resH2.Response.Body.Close()
+		if string(bodyH2) != "hello-utls-clash" || resH2.NegotiatedALPN != "h2" {
+			t.Fatalf("unexpected H2 uTLS result for %s: body=%q alpn=%q tls=%q", profID, string(bodyH2), resH2.NegotiatedALPN, resH2.TLSVersion)
+		}
 	}
 	if socksHits.Load() < 1 || seenUA == "" {
 		t.Fatalf("expected request to traverse SOCKS5 with template UA, hits=%d ua=%q", socksHits.Load(), seenUA)
+	}
+	if DefaultProfileForProvider("codex", "oauth") != CodexRustlsProfileID ||
+		DefaultProfileForProvider("antigravity", "vm_cli_seed") != AntigravityElectronProfileID ||
+		DefaultProfileForProvider("anthropic", "oauth") != ClaudeBunProfileID {
+		t.Fatalf("unexpected DefaultProfileForProvider mapping")
 	}
 
 	// 5. Built-in claude-cli-mac profile forces http/1.1 without h2 (check http/1.1 or empty ALPN on HTTP/1.1-selected TLS)

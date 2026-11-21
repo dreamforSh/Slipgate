@@ -24,7 +24,7 @@ pub fn nextBanTier(prior_strikes: u8, is_ordinary_upstream_400: bool) BanDuratio
     };
 }
 
-/// Identifies internal CLI tools that must never leak to callers under Zero-Injection mode.
+/// Identifies internal CLI/IDE tools across Claude Code, Codex CLI, and Antigravity that must never leak to callers under Zero-Injection mode.
 pub fn isInternalCliTool(tool_name: []const u8) bool {
     const internal_tools = [_][]const u8{
         "Bash",
@@ -34,6 +34,13 @@ pub fn isInternalCliTool(tool_name: []const u8) bool {
         "Glob",
         "Grep",
         "NotebookEdit",
+        "apply_patch",
+        "exec_command",
+        "write_stdin",
+        "update_plan",
+        "view_file_outline",
+        "run_command",
+        "browser_subagent",
     };
     for (internal_tools) |name| {
         if (std.mem.eql(u8, tool_name, name)) return true;
@@ -87,5 +94,7 @@ test "zero-injection gate strips undeclared CLI tools but preserves caller tools
     const caller_tools = [_][]const u8{"Bash"};
     try std.testing.expect(!shouldStripInternalTool(.zero, "Bash", &caller_tools));
     try std.testing.expect(shouldStripInternalTool(.zero, "Read", &caller_tools));
+    try std.testing.expect(shouldStripInternalTool(.zero, "exec_command", &caller_tools));
+    try std.testing.expect(shouldStripInternalTool(.zero, "browser_subagent", &caller_tools));
     try std.testing.expect(!shouldStripInternalTool(.official, "Read", &caller_tools));
 }

@@ -3,6 +3,8 @@ package vmslot
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -114,6 +116,7 @@ func (d *LocalSlotDriver) MaterializeSlot(_ context.Context, node ClusterNode, s
 	runtimeSpec := map[string]any{
 		"slotId":          slot.ID,
 		"clusterNodeId":   node.ID,
+		"runtimeProfile":  effectiveRuntimeProfile(slot.RuntimeProfile),
 		"hypervisorKind":  slot.Hypervisor,
 		"guestMachineId":  slot.Persona.GuestMachineID,
 		"macAddress":      slot.Persona.MACAddress,
@@ -136,6 +139,9 @@ func (d *LocalSlotDriver) MaterializeSlot(_ context.Context, node ClusterNode, s
 	if err := writeSeedFiles(seedDir, slot, seed, target); err != nil {
 		return slot, err
 	}
+	if err := writeRuntimeHomeFiles(rootDir, slot, seed); err != nil {
+		return slot, err
+	}
 
 	slot.RootDir = rootDir
 	return slot, nil
@@ -154,7 +160,10 @@ func (d *LocalSlotDriver) SyncSeed(_ context.Context, _ ClusterNode, slot Slot, 
 	if err := os.MkdirAll(seedDir, 0o750); err != nil {
 		return err
 	}
-	return writeSeedFiles(seedDir, slot, seed, target)
+	if err := writeSeedFiles(seedDir, slot, seed, target); err != nil {
+		return err
+	}
+	return writeRuntimeHomeFiles(rootDir, slot, seed)
 }
 
 func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slot) (Slot, error) {
@@ -189,15 +198,22 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
+	rp := effectiveRuntimeProfile(slot.RuntimeProfile)
+	guestHome := filepath.Join(slot.RootDir, "home", "runner")
 	cmd := exec.Command(d.guestdBin)
 	cmd.Dir = slot.RootDir
 	cmd.Env = append(os.Environ(),
+		"HOME="+guestHome,
 		"SLIPGATE_GUEST_ADDR="+addr,
 		"SLIPGATE_GUEST_MACHINE_ID="+slot.Persona.GuestMachineID,
 		"SLIPGATE_SLOT_ID="+slot.ID,
+		"SLIPGATE_RUNTIME_PROFILE="+string(rp),
 		"SLIPGATE_MAX_SUBAGENTS="+strconv.FormatUint(uint64(max(1, slot.MaxSubagents)), 10),
 		"SLIPGATE_CLEANSE_MODE="+defaultIfEmpty(slot.CleanseMode, "zero"),
 		"SLIPGATE_TELEMETRY_MODE="+defaultIfEmpty(string(slot.Telemetry), string(TelemetryIsolated)),
+		"CLAUDE_CONFIG_DIR="+filepath.Join(guestHome, ".claude"),
+		"CODEX_HOME="+filepath.Join(guestHome, ".codex"),
+		"ANTIGRAVITY_HOME="+filepath.Join(guestHome, ".antigravity"),
 	)
 	if err := cmd.Start(); err != nil {
 		return slot, fmt.Errorf("vmslot: spawn slipgate-guestd: %w", err)
@@ -261,10 +277,15 @@ func (d *LocalSlotDriver) DestroySlot(ctx context.Context, node ClusterNode, slo
 			return err
 		}
 	}
-	// Reset read-only file permission on etc/machine-id so Windows os.RemoveAll succeeds cleanly.
-	machineIDPath := filepath.Join(rootDir, "etc", "machine-id")
-	if _, statErr := os.Stat(machineIDPath); statErr == nil {
-		_ = os.Chmod(machineIDPath, 0o644)
+	// Reset read-only file permissions on machine-id anchors so Windows os.RemoveAll succeeds cleanly.
+	for _, roRel := range []string{
+		filepath.Join("etc", "machine-id"),
+		filepath.Join("home", "runner", ".antigravity", "machineid"),
+	} {
+		roPath := filepath.Join(rootDir, roRel)
+		if _, statErr := os.Stat(roPath); statErr == nil {
+			_ = os.Chmod(roPath, 0o644)
+		}
 	}
 	return os.RemoveAll(rootDir)
 }
@@ -296,17 +317,28 @@ func (d *LocalSlotDriver) ExecTerminalCommand(ctx context.Context, node ClusterN
 	switch op {
 	case "help":
 		return DriverExecResult{
-			Stdout: "Built-in jailed commands: help, status, uname -a, machine-id, persona, seed, env, ls [dir], cat <rel-path>, ping\n",
+			Stdout: "Built-in jailed commands: help, status, runtime, uname -a, machine-id, persona, seed, env, ls [dir], cat <rel-path>, ping\n",
 		}, nil
 
 	case "status":
 		return DriverExecResult{
 			Stdout: fmt.Sprintf(
-				"slot=%s state=%s node=%s (%s) hypervisor=%s exit_ip=%s subagents=%d/%d daemon=%s endpoint=%s\n",
-				slot.ID, slot.State, node.ID, node.Arch, slot.Hypervisor, slot.ExitIP,
+				"slot=%s runtime=%s state=%s node=%s (%s) hypervisor=%s exit_ip=%s subagents=%d/%d daemon=%s endpoint=%s\n",
+				slot.ID, effectiveRuntimeProfile(slot.RuntimeProfile), slot.State, node.ID, node.Arch, slot.Hypervisor, slot.ExitIP,
 				slot.ActiveSubagents, slot.MaxSubagents, defaultIfEmpty(slot.DaemonVersion, "sandbox-ready"), slot.GuestUDSPath,
 			),
 		}, nil
+
+	case "runtime":
+		rp := effectiveRuntimeProfile(slot.RuntimeProfile)
+		switch rp {
+		case RuntimeCodexCLI:
+			return readJailedFile(rootDir, "home/runner/.codex/config.toml", false)
+		case RuntimeAntigravity:
+			return readJailedFile(rootDir, "home/runner/.antigravity/settings.json", false)
+		default:
+			return readJailedFile(rootDir, "home/runner/.claude/settings.json", false)
+		}
 
 	case "uname":
 		return DriverExecResult{
@@ -453,6 +485,11 @@ func writeSeedFiles(seedDir string, slot Slot, seed SlotSeed, target *clashpool.
 	if err := os.WriteFile(filepath.Join(seedDir, "custom_setting.env"), []byte(seed.CustomSettingRaw), 0o600); err != nil {
 		return fmt.Errorf("vmslot: write seed custom_setting.env: %w", err)
 	}
+	if strings.TrimSpace(seed.AuthJSONRaw) != "" {
+		if err := os.WriteFile(filepath.Join(seedDir, "auth.json"), []byte(seed.AuthJSONRaw+"\n"), 0o600); err != nil {
+			return fmt.Errorf("vmslot: write seed auth.json: %w", err)
+		}
+	}
 	proxyEnv := seed.ProxyEnvRaw
 	if proxyEnv == "" && target != nil && target.SOCKSAddr != "" {
 		proxyURL := fmt.Sprintf("socks5h://%s:%s@%s", target.SocksUsername, target.SocksPassword, target.SOCKSAddr)
@@ -463,7 +500,7 @@ func writeSeedFiles(seedDir string, slot Slot, seed SlotSeed, target *clashpool.
 	}
 	bootstrap := seed.BootstrapScriptRaw
 	if strings.TrimSpace(bootstrap) == "" {
-		bootstrap = fmt.Sprintf("#!/bin/sh\nset -e\n# Bound slot=%s machine_id=%s exit_ip=%s\n", slot.ID, slot.Persona.GuestMachineID, slot.ExitIP)
+		bootstrap = fmt.Sprintf("#!/bin/sh\nset -e\n# Bound slot=%s runtime=%s machine_id=%s exit_ip=%s\n", slot.ID, effectiveRuntimeProfile(slot.RuntimeProfile), slot.Persona.GuestMachineID, slot.ExitIP)
 	}
 	if err := os.WriteFile(filepath.Join(seedDir, "bootstrap.sh"), []byte(bootstrap), 0o700); err != nil {
 		return fmt.Errorf("vmslot: write bootstrap.sh: %w", err)
@@ -471,19 +508,131 @@ func writeSeedFiles(seedDir string, slot Slot, seed SlotSeed, target *clashpool.
 	return nil
 }
 
+func effectiveRuntimeProfile(rp RuntimeProfile) RuntimeProfile {
+	switch rp {
+	case RuntimeCodexCLI, RuntimeAntigravity:
+		return rp
+	default:
+		return RuntimeClaudeCode
+	}
+}
+
+func writeRuntimeHomeFiles(rootDir string, slot Slot, seed SlotSeed) error {
+	rp := effectiveRuntimeProfile(slot.RuntimeProfile)
+	homeDir := filepath.Join(rootDir, "home", "runner")
+	if err := os.MkdirAll(homeDir, 0o750); err != nil {
+		return fmt.Errorf("vmslot: create guest home dir: %w", err)
+	}
+
+	userDigest := sha256.Sum256([]byte("slipgate-vm-user:" + slot.Persona.GuestMachineID))
+	userIDHex := hex.EncodeToString(userDigest[:])
+	authContent := strings.TrimSpace(seed.AuthJSONRaw)
+	if authContent == "" {
+		authContent = "{}"
+	}
+	settingsContent := strings.TrimSpace(seed.SettingsJSONRaw)
+	if settingsContent == "" {
+		settingsContent = "{}"
+	}
+
+	switch rp {
+	case RuntimeCodexCLI:
+		codexDir := filepath.Join(homeDir, ".codex")
+		if err := os.MkdirAll(codexDir, 0o700); err != nil {
+			return err
+		}
+		otelExporter := "none"
+		if slot.Telemetry == TelemetryEnabled {
+			otelExporter = "otlp-http"
+		}
+		configTOML := fmt.Sprintf(
+			"# Generated by Slipgate VM Coordinator (slot=%s machine_id=%s)\n"+
+				"model = \"gpt-5-codex\"\n"+
+				"approval_policy = \"never\"\n"+
+				"sandbox_mode = \"workspace-write\"\n"+
+				"disable_response_storage = true\n\n"+
+				"[otel]\n"+
+				"exporter = %q\n",
+			slot.ID, slot.Persona.GuestMachineID, otelExporter,
+		)
+		if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(configTOML), 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(authContent+"\n"), 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(codexDir, "version.json"), []byte("{\"version\":\"0.38.0\",\"channel\":\"stable\"}\n"), 0o600); err != nil {
+			return err
+		}
+
+	case RuntimeAntigravity:
+		agDir := filepath.Join(homeDir, ".antigravity")
+		agCfgDir := filepath.Join(homeDir, ".config", "antigravity")
+		if err := os.MkdirAll(agDir, 0o700); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(agCfgDir, 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(agDir, "settings.json"), []byte(settingsContent+"\n"), 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(agDir, "oauth_creds.json"), []byte(authContent+"\n"), 0o600); err != nil {
+			return err
+		}
+		midPath := filepath.Join(agDir, "machineid")
+		if _, statErr := os.Stat(midPath); os.IsNotExist(statErr) {
+			if err := os.WriteFile(midPath, []byte(slot.Persona.GuestMachineID+"\n"), 0o600); err != nil {
+				return err
+			}
+			_ = os.Chmod(midPath, 0o444)
+		}
+		argvJSON, _ := json.MarshalIndent(map[string]any{
+			"enable-crash-reporter": false,
+			"crash-reporter-id":     slot.Persona.SMBIOSUUID,
+			"machine-id":            slot.Persona.GuestMachineID,
+		}, "", "  ")
+		if err := os.WriteFile(filepath.Join(agCfgDir, "argv.json"), append(argvJSON, '\n'), 0o600); err != nil {
+			return err
+		}
+
+	default:
+		claudeDir := filepath.Join(homeDir, ".claude")
+		if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settingsContent+"\n"), 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(claudeDir, ".credentials.json"), []byte(authContent+"\n"), 0o600); err != nil {
+			return err
+		}
+		claudeState, _ := json.MarshalIndent(map[string]any{
+			"userID":                        userIDHex,
+			"hasCompletedOnboarding":        true,
+			"bypassPermissionsModeAccepted": true,
+		}, "", "  ")
+		if err := os.WriteFile(filepath.Join(homeDir, ".claude.json"), append(claudeState, '\n'), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func buildLaunchCommandPreview(slot Slot, rootDir string) string {
+	rp := effectiveRuntimeProfile(slot.RuntimeProfile)
 	switch slot.Hypervisor {
 	case HypervisorKVM:
 		return fmt.Sprintf(
-			"qemu-system-x86_64 -name slipgate-%s -m %d -smp %d -smbios type=1,uuid=%s,serial=%s -device virtio-net-pci,mac=%s -fw_cfg name=opt/slipgate/machine-id,file=%s",
-			slot.ID, slot.MemoryMiB, max(1, slot.Persona.CPUCores), slot.Persona.SMBIOSUUID, slot.Persona.SMBIOSSerial, slot.Persona.MACAddress, filepath.Join(rootDir, "etc", "machine-id"),
+			"qemu-system-x86_64 -name slipgate-%s-%s -m %d -smp %d -smbios type=1,uuid=%s,serial=%s -device virtio-net-pci,mac=%s -fw_cfg name=opt/slipgate/machine-id,file=%s",
+			rp, slot.ID, slot.MemoryMiB, max(1, slot.Persona.CPUCores), slot.Persona.SMBIOSUUID, slot.Persona.SMBIOSSerial, slot.Persona.MACAddress, filepath.Join(rootDir, "etc", "machine-id"),
 		)
 	case HypervisorMacOS:
 		return fmt.Sprintf("vfkit --cpus %d --memory %d --device virtio-net,mac=%s", max(1, slot.Persona.CPUCores), slot.MemoryMiB, slot.Persona.MACAddress)
 	default:
 		return fmt.Sprintf(
-			"docker run -d --name slipgate-%s --memory %dm --mac-address %s -v %s:/etc/machine-id:ro -e SLIPGATE_GUEST_MACHINE_ID=%s",
-			slot.ID, slot.MemoryMiB, slot.Persona.MACAddress, filepath.Join(rootDir, "etc", "machine-id"), slot.Persona.GuestMachineID,
+			"docker run -d --name slipgate-%s --memory %dm --mac-address %s -v %s:/etc/machine-id:ro -v %s:/home/runner -e SLIPGATE_GUEST_MACHINE_ID=%s -e SLIPGATE_RUNTIME_PROFILE=%s",
+			slot.ID, slot.MemoryMiB, slot.Persona.MACAddress, filepath.Join(rootDir, "etc", "machine-id"), filepath.Join(rootDir, "home", "runner"), slot.Persona.GuestMachineID, rp,
 		)
 	}
 }
@@ -565,9 +714,17 @@ func (d *AgentlessSSHDriver) MaterializeSlot(ctx context.Context, node ClusterNo
 	if proxyEnv == "" && target != nil && target.SOCKSAddr != "" {
 		proxyEnv = fmt.Sprintf("ALL_PROXY=socks5h://%s:%s@%s", target.SocksUsername, target.SocksPassword, target.SOCKSAddr)
 	}
+	rp := effectiveRuntimeProfile(slot.RuntimeProfile)
+	runtimeSetup := fmt.Sprintf("mkdir -p %s/home/runner/.claude", slotDir)
+	switch rp {
+	case RuntimeCodexCLI:
+		runtimeSetup = fmt.Sprintf("mkdir -p %s/home/runner/.codex", slotDir)
+	case RuntimeAntigravity:
+		runtimeSetup = fmt.Sprintf("mkdir -p %s/home/runner/.antigravity %s/home/runner/.config/antigravity && printf '%%s\\n' %q > %s/home/runner/.antigravity/machineid && chmod 444 %s/home/runner/.antigravity/machineid", slotDir, slotDir, slot.Persona.GuestMachineID, slotDir, slotDir)
+	}
 	script := fmt.Sprintf(
-		"set -e; umask 077; mkdir -p %s/etc %s/seed; printf '%%s\\n' %q > %s/etc/machine-id; chmod 444 %s/etc/machine-id; printf '%%s' %q > %s/seed/proxy.env",
-		slotDir, slotDir, slot.Persona.GuestMachineID, slotDir, slotDir, proxyEnv, slotDir,
+		"set -e; umask 077; mkdir -p %s/etc %s/seed; printf '%%s\\n' %q > %s/etc/machine-id; chmod 444 %s/etc/machine-id; printf '%%s' %q > %s/seed/proxy.env; %s",
+		slotDir, slotDir, slot.Persona.GuestMachineID, slotDir, slotDir, proxyEnv, slotDir, runtimeSetup,
 	)
 	if _, err := d.runRemote(ctx, node, script); err != nil {
 		return slot, err
@@ -615,7 +772,7 @@ func (d *AgentlessSSHDriver) ExecTerminalCommand(ctx context.Context, node Clust
 }
 
 func (d *AgentlessSSHDriver) DestroySlot(ctx context.Context, node ClusterNode, slot Slot) error {
-	_, err := d.runRemote(ctx, node, fmt.Sprintf("chmod 644 /var/lib/slipgate/slots/%s/etc/machine-id 2>/dev/null || true; rm -rf /var/lib/slipgate/slots/%s", slot.ID, slot.ID))
+	_, err := d.runRemote(ctx, node, fmt.Sprintf("chmod 644 /var/lib/slipgate/slots/%s/etc/machine-id /var/lib/slipgate/slots/%s/home/runner/.antigravity/machineid 2>/dev/null || true; rm -rf /var/lib/slipgate/slots/%s", slot.ID, slot.ID, slot.ID))
 	return err
 }
 

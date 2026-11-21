@@ -24,6 +24,12 @@ fn isValidTelemetryMode(mode: []const u8) bool {
         std.mem.eql(u8, mode, "disabled");
 }
 
+fn isValidRuntimeProfile(profile: []const u8) bool {
+    return std.mem.eql(u8, profile, "claude_code") or
+        std.mem.eql(u8, profile, "codex_cli") or
+        std.mem.eql(u8, profile, "antigravity");
+}
+
 fn isSafeJsonToken(s: []const u8) bool {
     if (s.len == 0 or s.len > 128) return false;
     for (s) |ch| {
@@ -84,10 +90,16 @@ pub fn main() !void {
         return error.InvalidTelemetryMode;
     }
 
+    const runtime_profile = try getEnvOrDefault(allocator, "SLIPGATE_RUNTIME_PROFILE", "claude_code");
+    defer allocator.free(runtime_profile);
+    if (!isValidRuntimeProfile(runtime_profile)) {
+        return error.InvalidRuntimeProfile;
+    }
+
     const directive_json = try std.fmt.allocPrint(
         allocator,
-        "{{\"daemon\":\"slipgate-guestd\",\"version\":\"{s}\",\"slot_id\":\"{s}\",\"guest_machine_id\":\"{s}\",\"native_handoff_v1\":true,\"max_subagents\":{d},\"cleanse_mode\":\"{s}\",\"telemetry_mode\":\"{s}\"}}",
-        .{ VERSION, slot_id, machine_id, max_subagents, cleanse_mode, telemetry_mode },
+        "{{\"daemon\":\"slipgate-guestd\",\"version\":\"{s}\",\"slot_id\":\"{s}\",\"guest_machine_id\":\"{s}\",\"runtime_profile\":\"{s}\",\"native_handoff_v1\":true,\"max_subagents\":{d},\"cleanse_mode\":\"{s}\",\"telemetry_mode\":\"{s}\"}}",
+        .{ VERSION, slot_id, machine_id, runtime_profile, max_subagents, cleanse_mode, telemetry_mode },
     );
     defer allocator.free(directive_json);
 

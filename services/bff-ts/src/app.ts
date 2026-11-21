@@ -12,6 +12,7 @@ import {
   CreateApiKeyRequestSchema,
   CreateClashSubscriptionRequestSchema,
   CreateClusterNodeRequestSchema,
+  CreateCompositeRouteRequestSchema,
   CreateGroupRequestSchema,
   CreatedApiKeyResponseSchema,
   CreateTlsProfileRequestSchema,
@@ -20,13 +21,14 @@ import {
   parseUsdToNano,
   PlaneHealthSchema,
   ProvisionVmSlotRequestSchema,
-  RiskBanEventSchema,
+  RecordRiskBanInputSchema,
   RoutePreviewRequestSchema,
   RoutePreviewResponseSchema,
   SetupInitializeRequestSchema,
   SlotSeedSnapshotSchema,
   SystemUpdateStatusSchema,
   TriggerUpdateSyncRequestSchema,
+  TurnSettlementEventSchema,
   UpdateAccountRequestSchema,
   UpdateApiKeyRequestSchema,
   UpdateGroupRequestSchema,
@@ -38,7 +40,6 @@ import {
   type ClusterNode,
   type CompositeRouteRule,
   type Provider,
-  type RiskBanEvent,
   type SlotSeedSnapshot,
   type TlsProfile,
   type VmSlotSummary,
@@ -60,6 +61,7 @@ export interface BffAppOptions {
   store?: ControlStore;
   jwtSecret?: string;
   vaultSecret?: string;
+  internalToken?: string;
   registry?: PluginRegistry;
 }
 
@@ -118,6 +120,7 @@ const SAMPLE_VM_SLOTS: VmSlotSummary[] = [
     clashNodeId: "node-tokyo-01",
     exitIp: "203.0.113.11",
     hypervisorKind: "kvm_qemu",
+    runtimeProfile: "claude_code",
     state: "ready",
     activeSubagents: 3,
     maxSubagents: 20,
@@ -139,28 +142,34 @@ const SAMPLE_VM_SLOTS: VmSlotSummary[] = [
   }),
 ];
 
-const SAMPLE_RISK_EVENTS: RiskBanEvent[] = [
-  RiskBanEventSchema.parse({
-    eventId: "risk-001",
-    subjectKind: "session",
-    strikeLevel: 1,
-    banDuration: "10m",
-    reason: "prompt_distillation_signature",
-    ordinaryUpstream400Count: 0,
-    downgradedCount: 1,
-    createdAtIso: "2026-11-20T12:00:00Z",
-  }),
-];
-
 function detectBuiltinProvider(model: string): Provider | null {
+  if (model.startsWith("antigravity/") || model.startsWith("ag-")) return "antigravity";
+  if (
+    model.startsWith("codex-") ||
+    model.startsWith("codex/") ||
+    model.startsWith("gpt-5-codex") ||
+    model.startsWith("o3-codex") ||
+    model.startsWith("o4-mini-codex")
+  ) {
+    return "codex";
+  }
   if (model.startsWith("claude-") || model.startsWith("anthropic/")) return "anthropic";
   if (model.startsWith("gemini-") || model.startsWith("google/")) return "gemini";
-  if (model.startsWith("gpt-") || model.startsWith("codex-") || model.startsWith("openai/")) return "openai";
+  if (
+    model.startsWith("gpt-") ||
+    model.startsWith("o1") ||
+    model.startsWith("o3") ||
+    model.startsWith("o4") ||
+    model.startsWith("openai/")
+  ) {
+    return "openai";
+  }
   if (model.startsWith("grok-") || model.startsWith("xai/")) return "grok";
   if (model.startsWith("deepseek-")) return "deepseek";
   if (model.startsWith("glm-")) return "glm";
   if (model.startsWith("kimi-") || model.startsWith("moonshot-")) return "kimi";
   if (model.startsWith("minimax-") || model.startsWith("abab")) return "minimax";
+  if (model.startsWith("qwen-")) return "qwen";
   return null;
 }
 
@@ -282,6 +291,48 @@ const STANDALONE_TLS_PROFILES: TlsProfile[] = [
     builtIn: true,
   },
   {
+    id: "codex-rustls-01",
+    name: "OpenAI Codex CLI (Rust reqwest/rustls)",
+    description: "GREASE-free Rustls TLS 1.3/1.2 ClientHello with AES-256-GCM preference and X25519 key share",
+    clientHelloPreset: "codex_rustls",
+    ja3Fingerprint: "",
+    ja4Fingerprint: "",
+    alpnProtocols: ["h2", "http/1.1"],
+    userAgentTemplate: "codex_cli_rs/0.38.0 (Linux 6.8.0; x86_64)",
+    enableGrease: false,
+    cipherSuites: [4866, 4865, 4867, 49196, 49195, 52393, 49200, 49199, 52392],
+    curves: [29, 23, 24],
+    pointFormats: [0],
+    signatureAlgorithms: [1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537, 513],
+    supportedVersions: [772, 771],
+    keyShareGroups: [29],
+    pskModes: [1],
+    extensions: [0, 23, 65281, 10, 11, 35, 16, 5, 13, 51, 45, 43],
+    osHint: "linux",
+    builtIn: true,
+  },
+  {
+    id: "antigravity-electron-15",
+    name: "Antigravity IDE 1.15 (Electron BoringSSL + PQ)",
+    description: "Electron/Chromium GREASE + X25519MLKEM768 + Brotli cert compression + ALPS h2 ClientHello",
+    clientHelloPreset: "antigravity_ide",
+    ja3Fingerprint: "",
+    ja4Fingerprint: "",
+    alpnProtocols: ["h2", "http/1.1"],
+    userAgentTemplate: "antigravity/1.15.8 linux/amd64",
+    enableGrease: true,
+    cipherSuites: [4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392],
+    curves: [4588, 29, 23, 24],
+    pointFormats: [0],
+    signatureAlgorithms: [1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537, 513],
+    supportedVersions: [772, 771],
+    keyShareGroups: [4588, 29],
+    pskModes: [1],
+    extensions: [0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27, 17513],
+    osHint: "linux",
+    builtIn: true,
+  },
+  {
     id: "chrome-131",
     name: "Chrome 131 (Windows Desktop)",
     description: "Google Chrome desktop TLS + HTTP/2 ClientHello",
@@ -348,12 +399,13 @@ const STANDALONE_TLS_PROFILES: TlsProfile[] = [
   },
 ];
 
-type ForwardStatus = 200 | 201 | 400 | 403 | 404 | 409 | 502 | 503;
+type ForwardStatus = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 502 | 503;
 
 function toForwardStatus(code: number): ForwardStatus {
   if (
     code === 200 ||
     code === 201 ||
+    code === 202 ||
     code === 400 ||
     code === 403 ||
     code === 404 ||
@@ -403,10 +455,41 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   const jwtSecret = options.jwtSecret ?? process.env.SLIPGATE_JWT_SECRET ?? "slipgate-dev-jwt-secret-change-in-prod";
   const vaultSecret =
     options.vaultSecret ?? process.env.SLIPGATE_VAULT_SECRET ?? "slipgate-dev-vault-secret-change-in-prod";
+  const internalToken = options.internalToken ?? process.env.SLIPGATE_INTERNAL_TOKEN ?? "";
   const registry = options.registry ?? new PluginRegistry();
 
   const app = new Hono<AuthEnv>();
   const startedAt = Date.now();
+
+  function verifyInternalHeader(c: Context): boolean {
+    if (!internalToken) return false;
+    const provided = c.req.header("X-Slipgate-Internal-Token") ?? "";
+    if (provided.length !== internalToken.length) return false;
+    let diff = 0;
+    for (let i = 0; i < internalToken.length; i++) {
+      diff |= provided.charCodeAt(i) ^ internalToken.charCodeAt(i);
+    }
+    return diff === 0;
+  }
+
+  async function syncDataPlaneBestEffort(): Promise<void> {
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    if (!internalUrl || !internalToken) return;
+    try {
+      const snapshot = await store.exportDataPlaneSnapshot();
+      await fetch(`${internalUrl}/internal/net/dataplane/sync`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Slipgate-Internal-Token": internalToken,
+        },
+        body: JSON.stringify(snapshot),
+        signal: AbortSignal.timeout(2500),
+      });
+    } catch {
+      // DataPlane coordinator also reconciles periodically via background pull.
+    }
+  }
 
   app.onError((err, c) => {
     if (err instanceof StoreError) {
@@ -488,6 +571,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
     const passwordHash = await hashPassword(parsed.data.adminPassword);
     const admin = await store.initializeSetup(parsed.data, passwordHash);
+    await syncDataPlaneBestEffort();
     const { token, expiresAtIso } = await signJwt(
       { sub: admin.id, email: admin.email, role: admin.role },
       jwtSecret,
@@ -510,6 +594,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
     const passwordHash = await hashPassword(parsed.data.password);
     const user = await store.registerUser(parsed.data.email, passwordHash);
+    await syncDataPlaneBestEffort();
     const { token, expiresAtIso } = await signJwt(
       { sub: user.id, email: user.email, role: user.role },
       jwtSecret,
@@ -575,6 +660,20 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return c.json({ groups });
   });
 
+  app.get("/api/v1/user/wallet", async (c) => {
+    const claims = c.get("authUser");
+    const wallet = await store.getWallet(claims.sub);
+    return c.json({ wallet });
+  });
+
+  app.get("/api/v1/user/usage", async (c) => {
+    const claims = c.get("authUser");
+    const limitRaw = Number.parseInt(c.req.query("limit") ?? "50", 10);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 50;
+    const items = await store.listUsageLogs({ userId: claims.sub, limit });
+    return c.json({ items });
+  });
+
   app.get("/api/v1/user/api-keys", async (c) => {
     const claims = c.get("authUser");
     const items = await store.listUserApiKeys(claims.sub);
@@ -590,6 +689,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
     const { plaintextKey, keyPrefix, keyHash } = await generateApiKey();
     const item = await store.createApiKey(claims.sub, parsed.data, keyPrefix, keyHash);
+    await syncDataPlaneBestEffort();
     return c.json(CreatedApiKeyResponseSchema.parse({ item, plaintextKey }), 201);
   });
 
@@ -602,6 +702,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
     const item = await store.updateUserApiKey(claims.sub, keyId, parsed.data);
+    await syncDataPlaneBestEffort();
     return c.json({ item });
   });
 
@@ -609,6 +710,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     const claims = c.get("authUser");
     const keyId = c.req.param("keyId");
     await store.deleteUserApiKey(claims.sub, keyId);
+    await syncDataPlaneBestEffort();
     return c.json({ deleted: true, keyId });
   });
 
@@ -660,6 +762,43 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       outboxEvent: "core.v1.CreditWallet",
       idempotencyKey: `credit:${provider}:${parsed.data.orderId}`,
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Internal DataPlane Synchronization & Post-Turn Settlement Bridge
+  // ---------------------------------------------------------------------------
+  app.get("/api/v1/internal/dataplane/snapshot", async (c) => {
+    if (!verifyInternalHeader(c)) {
+      return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
+    }
+    const snapshot = await store.exportDataPlaneSnapshot();
+    return c.json(snapshot);
+  });
+
+  app.post("/api/v1/internal/dataplane/settlement", async (c) => {
+    if (!verifyInternalHeader(c)) {
+      return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
+    }
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = TurnSettlementEventSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const item = await store.recordTurnSettlement(parsed.data);
+    return c.json({ ok: true, item });
+  });
+
+  app.post("/api/v1/internal/dataplane/risk-events", async (c) => {
+    if (!verifyInternalHeader(c)) {
+      return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
+    }
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = RecordRiskBanInputSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const event = await store.recordRiskBanEvent(parsed.data);
+    return c.json({ ok: true, event });
   });
 
   // ---------------------------------------------------------------------------
@@ -756,6 +895,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
     const group = await store.createGroup(parsed.data);
+    await syncDataPlaneBestEffort();
     return c.json({ group }, 201);
   });
 
@@ -767,12 +907,14 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
     const group = await store.updateGroup(groupId, parsed.data);
+    await syncDataPlaneBestEffort();
     return c.json({ group });
   });
 
   app.delete("/api/v1/admin/groups/:groupId", async (c) => {
     const groupId = c.req.param("groupId");
     await store.deleteGroup(groupId);
+    await syncDataPlaneBestEffort();
     return c.json({ deleted: true, groupId });
   });
 
@@ -795,6 +937,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     const encrypted = await encryptSecret(parsed.data.credentialSecret, vaultSecret);
     const preview = maskSecret(parsed.data.credentialSecret);
     const account = await store.createAccount(parsed.data, encrypted, preview);
+    await syncDataPlaneBestEffort();
     return c.json({ account }, 201);
   });
 
@@ -812,12 +955,14 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       preview = maskSecret(parsed.data.credentialSecret);
     }
     const account = await store.updateAccount(accountId, parsed.data, encrypted, preview);
+    await syncDataPlaneBestEffort();
     return c.json({ account });
   });
 
   app.delete("/api/v1/admin/accounts/:accountId", async (c) => {
     const accountId = c.req.param("accountId");
     await store.deleteAccount(accountId);
+    await syncDataPlaneBestEffort();
     return c.json({ deleted: true, accountId });
   });
 
@@ -840,7 +985,43 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       `admin:${crypto.randomUUID()}`,
       parsed.data.reason,
     );
+    await syncDataPlaneBestEffort();
     return c.json({ wallet });
+  });
+
+  app.get("/api/v1/admin/usage", async (c) => {
+    const userId = c.req.query("userId");
+    const limitRaw = Number.parseInt(c.req.query("limit") ?? "100", 10);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 100;
+    const items = await store.listUsageLogs({
+      userId: userId || undefined,
+      limit,
+    });
+    return c.json({ items });
+  });
+
+  app.get("/api/v1/admin/routes", async (c) => {
+    const groupId = c.req.query("groupId");
+    const routes = await store.listCompositeRoutes(groupId || undefined);
+    return c.json({ routes });
+  });
+
+  app.post("/api/v1/admin/routes", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = CreateCompositeRouteRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const route = await store.createCompositeRoute(parsed.data);
+    await syncDataPlaneBestEffort();
+    return c.json({ route }, 201);
+  });
+
+  app.delete("/api/v1/admin/routes/:routeId", async (c) => {
+    const routeId = c.req.param("routeId");
+    await store.deleteCompositeRoute(routeId);
+    await syncDataPlaneBestEffort();
+    return c.json({ deleted: true, routeId });
   });
 
   app.get("/api/v1/admin/clash/nodes", async (c) => {
@@ -1229,7 +1410,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       if (forwarded.configured) {
         return c.json(forwarded.payload, forwarded.status);
       }
-      if (c.req.param("id") === "auto" || c.req.param("id") === "claude-bun-21" || c.req.param("id") === "chrome-131") {
+      if (STANDALONE_TLS_PROFILES.some((p) => p.id === c.req.param("id") && p.builtIn)) {
         return c.json({ error: "clash_operation_failed", message: "built-in TLS profile is immutable" }, 403);
       }
       return c.json({
@@ -1381,6 +1562,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return forwardVmAdmin(c, `/internal/net/vms/slots/${encodeURIComponent(slotId)}/seed`, {}, () => {
       const snapshot: SlotSeedSnapshot = SlotSeedSnapshotSchema.parse({
         slotId,
+        runtimeProfile: "claude_code",
         settingsJsonRaw: JSON.stringify(
           {
             cleanupPeriodDays: 30,
@@ -1391,6 +1573,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
           2,
         ),
         customSettingRaw: "cleanse_mode=zero\ntelemetry=isolated\n",
+        authJsonRaw: "",
         rejectClientSettings: true,
         rejectClientIdentity: true,
         telemetryMode: "isolated",
@@ -1451,9 +1634,10 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/terminal-ticket`, { method: "POST" });
   });
 
-  app.get("/api/v1/admin/risk/events", (c) => {
+  app.get("/api/v1/admin/risk/events", async (c) => {
+    const events = await store.listRiskBanEvents(50);
     return c.json({
-      events: SAMPLE_RISK_EVENTS,
+      events,
       banLadder: ["10m", "24h", "permanent"],
       exemptOrdinaryUpstream400: true,
     });
@@ -1466,7 +1650,22 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
 
-    const { endpoint, publicModel, rules } = parsed.data;
+    const { endpoint, groupId, publicModel } = parsed.data;
+    let rules = parsed.data.rules;
+    if (rules.length === 0) {
+      const persisted = await store.listCompositeRoutes(groupId);
+      rules = persisted.map((r) => ({
+        routeId: r.id,
+        groupId: r.groupId,
+        publicModel: r.publicModel,
+        matchType: r.matchType,
+        targetPlatform: r.targetPlatform,
+        upstreamModel: r.upstreamModel,
+        endpoint: r.endpoint,
+        priority: r.priority,
+        enabled: r.enabled,
+      }));
+    }
     let best: CompositeRouteRule | null = null;
     for (const rule of rules) {
       if (!rule.enabled) continue;
@@ -1495,10 +1694,14 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
 
     const builtin = detectBuiltinProvider(publicModel);
     if (builtin) {
+      const groups = await store.listGroups(false);
+      const grp = groups.find((g) => g.id === groupId);
+      const targetPlatform: Provider =
+        grp && grp.platform !== "composite" ? grp.platform : builtin;
       return c.json(
         RoutePreviewResponseSchema.parse({
           matched: true,
-          targetPlatform: builtin,
+          targetPlatform,
           upstreamModel: publicModel,
           matchedRuleId: null,
           resolutionSource: "builtin_detector",

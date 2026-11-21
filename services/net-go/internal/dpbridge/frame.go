@@ -28,7 +28,11 @@ const (
 	FrameDispatchDirective FrameType = 0x12
 	FrameUpstreamChunk     FrameType = 0x13
 	FrameStreamEnd         FrameType = 0x14
+	FrameSettleReport      FrameType = 0x15
+	FrameSettleAck         FrameType = 0x16
 	FrameExitHealth        FrameType = 0x20
+	FrameSyncState         FrameType = 0x30
+	FrameSyncAck           FrameType = 0x31
 )
 
 const (
@@ -133,11 +137,11 @@ func DialIPC(ctx context.Context, endpoint string) (net.Conn, error) {
 	return dialer.DialContext(ctx, "tcp", target)
 }
 
-// Ping verifies live connectivity to slipgate-core over the binary frame protocol.
-func Ping(ctx context.Context, endpoint string) error {
+// Exchange sends req over endpoint and returns the single reply Frame.
+func Exchange(ctx context.Context, endpoint string, req Frame) (Frame, error) {
 	conn, err := DialIPC(ctx, endpoint)
 	if err != nil {
-		return err
+		return Frame{}, err
 	}
 	defer conn.Close()
 
@@ -145,16 +149,20 @@ func Ping(ctx context.Context, endpoint string) error {
 		_ = conn.SetDeadline(deadline)
 	}
 
-	req := Frame{
+	if err := WriteFrame(conn, req); err != nil {
+		return Frame{}, err
+	}
+	return ReadFrame(conn)
+}
+
+// Ping verifies live connectivity to slipgate-core over the binary frame protocol.
+func Ping(ctx context.Context, endpoint string) error {
+	resp, err := Exchange(ctx, endpoint, Frame{
 		StreamID: 0,
 		Type:     FramePing,
 		Flags:    FlagEndStream,
 		Payload:  []byte("slipgate-ping"),
-	}
-	if err := WriteFrame(conn, req); err != nil {
-		return err
-	}
-	resp, err := ReadFrame(conn)
+	})
 	if err != nil {
 		return err
 	}

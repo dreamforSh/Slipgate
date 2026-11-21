@@ -19,9 +19,11 @@ import (
 type ProfileSpec = clashpool.TLSProfile
 
 const (
-	DefaultProfileID   = "chrome-131"
-	ClaudeBunProfileID = "claude-bun-21"
-	AutoProfileID      = "auto"
+	DefaultProfileID             = "chrome-131"
+	ClaudeBunProfileID           = "claude-bun-21"
+	CodexRustlsProfileID         = "codex-rustls-01"
+	AntigravityElectronProfileID = "antigravity-electron-15"
+	AutoProfileID                = "auto"
 )
 
 var (
@@ -105,18 +107,65 @@ var (
 )
 
 var allowedPresets = map[string]struct{}{
-	"":              {},
-	"auto":          {},
-	"custom_wire":   {},
-	"claude_bun_21": {},
-	"bun_default":   {},
-	"chrome_auto":   {},
-	"chrome_131":    {},
-	"firefox_auto":  {},
-	"safari_auto":   {},
-	"ios_auto":      {},
-	"edge_auto":     {},
-	"randomized":    {},
+	"":                {},
+	"auto":            {},
+	"custom_wire":     {},
+	"claude_bun_21":   {},
+	"codex_rustls":    {},
+	"antigravity_ide": {},
+	"bun_default":     {},
+	"chrome_auto":     {},
+	"chrome_131":      {},
+	"firefox_auto":    {},
+	"safari_auto":     {},
+	"ios_auto":        {},
+	"edge_auto":       {},
+	"randomized":      {},
+	"claude_cli":      {},
+}
+
+var (
+	codexRustlsCiphers = []uint16{
+		utls.TLS_AES_256_GCM_SHA384,
+		utls.TLS_AES_128_GCM_SHA256,
+		utls.TLS_CHACHA20_POLY1305_SHA256,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		utls.FAKE_TLS_EMPTY_RENEGOTIATION_INFO_SCSV,
+	}
+	codexRustlsCurves     = []uint16{uint16(utls.X25519), uint16(utls.CurveP256), uint16(utls.CurveP384)}
+	codexRustlsKeyShares  = []uint16{uint16(utls.X25519)}
+	codexRustlsExtensions = []uint16{0, 23, 65281, 10, 11, 35, 16, 5, 13, 51, 45, 43}
+
+	antigravityExtensions = []uint16{0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27, 17513, 21}
+)
+
+// DefaultProfileForProvider selects the canonical uTLS persona for a subscription/API provider when none is explicitly pinned.
+func DefaultProfileForProvider(provider, authKind string) string {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	ak := strings.ToLower(strings.TrimSpace(authKind))
+	switch p {
+	case "anthropic":
+		if ak == "oauth" || ak == "setup_token" || ak == "vm_cli_seed" {
+			return ClaudeBunProfileID
+		}
+		return DefaultProfileID
+	case "codex":
+		return CodexRustlsProfileID
+	case "openai":
+		if ak == "oauth" || ak == "vm_cli_seed" {
+			return CodexRustlsProfileID
+		}
+		return DefaultProfileID
+	case "antigravity":
+		return AntigravityElectronProfileID
+	default:
+		return DefaultProfileID
+	}
 }
 
 // DefaultProfiles returns built-in uTLS profiles including selector "auto", Claude Bun 2.1.280 PQ wire defaults, and desktop browsers.
@@ -146,6 +195,44 @@ func DefaultProfiles() []ProfileSpec {
 			KeyShareGroups:      append([]uint16(nil), defaultWireKeyShareGroups...),
 			PSKModes:            append([]uint16(nil), defaultWirePSKModes...),
 			Extensions:          append([]uint16(nil), defaultWireExtensions...),
+			OSHint:              "linux",
+			BuiltIn:             true,
+		},
+		{
+			ID:                  CodexRustlsProfileID,
+			Name:                "OpenAI Codex CLI (Rust reqwest/rustls)",
+			Description:         "GREASE-free Rustls TLS 1.3/1.2 ClientHello with AES-256-GCM preference and X25519 key share",
+			ClientHelloPreset:   "codex_rustls",
+			ALPNProtocols:       []string{"h2", "http/1.1"},
+			UserAgentTemplate:   "codex_cli_rs/0.38.0 (Linux 6.8.0; x86_64)",
+			EnableGREASE:        false,
+			CipherSuites:        append([]uint16(nil), codexRustlsCiphers...),
+			Curves:              append([]uint16(nil), codexRustlsCurves...),
+			PointFormats:        append([]uint16(nil), defaultWirePointFormats...),
+			SignatureAlgorithms: append([]uint16(nil), defaultWireSignatureAlgorithms...),
+			SupportedVersions:   append([]uint16(nil), defaultWireSupportedVersions...),
+			KeyShareGroups:      append([]uint16(nil), codexRustlsKeyShares...),
+			PSKModes:            append([]uint16(nil), defaultWirePSKModes...),
+			Extensions:          append([]uint16(nil), codexRustlsExtensions...),
+			OSHint:              "linux",
+			BuiltIn:             true,
+		},
+		{
+			ID:                  AntigravityElectronProfileID,
+			Name:                "Antigravity IDE 1.15 (Electron BoringSSL + PQ)",
+			Description:         "Electron/Chromium GREASE + X25519MLKEM768 + Brotli cert compression + ALPS h2 ClientHello",
+			ClientHelloPreset:   "antigravity_ide",
+			ALPNProtocols:       []string{"h2", "http/1.1"},
+			UserAgentTemplate:   "antigravity/1.15.8 linux/amd64",
+			EnableGREASE:        true,
+			CipherSuites:        append([]uint16(nil), defaultWireCipherSuites...),
+			Curves:              append([]uint16(nil), defaultWireCurves...),
+			PointFormats:        append([]uint16(nil), defaultWirePointFormats...),
+			SignatureAlgorithms: append([]uint16(nil), defaultWireSignatureAlgorithms...),
+			SupportedVersions:   append([]uint16(nil), defaultWireSupportedVersions...),
+			KeyShareGroups:      append([]uint16(nil), defaultWireKeyShareGroups...),
+			PSKModes:            append([]uint16(nil), defaultWirePSKModes...),
+			Extensions:          append([]uint16(nil), antigravityExtensions...),
 			OSHint:              "linux",
 			BuiltIn:             true,
 		},
@@ -388,7 +475,7 @@ func ResolveClientHelloID(preset string) utls.ClientHelloID {
 		return utls.HelloEdge_Auto
 	case "randomized", "random":
 		return utls.HelloRandomizedALPN
-	case "custom_wire", "claude_bun_21", "bun_default":
+	case "custom_wire", "claude_bun_21", "codex_rustls", "antigravity_ide", "bun_default":
 		return utls.HelloCustom
 	case "chrome_auto", "chrome_131", "":
 		return utls.HelloChrome_Auto
@@ -403,7 +490,12 @@ func BuildClientHelloSpec(spec ProfileSpec) (*utls.ClientHelloSpec, error) {
 		return nil, err
 	}
 	preset := strings.ToLower(strings.TrimSpace(spec.ClientHelloPreset))
-	useWire := spec.HasCustomWireSpec() || preset == "custom_wire" || preset == "claude_bun_21" || preset == "bun_default"
+	useWire := spec.HasCustomWireSpec() ||
+		preset == "custom_wire" ||
+		preset == "claude_bun_21" ||
+		preset == "codex_rustls" ||
+		preset == "antigravity_ide" ||
+		preset == "bun_default"
 	if !useWire {
 		return nil, nil
 	}
