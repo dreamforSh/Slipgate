@@ -67,6 +67,7 @@ jobs:
         run: |
           zig build -Doptimize=ReleaseSafe
           ./zig-out/bin/slipgate-core --version
+          ./zig-out/bin/slipgate-guestd --version
 
   bun-workspace:
     name: L3/L4 Contracts, BFF & Vue Console (Bun)
@@ -114,6 +115,7 @@ jobs:
         run: |
           docker run --rm slipgate:ci --version
           docker run --rm --entrypoint /usr/local/bin/slipgate-core slipgate:ci --version
+          docker run --rm --entrypoint /usr/local/share/slipgate/guest/slipgate-guestd slipgate:ci --version
           docker run --rm --entrypoint /usr/local/bin/slipgate-bff slipgate:ci --version
       - name: Verify single-service 3-plane boot & dual-plane routing
         run: |
@@ -130,5 +132,6 @@ jobs:
 
           curl -fsS http://127.0.0.1:18080/readyz | grep -q '"ready":true'
           curl -fsS http://127.0.0.1:18080/api/v1/system/architecture | grep -q 'slipgate-bff'
+          curl -fsS http://127.0.0.1:18080/api/v1/admin/vms/slots | grep -q 'kvm_qemu'
           curl -fsS -D /tmp/dp.headers -X POST http://127.0.0.1:18080/v1/chat/completions | grep -q 'slipgate-core'
           grep -qi 'X-Slipgate-Plane: dataplane-direct' /tmp/dp.headers

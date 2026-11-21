@@ -51,4 +51,23 @@ describe("slipgate-bff ControlPlane API", () => {
     });
     expect(badRes.status).toBe(400);
   });
+
+  it("exposes VM slot fleet, live seed inspection, and pre-hop risk audit endpoints", async () => {
+    const slotsRes = await app.request("/api/v1/admin/vms/slots");
+    expect(slotsRes.status).toBe(200);
+    const slotsBody = (await slotsRes.json()) as { slots: Array<{ hypervisorKind: string; maxSubagents: number }> };
+    expect(slotsBody.slots[0]?.hypervisorKind).toBe("kvm_qemu");
+    expect(slotsBody.slots[0]?.maxSubagents).toBe(20);
+
+    const seedRes = await app.request("/api/v1/admin/vms/vm-tokyo-01/seed");
+    expect(seedRes.status).toBe(200);
+    const seedBody = (await seedRes.json()) as { rejectClientSettings: boolean; telemetryDaemonRunning: boolean };
+    expect(seedBody.rejectClientSettings).toBe(true);
+    expect(seedBody.telemetryDaemonRunning).toBe(true);
+
+    const riskRes = await app.request("/api/v1/admin/risk/events");
+    expect(riskRes.status).toBe(200);
+    const riskBody = (await riskRes.json()) as { exemptOrdinaryUpstream400: boolean };
+    expect(riskBody.exemptOrdinaryUpstream400).toBe(true);
+  });
 });

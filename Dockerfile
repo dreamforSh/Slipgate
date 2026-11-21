@@ -93,13 +93,14 @@ FROM ${ALPINE_IMAGE} AS runtime
 
 RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc && \
     addgroup -S slipgate && adduser -S slipgate -G slipgate && \
-    mkdir -p /etc/slipgate /var/run/slipgate && \
+    mkdir -p /etc/slipgate /var/run/slipgate /usr/local/share/slipgate/guest && \
     chown -R slipgate:slipgate /etc/slipgate /var/run/slipgate
 
 COPY --from=go-builder /out/slipgate /usr/local/bin/slipgate
 COPY --from=zig-builder /out/bin/slipgate-core /usr/local/bin/slipgate-core
+COPY --from=zig-builder /out/bin/slipgate-guestd /usr/local/share/slipgate/guest/slipgate-guestd
 COPY --from=bff-builder /out/slipgate-bff /usr/local/bin/slipgate-bff
-RUN chmod 0755 /usr/local/bin/slipgate /usr/local/bin/slipgate-core /usr/local/bin/slipgate-bff
+RUN chmod 0755 /usr/local/bin/slipgate /usr/local/bin/slipgate-core /usr/local/share/slipgate/guest/slipgate-guestd /usr/local/bin/slipgate-bff
 COPY migrations /etc/slipgate/migrations
 COPY config/slipgate.example.yaml /etc/slipgate/slipgate.example.yaml
 

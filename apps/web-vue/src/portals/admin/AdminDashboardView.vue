@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import type { ClashExitNode, RoutePreviewResponse } from "@slipgate/contracts";
+import type {
+  ClashExitNode,
+  RiskBanEvent,
+  RoutePreviewResponse,
+  VmSlotSummary,
+} from "@slipgate/contracts";
 
 interface ArchitectureLayer {
   id: string;
@@ -18,6 +23,8 @@ interface ReadinessState {
 
 const layers = ref<ArchitectureLayer[]>([]);
 const clashNodes = ref<ClashExitNode[]>([]);
+const vmSlots = ref<VmSlotSummary[]>([]);
+const riskEvents = ref<RiskBanEvent[]>([]);
 const readiness = ref<ReadinessState | null>(null);
 const previewModel = ref("claude-sonnet-4-5");
 const previewResult = ref<RoutePreviewResponse | null>(null);
@@ -25,9 +32,11 @@ const previewError = ref<string | null>(null);
 
 async function loadOverview() {
   try {
-    const [archRes, clashRes, readyRes] = await Promise.all([
+    const [archRes, clashRes, vmRes, riskRes, readyRes] = await Promise.all([
       fetch("/api/v1/system/architecture"),
       fetch("/api/v1/admin/clash/nodes"),
+      fetch("/api/v1/admin/vms/slots"),
+      fetch("/api/v1/admin/risk/events"),
       fetch("/readyz"),
     ]);
     if (archRes.ok) {
@@ -37,6 +46,14 @@ async function loadOverview() {
     if (clashRes.ok) {
       const clashData = (await clashRes.json()) as { nodes: ClashExitNode[] };
       clashNodes.value = clashData.nodes;
+    }
+    if (vmRes.ok) {
+      const vmData = (await vmRes.json()) as { slots: VmSlotSummary[] };
+      vmSlots.value = vmData.slots;
+    }
+    if (riskRes.ok) {
+      const riskData = (await riskRes.json()) as { events: RiskBanEvent[] };
+      riskEvents.value = riskData.events;
     }
     if (readyRes.ok || readyRes.status === 503) {
       readiness.value = (await readyRes.json()) as ReadinessState;
@@ -165,6 +182,58 @@ onMounted(() => {
         <p v-if="previewError" class="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300">
           {{ previewError }}
         </p>
+      </div>
+    </section>
+
+    <section class="grid gap-6 md:grid-cols-2">
+      <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
+        <h2 class="text-base font-semibold text-white">VM 完全拟真槽舰队（1 槽 1 出口 · 20 路 Subagent）</h2>
+        <div class="mt-4 space-y-3">
+          <div
+            v-for="slot in vmSlots"
+            :key="slot.slotId"
+            class="rounded-lg border border-slate-800 bg-slate-950/60 p-4 text-sm"
+          >
+            <div class="flex items-center justify-between">
+              <span class="font-mono font-semibold text-sky-400">
+                {{ slot.slotId }} · {{ slot.hypervisorKind }}
+              </span>
+              <span class="rounded-full bg-sky-500/15 px-2.5 py-0.5 text-xs text-sky-300">
+                {{ slot.activeSubagents }}/{{ slot.maxSubagents }} Subagents · {{ slot.state }}
+              </span>
+            </div>
+            <p class="mt-1 font-mono text-xs text-slate-400">
+              出口 {{ slot.exitIp }} · 5h {{ (slot.window5hUsedBps / 100).toFixed(1) }}% · 7d {{ (slot.window7dUsedBps / 100).toFixed(1) }}%
+            </p>
+            <p class="mt-1 font-mono text-xs text-slate-500">
+              machine-id: {{ slot.persona.guestMachineId }} · MAC: {{ slot.persona.macAddress }}
+            </p>
+            <p class="mt-1 text-xs text-slate-300">
+              注入策略: {{ slot.cleanseMode }} · 遥测: {{ slot.telemetryMode }} · 内存: {{ slot.memoryMiB }} MiB
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
+        <h2 class="text-base font-semibold text-white">进槽前风控拦截（阶梯封禁 10m → 24h → 永久）</h2>
+        <div class="mt-4 space-y-3">
+          <div
+            v-for="ev in riskEvents"
+            :key="ev.eventId"
+            class="rounded-lg border border-slate-800 bg-slate-950/60 p-4 text-sm"
+          >
+            <div class="flex items-center justify-between">
+              <span class="font-mono text-xs text-amber-300">
+                {{ ev.subjectKind }} · Strike {{ ev.strikeLevel }} ({{ ev.banDuration }})
+              </span>
+              <span class="text-xs text-slate-400">
+                降级出站 {{ ev.downgradedCount }} · 普通 400 {{ ev.ordinaryUpstream400Count }}
+              </span>
+            </div>
+            <p class="mt-1 font-mono text-xs text-slate-200">{{ ev.reason }}</p>
+          </div>
+        </div>
       </div>
     </section>
   </div>

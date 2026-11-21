@@ -23,6 +23,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    const guest_mod = b.createModule(.{
+        .root_source_file = b.path("src/guest_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    guest_mod.addImport("slipgate_core", core_mod);
+
+    const guest_exe = b.addExecutable(.{
+        .name = "slipgate-guestd",
+        .root_module = guest_mod,
+    });
+    b.installArtifact(guest_exe);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+package slipgate.vm.v1;
+
+import "slipgate/dataplane/v1/dataplane.proto";
+
+enum HypervisorKind {
+  HYPERVISOR_KIND_UNSPECIFIED = 0;
+  HYPERVISOR_KIND_KVM_QEMU = 1;
+  HYPERVISOR_KIND_DOCKER_HARDENED = 2;
+  HYPERVISOR_KIND_MACOS_NATIVE = 3;
+}
+
+enum VmSlotState {
+  VM_SLOT_STATE_UNSPECIFIED = 0;
+  VM_SLOT_STATE_PROVISIONING = 1;
+  VM_SLOT_STATE_READY = 2;
+  VM_SLOT_STATE_COOLDOWN_5H = 3;
+  VM_SLOT_STATE_COOLDOWN_7D = 4;
+  VM_SLOT_STATE_DRAINING = 5;
+  VM_SLOT_STATE_STOPPED = 6;
+  VM_SLOT_STATE_AUTH_EXPIRED = 7;
+  VM_SLOT_STATE_MIGRATING = 8;
+}
+
+enum TelemetryMode {
+  TELEMETRY_MODE_UNSPECIFIED = 0;
+  TELEMETRY_MODE_ENABLED = 1;
+  TELEMETRY_MODE_ISOLATED = 2;
+  TELEMETRY_MODE_DISABLED = 3;
+}
+
+message HardwarePersona {
+  string guest_machine_id = 1;
+  string mac_address = 2;
+  string smbios_uuid = 3;
+  string smbios_serial = 4;
+  string cpu_model = 5;
+  uint32 cpu_cores = 6;
+  string timezone = 7;
+  string doh_url = 8;
+}
+
+message VmSlotSummary {
+  string slot_id = 1;
+  string cluster_node_id = 2;
+  string account_id = 3;
+  string clash_node_id = 4;
+  string exit_ip = 5;
+  HypervisorKind hypervisor_kind = 6;
+  VmSlotState state = 7;
+  uint32 vsock_cid = 8;
+  string guest_uds_path = 9;
+  uint32 active_subagents = 10;
+  uint32 max_subagents = 11;
+  uint32 window_5h_used_bps = 12;
+  uint32 window_7d_used_bps = 13;
+  TelemetryMode telemetry_mode = 14;
+  slipgate.dataplane.v1.PromptCleanseMode cleanse_mode = 15;
+  uint32 memory_mib = 16;
+  HardwarePersona persona = 17;
+}
+
+message SlotSeedSnapshot {
+  string slot_id = 1;
+  string settings_json_raw = 2;
+  string custom_setting_raw = 3;
+  bool reject_client_settings = 4;
+  bool reject_client_identity = 5;
+  TelemetryMode telemetry_mode = 6;
+  bool telemetry_daemon_running = 7;
+  int64 synced_at_unix_ms = 8;
+}
+
+message ListVmSlotsRequest {
+  string cluster_node_id = 1;
+  bool ready_only = 2;
+}
+
+message ListVmSlotsResponse {
+  repeated VmSlotSummary slots = 1;
+}
+
+message ProvisionVmSlotRequest {
+  string slot_id = 1;
+  string cluster_node_id = 2;
+  string account_id = 3;
+  string clash_node_id = 4;
+  HypervisorKind hypervisor_kind = 5;
+  uint32 max_subagents = 6;
+  uint32 memory_mib = 7;
+  TelemetryMode telemetry_mode = 8;
+  slipgate.dataplane.v1.PromptCleanseMode cleanse_mode = 9;
+  HardwarePersona persona = 10;
+}
+
+message ProvisionVmSlotResponse {
+  VmSlotSummary slot = 1;
+}
+
+message InspectSlotSeedRequest {
+  string slot_id = 1;
+}
+
+message InspectSlotSeedResponse {
+  SlotSeedSnapshot snapshot = 1;
+}
+
+message ApplySlotSeedRequest {
+  string slot_id = 1;
+  string settings_json_raw = 2;
+  string custom_setting_raw = 3;
+  bool reject_client_settings = 4;
+  bool reject_client_identity = 5;
+}
+
+message ApplySlotSeedResponse {
+  SlotSeedSnapshot snapshot = 1;
+}
+
+message SetSlotTelemetryRequest {
+  string slot_id = 1;
+  TelemetryMode telemetry_mode = 2;
+}
+
+message SetSlotTelemetryResponse {
+  string slot_id = 1;
+  TelemetryMode telemetry_mode = 2;
+  bool telemetry_daemon_running = 3;
+}
+
+message MigrateVmSlotRequest {
+  string slot_id = 1;
+  string target_cluster_node_id = 2;
+  uint32 target_memory_mib = 3;
+}
+
+message MigrateVmSlotResponse {
+  VmSlotSummary slot = 1;
+  string migration_job_id = 2;
+}
+
+message IssueTerminalTicketRequest {
+  string slot_id = 1;
+  string operator_user_id = 2;
+  uint32 ttl_seconds = 3;
+}
+
+message IssueTerminalTicketResponse {
+  string ticket_token = 1;
+  string websocket_path = 2;
+  int64 expires_at_unix_ms = 3;
+}
+
+service VmSlotService {
+  rpc ListVmSlots(ListVmSlotsRequest) returns (ListVmSlotsResponse);
+  rpc ProvisionVmSlot(ProvisionVmSlotRequest) returns (ProvisionVmSlotResponse);
+  rpc InspectSlotSeed(InspectSlotSeedRequest) returns (InspectSlotSeedResponse);
+  rpc ApplySlotSeed(ApplySlotSeedRequest) returns (ApplySlotSeedResponse);
+  rpc SetSlotTelemetry(SetSlotTelemetryRequest) returns (SetSlotTelemetryResponse);
+  rpc MigrateVmSlot(MigrateVmSlotRequest) returns (MigrateVmSlotResponse);
+  rpc IssueTerminalTicket(IssueTerminalTicketRequest) returns (IssueTerminalTicketResponse);
+}

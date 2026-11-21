@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   ClashExitNodeSchema,
   formatNanoUsd,
+  HardwarePersonaSchema,
   NANO_PER_USD,
   parseUsdToNano,
 } from "../index.ts";
@@ -35,5 +36,26 @@ describe("ClashExitNodeSchema", () => {
       maxAccounts: 1,
     });
     expect(parsed.listenerPort).toBe(20001);
+  });
+});
+
+describe("HardwarePersonaSchema", () => {
+  it("accepts valid non-zero 32-char lowercase machine-id and rejects all-zero id", () => {
+    const ok = HardwarePersonaSchema.parse({
+      guestMachineId: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      macAddress: "02:42:ac:11:00:02",
+      smbiosUuid: "11111111-2222-3333-4444-555555555555",
+      smbiosSerial: "SG-01",
+      cpuModel: "AMD EPYC 9354",
+      cpuCores: 4,
+      timezone: "Asia/Tokyo",
+    });
+    expect(ok.cpuCores).toBe(4);
+    expect(() =>
+      HardwarePersonaSchema.parse({
+        ...ok,
+        guestMachineId: "00000000000000000000000000000000",
+      }),
+    ).toThrow();
   });
 });

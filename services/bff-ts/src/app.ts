@@ -5,11 +5,17 @@ import {
   formatNanoUsd,
   parseUsdToNano,
   PlaneHealthSchema,
+  RiskBanEventSchema,
   RoutePreviewRequestSchema,
   RoutePreviewResponseSchema,
+  SlotSeedSnapshotSchema,
+  VmSlotSummarySchema,
   type ClashExitNode,
   type CompositeRouteRule,
   type Provider,
+  type RiskBanEvent,
+  type SlotSeedSnapshot,
+  type VmSlotSummary,
 } from "@slipgate/contracts";
 import { PluginRegistry } from "@slipgate/plugin-sdk";
 
@@ -52,6 +58,48 @@ const SAMPLE_CLASH_NODES: ClashExitNode[] = [
     driftUnconfirmed: false,
     boundAccounts: 0,
     maxAccounts: 1,
+  }),
+];
+
+const SAMPLE_VM_SLOTS: VmSlotSummary[] = [
+  VmSlotSummarySchema.parse({
+    slotId: "vm-tokyo-01",
+    clusterNodeId: "vps-tokyo-01",
+    accountId: "acc-claude-max-01",
+    clashNodeId: "node-tokyo-01",
+    exitIp: "203.0.113.11",
+    hypervisorKind: "kvm_qemu",
+    state: "ready",
+    activeSubagents: 3,
+    maxSubagents: 20,
+    window5hUsedBps: 1850,
+    window7dUsedBps: 3120,
+    telemetryMode: "isolated",
+    cleanseMode: "zero",
+    memoryMiB: 2048,
+    persona: {
+      guestMachineId: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      macAddress: "02:42:ac:11:00:02",
+      smbiosUuid: "11111111-2222-3333-4444-555555555555",
+      smbiosSerial: "SG-KVM-01",
+      cpuModel: "AMD EPYC 9354",
+      cpuCores: 4,
+      timezone: "Asia/Tokyo",
+      dohUrl: "https://dns.quad9.net/dns-query",
+    },
+  }),
+];
+
+const SAMPLE_RISK_EVENTS: RiskBanEvent[] = [
+  RiskBanEventSchema.parse({
+    eventId: "risk-001",
+    subjectKind: "session",
+    strikeLevel: 1,
+    banDuration: "10m",
+    reason: "prompt_distillation_signature",
+    ordinaryUpstream400Count: 0,
+    downgradedCount: 1,
+    createdAtIso: "2026-11-20T12:00:00Z",
   }),
 ];
 
@@ -107,20 +155,22 @@ export function createBffApp(registry = new PluginRegistry()): Hono {
       project: "Slipgate",
       version: "0.1.0",
       startupModel: "single-service-supervisor",
+      executionModes: ["stealth_http", "vm_slot", "direct_api"],
+      guestDaemon: "slipgate-guestd (Zig 0.14)",
       layers: [
         {
           id: "L1",
           name: "slipgate-net",
-          stack: "Go 1.27 + mihomo + uTLS",
+          stack: "Go 1.27 + mihomo + uTLS + SSH/KVM",
           schema: "net",
-          role: "Unified edge ingress, single-service supervisor, Clash 1-account-1-exit pool & fail-closed circuit breaker",
+          role: "Unified edge ingress, single-service supervisor, Clash 1-slot-1-exit pool & VM hardware persona orchestration",
         },
         {
           id: "L2",
           name: "slipgate-core",
-          stack: "Zig 0.14 + Arena + i128 Ledger",
+          stack: "Zig 0.14 + slipgate-guestd + i128 Ledger",
           schema: "core",
-          role: "Zero-GC DataPlane scheduling, Composite Trie routing, SlipIR streaming codec, nano-USD two-phase billing",
+          role: "Zero-GC DataPlane scheduling, pre-hop risk gate, 5h/7d window alignment, native tool handoff & in-VM guest daemon",
         },
         {
           id: "L3",
@@ -148,6 +198,48 @@ export function createBffApp(registry = new PluginRegistry()): Hono {
         failClosed: true,
         dropGuardThreshold: 0.5,
       },
+    });
+  });
+
+  app.get("/api/v1/admin/vms/slots", (c) => {
+    return c.json({
+      slots: SAMPLE_VM_SLOTS,
+      invariants: {
+        oneSlotOneEgress: true,
+        maxSubagentsDefault: 20,
+        zeroPromptInjection: true,
+      },
+    });
+  });
+
+  app.get("/api/v1/admin/vms/:slotId/seed", (c) => {
+    const slotId = c.req.param("slotId");
+    const snapshot: SlotSeedSnapshot = SlotSeedSnapshotSchema.parse({
+      slotId,
+      settingsJsonRaw: JSON.stringify(
+        {
+          cleanupPeriodDays: 30,
+          includeCoAuthoredBy: false,
+          permissions: { allow: [], deny: [] },
+        },
+        null,
+        2,
+      ),
+      customSettingRaw: "cleanse_mode=zero\ntelemetry=isolated\n",
+      rejectClientSettings: true,
+      rejectClientIdentity: true,
+      telemetryMode: "isolated",
+      telemetryDaemonRunning: true,
+      syncedAtUnixMs: Date.now(),
+    });
+    return c.json(snapshot);
+  });
+
+  app.get("/api/v1/admin/risk/events", (c) => {
+    return c.json({
+      events: SAMPLE_RISK_EVENTS,
+      banLadder: ["10m", "24h", "permanent"],
+      exemptOrdinaryUpstream400: true,
     });
   });
 

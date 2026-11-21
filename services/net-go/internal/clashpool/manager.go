@@ -272,6 +272,18 @@ func (m *Manager) ResolveDialTarget(accountID string) (DialTarget, error) {
 	}, nil
 }
 
+// GetNode returns a copy of a single Clash exit node by ID.
+func (m *Manager) GetNode(nodeID string) (Node, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	n, ok := m.nodes[nodeID]
+	if !ok {
+		return Node{}, false
+	}
+	return *n, true
+}
+
 // Snapshot returns a copy of all known exit nodes.
 func (m *Manager) Snapshot() []Node {
 	m.mu.RLock()

@@ -29,11 +29,15 @@ if (existsSync(goWebDist)) {
 mkdirSync(goWebDist, { recursive: true });
 cpSync(webDist, goWebDist, { recursive: true });
 
-// 2. Build Zig core engine (L2).
+// 2. Build Zig core engine (L2) and in-VM guest daemon.
 run(["zig", "build", "-Doptimize=ReleaseSafe"], join(root, "services", "core-zig"));
 cpSync(
   join(root, "services", "core-zig", "zig-out", "bin", `slipgate-core${ext}`),
   join(binDir, `slipgate-core${ext}`),
+);
+cpSync(
+  join(root, "services", "core-zig", "zig-out", "bin", `slipgate-guestd${ext}`),
+  join(binDir, `slipgate-guestd${ext}`),
 );
 
 // 3. Compile Bun TS BFF (L3) into a standalone executable.

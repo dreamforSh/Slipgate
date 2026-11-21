@@ -16,6 +16,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/webui"
 )
 
@@ -24,11 +25,17 @@ type Server struct {
 	cfg        config.Config
 	version    string
 	pool       *clashpool.Manager
+	vmSlots    *vmslot.Manager
 	sup        *supervisor.Supervisor
 	httpClient *http.Client
 	bffProxy   *httputil.ReverseProxy
 	uiHandler  http.Handler
 	streamSeq  atomic.Uint32
+}
+
+// WithVmSlotManager attaches the VM full-emulation slot manager for readiness observability.
+func (s *Server) WithVmSlotManager(vmSlots *vmslot.Manager) {
+	s.vmSlots = vmSlots
 }
 
 // NewServer builds the unified ingress handler separating DataPlane (/v1/*) from ControlPlane (/api/*).
@@ -120,6 +127,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		clashNodes = len(s.pool.Snapshot())
 	}
 
+	var vmSlotCount int
+	if s.vmSlots != nil {
+		vmSlotCount = len(s.vmSlots.Snapshot())
+	}
+
 	writeJSON(w, status, map[string]any{
 		"ready":    ready,
 		"degraded": !ready,
@@ -129,6 +141,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 			"bff":  upDown(bffUp),
 		},
 		"clash_nodes": clashNodes,
+		"vm_slots":    vmSlotCount,
 		"children":    children,
 	})
 }

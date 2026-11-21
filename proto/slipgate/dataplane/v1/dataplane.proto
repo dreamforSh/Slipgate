@@ -27,9 +27,43 @@ enum ProtocolCodec {
   PROTOCOL_CODEC_MCP = 6;
 }
 
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_STEALTH_HTTP = 1;
+  EXECUTION_MODE_VM_SLOT = 2;
+  EXECUTION_MODE_DIRECT_API = 3;
+}
+
+enum PromptCleanseMode {
+  PROMPT_CLEANSE_MODE_UNSPECIFIED = 0;
+  PROMPT_CLEANSE_MODE_ZERO = 1;
+  PROMPT_CLEANSE_MODE_OFFICIAL = 2;
+  PROMPT_CLEANSE_MODE_TEMPLATE = 3;
+}
+
 message HeaderEntry {
   string name = 1;
   string value = 2;
+}
+
+message GatewayTurnPolicy {
+  uint32 queue_wait_ms = 1;
+  uint32 first_byte_timeout_ms = 2;
+  uint32 stream_idle_timeout_ms = 3;
+  uint32 session_idle_ttl_seconds = 4;
+  bool native_handoff_enabled = 5;
+}
+
+message NativeProviderHandoff {
+  string message_id = 1;
+  string resolved_model = 2;
+  string stop_reason = 3;
+  bool usage_complete = 4;
+  uint32 http_status = 5;
+  int64 ratelimit_5h_remaining = 6;
+  int64 ratelimit_5h_reset_unix = 7;
+  int64 ratelimit_7d_remaining = 8;
+  int64 ratelimit_7d_reset_unix = 9;
 }
 
 message DispatchDirective {
@@ -43,6 +77,10 @@ message DispatchDirective {
   string hold_id = 8;
   string account_id = 9;
   string resolved_model = 10;
+  ExecutionMode execution_mode = 11;
+  string vm_slot_id = 12;
+  PromptCleanseMode cleanse_mode = 13;
+  GatewayTurnPolicy turn_policy = 14;
 }
 
 message UsageSettlement {

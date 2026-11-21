@@ -16,6 +16,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/ingress"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 )
 
 const version = "0.1.0"
@@ -44,6 +45,7 @@ func main() {
 	defer stopSignals()
 
 	pool := clashpool.NewManager(cfg.ClashPortMin, cfg.ClashPortMax, cfg.MaxAccountsPerExit)
+	vmSlots := vmslot.NewManager(pool)
 	sup := supervisor.New(logger)
 
 	if cfg.Supervise {
@@ -75,6 +77,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("failed to initialize edge ingress: %v", err)
 	}
+	edge.WithVmSlotManager(vmSlots)
 
 	httpSrv := ingress.NewHTTPServer(cfg.ListenAddr, edge.Handler())
 	errCh := make(chan error, 1)

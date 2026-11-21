@@ -16,16 +16,17 @@ if (Get-Command bun -ErrorAction SilentlyContinue) {
 }
 
 if (Get-Command zig -ErrorAction SilentlyContinue) {
-    Write-Host "==> Building slipgate-core via Zig..."
+    Write-Host "==> Building slipgate-core & slipgate-guestd via Zig..."
     Push-Location (Join-Path $Root "services/core-zig")
     try {
         zig build -Doptimize=ReleaseSafe
         Copy-Item -Force "zig-out/bin/slipgate-core.exe" (Join-Path $BinDir "slipgate-core.exe")
+        Copy-Item -Force "zig-out/bin/slipgate-guestd.exe" (Join-Path $BinDir "slipgate-guestd.exe")
     } finally {
         Pop-Location
     }
 } else {
-    Write-Warning "zig not found; skipping slipgate-core build."
+    Write-Warning "zig not found; skipping slipgate-core and slipgate-guestd build."
 }
 
 if (Get-Command go -ErrorAction SilentlyContinue) {

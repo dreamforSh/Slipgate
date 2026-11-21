@@ -54,6 +54,87 @@ pub const Header = struct {
     }
 };
 
+pub const Endpoint = struct {
+    host: []const u8,
+    port: u16,
+};
+
+pub fn parseEndpoint(raw: []const u8, default_port: u16) !Endpoint {
+    const trimmed = if (std.mem.startsWith(u8, raw, "tcp://")) raw["tcp://".len..] else raw;
+    const colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return .{
+        .host = "127.0.0.1",
+        .port = default_port,
+    };
+    const host = if (colon == 0) "127.0.0.1" else trimmed[0..colon];
+    const port = try std.fmt.parseInt(u16, trimmed[colon + 1 ..], 10);
+    return .{ .host = host, .port = port };
+}
+
+pub fn serveConnection(
+    allocator: std.mem.Allocator,
+    conn: std.net.Server.Connection,
+    directive_json: []const u8,
+) void {
+    defer conn.stream.close();
+
+    const reader = conn.stream.reader();
+    const writer = conn.stream.writer();
+
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+
+    while (true) {
+        _ = frame_arena.reset(.retain_capacity);
+        const arena = frame_arena.allocator();
+
+        var hdr_buf: [HEADER_LEN]u8 = undefined;
+        const read_n = reader.readAll(&hdr_buf) catch return;
+        if (read_n == 0 or read_n < HEADER_LEN) return;
+
+        const hdr = Header.decode(&hdr_buf) catch return;
+        const payload = arena.alloc(u8, hdr.payload_len) catch return;
+
+        if (hdr.payload_len > 0) {
+            const payload_n = reader.readAll(payload) catch return;
+            if (payload_n != hdr.payload_len) return;
+        }
+
+        switch (hdr.frame_type) {
+            .ping => {
+                const resp_hdr = (Header{
+                    .stream_id = hdr.stream_id,
+                    .frame_type = .pong,
+                    .flags = FLAG_END_STREAM,
+                    .payload_len = hdr.payload_len,
+                }).encode() catch return;
+                writer.writeAll(&resp_hdr) catch return;
+                if (payload.len > 0) writer.writeAll(payload) catch return;
+            },
+            .req_headers => {
+                const resp_hdr = (Header{
+                    .stream_id = hdr.stream_id,
+                    .frame_type = .dispatch_directive,
+                    .flags = FLAG_END_STREAM | FLAG_PASSTHROUGH,
+                    .payload_len = @intCast(directive_json.len),
+                }).encode() catch return;
+                writer.writeAll(&resp_hdr) catch return;
+                writer.writeAll(directive_json) catch return;
+            },
+            else => {
+                const err_body = "{\"error\":\"unsupported_frame\"}";
+                const resp_hdr = (Header{
+                    .stream_id = hdr.stream_id,
+                    .frame_type = .stream_end,
+                    .flags = FLAG_END_STREAM | FLAG_ERROR,
+                    .payload_len = @intCast(err_body.len),
+                }).encode() catch return;
+                writer.writeAll(&resp_hdr) catch return;
+                writer.writeAll(err_body) catch return;
+            },
+        }
+    }
+}
+
 test "frame header big-endian roundtrip" {
     const original = Header{
         .stream_id = 0x01020304,

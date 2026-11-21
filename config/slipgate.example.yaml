@@ -26,6 +26,21 @@ clash_pool:
   drop_guard_threshold: 0.50
   fail_closed: true
 
+vm_pool:
+  enabled: true
+  default_hypervisor: "kvm_qemu"
+  max_subagents_per_slot: 20
+  default_cleanse_mode: "zero"
+  default_telemetry_mode: "isolated"
+  quota_watermark_bps: 9500
+  require_unique_egress_per_slot: true
+
+risk_gate:
+  enabled: true
+  ban_ladder: ["10m", "24h", "permanent"]
+  exempt_ordinary_upstream_400: true
+  refusal_cache_ttl_sec: 3600
+
 database:
   host: "127.0.0.1"
   port: 5432

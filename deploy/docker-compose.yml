@@ -11,6 +11,8 @@ services:
       - ../migrations/core/0001_init_core.sql:/docker-entrypoint-initdb.d/01_core.sql:ro
       - ../migrations/net/0001_init_net.sql:/docker-entrypoint-initdb.d/02_net.sql:ro
       - ../migrations/commerce/0001_init_commerce.sql:/docker-entrypoint-initdb.d/03_commerce.sql:ro
+      - ../migrations/core/0002_vm_quota_and_risk.sql:/docker-entrypoint-initdb.d/04_core_vm.sql:ro
+      - ../migrations/net/0002_vm_slots_and_cluster.sql:/docker-entrypoint-initdb.d/05_net_vm.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slipgate} -d ${POSTGRES_DB:-slipgate}"]
       interval: 5s
