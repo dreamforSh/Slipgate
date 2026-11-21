@@ -6,6 +6,9 @@ import type {
   RoutePreviewResponse,
   VmSlotSummary,
 } from "@slipgate/contracts";
+import { useAuthStore } from "../../stores/auth";
+
+const auth = useAuthStore();
 
 interface ArchitectureLayer {
   id: string;
@@ -34,9 +37,9 @@ async function loadOverview() {
   try {
     const [archRes, clashRes, vmRes, riskRes, readyRes] = await Promise.all([
       fetch("/api/v1/system/architecture"),
-      fetch("/api/v1/admin/clash/nodes"),
-      fetch("/api/v1/admin/vms/slots"),
-      fetch("/api/v1/admin/risk/events"),
+      auth.apiFetch("/api/v1/admin/clash/nodes"),
+      auth.apiFetch("/api/v1/admin/vms/slots"),
+      auth.apiFetch("/api/v1/admin/risk/events"),
       fetch("/readyz"),
     ]);
     if (archRes.ok) {
@@ -67,7 +70,7 @@ async function runRoutePreview() {
   previewError.value = null;
   previewResult.value = null;
   try {
-    const res = await fetch("/api/v1/admin/routes/preview", {
+    const res = await auth.apiFetch("/api/v1/admin/routes/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

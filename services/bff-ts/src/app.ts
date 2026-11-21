@@ -1,14 +1,25 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import {
+  AuthLoginRequestSchema,
+  AuthRegisterRequestSchema,
+  AuthSessionResponseSchema,
   ClashExitNodeSchema,
+  CreateAccountRequestSchema,
+  CreateApiKeyRequestSchema,
+  CreateGroupRequestSchema,
+  CreatedApiKeyResponseSchema,
   formatNanoUsd,
   parseUsdToNano,
   PlaneHealthSchema,
   RiskBanEventSchema,
   RoutePreviewRequestSchema,
   RoutePreviewResponseSchema,
+  SetupInitializeRequestSchema,
   SlotSeedSnapshotSchema,
+  UpdateAccountRequestSchema,
+  UpdateApiKeyRequestSchema,
+  UpdateGroupRequestSchema,
   VmSlotSummarySchema,
   type ClashExitNode,
   type CompositeRouteRule,
@@ -18,6 +29,24 @@ import {
   type VmSlotSummary,
 } from "@slipgate/contracts";
 import { PluginRegistry } from "@slipgate/plugin-sdk";
+import { requireAdmin, requireAuth, type AuthEnv } from "./middleware/auth.ts";
+import {
+  encryptSecret,
+  generateApiKey,
+  hashPassword,
+  maskSecret,
+  signJwt,
+  verifyPassword,
+} from "./security/crypto.ts";
+import { MemoryControlStore } from "./store/memory_store.ts";
+import { StoreError, type ControlStore } from "./store/types.ts";
+
+export interface BffAppOptions {
+  store?: ControlStore;
+  jwtSecret?: string;
+  vaultSecret?: string;
+  registry?: PluginRegistry;
+}
 
 const CreateOrderSchema = z.object({
   userId: z.string().min(1),
@@ -30,6 +59,11 @@ const PaymentWebhookSchema = z.object({
   userId: z.string().min(1),
   providerTradeNo: z.string().min(1),
   amountNanoUsd: z.string().regex(/^\d+$/),
+});
+
+const AdminCreditUserSchema = z.object({
+  amountUsd: z.string().min(1),
+  reason: z.string().trim().min(1).max(120).default("admin_manual_credit"),
 });
 
 const SAMPLE_CLASH_NODES: ClashExitNode[] = [
@@ -130,10 +164,35 @@ function ruleBeats(candidate: CompositeRouteRule, incumbent: CompositeRouteRule)
   return candidate.priority < incumbent.priority;
 }
 
-export function createBffApp(registry = new PluginRegistry()): Hono {
-  const app = new Hono();
+async function readJsonBody(req: Request): Promise<unknown> {
+  try {
+    return await req.json();
+  } catch {
+    throw new StoreError("bad_request", "Malformed JSON request body");
+  }
+}
+
+export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
+  const store = options.store ?? new MemoryControlStore();
+  const jwtSecret = options.jwtSecret ?? process.env.SLIPGATE_JWT_SECRET ?? "slipgate-dev-jwt-secret-change-in-prod";
+  const vaultSecret =
+    options.vaultSecret ?? process.env.SLIPGATE_VAULT_SECRET ?? "slipgate-dev-vault-secret-change-in-prod";
+  const registry = options.registry ?? new PluginRegistry();
+
+  const app = new Hono<AuthEnv>();
   const startedAt = Date.now();
 
+  app.onError((err, c) => {
+    if (err instanceof StoreError) {
+      return c.json({ error: err.code, message: err.message }, err.status);
+    }
+    const message = err instanceof Error ? err.message : "Internal server error";
+    return c.json({ error: "internal_error", message }, 500);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Public Health, Setup Wizard & Authentication Endpoints
+  // ---------------------------------------------------------------------------
   app.get("/api/v1/health", (c) => {
     const payload = PlaneHealthSchema.parse({
       status: "ok",
@@ -175,9 +234,9 @@ export function createBffApp(registry = new PluginRegistry()): Hono {
         {
           id: "L3",
           name: "slipgate-bff",
-          stack: "Bun + TypeScript + Hono + Zod",
+          stack: "Bun + TypeScript + Hono + Zod + Postgres",
           schema: "commerce",
-          role: "ControlPlane API aggregation, IAM/Passkey/OAuth2, payment gateways, transactional outbox & TS plugins",
+          role: "ControlPlane API aggregation, IAM/Setup/RBAC, account vault & API key lifecycle, payment outbox & TS plugins",
         },
         {
           id: "L4",
@@ -188,6 +247,297 @@ export function createBffApp(registry = new PluginRegistry()): Hono {
         },
       ],
     });
+  });
+
+  app.get("/api/v1/setup/status", async (c) => {
+    const status = await store.getSetupStatus();
+    return c.json(status);
+  });
+
+  app.post("/api/v1/setup/initialize", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = SetupInitializeRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const passwordHash = await hashPassword(parsed.data.adminPassword);
+    const admin = await store.initializeSetup(parsed.data, passwordHash);
+    const { token, expiresAtIso } = await signJwt(
+      { sub: admin.id, email: admin.email, role: admin.role },
+      jwtSecret,
+    );
+    return c.json(
+      AuthSessionResponseSchema.parse({
+        accessToken: token,
+        expiresAtIso,
+        user: admin,
+      }),
+      201,
+    );
+  });
+
+  app.post("/api/v1/auth/register", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = AuthRegisterRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const passwordHash = await hashPassword(parsed.data.password);
+    const user = await store.registerUser(parsed.data.email, passwordHash);
+    const { token, expiresAtIso } = await signJwt(
+      { sub: user.id, email: user.email, role: user.role },
+      jwtSecret,
+    );
+    return c.json(
+      AuthSessionResponseSchema.parse({
+        accessToken: token,
+        expiresAtIso,
+        user,
+      }),
+      201,
+    );
+  });
+
+  app.post("/api/v1/auth/login", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = AuthLoginRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const userRecord = await store.findUserByEmail(parsed.data.email);
+    if (!userRecord || !userRecord.passwordHash) {
+      return c.json({ error: "invalid_credentials", message: "Invalid email or password" }, 401);
+    }
+    const ok = await verifyPassword(parsed.data.password, userRecord.passwordHash);
+    if (!ok) {
+      return c.json({ error: "invalid_credentials", message: "Invalid email or password" }, 401);
+    }
+    if (userRecord.status !== "active") {
+      return c.json({ error: "account_suspended", message: "Account is suspended" }, 403);
+    }
+    const { passwordHash: _, ...profile } = userRecord;
+    const { token, expiresAtIso } = await signJwt(
+      { sub: profile.id, email: profile.email, role: profile.role },
+      jwtSecret,
+    );
+    return c.json(
+      AuthSessionResponseSchema.parse({
+        accessToken: token,
+        expiresAtIso,
+        user: profile,
+      }),
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // Authenticated User Self-Service Endpoints
+  // ---------------------------------------------------------------------------
+  app.get("/api/v1/auth/me", requireAuth(jwtSecret), async (c) => {
+    const claims = c.get("authUser");
+    const user = await store.getUserById(claims.sub);
+    if (!user) {
+      return c.json({ error: "unauthorized", message: "User no longer exists" }, 401);
+    }
+    const wallet = await store.getWallet(user.id);
+    return c.json({ user, wallet });
+  });
+
+  app.use("/api/v1/user/*", requireAuth(jwtSecret));
+
+  app.get("/api/v1/user/groups", async (c) => {
+    const groups = await store.listGroups(true);
+    return c.json({ groups });
+  });
+
+  app.get("/api/v1/user/api-keys", async (c) => {
+    const claims = c.get("authUser");
+    const items = await store.listUserApiKeys(claims.sub);
+    return c.json({ items });
+  });
+
+  app.post("/api/v1/user/api-keys", async (c) => {
+    const claims = c.get("authUser");
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = CreateApiKeyRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const { plaintextKey, keyPrefix, keyHash } = await generateApiKey();
+    const item = await store.createApiKey(claims.sub, parsed.data, keyPrefix, keyHash);
+    return c.json(CreatedApiKeyResponseSchema.parse({ item, plaintextKey }), 201);
+  });
+
+  app.patch("/api/v1/user/api-keys/:keyId", async (c) => {
+    const claims = c.get("authUser");
+    const keyId = c.req.param("keyId");
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = UpdateApiKeyRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const item = await store.updateUserApiKey(claims.sub, keyId, parsed.data);
+    return c.json({ item });
+  });
+
+  app.delete("/api/v1/user/api-keys/:keyId", async (c) => {
+    const claims = c.get("authUser");
+    const keyId = c.req.param("keyId");
+    await store.deleteUserApiKey(claims.sub, keyId);
+    return c.json({ deleted: true, keyId });
+  });
+
+  app.post("/api/v1/commerce/orders", requireAuth(jwtSecret), async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = CreateOrderSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_order", issues: parsed.error.issues }, 400);
+    }
+    const amountNano = parseUsdToNano(parsed.data.amountUsd);
+    const orderId = `ord_${crypto.randomUUID()}`;
+    return c.json(
+      {
+        orderId,
+        userId: parsed.data.userId,
+        provider: parsed.data.provider,
+        amountNanoUsd: amountNano.toString(),
+        formattedAmountUsd: formatNanoUsd(amountNano),
+        status: "pending",
+        idempotencyKey: `credit:${orderId}`,
+      },
+      201,
+    );
+  });
+
+  app.post("/webhooks/payment/:provider", async (c) => {
+    const provider = c.req.param("provider");
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = PaymentWebhookSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_webhook", issues: parsed.error.issues }, 400);
+    }
+
+    await registry.emitPaymentSettled(
+      {
+        serviceVersion: "0.1.0",
+        logger: (msg, meta) => console.log(`[plugin] ${msg}`, meta ?? {}),
+      },
+      {
+        orderId: parsed.data.orderId,
+        userId: parsed.data.userId,
+        provider,
+        amountNanoUsd: parsed.data.amountNanoUsd,
+      },
+    );
+
+    return c.json({
+      accepted: true,
+      outboxEvent: "core.v1.CreditWallet",
+      idempotencyKey: `credit:${provider}:${parsed.data.orderId}`,
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Admin Console Endpoints (RBAC: admin required)
+  // ---------------------------------------------------------------------------
+  app.use("/api/v1/admin/*", requireAdmin(jwtSecret));
+
+  app.get("/api/v1/admin/groups", async (c) => {
+    const groups = await store.listGroups(false);
+    return c.json({ groups });
+  });
+
+  app.post("/api/v1/admin/groups", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = CreateGroupRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const group = await store.createGroup(parsed.data);
+    return c.json({ group }, 201);
+  });
+
+  app.patch("/api/v1/admin/groups/:groupId", async (c) => {
+    const groupId = c.req.param("groupId");
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = UpdateGroupRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const group = await store.updateGroup(groupId, parsed.data);
+    return c.json({ group });
+  });
+
+  app.delete("/api/v1/admin/groups/:groupId", async (c) => {
+    const groupId = c.req.param("groupId");
+    await store.deleteGroup(groupId);
+    return c.json({ deleted: true, groupId });
+  });
+
+  app.get("/api/v1/admin/accounts", async (c) => {
+    const groupId = c.req.query("groupId");
+    const executionMode = c.req.query("executionMode");
+    const accounts = await store.listAccounts({
+      groupId: groupId || undefined,
+      executionMode: executionMode || undefined,
+    });
+    return c.json({ accounts });
+  });
+
+  app.post("/api/v1/admin/accounts", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = CreateAccountRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const encrypted = await encryptSecret(parsed.data.credentialSecret, vaultSecret);
+    const preview = maskSecret(parsed.data.credentialSecret);
+    const account = await store.createAccount(parsed.data, encrypted, preview);
+    return c.json({ account }, 201);
+  });
+
+  app.patch("/api/v1/admin/accounts/:accountId", async (c) => {
+    const accountId = c.req.param("accountId");
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = UpdateAccountRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    let encrypted: Uint8Array | undefined;
+    let preview: string | undefined;
+    if (parsed.data.credentialSecret !== undefined) {
+      encrypted = await encryptSecret(parsed.data.credentialSecret, vaultSecret);
+      preview = maskSecret(parsed.data.credentialSecret);
+    }
+    const account = await store.updateAccount(accountId, parsed.data, encrypted, preview);
+    return c.json({ account });
+  });
+
+  app.delete("/api/v1/admin/accounts/:accountId", async (c) => {
+    const accountId = c.req.param("accountId");
+    await store.deleteAccount(accountId);
+    return c.json({ deleted: true, accountId });
+  });
+
+  app.get("/api/v1/admin/users", async (c) => {
+    const users = await store.listUsers();
+    return c.json({ users });
+  });
+
+  app.post("/api/v1/admin/users/:userId/credit", async (c) => {
+    const userId = c.req.param("userId");
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = AdminCreditUserSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const amountNano = parseUsdToNano(parsed.data.amountUsd);
+    const wallet = await store.creditWallet(
+      userId,
+      amountNano,
+      `admin:${crypto.randomUUID()}`,
+      parsed.data.reason,
+    );
+    return c.json({ wallet });
   });
 
   app.get("/api/v1/admin/clash/nodes", (c) => {
@@ -244,7 +594,7 @@ export function createBffApp(registry = new PluginRegistry()): Hono {
   });
 
   app.post("/api/v1/admin/routes/preview", async (c) => {
-    const raw = await c.req.json();
+    const raw = await readJsonBody(c.req.raw);
     const parsed = RoutePreviewRequestSchema.safeParse(raw);
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
@@ -300,56 +650,6 @@ export function createBffApp(registry = new PluginRegistry()): Hono {
       }),
       400,
     );
-  });
-
-  app.post("/api/v1/commerce/orders", async (c) => {
-    const raw = await c.req.json();
-    const parsed = CreateOrderSchema.safeParse(raw);
-    if (!parsed.success) {
-      return c.json({ error: "invalid_order", issues: parsed.error.issues }, 400);
-    }
-    const amountNano = parseUsdToNano(parsed.data.amountUsd);
-    const orderId = `ord_${crypto.randomUUID()}`;
-    return c.json(
-      {
-        orderId,
-        userId: parsed.data.userId,
-        provider: parsed.data.provider,
-        amountNanoUsd: amountNano.toString(),
-        formattedAmountUsd: formatNanoUsd(amountNano),
-        status: "pending",
-        idempotencyKey: `credit:${orderId}`,
-      },
-      201,
-    );
-  });
-
-  app.post("/webhooks/payment/:provider", async (c) => {
-    const provider = c.req.param("provider");
-    const raw = await c.req.json();
-    const parsed = PaymentWebhookSchema.safeParse(raw);
-    if (!parsed.success) {
-      return c.json({ error: "invalid_webhook", issues: parsed.error.issues }, 400);
-    }
-
-    await registry.emitPaymentSettled(
-      {
-        serviceVersion: "0.1.0",
-        logger: (msg, meta) => console.log(`[plugin] ${msg}`, meta ?? {}),
-      },
-      {
-        orderId: parsed.data.orderId,
-        userId: parsed.data.userId,
-        provider,
-        amountNanoUsd: parsed.data.amountNanoUsd,
-      },
-    );
-
-    return c.json({
-      accepted: true,
-      outboxEvent: "core.v1.CreditWallet",
-      idempotencyKey: `credit:${provider}:${parsed.data.orderId}`,
-    });
   });
 
   return app;

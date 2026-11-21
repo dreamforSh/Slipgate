@@ -1,10 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import {
   ClashExitNodeSchema,
+  CreateAccountRequestSchema,
+  CreateApiKeyRequestSchema,
   formatNanoUsd,
   HardwarePersonaSchema,
   NANO_PER_USD,
   parseUsdToNano,
+  SetupInitializeRequestSchema,
 } from "../index.ts";
 
 describe("nano-USD fixed-point helpers", () => {
@@ -57,5 +60,32 @@ describe("HardwarePersonaSchema", () => {
         guestMachineId: "00000000000000000000000000000000",
       }),
     ).toThrow();
+  });
+});
+
+describe("IAM, Pool and API Key contracts", () => {
+  it("validates setup, account creation, and API key defaults", () => {
+    const setup = SetupInitializeRequestSchema.parse({
+      siteName: "Slipgate Cloud",
+      adminEmail: "admin@slipgate.dev",
+      adminPassword: "StrongPassword123!",
+    });
+    expect(setup.allowRegistration).toBe(true);
+
+    const account = CreateAccountRequestSchema.parse({
+      name: "claude-max-01",
+      groupId: "grp-claude",
+      platform: "anthropic",
+      credentialSecret: "sk-ant-oat01-demo-secret",
+    });
+    expect(account.executionMode).toBe("stealth_http");
+    expect(account.maxConcurrency).toBe(5);
+
+    const apiKey = CreateApiKeyRequestSchema.parse({
+      name: "cli-key",
+      groupId: "grp-claude",
+    });
+    expect(apiKey.rpmLimit).toBe(60);
+    expect(apiKey.ipAllowlist).toEqual([]);
   });
 });

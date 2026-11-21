@@ -1,5 +1,14 @@
 <script setup lang="ts">
-import { RouterLink, RouterView } from "vue-router";
+import { RouterLink, RouterView, useRouter } from "vue-router";
+import { useAuthStore } from "./stores/auth";
+
+const auth = useAuthStore();
+const router = useRouter();
+
+async function handleLogout() {
+  auth.logout();
+  await router.push("/login");
+}
 </script>
 
 <template>
@@ -11,24 +20,55 @@ import { RouterLink, RouterView } from "vue-router";
             SG
           </span>
           <div>
-            <h1 class="text-base font-semibold tracking-tight text-white">Slipgate Gateway</h1>
+            <h1 class="text-base font-semibold tracking-tight text-white">
+              {{ auth.setupStatus?.siteName || "Slipgate Gateway" }}
+            </h1>
             <p class="text-xs text-slate-400">Go Net · Zig Core · Bun BFF · Vue 3</p>
           </div>
         </div>
+
         <nav class="flex items-center gap-2 text-sm">
+          <template v-if="auth.isAuthenticated">
+            <RouterLink
+              v-if="auth.isAdmin"
+              to="/admin"
+              class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+              active-class="bg-sky-500/20 text-sky-300"
+            >
+              系统看板
+            </RouterLink>
+            <RouterLink
+              v-if="auth.isAdmin"
+              to="/admin/accounts"
+              class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+              active-class="bg-sky-500/20 text-sky-300"
+            >
+              号池与分组
+            </RouterLink>
+            <RouterLink
+              to="/user"
+              class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+              active-class="bg-sky-500/20 text-sky-300"
+            >
+              密钥与配额
+            </RouterLink>
+            <span class="ml-2 rounded-md bg-slate-800 px-2.5 py-1 font-mono text-xs text-slate-300">
+              {{ auth.user?.email }}
+            </span>
+            <button
+              type="button"
+              class="rounded-lg border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800"
+              @click="handleLogout"
+            >
+              退出
+            </button>
+          </template>
           <RouterLink
-            to="/admin"
-            class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
-            active-class="bg-sky-500/20 text-sky-300"
+            v-else
+            to="/login"
+            class="rounded-lg bg-sky-500/15 px-3 py-1.5 text-sky-300 hover:bg-sky-500/25"
           >
-            管理后台
-          </RouterLink>
-          <RouterLink
-            to="/user"
-            class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
-            active-class="bg-sky-500/20 text-sky-300"
-          >
-            用户工作台
+            登录
           </RouterLink>
         </nav>
       </div>

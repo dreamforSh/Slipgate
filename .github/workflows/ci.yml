@@ -132,6 +132,18 @@ jobs:
 
           curl -fsS http://127.0.0.1:18080/readyz | grep -q '"ready":true'
           curl -fsS http://127.0.0.1:18080/api/v1/system/architecture | grep -q 'slipgate-bff'
-          curl -fsS http://127.0.0.1:18080/api/v1/admin/vms/slots | grep -q 'kvm_qemu'
+
+          # Verify admin endpoints reject unauthenticated requests, then complete first-run setup
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/v1/admin/vms/slots)" = "401" ]
+          SETUP_JSON=$(curl -fsS -X POST http://127.0.0.1:18080/api/v1/setup/initialize \
+            -H 'Content-Type: application/json' \
+            -d '{"siteName":"Slipgate CI","adminEmail":"ci@slipgate.dev","adminPassword":"CiPassword123!"}')
+          TOKEN=$(printf '%s' "$SETUP_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["accessToken"])')
+
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/vms/slots | grep -q 'kvm_qemu'
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"ci-smoke-key","groupId":"grp_default"}' \
+            http://127.0.0.1:18080/api/v1/user/api-keys | grep -q 'sk-sg-'
+
           curl -fsS -D /tmp/dp.headers -X POST http://127.0.0.1:18080/v1/chat/completions | grep -q 'slipgate-core'
           grep -qi 'X-Slipgate-Plane: dataplane-direct' /tmp/dp.headers

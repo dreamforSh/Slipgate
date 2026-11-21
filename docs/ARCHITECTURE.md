@@ -49,6 +49,11 @@ Slipgate 融合 [Linksyncx](../Linksyncx) 的企业级多平台网关与计费�
 | :--- | :--- | :--- |
 | `core.*` | `slipgate-core` (Zig) | `groups`, `accounts`, `composite_routes`, `api_keys`, `quota_wallets`, `ledger_entries`, `usage_logs`, `account_window_quotas`, `risk_ban_records`, `refusal_cache` |
 | `net.*` | `slipgate-net` (Go) | `clash_subscriptions`, `clash_nodes`, `tls_profiles`, `proxy_bindings`, `node_traffic_daily`, `cluster_nodes`, `vm_slots`, `vm_hardware_personas`, `vm_migration_jobs` |
-| `commerce.*` | `slipgate-bff` (Bun TS) | `users`, `auth_identities`, `passkeys`, `payment_orders`, `outbox_events`, `subscriptions`, `redeem_codes` |
+| `commerce.*` | `slipgate-bff` (Bun TS) | `users`, `auth_identities`, `passkeys`, `payment_orders`, `outbox_events`, `subscriptions`, `redeem_codes`, `portal_settings` |
 
 所有金额均采用 `i128` 定点纳美元（`1 USD = 1,000,000,000 nano-USD`），PostgreSQL 中以 `NUMERIC(39, 0)` 存储。
+
+## 5. `slipgate-bff` 控制面存储与过渡适配器边界
+
+- **双模持久化（`ControlStore`）**：配置 `DATABASE_URL` 时启用纯 JS `PostgresControlStore`（保证 `bun build --compile` 在 Alpine musl 下零原生依赖编译）；未配置或单元测试场景自动回退 `MemoryControlStore`。
+- **过渡期单写者边界**：在 Zig `CoreControlService` RPC 就绪前，`PostgresControlStore` 通过统一 `ControlStore` 接口维护账号池与 API Key 元数据（凭据使用 WebCrypto `AES-256-GCM` 密文落库，API Key 仅签发时返回明文并用 `SHA-256` 存摘要），所有余额变动同步写入 `commerce.outbox_events`，便于后续平滑切换至 Zig RPC。

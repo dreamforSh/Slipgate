@@ -1,5 +1,8 @@
 import { PluginRegistry } from "@slipgate/plugin-sdk";
 import { createBffApp } from "./app.ts";
+import { MemoryControlStore } from "./store/memory_store.ts";
+import { PostgresControlStore } from "./store/postgres_store.ts";
+import type { ControlStore } from "./store/types.ts";
 
 const VERSION = "0.1.0";
 
@@ -25,6 +28,11 @@ function resolveBindAddress(): { hostname: string; port: number } {
   return { hostname, port: Number.isInteger(port) ? port : 19082 };
 }
 
+const databaseUrl = process.env.DATABASE_URL?.trim();
+const store: ControlStore = databaseUrl ? new PostgresControlStore(databaseUrl) : new MemoryControlStore();
+await store.init();
+console.log(`slipgate-bff ${VERSION} store initialized (${databaseUrl ? "postgres" : "memory"})`);
+
 const registry = new PluginRegistry();
 await registry.initAll({
   serviceVersion: VERSION,
@@ -32,7 +40,7 @@ await registry.initAll({
 });
 
 const { hostname, port } = resolveBindAddress();
-const app = createBffApp(registry);
+const app = createBffApp({ store, registry });
 
 const server = Bun.serve({
   hostname,
@@ -42,10 +50,15 @@ const server = Bun.serve({
 
 console.log(`slipgate-bff ${VERSION} listening on http://${server.hostname}:${server.port}`);
 
-const shutdown = () => {
+const shutdown = async () => {
   server.stop(true);
+  await store.close();
   process.exit(0);
 };
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => {
+  void shutdown();
+});
+process.on("SIGTERM", () => {
+  void shutdown();
+});
