@@ -49,9 +49,11 @@ type mockStealthBridge struct {
 	exitIPToReturn atomic.Value
 }
 
-func (b *mockStealthBridge) ListProfiles() []TLSProfile { return nil }
-func (b *mockStealthBridge) RegisterProfile(TLSProfile) {}
-func (b *mockStealthBridge) DeleteProfile(string) error { return nil }
+func (b *mockStealthBridge) ListProfiles() []TLSProfile     { return nil }
+func (b *mockStealthBridge) RegisterProfile(TLSProfile)     {}
+func (b *mockStealthBridge) UpdateProfile(TLSProfile) error { return nil }
+func (b *mockStealthBridge) DeleteProfile(string) error     { return nil }
+func (b *mockStealthBridge) ValidateProfile(TLSProfile) error { return nil }
 func (b *mockStealthBridge) TestAccountHTTP(context.Context, string, string, string) (OutboundMeta, error) {
 	return OutboundMeta{StatusCode: 200, TLSVersion: "TLS 1.3", NegotiatedALPN: "h2"}, nil
 }

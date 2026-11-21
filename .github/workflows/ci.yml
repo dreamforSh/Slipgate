@@ -140,11 +140,23 @@ jobs:
             -d '{"siteName":"Slipgate CI","adminEmail":"ci@slipgate.dev","adminPassword":"CiPassword123!"}')
           TOKEN=$(printf '%s' "$SETUP_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["accessToken"])')
 
-          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/vms/slots | grep -q 'kvm_qemu'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/vms/overview | grep -q '"local-node"'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/vms/overview | grep -q '"oneSlotOneEgress":true'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/system/update | grep -q 'dreamforSh/Slipgate'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/clash/overview | grep -q '"ready":true'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/clash/overview | grep -q '"mode":"embedded"'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q 'chrome-131'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q 'claude-bun-21'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q '"auto"'
+          BAD_TLS_CODE=$(curl -s -o /tmp/bad_tls.json -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"CI Bad KeyShare","curves":[23],"keyShareGroups":[29],"extensions":[0,10,16,43,51]}' \
+            http://127.0.0.1:18080/api/v1/admin/tls-profiles)
+          [ "$BAD_TLS_CODE" = "400" ]
+          grep -q 'TLS_PROFILE_KEY_SHARE_NOT_IN_CURVES' /tmp/bad_tls.json
+          BAD_VM_CODE=$(curl -s -o /tmp/bad_vm.json -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"accountId":"ci-unbound-account"}' \
+            http://127.0.0.1:18080/api/v1/admin/vms/slots)
+          [ "$BAD_VM_CODE" = "503" ] || [ "$BAD_VM_CODE" = "400" ] || [ "$BAD_VM_CODE" = "409" ]
           curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
             -d '{"name":"CI Inline Sub","sourceKind":"inline","sourceUrl":"proxies:\n  - name: Tokyo-CI\n    type: socks5\n    server: 198.51.100.10\n    port: 1080","autoSync":true}' \
             http://127.0.0.1:18080/api/v1/admin/clash/subscriptions | grep -q '"activeListeners":1'

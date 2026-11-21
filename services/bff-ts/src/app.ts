@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import {
   AuthLoginRequestSchema,
@@ -11,12 +11,15 @@ import {
   CreateAccountRequestSchema,
   CreateApiKeyRequestSchema,
   CreateClashSubscriptionRequestSchema,
+  CreateClusterNodeRequestSchema,
   CreateGroupRequestSchema,
   CreatedApiKeyResponseSchema,
   CreateTlsProfileRequestSchema,
   formatNanoUsd,
+  MigrateVmSlotRequestSchema,
   parseUsdToNano,
   PlaneHealthSchema,
+  ProvisionVmSlotRequestSchema,
   RiskBanEventSchema,
   RoutePreviewRequestSchema,
   RoutePreviewResponseSchema,
@@ -27,8 +30,12 @@ import {
   UpdateAccountRequestSchema,
   UpdateApiKeyRequestSchema,
   UpdateGroupRequestSchema,
+  UpdateTlsProfileRequestSchema,
+  UpdateVmSeedRequestSchema,
+  UpdateVmTelemetryRequestSchema,
   VmSlotSummarySchema,
   type ClashExitNode,
+  type ClusterNode,
   type CompositeRouteRule,
   type Provider,
   type RiskBanEvent,
@@ -213,37 +220,130 @@ function buildStandaloneSystemUpdateStatus() {
   });
 }
 
+const STANDALONE_CLUSTER_NODES: ClusterNode[] = [
+  {
+    id: "local-node",
+    name: "Local Control Node",
+    driverKind: "local",
+    sshAddr: "127.0.0.1:22",
+    sshUser: "slipgate",
+    hasSSHKey: false,
+    arch: "amd64",
+    kvmCapable: false,
+    dockerCapable: true,
+    status: "online",
+    maxSlots: 32,
+    createdAtIso: "2026-11-20T00:00:00Z",
+    updatedAtIso: "2026-11-20T00:00:00Z",
+  },
+];
+
 const STANDALONE_TLS_PROFILES: TlsProfile[] = [
+  {
+    id: "auto",
+    name: "Auto Sticky (Rendezvous OS-Aware)",
+    description: "Deterministic Rendezvous sticky profile selection per account ID",
+    clientHelloPreset: "auto",
+    ja3Fingerprint: "",
+    ja4Fingerprint: "",
+    alpnProtocols: ["h2", "http/1.1"],
+    userAgentTemplate: "",
+    enableGrease: false,
+    cipherSuites: [],
+    curves: [],
+    pointFormats: [],
+    signatureAlgorithms: [],
+    supportedVersions: [],
+    keyShareGroups: [],
+    pskModes: [],
+    extensions: [],
+    osHint: "",
+    builtIn: true,
+  },
+  {
+    id: "claude-bun-21",
+    name: "Claude Code 2.1.280 (Bun uTLS + PQ X25519MLKEM768)",
+    description: "Wire-exact BoringSSL/Bun ClientHello with X25519MLKEM768 hybrid key share",
+    clientHelloPreset: "custom_wire",
+    ja3Fingerprint: "",
+    ja4Fingerprint: "",
+    alpnProtocols: ["h2", "http/1.1"],
+    userAgentTemplate: "claude-cli/2.1.280 (external, cli)",
+    enableGrease: false,
+    cipherSuites: [4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392],
+    curves: [4588, 29, 23, 24],
+    pointFormats: [0],
+    signatureAlgorithms: [1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537, 513],
+    supportedVersions: [772, 771],
+    keyShareGroups: [4588, 29],
+    pskModes: [1],
+    extensions: [0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43],
+    osHint: "linux",
+    builtIn: true,
+  },
   {
     id: "chrome-131",
     name: "Chrome 131 (Windows Desktop)",
+    description: "Google Chrome desktop TLS + HTTP/2 ClientHello",
     clientHelloPreset: "chrome_auto",
     ja3Fingerprint: "",
     ja4Fingerprint: "",
     alpnProtocols: ["h2", "http/1.1"],
     userAgentTemplate:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    enableGrease: false,
+    cipherSuites: [],
+    curves: [],
+    pointFormats: [],
+    signatureAlgorithms: [],
+    supportedVersions: [],
+    keyShareGroups: [],
+    pskModes: [],
+    extensions: [],
+    osHint: "windows",
     builtIn: true,
   },
   {
     id: "firefox-133",
     name: "Firefox 133 (Desktop)",
+    description: "Mozilla Firefox desktop TLS + HTTP/2 ClientHello",
     clientHelloPreset: "firefox_auto",
     ja3Fingerprint: "",
     ja4Fingerprint: "",
     alpnProtocols: ["h2", "http/1.1"],
     userAgentTemplate:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    enableGrease: false,
+    cipherSuites: [],
+    curves: [],
+    pointFormats: [],
+    signatureAlgorithms: [],
+    supportedVersions: [],
+    keyShareGroups: [],
+    pskModes: [],
+    extensions: [],
+    osHint: "windows",
     builtIn: true,
   },
   {
     id: "claude-cli-mac",
     name: "Official CLI Runtime (Bun/macOS)",
+    description: "HTTP/1.1 pinned CLI profile for macOS hosts",
     clientHelloPreset: "chrome_auto",
     ja3Fingerprint: "",
     ja4Fingerprint: "",
     alpnProtocols: ["http/1.1"],
     userAgentTemplate: "claude-cli/2.1.280 (external, cli)",
+    enableGrease: false,
+    cipherSuites: [],
+    curves: [],
+    pointFormats: [],
+    signatureAlgorithms: [],
+    supportedVersions: [],
+    keyShareGroups: [],
+    pskModes: [],
+    extensions: [],
+    osHint: "darwin",
     builtIn: true,
   },
 ];
@@ -1114,6 +1214,42 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
   });
 
+  app.put("/api/v1/admin/tls-profiles/:id", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = UpdateTlsProfileRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const id = encodeURIComponent(c.req.param("id"));
+    try {
+      const forwarded = await forwardNetInternal(`/internal/net/tls-profiles/${id}`, {
+        method: "PUT",
+        body: parsed.data,
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      if (c.req.param("id") === "auto" || c.req.param("id") === "claude-bun-21" || c.req.param("id") === "chrome-131") {
+        return c.json({ error: "clash_operation_failed", message: "built-in TLS profile is immutable" }, 403);
+      }
+      return c.json({
+        profile: {
+          id: c.req.param("id"),
+          ...parsed.data,
+          builtIn: false,
+        },
+      });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
   app.delete("/api/v1/admin/tls-profiles/:id", async (c) => {
     const id = encodeURIComponent(c.req.param("id"));
     try {
@@ -1135,38 +1271,184 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
   });
 
-  app.get("/api/v1/admin/vms/slots", (c) => {
-    return c.json({
-      slots: SAMPLE_VM_SLOTS,
-      invariants: {
-        oneSlotOneEgress: true,
-        maxSubagentsDefault: 20,
-        zeroPromptInjection: true,
-      },
-    });
+  async function forwardVmAdmin(
+    c: Context<AuthEnv>,
+    internalPath: string,
+    opts: { method?: string; body?: unknown; timeoutMs?: number } = {},
+    standaloneFallback?: () => Response,
+  ) {
+    try {
+      const forwarded = await forwardNetInternal(internalPath, opts);
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      if (standaloneFallback) {
+        return standaloneFallback();
+      }
+      return c.json(
+        { error: "net_supervisor_unconfigured", message: "VM coordinator requires live net supervisor" },
+        503,
+      );
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  }
+
+  app.get("/api/v1/admin/vms/overview", (c) =>
+    forwardVmAdmin(c, "/internal/net/vms/overview", {}, () =>
+      c.json({
+        nodes: STANDALONE_CLUSTER_NODES,
+        slots: SAMPLE_VM_SLOTS,
+        migrations: [],
+        invariants: {
+          oneSlotOneEgress: true,
+          maxSubagentsDefault: 20,
+          zeroPromptInjection: true,
+        },
+        runtime: {
+          vmDataDir: "/var/run/slipgate/vms",
+          guestdBin: "/usr/local/share/slipgate/guest/slipgate-guestd",
+          guestdAvailable: false,
+          localNodeId: "local-node",
+        },
+      }),
+    ),
+  );
+
+  app.get("/api/v1/admin/vms/nodes", (c) =>
+    forwardVmAdmin(c, "/internal/net/vms/nodes", {}, () => c.json({ nodes: STANDALONE_CLUSTER_NODES })),
+  );
+
+  app.post("/api/v1/admin/vms/nodes", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = CreateClusterNodeRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    return forwardVmAdmin(c, "/internal/net/vms/nodes", { method: "POST", body: parsed.data });
+  });
+
+  app.delete("/api/v1/admin/vms/nodes/:id", (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    return forwardVmAdmin(c, `/internal/net/vms/nodes/${id}`, { method: "DELETE" });
+  });
+
+  app.get("/api/v1/admin/vms/slots", (c) =>
+    forwardVmAdmin(c, "/internal/net/vms/slots", {}, () =>
+      c.json({
+        slots: SAMPLE_VM_SLOTS,
+        invariants: {
+          oneSlotOneEgress: true,
+          maxSubagentsDefault: 20,
+          zeroPromptInjection: true,
+        },
+      }),
+    ),
+  );
+
+  app.post("/api/v1/admin/vms/slots", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = ProvisionVmSlotRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    return forwardVmAdmin(c, "/internal/net/vms/slots", { method: "POST", body: parsed.data });
+  });
+
+  app.delete("/api/v1/admin/vms/slots/:id", (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}`, { method: "DELETE" });
+  });
+
+  app.post("/api/v1/admin/vms/slots/:id/start", (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/start`, { method: "POST" });
+  });
+
+  app.post("/api/v1/admin/vms/slots/:id/stop", (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/stop`, { method: "POST" });
   });
 
   app.get("/api/v1/admin/vms/:slotId/seed", (c) => {
     const slotId = c.req.param("slotId");
-    const snapshot: SlotSeedSnapshot = SlotSeedSnapshotSchema.parse({
-      slotId,
-      settingsJsonRaw: JSON.stringify(
-        {
-          cleanupPeriodDays: 30,
-          includeCoAuthoredBy: false,
-          permissions: { allow: [], deny: [] },
-        },
-        null,
-        2,
-      ),
-      customSettingRaw: "cleanse_mode=zero\ntelemetry=isolated\n",
-      rejectClientSettings: true,
-      rejectClientIdentity: true,
-      telemetryMode: "isolated",
-      telemetryDaemonRunning: true,
-      syncedAtUnixMs: Date.now(),
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${encodeURIComponent(slotId)}/seed`, {}, () => {
+      const snapshot: SlotSeedSnapshot = SlotSeedSnapshotSchema.parse({
+        slotId,
+        settingsJsonRaw: JSON.stringify(
+          {
+            cleanupPeriodDays: 30,
+            includeCoAuthoredBy: false,
+            permissions: { allow: [], deny: [] },
+          },
+          null,
+          2,
+        ),
+        customSettingRaw: "cleanse_mode=zero\ntelemetry=isolated\n",
+        rejectClientSettings: true,
+        rejectClientIdentity: true,
+        telemetryMode: "isolated",
+        telemetryDaemonRunning: true,
+        syncedAtUnixMs: Date.now(),
+      });
+      return c.json(snapshot);
     });
-    return c.json(snapshot);
+  });
+
+  app.put("/api/v1/admin/vms/:slotId/seed", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = UpdateVmSeedRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const id = encodeURIComponent(c.req.param("slotId"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/seed`, { method: "PUT", body: parsed.data });
+  });
+
+  app.get("/api/v1/admin/vms/slots/:slotId/seed", (c) => {
+    const id = encodeURIComponent(c.req.param("slotId"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/seed`);
+  });
+
+  app.put("/api/v1/admin/vms/slots/:slotId/seed", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = UpdateVmSeedRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const id = encodeURIComponent(c.req.param("slotId"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/seed`, { method: "PUT", body: parsed.data });
+  });
+
+  app.patch("/api/v1/admin/vms/slots/:id/telemetry", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = UpdateVmTelemetryRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const id = encodeURIComponent(c.req.param("id"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/telemetry`, { method: "PATCH", body: parsed.data });
+  });
+
+  app.post("/api/v1/admin/vms/slots/:id/migrate", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = MigrateVmSlotRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const id = encodeURIComponent(c.req.param("id"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/migrate`, { method: "POST", body: parsed.data });
+  });
+
+  app.post("/api/v1/admin/vms/slots/:id/terminal-ticket", (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    return forwardVmAdmin(c, `/internal/net/vms/slots/${id}/terminal-ticket`, { method: "POST" });
   });
 
   app.get("/api/v1/admin/risk/events", (c) => {

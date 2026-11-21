@@ -11,12 +11,16 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 )
 
 func TestHealthzAndDualPlaneIsolation(t *testing.T) {
@@ -257,4 +261,205 @@ func TestInternalClashAndTLSProfileRoutes(t *testing.T) {
 	if len(coord.EnrichedNodes()) != 1 {
 		t.Fatalf("expected 1 synced clash node, got %d", len(coord.EnrichedNodes()))
 	}
+}
+
+func TestTLSProfileWireValidationAndPUT(t *testing.T) {
+	t.Parallel()
+
+	pool := clashpool.NewManager(20000, 24999, 1)
+	dialer := stealth.NewAccountDialer(pool)
+	coord := clashpool.NewCoordinator(clashpool.CoordinatorOptions{
+		Manager: pool,
+		Store:   clashpool.NewMemoryNetStore(),
+		Stealth: stealth.NewCoordinatorAdapter(dialer),
+		Logger:  log.Default(),
+	})
+	if err := coord.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap failed: %v", err)
+	}
+
+	cfg := config.Config{
+		ListenAddr:    "127.0.0.1:0",
+		CoreIPC:       "127.0.0.1:0",
+		BFFAddr:       "http://127.0.0.1:19082",
+		InternalToken: "tok-tls",
+		AllowDegraded: true,
+	}
+	srv, err := NewServer(cfg, "0.2.0", pool, nil)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	srv.WithClashCoordinator(coord)
+	handler := srv.Handler()
+
+	// 1. Reject invalid keyShareGroups absent from curves with structured 400 reason.
+	badBody := `{"name":"InvalidPQ","curves":[23],"keyShareGroups":[29],"extensions":[0,10,16,43,51]}`
+	reqBad := httptest.NewRequest(http.MethodPost, "/internal/net/tls-profiles", strings.NewReader(badBody))
+	reqBad.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqBad)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "TLS_PROFILE_KEY_SHARE_NOT_IN_CURVES") {
+		t.Fatalf("expected 400 TLS_PROFILE_KEY_SHARE_NOT_IN_CURVES, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Create custom wire profile -> PUT update -> DELETE lifecycle.
+	goodBody := `{"id":"custom-wire-1","name":"CustomBunPQ","clientHelloPreset":"custom_wire","enableGrease":true,"curves":[4588,29,23],"keyShareGroups":[4588,29],"extensions":[0,23,65281,10,11,35,16,5,13,51,45,43,65037],"osHint":"linux"}`
+	reqCreate := httptest.NewRequest(http.MethodPost, "/internal/net/tls-profiles", strings.NewReader(goodBody))
+	reqCreate.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqCreate)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 create, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	putBody := `{"name":"CustomBunPQ-Updated","enableGrease":false,"curves":[4588,29],"keyShareGroups":[4588],"osHint":"darwin"}`
+	reqPut := httptest.NewRequest(http.MethodPut, "/internal/net/tls-profiles/custom-wire-1", strings.NewReader(putBody))
+	reqPut.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqPut)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "CustomBunPQ-Updated") {
+		t.Fatalf("expected 200 update, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Built-in immutable lock -> 403.
+	reqLock := httptest.NewRequest(http.MethodPut, "/internal/net/tls-profiles/claude-bun-21", strings.NewReader(putBody))
+	reqLock.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqLock)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 updating built-in profile, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	reqDel := httptest.NewRequest(http.MethodDelete, "/internal/net/tls-profiles/custom-wire-1", nil)
+	reqDel.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqDel)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 delete custom profile, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestVmFleetRoutesAndWebSocketTerminal(t *testing.T) {
+	t.Parallel()
+
+	pool := clashpool.NewManager(20000, 24999, 1)
+	_, err := pool.SyncNodes("sub-vm", []clashpool.Node{
+		{
+			ID:            "node-vm-1",
+			Name:          "Edge-VM-1",
+			ProxySlotID:   "ps-1",
+			ListenerPort:  20155,
+			SocksUsername: "u",
+			SocksPassword: "p",
+			ExitIP:        "198.51.100.77",
+			Health:        clashpool.HealthHealthy,
+			Enabled:       true,
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("SyncNodes failed: %v", err)
+	}
+	if err := pool.BindAccount("acc-vm-1", "node-vm-1", false); err != nil {
+		t.Fatalf("BindAccount failed: %v", err)
+	}
+
+	vmMgr := vmslot.NewManager(pool)
+	vmCoord := vmslot.NewCoordinator(vmslot.CoordinatorOptions{
+		Manager:   vmMgr,
+		ClashPool: pool,
+		Store:     vmslot.NewMemoryVmStore(),
+		VMDataDir: t.TempDir(),
+	})
+	if err := vmCoord.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("vmCoord Bootstrap failed: %v", err)
+	}
+
+	cfg := config.Config{
+		ListenAddr:    "127.0.0.1:0",
+		CoreIPC:       "127.0.0.1:0",
+		BFFAddr:       "http://127.0.0.1:19082",
+		InternalToken: "tok-vm",
+		AllowDegraded: true,
+	}
+	srv, err := NewServer(cfg, "0.2.0", pool, nil)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	srv.WithVmSlotManager(vmMgr)
+	srv.WithVmCoordinator(vmCoord)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Overview returns local-node.
+	reqOv, _ := http.NewRequest(http.MethodGet, ts.URL+"/internal/net/vms/overview", nil)
+	reqOv.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	resp, err := http.DefaultClient.Do(reqOv)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("overview failed: resp=%v err=%v", resp, err)
+	}
+	ovBytes, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if !strings.Contains(string(ovBytes), `"local-node"`) {
+		t.Fatalf("expected local-node in overview, got %s", string(ovBytes))
+	}
+
+	// 2. Fail closed without bound clash node.
+	reqFail, _ := http.NewRequest(http.MethodPost, ts.URL+"/internal/net/vms/slots", strings.NewReader(`{"accountId":"acc-none"}`))
+	reqFail.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	resp, _ = http.DefaultClient.Do(reqFail)
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+		t.Fatalf("expected fail-closed provisioning rejection, got %d", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	// 3. Provision valid slot + PUT seed + issue terminal ticket + WebSocket session.
+	reqProv, _ := http.NewRequest(http.MethodPost, ts.URL+"/internal/net/vms/slots", strings.NewReader(`{"slotId":"vm-ws-1","accountId":"acc-vm-1","hypervisorKind":"kvm_qemu"}`))
+	reqProv.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	resp, err = http.DefaultClient.Do(reqProv)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("provision failed: resp=%v err=%v", resp, err)
+	}
+	_ = resp.Body.Close()
+
+	reqSeed, _ := http.NewRequest(http.MethodPut, ts.URL+"/internal/net/vms/slots/vm-ws-1/seed", strings.NewReader(`{"settingsJsonRaw":"{\"cleanupPeriodDays\":7}"}`))
+	reqSeed.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	resp, err = http.DefaultClient.Do(reqSeed)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed update failed: resp=%v err=%v", resp, err)
+	}
+	_ = resp.Body.Close()
+
+	reqTicket, _ := http.NewRequest(http.MethodPost, ts.URL+"/internal/net/vms/slots/vm-ws-1/terminal-ticket", nil)
+	reqTicket.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	resp, err = http.DefaultClient.Do(reqTicket)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("ticket issue failed: resp=%v err=%v", resp, err)
+	}
+	var ticket vmslot.TerminalTicket
+	_ = json.NewDecoder(resp.Body).Decode(&ticket)
+	_ = resp.Body.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + ticket.WSPath
+	wsCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wsConn, _, err := websocket.Dial(wsCtx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket Dial failed: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	// Read welcome banner, send `status`, read output frame.
+	_, bannerBytes, err := wsConn.Read(wsCtx)
+	if err != nil || !strings.Contains(string(bannerBytes), "vm-ws-1") {
+		t.Fatalf("unexpected WS banner: %q err=%v", string(bannerBytes), err)
+	}
+	if err := wsConn.Write(wsCtx, websocket.MessageText, []byte("status")); err != nil {
+		t.Fatalf("ws write status failed: %v", err)
+	}
+	_, outBytes, err := wsConn.Read(wsCtx)
+	if err != nil || !strings.Contains(string(outBytes), "198.51.100.77") {
+		t.Fatalf("unexpected WS command output: %q err=%v", string(outBytes), err)
+	}
+	_ = wsConn.Close(websocket.StatusNormalClosure, "done")
 }

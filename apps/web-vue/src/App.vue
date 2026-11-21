@@ -54,6 +54,14 @@ async function handleLogout() {
               Clash 出口与 uTLS
             </RouterLink>
             <RouterLink
+              v-if="auth.isAdmin"
+              to="/admin/vms"
+              class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+              active-class="bg-sky-500/20 text-sky-300"
+            >
+              VM 拟真槽舰队
+            </RouterLink>
+            <RouterLink
               to="/user"
               class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
               active-class="bg-sky-500/20 text-sky-300"

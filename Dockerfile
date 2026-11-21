@@ -97,7 +97,7 @@ FROM ${ALPINE_IMAGE} AS runtime
 
 RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc && \
     addgroup -S slipgate && adduser -S slipgate -G slipgate && \
-    mkdir -p /etc/slipgate /var/run/slipgate /var/run/slipgate/clash /var/run/slipgate/hotupdate /usr/local/share/slipgate/guest && \
+    mkdir -p /etc/slipgate /var/run/slipgate /var/run/slipgate/clash /var/run/slipgate/vms /var/run/slipgate/hotupdate /usr/local/share/slipgate/guest && \
     chown -R slipgate:slipgate /etc/slipgate /var/run/slipgate
 
 COPY --from=go-builder /out/slipgate /usr/local/bin/slipgate
@@ -116,6 +116,8 @@ ENV SLIPGATE_LISTEN_ADDR=":8080" \
     SLIPGATE_BFF_ADDR="127.0.0.1:19082" \
     SLIPGATE_CLASH_MODE="embedded" \
     SLIPGATE_CLASH_DATA_DIR="/var/run/slipgate/clash" \
+    SLIPGATE_VM_DATA_DIR="/var/run/slipgate/vms" \
+    SLIPGATE_GUESTD_BIN="/usr/local/share/slipgate/guest/slipgate-guestd" \
     SLIPGATE_HOTUPDATE_DIR="/var/run/slipgate/hotupdate"
 
 EXPOSE 8080

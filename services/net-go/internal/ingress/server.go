@@ -31,6 +31,7 @@ type Server struct {
 	pool       *clashpool.Manager
 	clashCoord *clashpool.Coordinator
 	vmSlots    *vmslot.Manager
+	vmCoord    *vmslot.Coordinator
 	sup        *supervisor.Supervisor
 	updater    *hotupdate.Manager
 	httpClient *http.Client
@@ -65,6 +66,11 @@ func (s *Server) SetWebUIOverrideDir(dir string) {
 // WithVmSlotManager attaches the VM full-emulation slot manager for readiness observability.
 func (s *Server) WithVmSlotManager(vmSlots *vmslot.Manager) {
 	s.vmSlots = vmSlots
+}
+
+// WithVmCoordinator attaches the VM fleet coordinator for /internal/net/vms/* and WebSocket terminal routes.
+func (s *Server) WithVmCoordinator(coord *vmslot.Coordinator) {
+	s.vmCoord = coord
 }
 
 // NewServer builds the unified ingress handler separating DataPlane (/v1/*) from ControlPlane (/api/*).
@@ -121,6 +127,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /internal/supervisor/update", s.handleInternalUpdateStatus)
 	mux.HandleFunc("POST /internal/supervisor/update/sync", s.handleInternalUpdateSync)
 	s.registerClashInternalRoutes(mux)
+	s.registerVmInternalRoutes(mux)
 
 	// DataPlane AI hot paths strictly bypass the TypeScript BFF.
 	mux.HandleFunc("/v1/", s.handleDataPlane)
@@ -131,6 +138,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/", s.bffProxy)
 	mux.Handle("/webhooks/", s.bffProxy)
 	mux.Handle("/oauth/", s.bffProxy)
+
+	// Single-use ticket-authenticated WebSocket terminal endpoint for VM slots.
+	s.registerVmWebSocketRoutes(mux)
 
 	// Embedded Vue SPA (or Vite HMR dev server).
 	mux.Handle("/", s.uiHandler)

@@ -2,14 +2,13 @@ package stealth
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"time"
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 )
 
-// CoordinatorAdapter bridges AccountDialer onto clashpool.StealthDialer cleanly without circular imports.
+// CoordinatorAdapter bridges AccountDialer to clashpool.StealthDialer without introducing package import cycles.
 type CoordinatorAdapter struct {
 	dialer *AccountDialer
 }
@@ -29,8 +28,16 @@ func (a *CoordinatorAdapter) RegisterProfile(spec clashpool.TLSProfile) {
 	a.dialer.RegisterProfile(spec)
 }
 
+func (a *CoordinatorAdapter) UpdateProfile(spec clashpool.TLSProfile) error {
+	return a.dialer.UpdateProfile(spec)
+}
+
 func (a *CoordinatorAdapter) DeleteProfile(profileID string) error {
 	return a.dialer.DeleteProfile(profileID)
+}
+
+func (a *CoordinatorAdapter) ValidateProfile(spec clashpool.TLSProfile) error {
+	return a.dialer.ValidateProfile(spec)
 }
 
 func (a *CoordinatorAdapter) TestAccountHTTP(ctx context.Context, accountID, utlsProfileID, targetURL string) (clashpool.OutboundMeta, error) {
@@ -44,12 +51,11 @@ func (a *CoordinatorAdapter) TestAccountHTTP(ctx context.Context, accountID, utl
 	}
 	defer res.Response.Body.Close()
 
-	var snippetBuf [1024]byte
-	n, _ := io.ReadFull(res.Response.Body, snippetBuf[:])
+	snippet := readSnippet(res.Response.Body)
 	return clashpool.OutboundMeta{
 		StatusCode:     res.Response.StatusCode,
-		BodySnippet:    string(snippetBuf[:n]),
-		Target:         res.DialTarget,
+		BodySnippet:    snippet,
+		Target:         res.Target,
 		TLSVersion:     res.TLSVersion,
 		NegotiatedALPN: res.NegotiatedALPN,
 		LatencyMS:      res.LatencyMS,

@@ -111,6 +111,34 @@ func main() {
 	clashCoord.StartBackgroundTasks(rootCtx)
 
 	vmSlots := vmslot.NewManager(pool)
+	var vmStore vmslot.VmStore
+	if cfg.DatabaseURL != "" {
+		pgVmStore, pgErr := vmslot.NewPostgresVmStore(cfg.DatabaseURL, cfg.VaultSecret)
+		if pgErr != nil {
+			logger.Fatalf("failed to initialize vm postgres store: %v", pgErr)
+		}
+		vmStore = pgVmStore
+	} else {
+		vmStore = vmslot.NewMemoryVmStore()
+	}
+	defer func() { _ = vmStore.Close() }()
+
+	vmCoord := vmslot.NewCoordinator(vmslot.CoordinatorOptions{
+		Manager:   vmSlots,
+		ClashPool: pool,
+		Store:     vmStore,
+		VMDataDir: cfg.VMDataDir,
+		GuestdBin: cfg.GuestdBin,
+		Logger:    logger,
+	})
+	if err := vmCoord.Bootstrap(rootCtx); err != nil {
+		if !cfg.AllowDegraded {
+			logger.Fatalf("failed to bootstrap VM fleet coordinator: %v", err)
+		}
+		logger.Printf("[vmslot] bootstrap degraded (continuing): %v", err)
+	}
+	defer vmCoord.Shutdown()
+
 	sup := supervisor.New(logger)
 	internalURL := config.LoopbackOrigin(cfg.ListenAddr)
 
@@ -157,6 +185,7 @@ func main() {
 	edge.WithCommit(commit)
 	edge.WithClashCoordinator(clashCoord)
 	edge.WithVmSlotManager(vmSlots)
+	edge.WithVmCoordinator(vmCoord)
 
 	updater := hotupdate.NewManager(hotupdate.Options{
 		Config:        cfg,

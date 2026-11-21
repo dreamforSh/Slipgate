@@ -30,6 +30,8 @@ type Config struct {
 	ClashPortMin          int
 	ClashPortMax          int
 	MaxAccountsPerExit    int
+	VMDataDir             string
+	GuestdBin             string
 	DevUIURL           string
 	Mode               string
 	DevSyncMode        string
@@ -74,6 +76,11 @@ func LoadFromEnv() Config {
 
 	defaultHotDir := filepath.Join(os.TempDir(), "slipgate-hotupdate")
 	defaultClashDir := filepath.Join(os.TempDir(), "slipgate-clash")
+	defaultVMDir := filepath.Join(os.TempDir(), "slipgate-vms")
+	defaultGuestd := ResolveSiblingBinary("slipgate-guestd")
+	if info, err := os.Stat(defaultGuestd); err != nil || info.IsDir() {
+		defaultGuestd = "/usr/local/share/slipgate/guest/slipgate-guestd"
+	}
 	clashMode := strings.ToLower(envString("SLIPGATE_CLASH_MODE", "embedded"))
 	if clashMode != "disabled" {
 		clashMode = "embedded"
@@ -98,6 +105,8 @@ func LoadFromEnv() Config {
 		ClashProbeURL:         envString("SLIPGATE_CLASH_PROBE_URL", "https://www.gstatic.com/generate_204"),
 		ClashIPEchoURL:        envString("SLIPGATE_CLASH_IP_ECHO_URL", "https://api.ipify.org?format=json"),
 		ClashProbeIntervalSec: probeInterval,
+		VMDataDir:             envString("SLIPGATE_VM_DATA_DIR", defaultVMDir),
+		GuestdBin:             envString("SLIPGATE_GUESTD_BIN", defaultGuestd),
 		ClashPortMin:          envInt("SLIPGATE_CLASH_PORT_MIN", 20000),
 		ClashPortMax:          envInt("SLIPGATE_CLASH_PORT_MAX", 24999),
 		MaxAccountsPerExit:    envInt("SLIPGATE_MAX_ACCOUNTS_PER_EXIT_IP", 1),

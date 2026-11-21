@@ -216,4 +216,58 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
     });
     expect(delRes.status).toBe(200);
   });
+
+  it("exposes wire uTLS profiles and fail-closed VM fleet admin routes", async () => {
+    const app = createBffApp();
+    const setupRes = await app.request("/api/v1/setup/initialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        siteName: "Slipgate VM Test",
+        adminEmail: "admin@vm.test",
+        adminPassword: "StrongPassword123!",
+      }),
+    });
+    const { accessToken } = (await setupRes.json()) as { accessToken: string };
+    const adminHeaders = {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "application/json",
+    };
+
+    const tlsListRes = await app.request("/api/v1/admin/tls-profiles", { headers: adminHeaders });
+    expect(tlsListRes.status).toBe(200);
+    const tlsListBody = (await tlsListRes.json()) as { profiles: Array<{ id: string }> };
+    expect(tlsListBody.profiles.some((p) => p.id === "claude-bun-21")).toBe(true);
+    expect(tlsListBody.profiles.some((p) => p.id === "auto")).toBe(true);
+
+    const putLocked = await app.request("/api/v1/admin/tls-profiles/claude-bun-21", {
+      method: "PUT",
+      headers: adminHeaders,
+      body: JSON.stringify({ name: "Cannot Mutate Builtin" }),
+    });
+    expect(putLocked.status).toBe(403);
+
+    const putCustom = await app.request("/api/v1/admin/tls-profiles/custom-bun-1", {
+      method: "PUT",
+      headers: adminHeaders,
+      body: JSON.stringify({ name: "Custom Bun Updated", enableGrease: true, curves: [4588, 29] }),
+    });
+    expect(putCustom.status).toBe(200);
+
+    const vmOverviewRes = await app.request("/api/v1/admin/vms/overview", { headers: adminHeaders });
+    expect(vmOverviewRes.status).toBe(200);
+    const vmOverview = (await vmOverviewRes.json()) as {
+      nodes: Array<{ id: string }>;
+      invariants: { oneSlotOneEgress: boolean };
+    };
+    expect(vmOverview.nodes.some((n) => n.id === "local-node")).toBe(true);
+    expect(vmOverview.invariants.oneSlotOneEgress).toBe(true);
+
+    const vmBadCreate = await app.request("/api/v1/admin/vms/slots", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({ accountId: "acc-unbound" }),
+    });
+    expect(vmBadCreate.status).toBe(503);
+  });
 });

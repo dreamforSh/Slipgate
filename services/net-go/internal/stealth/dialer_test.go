@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
+
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 )
 
@@ -200,5 +202,153 @@ func TestDoAccountRequestFailClosedAndUTLSHandshake(t *testing.T) {
 	}
 	if err := dialer.DeleteProfile("chrome-131"); !errors.Is(err, ErrBuiltInProfileLock) {
 		t.Fatalf("expected built-in profile delete lock, got %v", err)
+	}
+}
+
+func TestValidateProfileAndWireClientHelloParity(t *testing.T) {
+	t.Parallel()
+
+	// 1. key_share without supported_groups extension 10 fails closed.
+	invalidMissingExt10 := ProfileSpec{
+		ID:             "bad-ext10",
+		Name:           "Bad Missing Ext10",
+		KeyShareGroups: []uint16{29},
+		Extensions:     []uint16{0, 16, 43, 51},
+	}
+	if err := ValidateProfile(invalidMissingExt10); !errors.Is(err, ErrKeyShareWithoutSupportedGroups) {
+		t.Fatalf("expected ErrKeyShareWithoutSupportedGroups, got %v", err)
+	}
+
+	// 2. key_share group absent from curves fails closed with KeyShareNotInSupportedGroupsError.
+	invalidGroup := ProfileSpec{
+		ID:             "bad-group",
+		Name:           "Bad Curve Subset",
+		Curves:         []uint16{23}, // P256 only
+		KeyShareGroups: []uint16{29}, // X25519 not in curves
+		Extensions:     []uint16{0, 10, 16, 43, 51},
+	}
+	err := ValidateProfile(invalidGroup)
+	var groupErr *KeyShareNotInSupportedGroupsError
+	if !errors.As(err, &groupErr) || groupErr.Group != 29 {
+		t.Fatalf("expected KeyShareNotInSupportedGroupsError{29}, got %v", err)
+	}
+
+	// 3. Claude Code 2.1.280 Bun wire profile builds valid ClientHelloSpec with PQ X25519MLKEM768 + GREASE ECH option.
+	dialer := NewAccountDialer(clashpool.NewManager(1, 65535, 1))
+	bunSpec, ok := dialer.GetProfile(ClaudeBunProfileID)
+	if !ok {
+		t.Fatalf("expected built-in %q profile", ClaudeBunProfileID)
+	}
+	if err := ValidateProfile(bunSpec); err != nil {
+		t.Fatalf("expected valid claude-bun-21 profile, got %v", err)
+	}
+	helloSpec, err := BuildClientHelloSpec(bunSpec)
+	if err != nil || helloSpec == nil {
+		t.Fatalf("expected non-nil custom ClientHelloSpec, err=%v", err)
+	}
+
+	customECH := bunSpec.Clone()
+	customECH.ID = "custom-grease-ech"
+	customECH.BuiltIn = false
+	customECH.EnableGREASE = true
+	customECH.Extensions = append(append([]uint16(nil), customECH.Extensions...), 0xfe0d)
+	if _, err := BuildClientHelloSpec(customECH); err != nil {
+		t.Fatalf("BuildClientHelloSpec with EnableGREASE+0xfe0d failed: %v", err)
+	}
+
+	// 4. ProfileCacheKey sensitive to curve & GREASE mutations.
+	h1 := ProfileCacheKey(bunSpec)
+	h2 := ProfileCacheKey(customECH)
+	if h1 == h2 || h1 == 0 {
+		t.Fatalf("expected distinct non-zero cache keys, got %x vs %x", h1, h2)
+	}
+
+	// 5. Sticky Rendezvous selection deterministically picks concrete profile with OS hint & excludes "auto".
+	chosenA, okA := StickyProfileForAccount("acct-sticky-42", dialer.ListProfiles(), "darwin")
+	chosenB, okB := StickyProfileForAccount("acct-sticky-42", dialer.ListProfiles(), "macos")
+	if !okA || !okB || chosenA.ID != chosenB.ID || chosenA.ID == AutoProfileID {
+		t.Fatalf("expected deterministic OS-hinted sticky profile, got A=%v B=%v", chosenA.ID, chosenB.ID)
+	}
+}
+
+func TestAutoStickyProfileEndToEndAndUpdateInvalidation(t *testing.T) {
+	t.Parallel()
+
+	var socksHits atomic.Int32
+	socksPort := startTestSocks5Server(t, "sg-u", "sg-p", &socksHits)
+
+	tlsSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-" + r.Proto))
+	}))
+	tlsSrv.EnableHTTP2 = true
+	tlsSrv.StartTLS()
+	defer tlsSrv.Close()
+
+	pool := clashpool.NewManager(1, 65535, 1)
+	dialer := NewAccountDialer(pool)
+	roots := x509.NewCertPool()
+	roots.AddCert(tlsSrv.Certificate())
+	dialer.SetRootCAs(roots)
+
+	_, err := pool.SyncNodes("sub-1", []clashpool.Node{{
+		ID:            "node-1",
+		Name:          "Osaka-1",
+		ProxySlotID:   "slot-1",
+		ListenerPort:  socksPort,
+		SocksUsername: "sg-u",
+		SocksPassword: "sg-p",
+		ExitIP:        "203.0.113.88",
+		Health:        clashpool.HealthHealthy,
+		Enabled:       true,
+	}}, true)
+	if err != nil {
+		t.Fatalf("SyncNodes failed: %v", err)
+	}
+	if err := pool.BindAccountWithProfile("acc-auto", "node-1", false, AutoProfileID); err != nil {
+		t.Fatalf("BindAccountWithProfile failed: %v", err)
+	}
+
+	req1, _ := http.NewRequest(http.MethodGet, tlsSrv.URL+"/v1/messages", nil)
+	res1, err := dialer.DoAccountRequest(context.Background(), "acc-auto", "", req1)
+	if err != nil {
+		t.Fatalf("DoAccountRequest auto failed: %v", err)
+	}
+	_ = res1.Response.Body.Close()
+	if res1.ProfileIDUsed == "" || res1.ProfileIDUsed == AutoProfileID {
+		t.Fatalf("expected concrete resolved profile for auto binding, got %q", res1.ProfileIDUsed)
+	}
+
+	// Custom wire profile registration + UpdateProfile invalidates cached transport cleanly.
+	custom := ProfileSpec{
+		ID:                "custom-pq-1",
+		Name:              "Custom PQ",
+		ClientHelloPreset: "custom_wire",
+		ALPNProtocols:     []string{"h2", "http/1.1"},
+		Curves:            []uint16{uint16(utls.X25519MLKEM768), uint16(utls.X25519)},
+		KeyShareGroups:    []uint16{uint16(utls.X25519MLKEM768), uint16(utls.X25519)},
+		UserAgentTemplate: "custom-bun/1.0",
+	}
+	dialer.RegisterProfile(custom)
+	req2, _ := http.NewRequest(http.MethodGet, tlsSrv.URL+"/v1/messages", nil)
+	res2, err := dialer.DoAccountRequest(context.Background(), "acc-auto", custom.ID, req2)
+	if err != nil {
+		t.Fatalf("DoAccountRequest custom failed: %v", err)
+	}
+	_ = res2.Response.Body.Close()
+
+	custom.UserAgentTemplate = "custom-bun/2.0"
+	custom.EnableGREASE = true
+	if err := dialer.UpdateProfile(custom); err != nil {
+		t.Fatalf("UpdateProfile failed: %v", err)
+	}
+	req3, _ := http.NewRequest(http.MethodGet, tlsSrv.URL+"/v1/messages", nil)
+	res3, err := dialer.DoAccountRequest(context.Background(), "acc-auto", custom.ID, req3)
+	if err != nil {
+		t.Fatalf("DoAccountRequest after UpdateProfile failed: %v", err)
+	}
+	_ = res3.Response.Body.Close()
+	if socksHits.Load() < 2 {
+		t.Fatalf("expected SOCKS5 tunnel usage across custom profile update, hits=%d", socksHits.Load())
 	}
 }

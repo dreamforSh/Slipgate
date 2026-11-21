@@ -51,14 +51,25 @@ type Node struct {
 
 // TLSProfile defines uTLS ClientHello and HTTP/2 fingerprint traits attached to an upstream account or pool binding.
 type TLSProfile struct {
-	ID                string   `json:"id"`
-	Name              string   `json:"name"`
-	ClientHelloPreset string   `json:"clientHelloPreset"`
-	JA3Fingerprint    string   `json:"ja3Fingerprint"`
-	JA4Fingerprint    string   `json:"ja4Fingerprint"`
-	ALPNProtocols     []string `json:"alpnProtocols"`
-	UserAgentTemplate string   `json:"userAgentTemplate"`
-	BuiltIn           bool     `json:"builtIn"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	Description         string   `json:"description,omitempty"`
+	ClientHelloPreset   string   `json:"clientHelloPreset"`
+	JA3Fingerprint      string   `json:"ja3Fingerprint"`
+	JA4Fingerprint      string   `json:"ja4Fingerprint"`
+	ALPNProtocols       []string `json:"alpnProtocols"`
+	UserAgentTemplate   string   `json:"userAgentTemplate"`
+	EnableGREASE        bool     `json:"enableGrease"`
+	CipherSuites        []uint16 `json:"cipherSuites,omitempty"`
+	Curves              []uint16 `json:"curves,omitempty"`
+	PointFormats        []uint16 `json:"pointFormats,omitempty"`
+	SignatureAlgorithms []uint16 `json:"signatureAlgorithms,omitempty"`
+	SupportedVersions   []uint16 `json:"supportedVersions,omitempty"`
+	KeyShareGroups      []uint16 `json:"keyShareGroups,omitempty"`
+	PSKModes            []uint16 `json:"pskModes,omitempty"`
+	Extensions          []uint16 `json:"extensions,omitempty"`
+	OSHint              string   `json:"osHint,omitempty"`
+	BuiltIn             bool     `json:"builtIn"`
 }
 
 // SupportsHTTP2 reports whether the profile permits negotiating HTTP/2 ALPN.
@@ -69,6 +80,52 @@ func (p TLSProfile) SupportsHTTP2() bool {
 		}
 	}
 	return false
+}
+
+// HasCustomWireSpec reports whether explicit wire-level ClientHello fields are configured on this profile.
+func (p TLSProfile) HasCustomWireSpec() bool {
+	return p.EnableGREASE ||
+		len(p.CipherSuites) > 0 ||
+		len(p.Curves) > 0 ||
+		len(p.PointFormats) > 0 ||
+		len(p.SignatureAlgorithms) > 0 ||
+		len(p.SupportedVersions) > 0 ||
+		len(p.KeyShareGroups) > 0 ||
+		len(p.PSKModes) > 0 ||
+		len(p.Extensions) > 0
+}
+
+// Clone returns a deep copy of TLSProfile with independent slice backing arrays.
+func (p TLSProfile) Clone() TLSProfile {
+	out := p
+	if p.ALPNProtocols != nil {
+		out.ALPNProtocols = append([]string(nil), p.ALPNProtocols...)
+	}
+	if p.CipherSuites != nil {
+		out.CipherSuites = append([]uint16(nil), p.CipherSuites...)
+	}
+	if p.Curves != nil {
+		out.Curves = append([]uint16(nil), p.Curves...)
+	}
+	if p.PointFormats != nil {
+		out.PointFormats = append([]uint16(nil), p.PointFormats...)
+	}
+	if p.SignatureAlgorithms != nil {
+		out.SignatureAlgorithms = append([]uint16(nil), p.SignatureAlgorithms...)
+	}
+	if p.SupportedVersions != nil {
+		out.SupportedVersions = append([]uint16(nil), p.SupportedVersions...)
+	}
+	if p.KeyShareGroups != nil {
+		out.KeyShareGroups = append([]uint16(nil), p.KeyShareGroups...)
+	}
+	if p.PSKModes != nil {
+		out.PSKModes = append([]uint16(nil), p.PSKModes...)
+	}
+	if p.Extensions != nil {
+		out.Extensions = append([]uint16(nil), p.Extensions...)
+	}
+	return out
 }
 
 // AccountBindingRecord represents a resolved account -> Clash node (+ optional uTLS profile) mapping.

@@ -33,6 +33,7 @@ clash_pool:
 
 vm_pool:
   enabled: true
+  data_dir: "/var/run/slipgate/vms"
   default_hypervisor: "kvm_qemu"
   max_subagents_per_slot: 20
   default_cleanse_mode: "zero"

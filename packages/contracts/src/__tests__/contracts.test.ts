@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   BindAccountExitRequestSchema,
   ClashExitNodeSchema,
+  ClusterNodeSchema,
   CreateAccountRequestSchema,
   CreateApiKeyRequestSchema,
   CreateClashSubscriptionRequestSchema,
@@ -10,9 +11,13 @@ import {
   HardwarePersonaSchema,
   NANO_PER_USD,
   parseUsdToNano,
+  ProvisionVmSlotRequestSchema,
   SetupInitializeRequestSchema,
   SystemUpdateStatusSchema,
   TriggerUpdateSyncRequestSchema,
+  UpdateTlsProfileRequestSchema,
+  VmFleetOverviewSchema,
+  VmTerminalTicketResponseSchema,
 } from "../index.ts";
 
 describe("nano-USD fixed-point helpers", () => {
@@ -132,6 +137,75 @@ describe("IAM, Pool and API Key contracts", () => {
       name: "Custom Chrome",
     });
     expect(tlsReq.clientHelloPreset).toBe("chrome_auto");
+
+    const tlsWireReq = CreateTlsProfileRequestSchema.parse({
+      name: "Bun Wire Custom",
+      clientHelloPreset: "custom_wire",
+      enableGrease: true,
+      curves: [4588, 29, 23],
+      keyShareGroups: [4588, 29],
+      extensions: [0, 10, 16, 43, 51, 65037],
+      osHint: "linux",
+    });
+    expect(tlsWireReq.enableGrease).toBe(true);
+    expect(tlsWireReq.curves).toEqual([4588, 29, 23]);
+
+    const tlsUpdate = UpdateTlsProfileRequestSchema.parse({
+      name: "Bun Updated",
+      clientHelloPreset: "auto",
+      keyShareGroups: [29],
+    });
+    expect(tlsUpdate.clientHelloPreset).toBe("auto");
+
+    const vmProvision = ProvisionVmSlotRequestSchema.parse({
+      accountId: "acc-vm-1",
+      clashNodeId: "node-1",
+    });
+    expect(vmProvision.clusterNodeId).toBe("local-node");
+    expect(vmProvision.maxSubagents).toBe(20);
+
+    const clusterNode = ClusterNodeSchema.parse({
+      id: "local-node",
+      name: "Local Control Node",
+      driverKind: "local",
+      sshAddr: "127.0.0.1:22",
+      sshUser: "slipgate",
+      arch: "amd64",
+      kvmCapable: true,
+      dockerCapable: true,
+      status: "online",
+      maxSlots: 32,
+      createdAtIso: "2026-11-20T00:00:00Z",
+      updatedAtIso: "2026-11-20T00:00:00Z",
+    });
+    expect(clusterNode.driverKind).toBe("local");
+
+    const wsTicket = VmTerminalTicketResponseSchema.parse({
+      ticket: "abc123",
+      slotId: "vm-01",
+      actor: "admin",
+      wsPath: "/ws/admin/vms/terminal/abc123",
+      expiresAtIso: "2026-11-20T00:05:00Z",
+    });
+    expect(wsTicket.wsPath).toBe("/ws/admin/vms/terminal/abc123");
+
+    const overview = VmFleetOverviewSchema.parse({
+      nodes: [clusterNode],
+      slots: [],
+      migrations: [],
+      invariants: {
+        oneSlotOneEgress: true,
+        maxSubagentsDefault: 20,
+        zeroPromptInjection: true,
+      },
+      runtime: {
+        vmDataDir: "/var/run/slipgate/vms",
+        guestdBin: "/usr/local/share/slipgate/guest/slipgate-guestd",
+        guestdAvailable: true,
+        localNodeId: "local-node",
+      },
+    });
+    expect(overview.invariants.oneSlotOneEgress).toBe(true);
 
     const bindReq = BindAccountExitRequestSchema.parse({
       accountId: "acc-1",

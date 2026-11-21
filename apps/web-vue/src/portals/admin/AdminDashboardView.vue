@@ -311,7 +311,15 @@ onMounted(() => {
 
     <section class="grid gap-6 md:grid-cols-2">
       <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
-        <h2 class="text-base font-semibold text-white">VM 完全拟真槽舰队（1 槽 1 出口 · 20 路 Subagent）</h2>
+        <div class="flex items-center justify-between gap-3">
+          <h2 class="text-base font-semibold text-white">VM 完全拟真槽舰队（1 槽 1 出口 · 20 路 Subagent）</h2>
+          <RouterLink
+            to="/admin/vms"
+            class="rounded-lg border border-slate-700 px-2.5 py-1 text-xs text-sky-300 hover:border-sky-500"
+          >
+            管理 VM 舰队
+          </RouterLink>
+        </div>
         <div class="mt-4 space-y-3">
           <div
             v-for="slot in vmSlots"

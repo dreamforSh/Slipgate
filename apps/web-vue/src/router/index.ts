@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from "vue-router";
 import AdminAccountsView from "../portals/admin/AdminAccountsView.vue";
 import AdminClashPoolView from "../portals/admin/AdminClashPoolView.vue";
 import AdminDashboardView from "../portals/admin/AdminDashboardView.vue";
+import AdminVmFleetView from "../portals/admin/AdminVmFleetView.vue";
 import UserConsoleView from "../portals/user/UserConsoleView.vue";
 import { useAuthStore } from "../stores/auth";
 import AuthLoginView from "../views/AuthLoginView.vue";
@@ -29,6 +30,12 @@ const router = createRouter({
       path: "/admin/clash",
       name: "admin-clash",
       component: AdminClashPoolView,
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/vms",
+      name: "admin-vms",
+      component: AdminVmFleetView,
       meta: { requiresAuth: true, requiresAdmin: true },
     },
     {

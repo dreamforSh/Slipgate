@@ -25,6 +25,7 @@ func (s *Server) registerClashInternalRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/net/clash/test-outbound", s.handleTestClashOutbound)
 	mux.HandleFunc("GET /internal/net/tls-profiles", s.handleListTLSProfiles)
 	mux.HandleFunc("POST /internal/net/tls-profiles", s.handleCreateTLSProfile)
+	mux.HandleFunc("PUT /internal/net/tls-profiles/{id}", s.handleUpdateTLSProfile)
 	mux.HandleFunc("DELETE /internal/net/tls-profiles/{id}", s.handleDeleteTLSProfile)
 }
 
@@ -302,6 +303,24 @@ func (s *Server) handleCreateTLSProfile(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusCreated, map[string]any{"profile": created})
 }
 
+func (s *Server) handleUpdateTLSProfile(w http.ResponseWriter, r *http.Request) {
+	coord := s.requireClashCoordinator(w, r)
+	if coord == nil {
+		return
+	}
+	id := r.PathValue("id")
+	var req clashpool.TLSProfile
+	if !decodeLimitedJSON(w, r, 64<<10, &req) {
+		return
+	}
+	updated, err := coord.UpdateTLSProfile(r.Context(), id, req)
+	if err != nil {
+		writeClashError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profile": updated})
+}
+
 func (s *Server) handleDeleteTLSProfile(w http.ResponseWriter, r *http.Request) {
 	coord := s.requireClashCoordinator(w, r)
 	if coord == nil {
@@ -369,6 +388,20 @@ func mapClashErrorStatus(err error) int {
 }
 
 func writeClashError(w http.ResponseWriter, err error) {
+	var valErr *clashpool.TLSProfileValidationError
+	if errors.As(err, &valErr) {
+		payload := map[string]any{
+			"error":   "invalid_tls_profile",
+			"reason":  valErr.Reason,
+			"field":   valErr.Field,
+			"message": valErr.Error(),
+		}
+		if valErr.Group != 0 {
+			payload["group"] = valErr.Group
+		}
+		writeJSON(w, http.StatusBadRequest, payload)
+		return
+	}
 	writeJSON(w, mapClashErrorStatus(err), map[string]any{
 		"error":   "clash_operation_failed",
 		"message": err.Error(),

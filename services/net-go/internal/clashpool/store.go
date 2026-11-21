@@ -233,19 +233,16 @@ func (m *MemoryNetStore) ListTLSProfiles(context.Context) ([]TLSProfile, error) 
 	defer m.mu.RUnlock()
 	out := make([]TLSProfile, 0, len(m.profiles))
 	for _, p := range m.profiles {
-		clone := p
-		clone.ALPNProtocols = slices.Clone(p.ALPNProtocols)
-		out = append(out, clone)
+		out = append(out, p.Clone())
 	}
+	slices.SortFunc(out, func(a, b TLSProfile) int { return strings.Compare(a.ID, b.ID) })
 	return out, nil
 }
 
 func (m *MemoryNetStore) UpsertTLSProfile(_ context.Context, p TLSProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	clone := p
-	clone.ALPNProtocols = slices.Clone(p.ALPNProtocols)
-	m.profiles[p.ID] = clone
+	m.profiles[p.ID] = p.Clone()
 	return nil
 }
 
@@ -382,21 +379,45 @@ ALTER TABLE net.clash_nodes
     ADD COLUMN IF NOT EXISTS server_port INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS net.tls_profiles (
-    id                  TEXT PRIMARY KEY,
-    name                TEXT NOT NULL UNIQUE,
-    client_hello_preset TEXT NOT NULL DEFAULT 'chrome_auto',
-    ja3_fingerprint     TEXT,
-    ja4_fingerprint     TEXT,
-    alpn_protocols      JSONB NOT NULL DEFAULT '["h2","http/1.1"]'::jsonb,
-    h2_settings         JSONB NOT NULL DEFAULT '{}'::jsonb,
-    user_agent_template TEXT,
-    built_in            BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id                   TEXT PRIMARY KEY,
+    name                 TEXT NOT NULL UNIQUE,
+    description          TEXT NOT NULL DEFAULT '',
+    client_hello_preset  TEXT NOT NULL DEFAULT 'chrome_auto',
+    ja3_fingerprint      TEXT,
+    ja4_fingerprint      TEXT,
+    alpn_protocols       JSONB NOT NULL DEFAULT '["h2","http/1.1"]'::jsonb,
+    h2_settings          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    user_agent_template  TEXT,
+    enable_grease        BOOLEAN NOT NULL DEFAULT FALSE,
+    cipher_suites        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    curves               JSONB NOT NULL DEFAULT '[]'::jsonb,
+    point_formats        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    signature_algorithms JSONB NOT NULL DEFAULT '[]'::jsonb,
+    supported_versions   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    key_share_groups     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    psk_modes            JSONB NOT NULL DEFAULT '[]'::jsonb,
+    extensions           JSONB NOT NULL DEFAULT '[]'::jsonb,
+    os_hint              TEXT NOT NULL DEFAULT '',
+    built_in             BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 ALTER TABLE net.tls_profiles
     ADD COLUMN IF NOT EXISTS client_hello_preset TEXT NOT NULL DEFAULT 'chrome_auto',
-    ADD COLUMN IF NOT EXISTS built_in BOOLEAN NOT NULL DEFAULT FALSE;
+    ADD COLUMN IF NOT EXISTS built_in BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS enable_grease BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS cipher_suites JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS curves JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS point_formats JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS signature_algorithms JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS supported_versions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS key_share_groups JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS psk_modes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS extensions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS os_hint TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS net.proxy_bindings (
     account_id          TEXT PRIMARY KEY,
@@ -690,8 +711,12 @@ func (p *PostgresNetStore) UpdateNodeRuntime(ctx context.Context, n Node) error 
 
 func (p *PostgresNetStore) ListTLSProfiles(ctx context.Context) ([]TLSProfile, error) {
 	rows, err := p.db.QueryContext(ctx, `
-		SELECT id, name, client_hello_preset, COALESCE(ja3_fingerprint, ''), COALESCE(ja4_fingerprint, ''),
-		       alpn_protocols, COALESCE(user_agent_template, ''), built_in
+		SELECT id, name, description, client_hello_preset,
+		       COALESCE(ja3_fingerprint, ''), COALESCE(ja4_fingerprint, ''),
+		       alpn_protocols, COALESCE(user_agent_template, ''),
+		       enable_grease, cipher_suites, curves, point_formats,
+		       signature_algorithms, supported_versions, key_share_groups,
+		       psk_modes, extensions, os_hint, built_in
 		FROM net.tls_profiles
 		ORDER BY built_in DESC, id ASC
 	`)
@@ -703,46 +728,142 @@ func (p *PostgresNetStore) ListTLSProfiles(ctx context.Context) ([]TLSProfile, e
 	var out []TLSProfile
 	for rows.Next() {
 		var (
-			tp       TLSProfile
-			alpnJSON []byte
+			tp             TLSProfile
+			alpnJSON       []byte
+			ciphersJSON    []byte
+			curvesJSON     []byte
+			pointJSON      []byte
+			sigAlgsJSON    []byte
+			versionsJSON   []byte
+			keyShareJSON   []byte
+			pskJSON        []byte
+			extensionsJSON []byte
 		)
 		if err := rows.Scan(
-			&tp.ID, &tp.Name, &tp.ClientHelloPreset, &tp.JA3Fingerprint, &tp.JA4Fingerprint,
-			&alpnJSON, &tp.UserAgentTemplate, &tp.BuiltIn,
+			&tp.ID, &tp.Name, &tp.Description, &tp.ClientHelloPreset,
+			&tp.JA3Fingerprint, &tp.JA4Fingerprint,
+			&alpnJSON, &tp.UserAgentTemplate,
+			&tp.EnableGREASE, &ciphersJSON, &curvesJSON, &pointJSON,
+			&sigAlgsJSON, &versionsJSON, &keyShareJSON,
+			&pskJSON, &extensionsJSON, &tp.OSHint, &tp.BuiltIn,
 		); err != nil {
 			return nil, err
 		}
-		if len(alpnJSON) > 0 {
-			_ = json.Unmarshal(alpnJSON, &tp.ALPNProtocols)
-		}
+		decodeJSONSlice(alpnJSON, &tp.ALPNProtocols)
+		decodeJSONSlice(ciphersJSON, &tp.CipherSuites)
+		decodeJSONSlice(curvesJSON, &tp.Curves)
+		decodeJSONSlice(pointJSON, &tp.PointFormats)
+		decodeJSONSlice(sigAlgsJSON, &tp.SignatureAlgorithms)
+		decodeJSONSlice(versionsJSON, &tp.SupportedVersions)
+		decodeJSONSlice(keyShareJSON, &tp.KeyShareGroups)
+		decodeJSONSlice(pskJSON, &tp.PSKModes)
+		decodeJSONSlice(extensionsJSON, &tp.Extensions)
 		out = append(out, tp)
 	}
 	return out, rows.Err()
 }
 
 func (p *PostgresNetStore) UpsertTLSProfile(ctx context.Context, tp TLSProfile) error {
-	alpnJSON, err := json.Marshal(tp.ALPNProtocols)
+	alpnJSON, err := marshalJSONArray(tp.ALPNProtocols)
+	if err != nil {
+		return err
+	}
+	ciphersJSON, err := marshalJSONArray(tp.CipherSuites)
+	if err != nil {
+		return err
+	}
+	curvesJSON, err := marshalJSONArray(tp.Curves)
+	if err != nil {
+		return err
+	}
+	pointJSON, err := marshalJSONArray(tp.PointFormats)
+	if err != nil {
+		return err
+	}
+	sigAlgsJSON, err := marshalJSONArray(tp.SignatureAlgorithms)
+	if err != nil {
+		return err
+	}
+	versionsJSON, err := marshalJSONArray(tp.SupportedVersions)
+	if err != nil {
+		return err
+	}
+	keyShareJSON, err := marshalJSONArray(tp.KeyShareGroups)
+	if err != nil {
+		return err
+	}
+	pskJSON, err := marshalJSONArray(tp.PSKModes)
+	if err != nil {
+		return err
+	}
+	extensionsJSON, err := marshalJSONArray(tp.Extensions)
 	if err != nil {
 		return err
 	}
 	preset := strings.TrimSpace(tp.ClientHelloPreset)
 	if preset == "" {
-		preset = "chrome_auto"
+		if tp.HasCustomWireSpec() {
+			preset = "custom_wire"
+		} else {
+			preset = "chrome_auto"
+		}
 	}
 	_, err = p.db.ExecContext(ctx, `
 		INSERT INTO net.tls_profiles (
-			id, name, client_hello_preset, ja3_fingerprint, ja4_fingerprint,
-			alpn_protocols, user_agent_template, built_in
-		) VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6::jsonb, NULLIF($7, ''), $8)
+			id, name, description, client_hello_preset, ja3_fingerprint, ja4_fingerprint,
+			alpn_protocols, user_agent_template, enable_grease, cipher_suites, curves,
+			point_formats, signature_algorithms, supported_versions, key_share_groups,
+			psk_modes, extensions, os_hint, built_in, updated_at
+		) VALUES (
+			$1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''),
+			$7::jsonb, NULLIF($8, ''), $9, $10::jsonb, $11::jsonb,
+			$12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb,
+			$16::jsonb, $17::jsonb, $18, $19, NOW()
+		)
 		ON CONFLICT (id) DO UPDATE SET
 			name = EXCLUDED.name,
+			description = EXCLUDED.description,
 			client_hello_preset = EXCLUDED.client_hello_preset,
 			ja3_fingerprint = EXCLUDED.ja3_fingerprint,
 			ja4_fingerprint = EXCLUDED.ja4_fingerprint,
 			alpn_protocols = EXCLUDED.alpn_protocols,
-			user_agent_template = EXCLUDED.user_agent_template
-	`, tp.ID, tp.Name, preset, tp.JA3Fingerprint, tp.JA4Fingerprint, string(alpnJSON), tp.UserAgentTemplate, tp.BuiltIn)
+			user_agent_template = EXCLUDED.user_agent_template,
+			enable_grease = EXCLUDED.enable_grease,
+			cipher_suites = EXCLUDED.cipher_suites,
+			curves = EXCLUDED.curves,
+			point_formats = EXCLUDED.point_formats,
+			signature_algorithms = EXCLUDED.signature_algorithms,
+			supported_versions = EXCLUDED.supported_versions,
+			key_share_groups = EXCLUDED.key_share_groups,
+			psk_modes = EXCLUDED.psk_modes,
+			extensions = EXCLUDED.extensions,
+			os_hint = EXCLUDED.os_hint,
+			updated_at = NOW()
+	`,
+		tp.ID, tp.Name, tp.Description, preset, tp.JA3Fingerprint, tp.JA4Fingerprint,
+		alpnJSON, tp.UserAgentTemplate, tp.EnableGREASE, ciphersJSON, curvesJSON,
+		pointJSON, sigAlgsJSON, versionsJSON, keyShareJSON,
+		pskJSON, extensionsJSON, tp.OSHint, tp.BuiltIn,
+	)
 	return err
+}
+
+func marshalJSONArray[T any](items []T) (string, error) {
+	if len(items) == 0 {
+		return "[]", nil
+	}
+	b, err := json.Marshal(items)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func decodeJSONSlice[T any](raw []byte, dst *[]T) {
+	if len(raw) == 0 {
+		return
+	}
+	_ = json.Unmarshal(raw, dst)
 }
 
 func (p *PostgresNetStore) DeleteTLSProfile(ctx context.Context, profileID string) error {

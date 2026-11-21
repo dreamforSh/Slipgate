@@ -34,11 +34,57 @@ type OutboundMeta struct {
 	LatencyMS      uint32     `json:"latencyMs"`
 }
 
+const (
+	TLSProfileReasonKeyShareNotInCurves            = "TLS_PROFILE_KEY_SHARE_NOT_IN_CURVES"
+	TLSProfileReasonKeyShareWithoutSupportedGroups = "TLS_PROFILE_KEY_SHARE_WITHOUT_SUPPORTED_GROUPS"
+	TLSProfileReasonInvalid                        = "TLS_PROFILE_INVALID"
+)
+
+var (
+	// ErrKeyShareWithoutSupportedGroups indicates key_share wire negotiation lacks extension 10 (supported_groups).
+	ErrKeyShareWithoutSupportedGroups = errors.New("key_share extension requires supported_groups (extension 10)")
+	// ErrBuiltInProfileLock indicates an immutable built-in TLS profile cannot be modified or deleted.
+	ErrBuiltInProfileLock = errors.New("clashpool: built-in TLS profile cannot be modified or deleted")
+)
+
+// KeyShareNotInSupportedGroupsError identifies a key_share curve absent from curves/supported_groups.
+type KeyShareNotInSupportedGroupsError struct {
+	Group uint16
+}
+
+func (e *KeyShareNotInSupportedGroupsError) Error() string {
+	return fmt.Sprintf("key_share group 0x%04x (%d) must be included in curves", e.Group, e.Group)
+}
+
+// TLSProfileValidationError carries structured diagnostics for HTTP/RPC error serialization.
+type TLSProfileValidationError struct {
+	Reason string
+	Field  string
+	Group  uint16
+	Err    error
+}
+
+func (e *TLSProfileValidationError) Error() string {
+	if e == nil || e.Err == nil {
+		return "invalid TLS profile"
+	}
+	return e.Err.Error()
+}
+
+func (e *TLSProfileValidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // StealthDialer decouples uTLS outbound operations from clashpool without creating package import cycles.
 type StealthDialer interface {
 	ListProfiles() []TLSProfile
 	RegisterProfile(spec TLSProfile)
+	UpdateProfile(spec TLSProfile) error
 	DeleteProfile(profileID string) error
+	ValidateProfile(spec TLSProfile) error
 	TestAccountHTTP(ctx context.Context, accountID, utlsProfileID, targetURL string) (OutboundMeta, error)
 	ProbeNodeExitIP(ctx context.Context, socksAddr, username, password, ipEchoURL string, timeout time.Duration) (string, uint32, error)
 }
@@ -805,17 +851,37 @@ func (c *Coordinator) CreateTLSProfile(ctx context.Context, profile TLSProfile) 
 	if profile.ID == "" {
 		profile.ID = "tls-" + randomHex(4)
 	}
+	if profile.ID == "auto" || profile.ID == "random" {
+		return TLSProfile{}, &TLSProfileValidationError{
+			Reason: TLSProfileReasonInvalid,
+			Field:  "id",
+			Err:    fmt.Errorf("clashpool: TLS profile id %q is reserved", profile.ID),
+		}
+	}
 	if profile.Name == "" {
-		return TLSProfile{}, errors.New("clashpool: TLS profile name is required")
+		return TLSProfile{}, &TLSProfileValidationError{
+			Reason: TLSProfileReasonInvalid,
+			Field:  "name",
+			Err:    errors.New("clashpool: TLS profile name is required"),
+		}
 	}
 	if strings.TrimSpace(profile.ClientHelloPreset) == "" {
-		profile.ClientHelloPreset = "chrome_auto"
+		if profile.HasCustomWireSpec() {
+			profile.ClientHelloPreset = "custom_wire"
+		} else {
+			profile.ClientHelloPreset = "chrome_auto"
+		}
 	}
 	if len(profile.ALPNProtocols) == 0 {
 		profile.ALPNProtocols = []string{"h2", "http/1.1"}
 	}
 	profile.BuiltIn = false
 
+	if c.stealth != nil {
+		if err := c.stealth.ValidateProfile(profile); err != nil {
+			return TLSProfile{}, err
+		}
+	}
 	if err := c.store.UpsertTLSProfile(ctx, profile); err != nil {
 		return TLSProfile{}, err
 	}
@@ -823,6 +889,70 @@ func (c *Coordinator) CreateTLSProfile(ctx context.Context, profile TLSProfile) 
 		c.stealth.RegisterProfile(profile)
 	}
 	return profile, nil
+}
+
+// UpdateTLSProfile validates and persists modifications to an existing non-built-in TLS profile.
+func (c *Coordinator) UpdateTLSProfile(ctx context.Context, profileID string, patch TLSProfile) (TLSProfile, error) {
+	profileID = strings.TrimSpace(profileID)
+	if profileID == "" {
+		return TLSProfile{}, &TLSProfileValidationError{
+			Reason: TLSProfileReasonInvalid,
+			Field:  "id",
+			Err:    errors.New("clashpool: TLS profile id is required"),
+		}
+	}
+	var existing *TLSProfile
+	for _, p := range c.ListTLSProfiles() {
+		if p.ID == profileID {
+			cp := p.Clone()
+			existing = &cp
+			break
+		}
+	}
+	if existing == nil {
+		return TLSProfile{}, ErrProfileNotFound
+	}
+	if existing.BuiltIn {
+		return TLSProfile{}, ErrBuiltInProfileLock
+	}
+
+	patch.ID = profileID
+	patch.BuiltIn = false
+	patch.Name = strings.TrimSpace(patch.Name)
+	if patch.Name == "" {
+		patch.Name = existing.Name
+	}
+	if strings.TrimSpace(patch.ClientHelloPreset) == "" {
+		if patch.HasCustomWireSpec() {
+			patch.ClientHelloPreset = "custom_wire"
+		} else if existing.ClientHelloPreset != "" {
+			patch.ClientHelloPreset = existing.ClientHelloPreset
+		} else {
+			patch.ClientHelloPreset = "chrome_auto"
+		}
+	}
+	if len(patch.ALPNProtocols) == 0 {
+		if len(existing.ALPNProtocols) > 0 {
+			patch.ALPNProtocols = append([]string(nil), existing.ALPNProtocols...)
+		} else {
+			patch.ALPNProtocols = []string{"h2", "http/1.1"}
+		}
+	}
+
+	if c.stealth != nil {
+		if err := c.stealth.ValidateProfile(patch); err != nil {
+			return TLSProfile{}, err
+		}
+	}
+	if err := c.store.UpsertTLSProfile(ctx, patch); err != nil {
+		return TLSProfile{}, err
+	}
+	if c.stealth != nil {
+		if err := c.stealth.UpdateProfile(patch); err != nil {
+			return TLSProfile{}, err
+		}
+	}
+	return patch, nil
 }
 
 // DeleteTLSProfile deletes a non-built-in TLS profile from both runtime registry and net.tls_profiles.

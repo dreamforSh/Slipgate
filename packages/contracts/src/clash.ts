@@ -4,11 +4,17 @@ export const ClashSubscriptionSourceKindSchema = z.enum(["url", "inline"]);
 export type ClashSubscriptionSourceKind = z.infer<typeof ClashSubscriptionSourceKindSchema>;
 
 export const ClientHelloPresetSchema = z.enum([
+  "auto",
+  "custom_wire",
+  "claude_bun_21",
+  "bun_default",
   "chrome_auto",
+  "chrome_131",
   "firefox_auto",
   "safari_auto",
   "ios_auto",
   "edge_auto",
+  "randomized",
   "claude_cli",
 ]);
 export type ClientHelloPreset = z.infer<typeof ClientHelloPresetSchema>;
@@ -81,14 +87,28 @@ export const ClashProbeResultSchema = z.object({
 });
 export type ClashProbeResult = z.infer<typeof ClashProbeResultSchema>;
 
+const Uint16ArraySchema = z.array(z.number().int().min(0).max(65535)).max(256);
+const Uint8ArraySchema = z.array(z.number().int().min(0).max(255)).max(64);
+
 export const TlsProfileSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
+  description: z.string().default(""),
   clientHelloPreset: z.string(),
   ja3Fingerprint: z.string().default(""),
   ja4Fingerprint: z.string().default(""),
   alpnProtocols: z.array(z.string()).default(["h2", "http/1.1"]),
   userAgentTemplate: z.string().default(""),
+  enableGrease: z.boolean().default(false),
+  cipherSuites: Uint16ArraySchema.default([]),
+  curves: Uint16ArraySchema.default([]),
+  pointFormats: Uint8ArraySchema.default([]),
+  signatureAlgorithms: Uint16ArraySchema.default([]),
+  supportedVersions: Uint16ArraySchema.default([]),
+  keyShareGroups: Uint16ArraySchema.default([]),
+  pskModes: Uint8ArraySchema.default([]),
+  extensions: Uint16ArraySchema.default([]),
+  osHint: z.string().default(""),
   builtIn: z.boolean().default(false),
 });
 export type TlsProfile = z.infer<typeof TlsProfileSchema>;
@@ -96,13 +116,29 @@ export type TlsProfile = z.infer<typeof TlsProfileSchema>;
 export const CreateTlsProfileRequestSchema = z.object({
   id: z.string().trim().min(1).max(64).optional(),
   name: z.string().trim().min(1).max(100),
+  description: z.string().max(512).default(""),
   clientHelloPreset: ClientHelloPresetSchema.default("chrome_auto"),
   ja3Fingerprint: z.string().max(512).default(""),
   ja4Fingerprint: z.string().max(128).default(""),
   alpnProtocols: z.array(z.string().min(1)).min(1).default(["h2", "http/1.1"]),
   userAgentTemplate: z.string().max(512).default(""),
+  enableGrease: z.boolean().default(false),
+  cipherSuites: Uint16ArraySchema.default([]),
+  curves: Uint16ArraySchema.default([]),
+  pointFormats: Uint8ArraySchema.default([]),
+  signatureAlgorithms: Uint16ArraySchema.default([]),
+  supportedVersions: Uint16ArraySchema.default([]),
+  keyShareGroups: Uint16ArraySchema.default([]),
+  pskModes: Uint8ArraySchema.default([]),
+  extensions: Uint16ArraySchema.default([]),
+  osHint: z.string().trim().max(32).default(""),
 });
 export type CreateTlsProfileRequest = z.infer<typeof CreateTlsProfileRequestSchema>;
+
+export const UpdateTlsProfileRequestSchema = CreateTlsProfileRequestSchema.omit({ id: true }).partial().extend({
+  name: z.string().trim().min(1).max(100).optional(),
+});
+export type UpdateTlsProfileRequest = z.infer<typeof UpdateTlsProfileRequestSchema>;
 
 export const AccountExitBindingSchema = z.object({
   accountId: z.string().min(1),

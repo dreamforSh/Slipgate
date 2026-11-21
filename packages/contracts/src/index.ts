@@ -1,11 +1,13 @@
 import { z } from "zod";
 import { ProviderSchema } from "./pool.ts";
+import { ClusterNodeSchema, VmMigrationJobSchema } from "./vm.ts";
 
 export * from "./iam.ts";
 export * from "./pool.ts";
 export * from "./apikeys.ts";
 export * from "./system.ts";
 export * from "./clash.ts";
+export * from "./vm.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 
@@ -159,6 +161,8 @@ export const SlotSeedSnapshotSchema = z.object({
   slotId: z.string().min(1),
   settingsJsonRaw: z.string(),
   customSettingRaw: z.string(),
+  proxyEnvRaw: z.string().optional(),
+  bootstrapScriptRaw: z.string().optional(),
   rejectClientSettings: z.boolean(),
   rejectClientIdentity: z.boolean(),
   telemetryMode: TelemetryModeSchema,
@@ -166,6 +170,24 @@ export const SlotSeedSnapshotSchema = z.object({
   syncedAtUnixMs: z.number().int(),
 });
 export type SlotSeedSnapshot = z.infer<typeof SlotSeedSnapshotSchema>;
+
+export const VmFleetOverviewSchema = z.object({
+  nodes: z.array(ClusterNodeSchema),
+  slots: z.array(VmSlotSummarySchema),
+  migrations: z.array(VmMigrationJobSchema),
+  invariants: z.object({
+    oneSlotOneEgress: z.boolean(),
+    maxSubagentsDefault: z.number().int().positive(),
+    zeroPromptInjection: z.boolean(),
+  }),
+  runtime: z.object({
+    vmDataDir: z.string(),
+    guestdBin: z.string(),
+    guestdAvailable: z.boolean(),
+    localNodeId: z.string(),
+  }),
+});
+export type VmFleetOverview = z.infer<typeof VmFleetOverviewSchema>;
 
 export const RiskBanEventSchema = z.object({
   eventId: z.string().min(1),

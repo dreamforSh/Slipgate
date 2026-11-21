@@ -55,12 +55,19 @@ const bindShadow = ref(false);
 const testTargetUrl = ref("https://api.ipify.org?format=json");
 const outboundResult = ref<ClashOutboundTestResponse | null>(null);
 
-// Custom TLS Profile form
+// Custom TLS Profile form (supports wire-level linksyncx parameters & PUT updates)
+const editingProfileId = ref<string | null>(null);
 const tlsName = ref("");
-const tlsPreset = ref<ClientHelloPreset>("chrome_auto");
+const tlsPreset = ref<ClientHelloPreset>("claude_bun_21");
 const tlsAlpnRaw = ref("h2,http/1.1");
 const tlsUA = ref("");
 const tlsJA3 = ref("");
+const tlsOsHint = ref("");
+const tlsEnableGrease = ref(false);
+const tlsCiphersRaw = ref("");
+const tlsCurvesRaw = ref("");
+const tlsKeySharesRaw = ref("");
+const tlsExtensionsRaw = ref("");
 
 async function loadOverview() {
   loading.value = true;
@@ -100,8 +107,19 @@ async function loadOverview() {
 
 async function readError(res: Response, fallback: string): Promise<string> {
   try {
-    const data = (await res.json()) as { message?: string; error?: string };
-    return data.message ?? data.error ?? fallback;
+    const data = (await res.json()) as {
+      message?: string;
+      error?: string;
+      reason?: string;
+      field?: string;
+      group?: number;
+    };
+    const base = data.message ?? data.error ?? fallback;
+    if (data.reason) {
+      const fieldInfo = data.field ? ` (${data.field})` : "";
+      return `[${data.reason}]${fieldInfo}: ${base}`;
+    }
+    return base;
   } catch {
     return fallback;
   }
@@ -299,7 +317,57 @@ async function runOutboundTest(accountId: string, utlsProfileId?: string) {
   }
 }
 
-async function createTlsProfile() {
+function parseUint16Csv(raw: string): number[] {
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((token) => (token.startsWith("0x") || token.startsWith("0X") ? parseInt(token, 16) : parseInt(token, 10)))
+    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 65535);
+}
+
+function fillClaudeBunWirePreset() {
+  tlsPreset.value = "custom_wire";
+  tlsOsHint.value = "linux";
+  tlsEnableGrease.value = false;
+  tlsAlpnRaw.value = "h2,http/1.1";
+  tlsUA.value = "claude-cli/2.1.280 (external, cli)";
+  tlsCurvesRaw.value = "4588,29,23,24";
+  tlsKeySharesRaw.value = "4588,29";
+  tlsExtensionsRaw.value = "0,23,65281,10,11,35,16,5,13,18,51,45,43";
+}
+
+function resetTlsForm() {
+  editingProfileId.value = null;
+  tlsName.value = "";
+  tlsPreset.value = "claude_bun_21";
+  tlsAlpnRaw.value = "h2,http/1.1";
+  tlsUA.value = "";
+  tlsJA3.value = "";
+  tlsOsHint.value = "";
+  tlsEnableGrease.value = false;
+  tlsCiphersRaw.value = "";
+  tlsCurvesRaw.value = "";
+  tlsKeySharesRaw.value = "";
+  tlsExtensionsRaw.value = "";
+}
+
+function startEditTlsProfile(p: TlsProfile) {
+  editingProfileId.value = p.id;
+  tlsName.value = p.name;
+  tlsPreset.value = p.clientHelloPreset as ClientHelloPreset;
+  tlsAlpnRaw.value = (p.alpnProtocols ?? ["h2", "http/1.1"]).join(",");
+  tlsUA.value = p.userAgentTemplate ?? "";
+  tlsJA3.value = p.ja3Fingerprint ?? "";
+  tlsOsHint.value = p.osHint ?? "";
+  tlsEnableGrease.value = Boolean(p.enableGrease);
+  tlsCiphersRaw.value = (p.cipherSuites ?? []).join(",");
+  tlsCurvesRaw.value = (p.curves ?? []).join(",");
+  tlsKeySharesRaw.value = (p.keyShareGroups ?? []).join(",");
+  tlsExtensionsRaw.value = (p.extensions ?? []).join(",");
+}
+
+async function saveTlsProfile() {
   busyAction.value = true;
   errorMessage.value = null;
   try {
@@ -307,24 +375,34 @@ async function createTlsProfile() {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-    const res = await auth.apiFetch("/api/v1/admin/tls-profiles", {
-      method: "POST",
+    const body = {
+      name: tlsName.value,
+      clientHelloPreset: tlsPreset.value,
+      alpnProtocols: alpns.length > 0 ? alpns : ["h2", "http/1.1"],
+      userAgentTemplate: tlsUA.value,
+      ja3Fingerprint: tlsJA3.value,
+      osHint: tlsOsHint.value.trim(),
+      enableGrease: tlsEnableGrease.value,
+      cipherSuites: parseUint16Csv(tlsCiphersRaw.value),
+      curves: parseUint16Csv(tlsCurvesRaw.value),
+      keyShareGroups: parseUint16Csv(tlsKeySharesRaw.value),
+      extensions: parseUint16Csv(tlsExtensionsRaw.value),
+    };
+    const isEdit = Boolean(editingProfileId.value);
+    const url = isEdit
+      ? `/api/v1/admin/tls-profiles/${encodeURIComponent(editingProfileId.value!)}`
+      : "/api/v1/admin/tls-profiles";
+    const res = await auth.apiFetch(url, {
+      method: isEdit ? "PUT" : "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: tlsName.value,
-        clientHelloPreset: tlsPreset.value,
-        alpnProtocols: alpns.length > 0 ? alpns : ["h2", "http/1.1"],
-        userAgentTemplate: tlsUA.value,
-        ja3Fingerprint: tlsJA3.value,
-      }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
-      errorMessage.value = await readError(res, "创建 uTLS 模板失败");
+      errorMessage.value = await readError(res, isEdit ? "更新 uTLS 模板失败" : "创建 uTLS 模板失败");
       return;
     }
-    tlsName.value = "";
-    tlsUA.value = "";
-    tlsJA3.value = "";
+    resetTlsForm();
+    actionNotice.value = isEdit ? "uTLS 模板已更新" : "uTLS 模板已创建";
     await loadOverview();
   } finally {
     busyAction.value = false;
@@ -698,33 +776,98 @@ onMounted(() => {
 
       <!-- uTLS Profiles -->
       <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
-        <h3 class="text-sm font-semibold text-white">uTLS ClientHello 指纹模板</h3>
-        <form class="mt-4 space-y-3" @submit.prevent="createTlsProfile">
+        <div class="flex items-center justify-between gap-2">
+          <h3 class="text-sm font-semibold text-white">
+            uTLS ClientHello 线级指纹模板
+          </h3>
+          <button
+            type="button"
+            class="rounded border border-slate-700 px-2 py-1 text-[11px] text-sky-300 hover:border-sky-500"
+            @click="fillClaudeBunWirePreset"
+          >
+            填充 Claude Bun PQ 参数
+          </button>
+        </div>
+        <form class="mt-4 space-y-3" @submit.prevent="saveTlsProfile">
           <div class="grid gap-3 sm:grid-cols-2">
             <input
               v-model="tlsName"
               type="text"
               required
-              placeholder="模板名称（如 Edge-Win11）"
+              placeholder="模板名称（如 Claude-PQ-Linux）"
               class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
             />
             <select
               v-model="tlsPreset"
               class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
             >
+              <option value="auto">auto (Rendezvous Sticky)</option>
+              <option value="custom_wire">custom_wire</option>
+              <option value="claude_bun_21">claude_bun_21 (PQ X25519MLKEM768)</option>
               <option value="chrome_auto">chrome_auto</option>
               <option value="firefox_auto">firefox_auto</option>
               <option value="safari_auto">safari_auto</option>
               <option value="ios_auto">ios_auto</option>
               <option value="edge_auto">edge_auto</option>
+              <option value="randomized">randomized</option>
               <option value="claude_cli">claude_cli</option>
             </select>
           </div>
-          <div class="grid gap-3 sm:grid-cols-2">
+          <div class="grid gap-3 sm:grid-cols-3">
             <input
               v-model="tlsAlpnRaw"
               type="text"
               placeholder="ALPN（如 h2,http/1.1）"
+              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
+            />
+            <select
+              v-model="tlsOsHint"
+              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
+            >
+              <option value="">OS Hint: 任意</option>
+              <option value="linux">linux</option>
+              <option value="darwin">darwin (macOS)</option>
+              <option value="windows">windows</option>
+              <option value="ios">ios</option>
+            </select>
+            <label class="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200">
+              <input v-model="tlsEnableGrease" type="checkbox" />
+              启用 GREASE
+            </label>
+          </div>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <input
+              v-model="tlsCurvesRaw"
+              type="text"
+              placeholder="Curves 十进制/0x十六进制（如 4588,29,23,24）"
+              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
+            />
+            <input
+              v-model="tlsKeySharesRaw"
+              type="text"
+              placeholder="KeyShare 必须属于 Curves（如 4588,29）"
+              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
+            />
+          </div>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <input
+              v-model="tlsExtensionsRaw"
+              type="text"
+              placeholder="Extensions IDs（含 10 与 51, 可含 0xfe0d）"
+              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
+            />
+            <input
+              v-model="tlsCiphersRaw"
+              type="text"
+              placeholder="CipherSuites（留空继承 BoringSSL 默认）"
+              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
+            />
+          </div>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <input
+              v-model="tlsUA"
+              type="text"
+              placeholder="User-Agent 模板（可选）"
               class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
             />
             <input
@@ -734,19 +877,23 @@ onMounted(() => {
               class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
             />
           </div>
-          <input
-            v-model="tlsUA"
-            type="text"
-            placeholder="User-Agent 模板（可选）"
-            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-          />
-          <button
-            type="submit"
-            :disabled="busyAction"
-            class="w-full rounded-lg border border-sky-500/40 bg-sky-500/15 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/25"
-          >
-            新增自定义指纹模板
-          </button>
+          <div class="flex gap-2">
+            <button
+              type="submit"
+              :disabled="busyAction"
+              class="flex-1 rounded-lg border border-sky-500/40 bg-sky-500/15 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/25"
+            >
+              {{ editingProfileId ? `保存更新 (${editingProfileId})` : "新增自定义指纹模板" }}
+            </button>
+            <button
+              v-if="editingProfileId"
+              type="button"
+              class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300"
+              @click="resetTlsForm"
+            >
+              取消
+            </button>
+          </div>
         </form>
 
         <div class="mt-4 space-y-2">
@@ -759,9 +906,15 @@ onMounted(() => {
               <p class="font-medium text-white">
                 {{ p.name }}
                 <span class="ml-1 font-mono text-slate-400">({{ p.id }})</span>
+                <span v-if="p.enableGrease" class="ml-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">
+                  GREASE
+                </span>
               </p>
               <p class="mt-0.5 font-mono text-slate-400">
                 Preset: {{ p.clientHelloPreset }} · ALPN: {{ p.alpnProtocols.join(", ") }}
+                <span v-if="p.keyShareGroups && p.keyShareGroups.length > 0">
+                  · KS: [{{ p.keyShareGroups.join(",") }}]
+                </span>
               </p>
             </div>
             <span
@@ -770,14 +923,22 @@ onMounted(() => {
             >
               内置
             </span>
-            <button
-              v-else
-              type="button"
-              class="rounded border border-rose-500/40 px-2 py-1 text-rose-300"
-              @click="deleteTlsProfile(p.id)"
-            >
-              删除
-            </button>
+            <div v-else class="flex gap-2">
+              <button
+                type="button"
+                class="rounded border border-sky-500/40 px-2 py-1 text-sky-300"
+                @click="startEditTlsProfile(p)"
+              >
+                编辑
+              </button>
+              <button
+                type="button"
+                class="rounded border border-rose-500/40 px-2 py-1 text-rose-300"
+                @click="deleteTlsProfile(p.id)"
+              >
+                删除
+              </button>
+            </div>
           </div>
         </div>
       </div>
