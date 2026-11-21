@@ -29,6 +29,7 @@ type Server struct {
 	version    string
 	commit     string
 	pool       *clashpool.Manager
+	clashCoord *clashpool.Coordinator
 	vmSlots    *vmslot.Manager
 	sup        *supervisor.Supervisor
 	updater    *hotupdate.Manager
@@ -37,6 +38,11 @@ type Server struct {
 	uiDynamic  *webui.DynamicHandler
 	uiHandler  http.Handler
 	streamSeq  atomic.Uint32
+}
+
+// WithClashCoordinator attaches the Clash mihomo pool + uTLS coordinator for /internal/net/clash/* endpoints.
+func (s *Server) WithClashCoordinator(coord *clashpool.Coordinator) {
+	s.clashCoord = coord
 }
 
 // WithCommit sets the build commit hash reported in health/readiness endpoints.
@@ -111,9 +117,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
-	// Token-authenticated internal supervisor bridge for slipgate-bff admin actions.
+	// Token-authenticated internal supervisor & net-plane bridges for slipgate-bff admin actions.
 	mux.HandleFunc("GET /internal/supervisor/update", s.handleInternalUpdateStatus)
 	mux.HandleFunc("POST /internal/supervisor/update/sync", s.handleInternalUpdateSync)
+	s.registerClashInternalRoutes(mux)
 
 	// DataPlane AI hot paths strictly bypass the TypeScript BFF.
 	mux.HandleFunc("/v1/", s.handleDataPlane)
@@ -168,20 +175,26 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		vmSlotCount = len(s.vmSlots.Snapshot())
 	}
 
+	var clashRuntime any
+	if s.clashCoord != nil {
+		clashRuntime = s.clashCoord.RuntimeStatusSnapshot()
+	}
+
 	writeJSON(w, status, map[string]any{
-		"ready":    ready,
-		"degraded": !ready,
-		"version":  s.version,
-		"commit":   s.commit,
-		"mode":     s.cfg.Mode,
+		"ready":         ready,
+		"degraded":      !ready,
+		"version":       s.version,
+		"commit":        s.commit,
+		"mode":          s.cfg.Mode,
 		"planes": map[string]string{
 			"net":  "up",
 			"core": upDown(coreUp),
 			"bff":  upDown(bffUp),
 		},
-		"clash_nodes": clashNodes,
-		"vm_slots":    vmSlotCount,
-		"children":    children,
+		"clash_runtime": clashRuntime,
+		"clash_nodes":   clashNodes,
+		"vm_slots":      vmSlotCount,
+		"children":      children,
 	})
 }
 

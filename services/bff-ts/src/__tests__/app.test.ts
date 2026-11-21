@@ -81,6 +81,26 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
     });
     expect(updateSyncRes.status).toBe(200);
 
+    const clashOverviewRes = await app.request("/api/v1/admin/clash/overview", { headers: adminHeaders });
+    expect(clashOverviewRes.status).toBe(200);
+    const clashOverview = (await clashOverviewRes.json()) as {
+      profiles: Array<{ id: string }>;
+      policy: { failClosed: boolean };
+    };
+    expect(clashOverview.policy.failClosed).toBe(true);
+    expect(clashOverview.profiles.some((p) => p.id === "chrome-131")).toBe(true);
+
+    const tlsCreateRes = await app.request("/api/v1/admin/tls-profiles", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: "Custom Safari Pool",
+        clientHelloPreset: "safari_auto",
+        alpnProtocols: ["h2", "http/1.1"],
+      }),
+    });
+    expect(tlsCreateRes.status).toBe(201);
+
     // 3. Create group + upstream account (secret encrypted & masked)
     const grpRes = await app.request("/api/v1/admin/groups", {
       method: "POST",

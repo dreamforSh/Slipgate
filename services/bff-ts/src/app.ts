@@ -4,11 +4,16 @@ import {
   AuthLoginRequestSchema,
   AuthRegisterRequestSchema,
   AuthSessionResponseSchema,
+  BindAccountExitRequestSchema,
   ClashExitNodeSchema,
+  ClashOutboundTestRequestSchema,
+  ClashProbeRequestSchema,
   CreateAccountRequestSchema,
   CreateApiKeyRequestSchema,
+  CreateClashSubscriptionRequestSchema,
   CreateGroupRequestSchema,
   CreatedApiKeyResponseSchema,
+  CreateTlsProfileRequestSchema,
   formatNanoUsd,
   parseUsdToNano,
   PlaneHealthSchema,
@@ -28,6 +33,7 @@ import {
   type Provider,
   type RiskBanEvent,
   type SlotSeedSnapshot,
+  type TlsProfile,
   type VmSlotSummary,
 } from "@slipgate/contracts";
 import { PluginRegistry } from "@slipgate/plugin-sdk";
@@ -205,6 +211,91 @@ function buildStandaloneSystemUpdateStatus() {
     lastUpdatedAtIso: null,
     lastError: null,
   });
+}
+
+const STANDALONE_TLS_PROFILES: TlsProfile[] = [
+  {
+    id: "chrome-131",
+    name: "Chrome 131 (Windows Desktop)",
+    clientHelloPreset: "chrome_auto",
+    ja3Fingerprint: "",
+    ja4Fingerprint: "",
+    alpnProtocols: ["h2", "http/1.1"],
+    userAgentTemplate:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    builtIn: true,
+  },
+  {
+    id: "firefox-133",
+    name: "Firefox 133 (Desktop)",
+    clientHelloPreset: "firefox_auto",
+    ja3Fingerprint: "",
+    ja4Fingerprint: "",
+    alpnProtocols: ["h2", "http/1.1"],
+    userAgentTemplate:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    builtIn: true,
+  },
+  {
+    id: "claude-cli-mac",
+    name: "Official CLI Runtime (Bun/macOS)",
+    clientHelloPreset: "chrome_auto",
+    ja3Fingerprint: "",
+    ja4Fingerprint: "",
+    alpnProtocols: ["http/1.1"],
+    userAgentTemplate: "claude-cli/2.1.280 (external, cli)",
+    builtIn: true,
+  },
+];
+
+type ForwardStatus = 200 | 201 | 400 | 403 | 404 | 409 | 502 | 503;
+
+function toForwardStatus(code: number): ForwardStatus {
+  if (
+    code === 200 ||
+    code === 201 ||
+    code === 400 ||
+    code === 403 ||
+    code === 404 ||
+    code === 409 ||
+    code === 503
+  ) {
+    return code;
+  }
+  return 502;
+}
+
+async function forwardNetInternal(
+  path: string,
+  options: { method?: string; body?: unknown; timeoutMs?: number } = {},
+): Promise<{ configured: false } | { configured: true; status: ForwardStatus; payload: Record<string, unknown> }> {
+  const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+  const internalToken = process.env.SLIPGATE_INTERNAL_TOKEN;
+  if (!internalUrl || !internalToken) {
+    return { configured: false };
+  }
+
+  const headers: Record<string, string> = {
+    "X-Slipgate-Internal-Token": internalToken,
+  };
+  let bodyStr: string | undefined;
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    bodyStr = JSON.stringify(options.body);
+  }
+
+  const res = await fetch(`${internalUrl}${path}`, {
+    method: options.method ?? "GET",
+    headers,
+    body: bodyStr,
+    signal: AbortSignal.timeout(options.timeoutMs ?? 30_000),
+  });
+  const payload = (await res.json()) as Record<string, unknown>;
+  return {
+    configured: true,
+    status: toForwardStatus(res.status),
+    payload,
+  };
 }
 
 export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
@@ -652,15 +743,396 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return c.json({ wallet });
   });
 
-  app.get("/api/v1/admin/clash/nodes", (c) => {
-    return c.json({
-      nodes: SAMPLE_CLASH_NODES,
-      policy: {
-        maxAccountsPerExitIp: 1,
-        failClosed: true,
-        dropGuardThreshold: 0.5,
-      },
-    });
+  app.get("/api/v1/admin/clash/nodes", async (c) => {
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/clash/nodes");
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({
+        nodes: SAMPLE_CLASH_NODES,
+        policy: {
+          maxAccountsPerExitIp: 1,
+          failClosed: true,
+          dropGuardThreshold: 0.5,
+        },
+      });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.get("/api/v1/admin/clash/overview", async (c) => {
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/clash/overview");
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({
+        runtime: {
+          mode: "standalone",
+          ready: false,
+          version: "standalone",
+          configHash: "",
+          activeListeners: 0,
+          activeProxies: 0,
+          lastReconciledAtIso: null,
+        },
+        subscriptions: [],
+        nodes: SAMPLE_CLASH_NODES,
+        bindings: [],
+        profiles: STANDALONE_TLS_PROFILES,
+        policy: {
+          maxAccountsPerExitIp: 1,
+          failClosed: true,
+          dropGuardThreshold: 0.5,
+        },
+      });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/clash/subscriptions", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = CreateClashSubscriptionRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/clash/subscriptions", {
+        method: "POST",
+        body: parsed.data,
+        timeoutMs: 30_000,
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json(
+        {
+          subscription: {
+            id: parsed.data.id ?? `sub-${crypto.randomUUID().slice(0, 8)}`,
+            name: parsed.data.name,
+            sourceKind: parsed.data.sourceKind,
+            sourceUrl: parsed.data.sourceUrl,
+            userAgent: parsed.data.userAgent,
+            excludeRegex: parsed.data.excludeRegex,
+            enabled: true,
+            lastSyncAt: null,
+            lastSyncStatus: "standalone",
+            lastNodeCount: 0,
+            createdAt: new Date().toISOString(),
+          },
+          sync: null,
+        },
+        201,
+      );
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/clash/subscriptions/:id/sync", async (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    let body: { force?: boolean } = {};
+    const text = await c.req.text();
+    if (text.trim().length > 0) {
+      try {
+        body = JSON.parse(text) as { force?: boolean };
+      } catch {
+        return c.json({ error: "invalid_request", message: "Malformed JSON request body" }, 400);
+      }
+    }
+    try {
+      const forwarded = await forwardNetInternal(`/internal/net/clash/subscriptions/${id}/sync`, {
+        method: "POST",
+        body: { force: Boolean(body.force) },
+        timeoutMs: 45_000,
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ error: "net_supervisor_unconfigured", message: "Standalone BFF mode" }, 503);
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.delete("/api/v1/admin/clash/subscriptions/:id", async (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    try {
+      const forwarded = await forwardNetInternal(`/internal/net/clash/subscriptions/${id}`, {
+        method: "DELETE",
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ deleted: true, subscriptionId: c.req.param("id") });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/clash/nodes/probe", async (c) => {
+    let rawBody: unknown = {};
+    const text = await c.req.text();
+    if (text.trim().length > 0) {
+      try {
+        rawBody = JSON.parse(text);
+      } catch {
+        return c.json({ error: "invalid_request", message: "Malformed JSON request body" }, 400);
+      }
+    }
+    const parsed = ClashProbeRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/clash/nodes/probe", {
+        method: "POST",
+        body: parsed.data,
+        timeoutMs: 60_000,
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ results: [] });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/clash/nodes/:id/confirm-drift", async (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    try {
+      const forwarded = await forwardNetInternal(`/internal/net/clash/nodes/${id}/confirm-drift`, {
+        method: "POST",
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ nodeId: c.req.param("id"), driftUnconfirmed: false });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.patch("/api/v1/admin/clash/nodes/:id", async (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    const raw = await readJsonBody(c.req.raw);
+    const bodySchema = z.object({ enabled: z.boolean() });
+    const parsed = bodySchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    try {
+      const forwarded = await forwardNetInternal(`/internal/net/clash/nodes/${id}`, {
+        method: "PATCH",
+        body: parsed.data,
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ nodeId: c.req.param("id"), enabled: parsed.data.enabled });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/clash/bindings", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = BindAccountExitRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/clash/bindings", {
+        method: "POST",
+        body: parsed.data,
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ binding: parsed.data });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.delete("/api/v1/admin/clash/bindings/:accountId", async (c) => {
+    const accountId = encodeURIComponent(c.req.param("accountId"));
+    try {
+      const forwarded = await forwardNetInternal(`/internal/net/clash/bindings/${accountId}`, {
+        method: "DELETE",
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ deleted: true, accountId: c.req.param("accountId") });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/clash/test-outbound", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = ClashOutboundTestRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/clash/test-outbound", {
+        method: "POST",
+        body: parsed.data,
+        timeoutMs: 30_000,
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ error: "net_supervisor_unconfigured", message: "Standalone BFF mode" }, 503);
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.get("/api/v1/admin/tls-profiles", async (c) => {
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/tls-profiles");
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ profiles: STANDALONE_TLS_PROFILES });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/tls-profiles", async (c) => {
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = CreateTlsProfileRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/tls-profiles", {
+        method: "POST",
+        body: parsed.data,
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json(
+        {
+          profile: {
+            id: parsed.data.id ?? `tls-${crypto.randomUUID().slice(0, 8)}`,
+            ...parsed.data,
+            builtIn: false,
+          },
+        },
+        201,
+      );
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
+  });
+
+  app.delete("/api/v1/admin/tls-profiles/:id", async (c) => {
+    const id = encodeURIComponent(c.req.param("id"));
+    try {
+      const forwarded = await forwardNetInternal(`/internal/net/tls-profiles/${id}`, {
+        method: "DELETE",
+      });
+      if (forwarded.configured) {
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ deleted: true, id: c.req.param("id") });
+    } catch (err) {
+      return c.json(
+        {
+          error: "net_supervisor_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+        502,
+      );
+    }
   });
 
   app.get("/api/v1/admin/vms/slots", (c) => {

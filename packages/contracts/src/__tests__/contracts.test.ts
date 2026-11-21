@@ -1,8 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
+  BindAccountExitRequestSchema,
   ClashExitNodeSchema,
   CreateAccountRequestSchema,
   CreateApiKeyRequestSchema,
+  CreateClashSubscriptionRequestSchema,
+  CreateTlsProfileRequestSchema,
   formatNanoUsd,
   HardwarePersonaSchema,
   NANO_PER_USD,
@@ -117,5 +120,23 @@ describe("IAM, Pool and API Key contracts", () => {
     });
     expect(status.mode).toBe("dev");
     expect(status.autoSyncEnabled).toBe(true);
+
+    const subReq = CreateClashSubscriptionRequestSchema.parse({
+      name: "Tokyo Inline",
+      sourceKind: "inline",
+      sourceUrl: "proxies:\n  - name: n1\n    type: socks5\n    server: 198.51.100.1\n    port: 1080",
+    });
+    expect(subReq.autoSync).toBe(true);
+
+    const tlsReq = CreateTlsProfileRequestSchema.parse({
+      name: "Custom Chrome",
+    });
+    expect(tlsReq.clientHelloPreset).toBe("chrome_auto");
+
+    const bindReq = BindAccountExitRequestSchema.parse({
+      accountId: "acc-1",
+      nodeId: "node-1",
+    });
+    expect(bindReq.isShadowFollower).toBe(false);
   });
 });

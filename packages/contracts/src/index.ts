@@ -5,6 +5,7 @@ export * from "./iam.ts";
 export * from "./pool.ts";
 export * from "./apikeys.ts";
 export * from "./system.ts";
+export * from "./clash.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 
@@ -42,6 +43,12 @@ export const ClashExitNodeSchema = z.object({
   driftUnconfirmed: z.boolean(),
   boundAccounts: z.number().int().nonnegative(),
   maxAccounts: z.number().int().positive(),
+  proxyType: z.string().optional(),
+  server: z.string().optional(),
+  serverPort: z.number().int().optional(),
+  enabled: z.boolean().optional(),
+  lastProbedAtIso: z.string().optional(),
+  lastError: z.string().optional(),
 });
 export type ClashExitNode = z.infer<typeof ClashExitNodeSchema>;
 

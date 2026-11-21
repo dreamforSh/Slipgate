@@ -2,11 +2,13 @@
 import { onMounted, ref } from "vue";
 import type {
   ClashExitNode,
+  ClashRuntimeStatus,
   RiskBanEvent,
   RoutePreviewResponse,
   SystemUpdateStatus,
   VmSlotSummary,
 } from "@slipgate/contracts";
+import { RouterLink } from "vue-router";
 import { useAuthStore } from "../../stores/auth";
 
 const auth = useAuthStore();
@@ -27,6 +29,7 @@ interface ReadinessState {
 
 const layers = ref<ArchitectureLayer[]>([]);
 const clashNodes = ref<ClashExitNode[]>([]);
+const clashRuntime = ref<ClashRuntimeStatus | null>(null);
 const vmSlots = ref<VmSlotSummary[]>([]);
 const riskEvents = ref<RiskBanEvent[]>([]);
 const readiness = ref<ReadinessState | null>(null);
@@ -52,8 +55,12 @@ async function loadOverview() {
       layers.value = archData.layers;
     }
     if (clashRes.ok) {
-      const clashData = (await clashRes.json()) as { nodes: ClashExitNode[] };
+      const clashData = (await clashRes.json()) as {
+        nodes: ClashExitNode[];
+        runtime?: ClashRuntimeStatus;
+      };
       clashNodes.value = clashData.nodes;
+      clashRuntime.value = clashData.runtime ?? null;
     }
     if (vmRes.ok) {
       const vmData = (await vmRes.json()) as { slots: VmSlotSummary[] };
@@ -240,7 +247,21 @@ onMounted(() => {
 
     <section class="grid gap-6 md:grid-cols-2">
       <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
-        <h2 class="text-base font-semibold text-white">Clash 独立出口池（1 号 1 IP）</h2>
+        <div class="flex items-center justify-between">
+          <div>
+            <h2 class="text-base font-semibold text-white">Clash 独立出口池（1 号 1 IP）</h2>
+            <p class="mt-0.5 font-mono text-xs text-slate-400">
+              内核: {{ clashRuntime?.mode ?? "embedded" }} ({{ clashRuntime?.version || "mihomo" }}) ·
+              活跃监听: {{ clashRuntime?.activeListeners ?? clashNodes.length }}
+            </p>
+          </div>
+          <RouterLink
+            to="/admin/clash"
+            class="rounded-lg border border-slate-700 px-2.5 py-1 text-xs text-sky-300 hover:border-sky-500"
+          >
+            管理出口与 uTLS
+          </RouterLink>
+        </div>
         <div class="mt-4 space-y-3">
           <div
             v-for="node in clashNodes"

@@ -17,12 +17,19 @@ type Config struct {
 	CoreIPC            string
 	BFFAddr            string
 	Supervise          bool
-	AllowDegraded      bool
-	CoreBin            string
-	BFFBin             string
-	ClashPortMin       int
-	ClashPortMax       int
-	MaxAccountsPerExit int
+	AllowDegraded         bool
+	CoreBin               string
+	BFFBin                string
+	DatabaseURL           string
+	VaultSecret           string
+	ClashMode             string
+	ClashDataDir          string
+	ClashProbeURL         string
+	ClashIPEchoURL        string
+	ClashProbeIntervalSec int
+	ClashPortMin          int
+	ClashPortMax          int
+	MaxAccountsPerExit    int
 	DevUIURL           string
 	Mode               string
 	DevSyncMode        string
@@ -66,18 +73,34 @@ func LoadFromEnv() Config {
 	}
 
 	defaultHotDir := filepath.Join(os.TempDir(), "slipgate-hotupdate")
+	defaultClashDir := filepath.Join(os.TempDir(), "slipgate-clash")
+	clashMode := strings.ToLower(envString("SLIPGATE_CLASH_MODE", "embedded"))
+	if clashMode != "disabled" {
+		clashMode = "embedded"
+	}
+	probeInterval := envInt("SLIPGATE_CLASH_PROBE_INTERVAL_SEC", 300)
+	if probeInterval < 0 {
+		probeInterval = 0
+	}
 
 	return Config{
-		ListenAddr:         envString("SLIPGATE_LISTEN_ADDR", ":8080"),
-		CoreIPC:            envString("SLIPGATE_CORE_IPC", "127.0.0.1:19081"),
-		BFFAddr:            envString("SLIPGATE_BFF_ADDR", "127.0.0.1:19082"),
-		Supervise:          envBool("SLIPGATE_SUPERVISE", true),
-		AllowDegraded:      envBool("SLIPGATE_ALLOW_DEGRADED", false),
-		CoreBin:            envString("SLIPGATE_CORE_BIN", ResolveSiblingBinary("slipgate-core")),
-		BFFBin:             envString("SLIPGATE_BFF_BIN", ResolveSiblingBinary("slipgate-bff")),
-		ClashPortMin:       envInt("SLIPGATE_CLASH_PORT_MIN", 20000),
-		ClashPortMax:       envInt("SLIPGATE_CLASH_PORT_MAX", 24999),
-		MaxAccountsPerExit: envInt("SLIPGATE_MAX_ACCOUNTS_PER_EXIT_IP", 1),
+		ListenAddr:            envString("SLIPGATE_LISTEN_ADDR", ":8080"),
+		CoreIPC:               envString("SLIPGATE_CORE_IPC", "127.0.0.1:19081"),
+		BFFAddr:               envString("SLIPGATE_BFF_ADDR", "127.0.0.1:19082"),
+		Supervise:             envBool("SLIPGATE_SUPERVISE", true),
+		AllowDegraded:         envBool("SLIPGATE_ALLOW_DEGRADED", false),
+		CoreBin:               envString("SLIPGATE_CORE_BIN", ResolveSiblingBinary("slipgate-core")),
+		BFFBin:                envString("SLIPGATE_BFF_BIN", ResolveSiblingBinary("slipgate-bff")),
+		DatabaseURL:           strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		VaultSecret:           envString("SLIPGATE_VAULT_SECRET", "slipgate-dev-vault-secret-change-in-prod"),
+		ClashMode:             clashMode,
+		ClashDataDir:          envString("SLIPGATE_CLASH_DATA_DIR", defaultClashDir),
+		ClashProbeURL:         envString("SLIPGATE_CLASH_PROBE_URL", "https://www.gstatic.com/generate_204"),
+		ClashIPEchoURL:        envString("SLIPGATE_CLASH_IP_ECHO_URL", "https://api.ipify.org?format=json"),
+		ClashProbeIntervalSec: probeInterval,
+		ClashPortMin:          envInt("SLIPGATE_CLASH_PORT_MIN", 20000),
+		ClashPortMax:          envInt("SLIPGATE_CLASH_PORT_MAX", 24999),
+		MaxAccountsPerExit:    envInt("SLIPGATE_MAX_ACCOUNTS_PER_EXIT_IP", 1),
 		DevUIURL:           strings.TrimSpace(os.Getenv("SLIPGATE_DEV_UI_URL")),
 		Mode:               mode,
 		DevSyncMode:        syncMode,

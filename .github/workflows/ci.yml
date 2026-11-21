@@ -142,6 +142,12 @@ jobs:
 
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/vms/slots | grep -q 'kvm_qemu'
           curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/system/update | grep -q 'dreamforSh/Slipgate'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/clash/overview | grep -q '"ready":true'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/clash/overview | grep -q '"mode":"embedded"'
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/admin/tls-profiles | grep -q 'chrome-131'
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"CI Inline Sub","sourceKind":"inline","sourceUrl":"proxies:\n  - name: Tokyo-CI\n    type: socks5\n    server: 198.51.100.10\n    port: 1080","autoSync":true}' \
+            http://127.0.0.1:18080/api/v1/admin/clash/subscriptions | grep -q '"activeListeners":1'
           curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
             -d '{"name":"ci-smoke-key","groupId":"grp_default"}' \
             http://127.0.0.1:18080/api/v1/user/api-keys | grep -q 'sk-sg-'

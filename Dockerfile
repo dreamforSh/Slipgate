@@ -80,6 +80,8 @@ ARG SLIPGATE_VERSION=0.1.0
 ARG SLIPGATE_COMMIT=unknown
 
 WORKDIR /app/services/net-go
+COPY services/net-go/go.mod services/net-go/go.sum ./
+RUN go mod download
 COPY services/net-go ./
 COPY --from=web-builder /app/apps/web-vue/dist ./internal/webui/dist
 
@@ -95,7 +97,7 @@ FROM ${ALPINE_IMAGE} AS runtime
 
 RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc && \
     addgroup -S slipgate && adduser -S slipgate -G slipgate && \
-    mkdir -p /etc/slipgate /var/run/slipgate /usr/local/share/slipgate/guest && \
+    mkdir -p /etc/slipgate /var/run/slipgate /var/run/slipgate/clash /var/run/slipgate/hotupdate /usr/local/share/slipgate/guest && \
     chown -R slipgate:slipgate /etc/slipgate /var/run/slipgate
 
 COPY --from=go-builder /out/slipgate /usr/local/bin/slipgate
@@ -112,6 +114,8 @@ ENV SLIPGATE_LISTEN_ADDR=":8080" \
     SLIPGATE_BFF_BIN="/usr/local/bin/slipgate-bff" \
     SLIPGATE_CORE_IPC="127.0.0.1:19081" \
     SLIPGATE_BFF_ADDR="127.0.0.1:19082" \
+    SLIPGATE_CLASH_MODE="embedded" \
+    SLIPGATE_CLASH_DATA_DIR="/var/run/slipgate/clash" \
     SLIPGATE_HOTUPDATE_DIR="/var/run/slipgate/hotupdate"
 
 EXPOSE 8080

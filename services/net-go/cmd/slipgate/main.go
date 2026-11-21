@@ -12,10 +12,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dreamforSh/slipgate/services/net-go/internal/clashcore"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/ingress"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 )
@@ -53,6 +55,61 @@ func main() {
 	defer stopSignals()
 
 	pool := clashpool.NewManager(cfg.ClashPortMin, cfg.ClashPortMax, cfg.MaxAccountsPerExit)
+
+	var clashRT clashcore.Runtime = clashcore.DisabledRuntime{}
+	if cfg.ClashMode != "disabled" {
+		engine, openErr := clashcore.Open(clashcore.Options{
+			HomeDir: cfg.ClashDataDir,
+			Log: func(level, msg string) {
+				logger.Printf("[mihomo:%s] %s", level, msg)
+			},
+		})
+		if openErr != nil {
+			if !cfg.AllowDegraded {
+				logger.Fatalf("failed to start embedded mihomo core: %v", openErr)
+			}
+			logger.Printf("[clash] embedded mihomo degraded (continuing): %v", openErr)
+		} else {
+			clashRT = engine
+			defer func() {
+				if err := engine.Close(); err != nil {
+					logger.Printf("[clash] mihomo close warning: %v", err)
+				}
+			}()
+		}
+	}
+
+	var netStore clashpool.NetStore
+	if cfg.DatabaseURL != "" {
+		pgStore, pgErr := clashpool.NewPostgresNetStore(cfg.DatabaseURL, cfg.VaultSecret)
+		if pgErr != nil {
+			logger.Fatalf("failed to initialize net postgres store: %v", pgErr)
+		}
+		netStore = pgStore
+	} else {
+		netStore = clashpool.NewMemoryNetStore()
+	}
+	defer func() { _ = netStore.Close() }()
+
+	stealthDialer := stealth.NewAccountDialer(pool)
+	clashCoord := clashpool.NewCoordinator(clashpool.CoordinatorOptions{
+		Manager:          pool,
+		Runtime:          clashRT,
+		Store:            netStore,
+		Stealth:          stealth.NewCoordinatorAdapter(stealthDialer),
+		Logger:           logger,
+		ProbeURL:         cfg.ClashProbeURL,
+		IPEchoURL:        cfg.ClashIPEchoURL,
+		ProbeIntervalSec: cfg.ClashProbeIntervalSec,
+	})
+	if err := clashCoord.Bootstrap(rootCtx); err != nil {
+		if !cfg.AllowDegraded {
+			logger.Fatalf("failed to bootstrap Clash/uTLS pool: %v", err)
+		}
+		logger.Printf("[clash] bootstrap degraded (continuing): %v", err)
+	}
+	clashCoord.StartBackgroundTasks(rootCtx)
+
 	vmSlots := vmslot.NewManager(pool)
 	sup := supervisor.New(logger)
 	internalURL := config.LoopbackOrigin(cfg.ListenAddr)
@@ -98,6 +155,7 @@ func main() {
 		logger.Fatalf("failed to initialize edge ingress: %v", err)
 	}
 	edge.WithCommit(commit)
+	edge.WithClashCoordinator(clashCoord)
 	edge.WithVmSlotManager(vmSlots)
 
 	updater := hotupdate.NewManager(hotupdate.Options{

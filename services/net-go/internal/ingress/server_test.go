@@ -1,6 +1,7 @@
 package ingress
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
 )
 
 func TestHealthzAndDualPlaneIsolation(t *testing.T) {
@@ -189,5 +191,70 @@ func TestInternalSupervisorUpdateAuthAndStatus(t *testing.T) {
 	}
 	if snapshot.Mode != "dev" || snapshot.ActiveCommit != "c08e679" {
 		t.Fatalf("unexpected snapshot: %+v", snapshot)
+	}
+}
+
+func TestInternalClashAndTLSProfileRoutes(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		ListenAddr:    ":0",
+		CoreIPC:       "127.0.0.1:19999",
+		BFFAddr:       "127.0.0.1:19998",
+		InternalToken: "clash-secret-token",
+	}
+	pool := clashpool.NewManager(22000, 22999, 1)
+	dialer := stealth.NewAccountDialer(pool)
+	coord := clashpool.NewCoordinator(clashpool.CoordinatorOptions{
+		Manager: pool,
+		Store:   clashpool.NewMemoryNetStore(),
+		Stealth: stealth.NewCoordinatorAdapter(dialer),
+		Logger:  log.New(io.Discard, "", 0),
+	})
+	if err := coord.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap failed: %v", err)
+	}
+
+	srv, err := NewServer(cfg, "0.1.0-test", pool, nil)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	srv.WithClashCoordinator(coord)
+	handler := srv.Handler()
+
+	// Unauthenticated internal clash call -> 403
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/net/clash/overview", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without internal token, got %d", rec.Code)
+	}
+
+	// Authenticated overview + built-in TLS profiles
+	req := httptest.NewRequest(http.MethodGet, "/internal/net/clash/overview", nil)
+	req.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on clash overview, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var ov clashpool.PoolOverview
+	if err := json.Unmarshal(rec.Body.Bytes(), &ov); err != nil {
+		t.Fatalf("decode overview failed: %v", err)
+	}
+	if len(ov.Profiles) < 4 {
+		t.Fatalf("expected built-in uTLS profiles, got %+v", ov.Profiles)
+	}
+
+	// Inline subscription create + sync via internal HTTP route
+	subBody := `{"name":"InlineTest","sourceKind":"inline","sourceUrl":"proxies:\n  - name: Node1\n    type: socks5\n    server: 198.51.100.1\n    port: 1080","autoSync":true}`
+	reqCreate := httptest.NewRequest(http.MethodPost, "/internal/net/clash/subscriptions", strings.NewReader(subBody))
+	reqCreate.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqCreate)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on subscription create, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(coord.EnrichedNodes()) != 1 {
+		t.Fatalf("expected 1 synced clash node, got %d", len(coord.EnrichedNodes()))
 	}
 }

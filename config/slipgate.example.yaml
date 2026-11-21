@@ -20,11 +20,16 @@ dataplane:
 
 clash_pool:
   enabled: true
+  mode: "embedded"
+  data_dir: "/var/run/slipgate/clash"
   port_min: 20000
   port_max: 24999
   max_accounts_per_exit_ip: 1
   drop_guard_threshold: 0.50
   fail_closed: true
+  probe_url: "https://www.gstatic.com/generate_204"
+  ip_echo_url: "https://api.ipify.org?format=json"
+  probe_interval_sec: 300
 
 vm_pool:
   enabled: true

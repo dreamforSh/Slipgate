@@ -46,6 +46,14 @@ async function handleLogout() {
               号池与分组
             </RouterLink>
             <RouterLink
+              v-if="auth.isAdmin"
+              to="/admin/clash"
+              class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+              active-class="bg-sky-500/20 text-sky-300"
+            >
+              Clash 出口与 uTLS
+            </RouterLink>
+            <RouterLink
               to="/user"
               class="rounded-lg px-3 py-1.5 text-slate-300 transition hover:bg-slate-800 hover:text-white"
               active-class="bg-sky-500/20 text-sky-300"

@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from "vue-router";
 import AdminAccountsView from "../portals/admin/AdminAccountsView.vue";
+import AdminClashPoolView from "../portals/admin/AdminClashPoolView.vue";
 import AdminDashboardView from "../portals/admin/AdminDashboardView.vue";
 import UserConsoleView from "../portals/user/UserConsoleView.vue";
 import { useAuthStore } from "../stores/auth";
@@ -22,6 +23,12 @@ const router = createRouter({
       path: "/admin/accounts",
       name: "admin-accounts",
       component: AdminAccountsView,
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/clash",
+      name: "admin-clash",
+      component: AdminClashPoolView,
       meta: { requiresAuth: true, requiresAdmin: true },
     },
     {
