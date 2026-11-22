@@ -178,3 +178,174 @@ export const ClashOutboundTestResponseSchema = z.object({
   bodySnippet: z.string(),
 });
 export type ClashOutboundTestResponse = z.infer<typeof ClashOutboundTestResponseSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Static IP proxies (IP management)                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A static IP proxy (SOCKS5 / HTTP / HTTPS) joins the exit pool as a single-node inline
+ * subscription, so it gets a mihomo listener, exit-IP probing and account binding like any
+ * other exit, and stays behind the fail-closed Clash egress. These ids mark such sources.
+ */
+export const STATIC_IP_SUBSCRIPTION_PREFIX = "ip-";
+
+export function isStaticIpSubscription(subscriptionId: string): boolean {
+  return subscriptionId.startsWith(STATIC_IP_SUBSCRIPTION_PREFIX);
+}
+
+export const StaticIpProtocolSchema = z.enum(["socks5", "http", "https"]);
+export type StaticIpProtocol = z.infer<typeof StaticIpProtocolSchema>;
+
+export interface StaticIpProxy {
+  protocol: StaticIpProtocol;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+}
+
+export type StaticIpParseError = "empty" | "bad_protocol" | "bad_host" | "bad_port" | "bad_format";
+
+const PROTOCOL_ALIASES: Record<string, StaticIpProtocol> = {
+  socks5: "socks5",
+  socks5h: "socks5",
+  socks: "socks5",
+  http: "http",
+  https: "https",
+};
+
+const HOSTNAME = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/i;
+const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+function validHost(host: string): boolean {
+  if (host.includes(":")) return /^[0-9a-f:.]+$/i.test(host); // IPv6 (brackets already stripped)
+  // All-numeric dotted names must be real IPv4 addresses (999.1.1.1 is a typo, not a host).
+  if (/^[\d.]+$/.test(host)) return IPV4.test(host);
+  return HOSTNAME.test(host);
+}
+
+function parsePort(raw: string): number | null {
+  if (!/^\d{1,5}$/.test(raw)) return null;
+  const port = Number(raw);
+  return port >= 1 && port <= 65535 ? port : null;
+}
+
+/** `[v6]:port` or `host:port` → parts; `null` when there is no port. */
+function splitHostPort(raw: string): { host: string; port: string } | null {
+  const v6 = /^\[([^\]]+)\]:(\d+)$/.exec(raw);
+  if (v6) return { host: v6[1]!, port: v6[2]! };
+  const idx = raw.lastIndexOf(":");
+  if (idx <= 0) return null;
+  return { host: raw.slice(0, idx), port: raw.slice(idx + 1) };
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * One proxy per line, in the shapes proxy sellers hand out:
+ * `socks5://user:pass@host:port`, `http://host:port`, `user:pass@host:port`,
+ * `host:port:user:pass` and `host:port`. Bare lines use `defaultProtocol`.
+ */
+export function parseStaticIpLine(
+  line: string,
+  defaultProtocol: StaticIpProtocol = "socks5",
+): { ok: true; proxy: StaticIpProxy } | { ok: false; error: StaticIpParseError } {
+  let rest = line.trim();
+  if (!rest) return { ok: false, error: "empty" };
+
+  let protocol = defaultProtocol;
+  const scheme = /^([a-z0-9]+):\/\//i.exec(rest);
+  if (scheme) {
+    const key = scheme[1]!.toLowerCase();
+    const alias = Object.prototype.hasOwnProperty.call(PROTOCOL_ALIASES, key) ? PROTOCOL_ALIASES[key] : undefined;
+    if (!alias) return { ok: false, error: "bad_protocol" };
+    protocol = alias;
+    rest = rest.slice(scheme[0].length).replace(/\/+$/, "");
+  }
+
+  let username = "";
+  let password = "";
+  let hostPort = rest;
+  const at = rest.lastIndexOf("@");
+  if (at >= 0) {
+    const auth = rest.slice(0, at);
+    hostPort = rest.slice(at + 1);
+    const colon = auth.indexOf(":");
+    username = safeDecode(colon >= 0 ? auth.slice(0, colon) : auth);
+    password = safeDecode(colon >= 0 ? auth.slice(colon + 1) : "");
+  } else if (!scheme && !hostPort.startsWith("[")) {
+    // host:port:user:pass (passwords may contain colons).
+    const parts = rest.split(":");
+    if (parts.length >= 4) {
+      hostPort = `${parts[0]}:${parts[1]}`;
+      username = parts[2]!;
+      password = parts.slice(3).join(":");
+    } else if (parts.length === 3) {
+      return { ok: false, error: "bad_format" };
+    }
+  }
+
+  const split = splitHostPort(hostPort);
+  if (!split) return { ok: false, error: "bad_port" };
+  const host = split.host.trim();
+  if (!validHost(host)) return { ok: false, error: "bad_host" };
+  const port = parsePort(split.port.trim());
+  if (port === null) return { ok: false, error: "bad_port" };
+  return { ok: true, proxy: { protocol, host, port, username, password } };
+}
+
+/** Stable identity for duplicate checks: same endpoint and user is the same proxy. */
+export function staticIpKey(proxy: Pick<StaticIpProxy, "host" | "port" | "username">): string {
+  return `${proxy.host.toLowerCase()}:${proxy.port}:${proxy.username}`;
+}
+
+/** `host:port`, bracketing IPv6. */
+export function staticIpAddress(proxy: Pick<StaticIpProxy, "host" | "port">): string {
+  return proxy.host.includes(":") ? `[${proxy.host}]:${proxy.port}` : `${proxy.host}:${proxy.port}`;
+}
+
+/**
+ * The inline Clash YAML for one static proxy. Values are JSON strings, which YAML reads as
+ * double-quoted scalars, so credentials with `:`, `#` or quotes survive intact.
+ */
+export function staticIpClashYaml(proxy: StaticIpProxy, name: string): string {
+  const lines = [
+    "proxies:",
+    `  - name: ${JSON.stringify(name)}`,
+    `    type: ${proxy.protocol === "socks5" ? "socks5" : "http"}`,
+    `    server: ${JSON.stringify(proxy.host)}`,
+    `    port: ${proxy.port}`,
+  ];
+  if (proxy.username) lines.push(`    username: ${JSON.stringify(proxy.username)}`);
+  if (proxy.password) lines.push(`    password: ${JSON.stringify(proxy.password)}`);
+  if (proxy.protocol === "https") lines.push("    tls: true");
+  if (proxy.protocol === "socks5") lines.push("    udp: true");
+  return `${lines.join("\n")}\n`;
+}
+
+/** Reads back what `staticIpClashYaml` wrote (protocol, endpoint, user; never the password). */
+export function readStaticIpClashYaml(yaml: string): Omit<StaticIpProxy, "password"> & { hasPassword: boolean } | null {
+  const field = (key: string): string | null => {
+    const m = new RegExp(`^\\s*${key}: (.+)$`, "m").exec(yaml);
+    if (!m) return null;
+    const raw = m[1]!.trim();
+    try {
+      return raw.startsWith('"') ? (JSON.parse(raw) as string) : raw;
+    } catch {
+      return raw;
+    }
+  };
+  const type = field("type");
+  const host = field("server");
+  const port = Number(field("port"));
+  if (!type || !host || !Number.isInteger(port)) return null;
+  const protocol: StaticIpProtocol = type === "socks5" ? "socks5" : field("tls") === "true" ? "https" : "http";
+  return { protocol, host, port, username: field("username") ?? "", hasPassword: field("password") !== null };
+}

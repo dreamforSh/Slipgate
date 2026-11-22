@@ -231,13 +231,17 @@ export function resolveTierForPlatform(platform: Provider, hint: string | null |
 }
 
 /* -------------------------------------------------------------------------- */
-/* Import file parsing (Slipgate backups and sub2api / linksyncx data exports) */
+/* Import file parsing (Slipgate backups, sub2api / linksyncx data exports,    */
+/* and CLIProxyAPI auth files)                                                */
 /* -------------------------------------------------------------------------- */
 
-export type AccountImportFormat = "slipgate" | "sub2api";
+/** `cpa` = CLIProxyAPI auth files (one JSON object per account, `type` names the provider). */
+export type AccountImportFormat = "slipgate" | "sub2api" | "cpa";
 
 /** One account ready to be sent to the import endpoint once a target group is chosen. */
 export interface AccountImportDraft {
+  /** Which kind of file the account came from (not sent to the server). */
+  origin: AccountImportFormat;
   name: string;
   notes: string;
   platform: Provider;
@@ -256,9 +260,16 @@ export interface AccountImportDraft {
   sourceLabel: string;
 }
 
-export type AccountImportSkipReason = "unsupported_platform" | "unsupported_type" | "missing_credentials" | "invalid";
+export type AccountImportSkipReason =
+  | "unsupported_platform"
+  | "unsupported_type"
+  | "missing_credentials"
+  | "invalid"
+  /** A whole file of a multi-file import that is not JSON or not an account file. */
+  | "unrecognized_file";
 
 export interface AccountImportSkip {
+  /** Position among all entries of the import (a rejected file counts as one entry). */
   index: number;
   name: string;
   reason: AccountImportSkipReason;
@@ -266,20 +277,40 @@ export interface AccountImportSkip {
 }
 
 export interface AccountImportParseResult {
-  format: AccountImportFormat;
+  /** Distinct formats found, in file order (several only for a multi-file import). */
+  formats: AccountImportFormat[];
   drafts: AccountImportDraft[];
   skipped: AccountImportSkip[];
 }
 
+/** One uploaded file (or the pasted text) after JSON parsing. */
+export interface AccountImportSource {
+  /** File name, used to name CPA accounts and to label rejected files; `""` for pasted text. */
+  name: string;
+  /** Parsed JSON, or `undefined` when the text is not JSON (see `parseImportJsonText`). */
+  value: unknown;
+}
+
+/** Why a whole document could not be read (stable, for translated messages). */
+export type AccountImportFormatErrorCode = "not_json" | "no_accounts" | "unrecognized";
+
+const FORMAT_ERROR_MESSAGES: Record<AccountImportFormatErrorCode, string> = {
+  not_json: "not valid JSON",
+  no_accounts: "no accounts array found",
+  unrecognized: "unrecognized account format",
+};
+
 export class AccountImportFormatError extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly code: AccountImportFormatErrorCode;
+  constructor(code: AccountImportFormatErrorCode) {
+    super(FORMAT_ERROR_MESSAGES[code]);
     this.name = "AccountImportFormatError";
+    this.code = code;
   }
 }
 
 export interface AccountImportParseOptions {
-  /** Access mode for OAuth / setup-token accounts from sub2api exports. */
+  /** Access mode for OAuth / setup-token accounts from sub2api exports and CPA auth files. */
   subscriptionMode?: ExecutionMode;
   /** Access mode for API-key / upstream accounts from sub2api exports. */
   apiKeyMode?: ExecutionMode;
@@ -326,6 +357,11 @@ const TIER_HINT_KEYS = [
   "tier_id",
   "account_tier",
 ];
+
+/** Own-property lookup, so names like `constructor` never resolve to Object.prototype members. */
+function own<T>(table: Record<string, T>, key: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
@@ -381,11 +417,11 @@ function parseSub2apiAccount(
   const sourcePlatform = str(rec.platform).toLowerCase();
   const sourceType = str(rec.type).toLowerCase();
 
-  const authKind = SUB2API_TYPES[sourceType];
+  const authKind = own(SUB2API_TYPES, sourceType);
   if (!authKind) {
     return { index, name, reason: "unsupported_type", detail: sourceType || "-" };
   }
-  const platformRule = SUB2API_PLATFORMS[sourcePlatform];
+  const platformRule = own(SUB2API_PLATFORMS, sourcePlatform);
   if (!platformRule) {
     return { index, name, reason: "unsupported_platform", detail: sourcePlatform || "-" };
   }
@@ -398,6 +434,7 @@ function parseSub2apiAccount(
 
   const isKey = authKind === "api_key";
   return {
+    origin: "sub2api",
     name,
     notes: str(rec.notes).slice(0, 500),
     platform,
@@ -433,12 +470,14 @@ function parseSlipgateAccount(item: unknown, index: number): AccountImportDraft 
   const mode = ExecutionModeSchema.safeParse(rec.executionMode);
   const status = AccountStatusSchema.safeParse(rec.status);
   return {
+    origin: "slipgate",
     name,
     notes: str(rec.notes).slice(0, 500),
     platform: platform.data,
     executionMode: mode.success ? mode.data : "stealth_http",
     authKind: authKind.data,
-    subscriptionTier: resolveTierForPlatform(platform.data, str(rec.subscriptionTier)),
+    // API keys carry no plan; a stray tier would only skew the scheduler weight.
+    subscriptionTier: authKind.data === "api_key" ? "standard" : resolveTierForPlatform(platform.data, str(rec.subscriptionTier)),
     credentialSecret,
     maxConcurrency: clampInt(rec.maxConcurrency, 1, 64, 5),
     priority: clampInt(rec.priority, 0, 10000, 100),
@@ -451,41 +490,350 @@ function parseSlipgateAccount(item: unknown, index: number): AccountImportDraft 
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/* CLIProxyAPI (CPA) auth files                                               */
+/* -------------------------------------------------------------------------- */
+
+/** CPA auth-file `type` → Slipgate platform. Every CPA auth file is an OAuth login. */
+const CPA_PLATFORMS: Record<string, Provider> = {
+  claude: "anthropic",
+  codex: "codex",
+  gemini: "gemini",
+  "gemini-cli": "gemini",
+  antigravity: "antigravity",
+  qwen: "qwen",
+  kimi: "kimi",
+};
+
+/** CPA providers without a Slipgate counterpart: reported as unsupported instead of guessed. */
+const CPA_UNSUPPORTED_TYPES = new Set(["iflow", "vertex", "aistudio"]);
+
+/** CPA routing metadata kept out of the stored credential (Slipgate has its own fields for these). */
+const CPA_METADATA_KEYS = new Set(["type", "disabled", "prefix", "proxy_url", "priority", "label"]);
+
+const CPA_TOKEN_KEYS = ["access_token", "refresh_token", "id_token", "api_key", "token"];
+
+/** Namespaced claim in ChatGPT id_tokens holding the account id and plan. */
+const CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
+
+/** A CLIProxyAPI auth object: a known provider `type`, without a sub2api / Slipgate wrapper. */
+function isCpaAuthRecord(rec: Record<string, unknown> | null): boolean {
+  if (!rec || "credentials" in rec || "credentialSecret" in rec || "platform" in rec) return false;
+  const type = str(rec.type).toLowerCase();
+  return own(CPA_PLATFORMS, type) !== undefined || CPA_UNSUPPORTED_TYPES.has(type);
+}
+
+/** Payload of a JWT, or `null` when it is not one. The signature is not checked: hints only. */
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  const part = token.split(".")[1];
+  if (!part) return null;
+  try {
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return asRecord(JSON.parse(new TextDecoder().decode(bytes)));
+  } catch {
+    return null;
+  }
+}
+
+/** `claude-a@b.com.json` → `claude-a@b.com`; `""` for pasted text. */
+function fileStem(fileName: string): string {
+  return fileName
+    .replace(/^.*[\\/]/, "")
+    .replace(/\.json$/i, "")
+    .trim();
+}
+
 /**
- * Parse an uploaded account file. Accepts Slipgate backups (`type: "slipgate-accounts"`)
- * and sub2api / linksyncx data exports (`type: "sub2api-data"` or the legacy bundle),
- * including a bare array of either kind of account object.
+ * The stored credential: the auth file minus CPA routing metadata. Gemini CLI logins nest the
+ * OAuth token (`token: {access_token, refresh_token, expiry, ...}`) while the data plane reads
+ * flat fields, so the nested fields are lifted up without overwriting top-level ones.
  */
-export function parseAccountImportFile(raw: unknown, options: AccountImportParseOptions = {}): AccountImportParseResult {
-  const opts: Required<AccountImportParseOptions> = {
+function cpaCredentials(rec: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(rec)) {
+    if (!CPA_METADATA_KEYS.has(key)) out[key] = value;
+  }
+  const nested = asRecord(rec.token);
+  if (nested) {
+    delete out.token;
+    for (const [key, value] of Object.entries(nested)) {
+      if (!(key in out)) out[key] = value;
+    }
+  }
+  return out;
+}
+
+/** Qwen OAuth answers on `https://<resource_url>/v1` (the same rule qwen-code applies). */
+function qwenBaseUrl(resourceUrl: string): string {
+  const host = resourceUrl.trim().replace(/\/+$/, "");
+  if (!host) return "";
+  const withScheme = /^https?:\/\//i.test(host) ? host : `https://${host}`;
+  return withScheme.endsWith("/v1") ? withScheme : `${withScheme}/v1`;
+}
+
+function parseCpaAuth(
+  item: unknown,
+  index: number,
+  nameHint: string,
+  opts: Required<AccountImportParseOptions>,
+): AccountImportDraft | AccountImportSkip {
+  const rec = asRecord(item);
+  if (!rec) return { index, name: nameHint || `account-${index + 1}`, reason: "invalid", detail: "not an object" };
+  const type = str(rec.type).toLowerCase();
+  const credentials = cpaCredentials(rec);
+  const idToken = str(credentials.id_token);
+  const idClaims = idToken ? decodeJwtPayload(idToken) : null;
+  const email = str(credentials.email) || str(idClaims?.email);
+  // CPA names files `<type>-<email>.json`; mirror that when the object came without a file.
+  const name = clipName(nameHint || (email ? `${type}-${email}` : ""), `${type || "account"}-${index + 1}`);
+
+  const platform = own(CPA_PLATFORMS, type);
+  if (!platform) return { index, name, reason: "unsupported_platform", detail: type || "-" };
+  if (!CPA_TOKEN_KEYS.some((key) => str(credentials[key]))) {
+    return { index, name, reason: "missing_credentials", detail: "" };
+  }
+
+  let hint = tierHint(credentials);
+  if (platform === "codex") {
+    const auth = asRecord(idClaims?.[CODEX_AUTH_CLAIM]);
+    const accountId = str(auth?.chatgpt_account_id);
+    // The data plane needs the ChatGPT account id; some CPA files only carry it in the id_token.
+    if (accountId && !str(credentials.account_id)) credentials.account_id = accountId;
+    hint ||= str(auth?.chatgpt_plan_type) || (/-(plus|pro|team|free)$/i.exec(nameHint)?.[1] ?? "");
+  }
+  if (platform === "qwen" && !str(credentials.base_url)) {
+    const baseUrl = qwenBaseUrl(str(credentials.resource_url));
+    if (baseUrl) credentials.base_url = baseUrl;
+  }
+
+  return {
+    origin: "cpa",
+    name,
+    notes: email && !name.includes(email) ? email.slice(0, 500) : "",
+    platform,
+    executionMode: opts.subscriptionMode,
+    authKind: "oauth",
+    subscriptionTier: resolveTierForPlatform(platform, hint),
+    credentialSecret: JSON.stringify(credentials),
+    maxConcurrency: 5,
+    priority: 100,
+    status: rec.disabled === true ? "paused" : "active",
+    // CPA's `expired` is the access token's expiry (refreshed hourly), not the end of the
+    // subscription; mapping it would auto-pause every account within the hour.
+    expiresAtIso: null,
+    autoPauseOnExpired: true,
+    groupName: null,
+    sourceLabel: `cpa/${type}`,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Single credential inspection (add-account form)                            */
+/* -------------------------------------------------------------------------- */
+
+export type CredentialSource = "cpa" | "claude_code" | "codex_cli" | "json";
+
+export interface CredentialInsight {
+  source: CredentialSource;
+  /** Platform the credential belongs to, when the shape tells. */
+  platform: Provider | null;
+  email: string;
+  /** Raw plan / tier string found in the credential (resolve with `resolveTierForPlatform`). */
+  tierHint: string;
+  /** Text to store: CPA auth files are normalized exactly like the importer does. */
+  credentialSecret: string;
+  /** CPA `type` (e.g. `claude`), for naming the account like CPA does. */
+  cpaType: string;
+}
+
+/**
+ * Read what a pasted OAuth credential says about itself: `.claude/.credentials.json`,
+ * `.codex/auth.json`, a CLIProxyAPI auth file, or any flat token JSON. `null` for non-JSON
+ * text (plain keys and tokens are stored as typed).
+ */
+export function inspectCredential(text: string): CredentialInsight | null {
+  const value = parseImportJsonText(text);
+  const rec = asRecord(value);
+  if (!rec) return null;
+
+  if (isCpaAuthRecord(rec)) {
+    const type = str(rec.type).toLowerCase();
+    const parsed = parseCpaAuth(rec, 0, "", resolveParseOptions({}));
+    if ("reason" in parsed) {
+      return { source: "cpa", platform: null, email: str(rec.email), tierHint: "", credentialSecret: text.trim(), cpaType: type };
+    }
+    const secret = asRecord(JSON.parse(parsed.credentialSecret)) ?? {};
+    return {
+      source: "cpa",
+      platform: parsed.platform,
+      email: str(secret.email) || str(decodeJwtPayload(str(secret.id_token))?.email),
+      tierHint: parsed.subscriptionTier === "standard" ? "" : parsed.subscriptionTier,
+      credentialSecret: parsed.credentialSecret,
+      cpaType: type,
+    };
+  }
+
+  const claude = asRecord(rec.claudeAiOauth);
+  if (claude) {
+    return {
+      source: "claude_code",
+      platform: "anthropic",
+      email: str(rec.email),
+      tierHint: str(claude.rateLimitTier) || str(claude.subscriptionType),
+      credentialSecret: text.trim(),
+      cpaType: "",
+    };
+  }
+
+  const tokens = asRecord(rec.tokens);
+  if (tokens) {
+    const claims = decodeJwtPayload(str(tokens.id_token));
+    const auth = asRecord(claims?.[CODEX_AUTH_CLAIM]);
+    return {
+      source: "codex_cli",
+      platform: "codex",
+      email: str(claims?.email),
+      tierHint: str(tokens.plan_type) || str(auth?.chatgpt_plan_type),
+      credentialSecret: text.trim(),
+      cpaType: "",
+    };
+  }
+
+  return { source: "json", platform: null, email: str(rec.email), tierHint: tierHint(rec), credentialSecret: text.trim(), cpaType: "" };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Format detection                                                           */
+/* -------------------------------------------------------------------------- */
+
+interface ParsedDocument {
+  format: AccountImportFormat;
+  drafts: AccountImportDraft[];
+  skipped: AccountImportSkip[];
+  /** Entries read from the document, for offsetting indexes across files. */
+  entries: number;
+}
+
+function resolveParseOptions(options: AccountImportParseOptions): Required<AccountImportParseOptions> {
+  return {
     subscriptionMode: options.subscriptionMode ?? "stealth_http",
     apiKeyMode: options.apiKeyMode ?? "direct_api",
   };
-  const root = asRecord(raw);
-  const items: unknown[] | null = Array.isArray(raw) ? raw : Array.isArray(root?.accounts) ? (root!.accounts as unknown[]) : null;
-  if (!items) throw new AccountImportFormatError("no accounts array found");
+}
 
-  const declared = str(root?.type).toLowerCase();
+function parseDocument(raw: unknown, opts: Required<AccountImportParseOptions>, sourceName: string): ParsedDocument {
+  const root = asRecord(raw);
+  let items: unknown[];
   let format: AccountImportFormat;
-  if (declared === SLIPGATE_ACCOUNT_EXPORT_TYPE) {
-    format = "slipgate";
-  } else if (declared.startsWith("sub2api")) {
-    format = "sub2api";
+  let nameHint = "";
+  if (isCpaAuthRecord(root)) {
+    // One CPA auth file holds exactly one account; its file name is the account's name.
+    items = [root];
+    format = "cpa";
+    nameHint = fileStem(sourceName);
   } else {
-    const first = asRecord(items[0]);
-    if (first && "credentialSecret" in first) format = "slipgate";
-    else if (first && "credentials" in first) format = "sub2api";
-    else throw new AccountImportFormatError("unrecognized account format");
+    const list = Array.isArray(raw) ? raw : Array.isArray(root?.accounts) ? (root!.accounts as unknown[]) : null;
+    if (!list) throw new AccountImportFormatError(root ? "no_accounts" : "unrecognized");
+    items = list;
+    const declared = str(root?.type).toLowerCase();
+    if (declared === SLIPGATE_ACCOUNT_EXPORT_TYPE) {
+      format = "slipgate";
+    } else if (declared.startsWith("sub2api")) {
+      format = "sub2api";
+    } else {
+      const first = asRecord(items.find((item) => asRecord(item)));
+      if (first && "credentialSecret" in first) format = "slipgate";
+      else if (first && "credentials" in first) format = "sub2api";
+      else if (isCpaAuthRecord(first)) format = "cpa";
+      else throw new AccountImportFormatError("unrecognized");
+    }
   }
 
   const drafts: AccountImportDraft[] = [];
   const skipped: AccountImportSkip[] = [];
   items.forEach((item, index) => {
-    const parsed = format === "slipgate" ? parseSlipgateAccount(item, index) : parseSub2apiAccount(item, index, opts);
+    const parsed =
+      format === "slipgate"
+        ? parseSlipgateAccount(item, index)
+        : format === "sub2api"
+          ? parseSub2apiAccount(item, index, opts)
+          : parseCpaAuth(item, index, nameHint, opts);
     if ("reason" in parsed) skipped.push(parsed);
     else drafts.push(parsed);
   });
-  return { format, drafts, skipped };
+  return { format, drafts, skipped, entries: items.length };
+}
+
+/**
+ * Parse one account document: a Slipgate backup (`type: "slipgate-accounts"`), a sub2api /
+ * linksyncx data export (`type: "sub2api-data"` or the legacy bundle), a CLIProxyAPI auth
+ * file, or a bare array of any of those account objects.
+ */
+export function parseAccountImportFile(raw: unknown, options: AccountImportParseOptions = {}): AccountImportParseResult {
+  const doc = parseDocument(raw, resolveParseOptions(options), "");
+  return { formats: [doc.format], drafts: doc.drafts, skipped: doc.skipped };
+}
+
+/**
+ * Parse every file of an import (or the pasted text as a single source). A lone source that
+ * cannot be read throws; in a multi-file import an unreadable file becomes an
+ * `unrecognized_file` skip, so a CPA auth directory with a stray config file still imports.
+ * Throws when no source holds accounts at all.
+ */
+export function parseAccountImportSources(
+  sources: readonly AccountImportSource[],
+  options: AccountImportParseOptions = {},
+): AccountImportParseResult {
+  const opts = resolveParseOptions(options);
+  const formats: AccountImportFormat[] = [];
+  const drafts: AccountImportDraft[] = [];
+  const skipped: AccountImportSkip[] = [];
+  let offset = 0;
+  let firstError: AccountImportFormatError | null = null;
+  for (const source of sources) {
+    let doc: ParsedDocument;
+    try {
+      if (source.value === undefined) throw new AccountImportFormatError("not_json");
+      doc = parseDocument(source.value, opts, source.name);
+    } catch (err) {
+      if (!(err instanceof AccountImportFormatError) || sources.length === 1) throw err;
+      firstError ??= err;
+      skipped.push({ index: offset, name: source.name || `#${offset + 1}`, reason: "unrecognized_file", detail: err.code });
+      offset += 1;
+      continue;
+    }
+    if (!formats.includes(doc.format)) formats.push(doc.format);
+    drafts.push(...doc.drafts);
+    for (const skip of doc.skipped) skipped.push({ ...skip, index: skip.index + offset });
+    offset += doc.entries;
+  }
+  if (!formats.length) throw firstError ?? new AccountImportFormatError("no_accounts");
+  return { formats, drafts, skipped };
+}
+
+/**
+ * JSON for the import dialog: one document, or several concatenated objects (`{..}{..}` or
+ * JSON lines, which is how CPA auth files look when pasted together) as an array.
+ * `undefined` when the text is not JSON. A leading UTF-8 BOM is trimmed like whitespace.
+ */
+export function parseImportJsonText(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    // Possibly several objects back to back.
+  }
+  if (!trimmed.startsWith("{")) return undefined;
+  const chunks = splitJsonObjects(trimmed);
+  if (!chunks || chunks.length < 2) return undefined;
+  try {
+    return chunks.map((chunk) => JSON.parse(chunk) as unknown);
+  } catch {
+    return undefined;
+  }
 }
 
 export interface CredentialBlock {

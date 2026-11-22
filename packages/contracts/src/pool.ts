@@ -73,6 +73,14 @@ export function isSubscriptionTierAllowedForProvider(
   return allowedSubscriptionTiersForProvider(platform).some((opt) => opt.tier === tier);
 }
 
+/**
+ * Tier an account is stored and scheduled with. API keys bill per token and carry no plan, so
+ * they are always `standard` (1x) whatever tier a request names.
+ */
+export function effectiveSubscriptionTier(authKind: AccountAuthKind, tier: SubscriptionTier): SubscriptionTier {
+  return authKind === "api_key" ? "standard" : tier;
+}
+
 export function subscriptionTierMultiplier(platform: Provider, tier: SubscriptionTier): number {
   switch (tier) {
     case "pro_5x":

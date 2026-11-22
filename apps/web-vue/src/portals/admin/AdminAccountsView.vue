@@ -19,7 +19,7 @@ import AccountBatchTestModal from "../../components/admin/accounts/AccountBatchT
 import AccountBulkEditModal from "../../components/admin/accounts/AccountBulkEditModal.vue";
 import AccountCard from "../../components/admin/accounts/AccountCard.vue";
 import AccountExportModal from "../../components/admin/accounts/AccountExportModal.vue";
-import AccountFormDrawer from "../../components/admin/accounts/AccountFormDrawer.vue";
+import AccountFormModal from "../../components/admin/accounts/AccountFormModal.vue";
 import AccountImportModal from "../../components/admin/accounts/AccountImportModal.vue";
 import AccountRowMenu from "../../components/admin/accounts/AccountRowMenu.vue";
 import AccountStatsDrawer from "../../components/admin/accounts/AccountStatsDrawer.vue";
@@ -998,7 +998,7 @@ onMounted(() => {
       @delete="removeAccount"
     />
 
-    <AccountFormDrawer
+    <AccountFormModal
       v-model:open="formOpen"
       :account="formAccount"
       :template="formTemplate"

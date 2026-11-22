@@ -6,19 +6,17 @@ import UiBadge from "../../ui/UiBadge.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UsageMeter from "../../ui/UsageMeter.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
+import PlatformTypeBadge from "./PlatformTypeBadge.vue";
 import {
   COLUMN_SORT,
   EXPIRY_TONE,
   MODE_ICON,
   expiryState,
-  tierBadge,
-  tierTone,
   type ColumnKey,
   type SortKey,
   type SortState,
 } from "./accountDisplay";
 import {
-  PROVIDER_OPTIONS,
   executionModeLabel,
   formatCompact,
   formatDateShort,
@@ -52,7 +50,6 @@ const visible = computed(() => new Set(props.columns));
 const allSelected = computed(() => props.accounts.length > 0 && props.accounts.every((a) => props.selected.has(a.id)));
 const someSelected = computed(() => !allSelected.value && props.accounts.some((a) => props.selected.has(a.id)));
 
-const platformLabel = (p: string) => PROVIDER_OPTIONS.find((o) => o.value === p)?.label ?? p;
 function authKindLabel(kind: string): string {
   const key = `accounts.authKinds.${kind}`;
   return te(key) ? t(key) : kind;
@@ -160,16 +157,17 @@ function openMenu(acc: UpstreamAccount, ev: MouseEvent) {
             </button>
           </td>
 
-          <td v-if="visible.has('platform')" class="min-w-[11rem]">
-            <div class="flex flex-wrap items-center gap-1">
-              <span class="text-xs font-medium text-fg">{{ platformLabel(acc.platform) }}</span>
-              <UiBadge :tone="tierTone(acc)" mono>{{ tierBadge(acc) }}</UiBadge>
-            </div>
-            <div class="mt-1 flex items-center gap-1.5 text-2xs text-fg-subtle">
+          <td v-if="visible.has('platform')" class="min-w-[13rem]">
+            <PlatformTypeBadge
+              inline
+              :platform="acc.platform"
+              :auth-kind="acc.authKind"
+              :subscription-tier="acc.subscriptionTier"
+              :tier-multiplier="acc.tierMultiplier"
+            />
+            <div class="mt-1 flex items-center gap-1.5 text-2xs text-fg-subtle" :title="authKindLabel(acc.authKind)">
               <UiIcon :name="MODE_ICON[acc.executionMode]" :size="11" />
               <span>{{ executionModeLabel(acc.executionMode) }}</span>
-              <span aria-hidden="true">·</span>
-              <span>{{ authKindLabel(acc.authKind) }}</span>
             </div>
           </td>
 
