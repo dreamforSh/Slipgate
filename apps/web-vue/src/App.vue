@@ -1,12 +1,18 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, watch } from "vue";
+import { useI18n } from "vue-i18n";
 import { RouterView, useRoute } from "vue-router";
 import AppShell from "./components/AppShell.vue";
 import ToastHost from "./components/ui/ToastHost.vue";
+import { syncDocumentTitle } from "./router";
 import { useThemeStore } from "./stores/theme";
 
 useThemeStore();
 const route = useRoute();
+const { locale } = useI18n();
+
+// Re-title the browser tab when the language changes (route changes are handled by the router).
+watch(locale, () => syncDocumentTitle());
 
 const isAuthLayout = computed(() => route.meta.layout === "auth");
 </script>

@@ -1,17 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
+import { useRoute } from "vue-router";
 import {
   allowedSubscriptionTiersForProvider,
   recommendedMaxConcurrencyForTier,
   type AccountAuthKind,
+  type AccountBulkResult,
+  type AccountStatus,
   type ExecutionMode,
   type GroupItem,
-  type GroupPlatform,
-  type GroupSubscriptionType,
   type Provider,
   type SubscriptionTier,
+  type UpdateAccountRequest,
   type UpstreamAccount,
 } from "@slipgate/contracts";
+import AccountTestModal from "../../components/admin/AccountTestModal.vue";
 import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import FormField from "../../components/ui/FormField.vue";
@@ -21,143 +25,45 @@ import StatCard from "../../components/ui/StatCard.vue";
 import UiBadge from "../../components/ui/UiBadge.vue";
 import UiCard from "../../components/ui/UiCard.vue";
 import UiDrawer from "../../components/ui/UiDrawer.vue";
-import UiIcon from "../../components/ui/UiIcon.vue";
+import UiIcon, { type IconName } from "../../components/ui/UiIcon.vue";
 import UiSwitch from "../../components/ui/UiSwitch.vue";
 import UsageMeter from "../../components/ui/UsageMeter.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import {
-  ACCOUNT_STATUS_LABEL,
-  EXECUTION_MODE_LABEL,
   PROVIDER_OPTIONS,
+  accountStatusLabel,
+  executionModeLabel,
   healthTone,
   type Tone,
 } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 
+const { t, te } = useI18n();
+const route = useRoute();
 const auth = useAuthStore();
+
+/** 18 cards fill complete rows in the 1 / 2 / 3-column grid. */
+const PAGE_SIZE = 18;
+const ACCOUNT_STATUSES: AccountStatus[] = ["active", "paused", "cooldown", "expired"];
+const EXECUTION_MODES: ExecutionMode[] = ["stealth_http", "direct_api", "vm_slot"];
+const AUTH_KINDS: AccountAuthKind[] = ["oauth", "setup_token", "api_key", "vm_cli_seed"];
 
 const groups = ref<GroupItem[]>([]);
 const accounts = ref<UpstreamAccount[]>([]);
-const modeFilter = ref<"all" | ExecutionMode>("all");
-const errorMessage = ref<string | null>(null);
 const loading = ref(false);
-const groupDrawerOpen = ref(false);
-const accountDrawerOpen = ref(false);
+const errorMessage = ref<string | null>(null);
+const toast = useFeedbackToasts(errorMessage);
 
-useFeedbackToasts(errorMessage);
+/* ---------------- Labels ---------------- */
 
-// Group creation form
-const groupName = ref("");
-const groupPlatform = ref<GroupPlatform>("composite");
-const groupSubType = ref<GroupSubscriptionType>("balance");
-const groupMultiplier = ref(1);
-
-// Account creation form
-const accName = ref("");
-const accGroupId = ref("");
-const accPlatform = ref<Provider>("anthropic");
-const accMode = ref<ExecutionMode>("stealth_http");
-const accAuthKind = ref<AccountAuthKind>("oauth");
-const accSubscriptionTier = ref<SubscriptionTier>("max");
-const accSecret = ref("");
-const accMaxConc = ref(12);
-const accPriority = ref(100);
-
-const tierOptions = computed(() => allowedSubscriptionTiersForProvider(accPlatform.value));
-
-type SubscriptionPreset =
-  | "claude_max"
-  | "claude_ultra"
-  | "codex_pro_5x"
-  | "codex_pro_10x"
-  | "codex_pro_25x"
-  | "antigravity";
-
-const presets: { key: SubscriptionPreset; label: string; tone: Tone }[] = [
-  { key: "claude_max", label: "Claude Max · 5x", tone: "warning" },
-  { key: "claude_ultra", label: "Claude Ultra · 20x", tone: "warning" },
-  { key: "codex_pro_5x", label: "Codex Pro · 5x", tone: "success" },
-  { key: "codex_pro_10x", label: "Codex Pro · 10x", tone: "success" },
-  { key: "codex_pro_25x", label: "Codex Pro · 25x", tone: "success" },
-  { key: "antigravity", label: "Antigravity VM", tone: "violet" },
-];
-
-const presetToneClass: Record<string, string> = {
-  warning: "border-warning/30 bg-warning/[0.07] text-warning hover:bg-warning/15",
-  success: "border-success/30 bg-success/[0.07] text-success hover:bg-success/15",
-  violet: "border-violet/30 bg-violet/[0.07] text-violet hover:bg-violet/15",
-};
-
-function onPlatformChange() {
-  const valid = tierOptions.value.some((o) => o.tier === accSubscriptionTier.value);
-  if (!valid) {
-    if (accPlatform.value === "anthropic") {
-      accSubscriptionTier.value = "max";
-    } else if (accPlatform.value === "codex" || accPlatform.value === "openai") {
-      accSubscriptionTier.value = "pro_5x";
-    } else if (accPlatform.value === "antigravity") {
-      accSubscriptionTier.value = "pro";
-    } else {
-      accSubscriptionTier.value = "standard";
-    }
-  }
-  accMaxConc.value = recommendedMaxConcurrencyForTier(accPlatform.value, accSubscriptionTier.value);
+function platformLabel(platform: string): string {
+  if (platform === "composite") return t("accounts.platforms.composite");
+  return PROVIDER_OPTIONS.find((p) => p.value === platform)?.label ?? platform;
 }
 
-function onTierChange() {
-  accMaxConc.value = recommendedMaxConcurrencyForTier(accPlatform.value, accSubscriptionTier.value);
-}
-
-function applySubscriptionTemplate(preset: SubscriptionPreset) {
-  if (preset === "claude_max" || preset === "claude_ultra") {
-    accPlatform.value = "anthropic";
-    accMode.value = "stealth_http";
-    accAuthKind.value = "oauth";
-    accSubscriptionTier.value = preset === "claude_ultra" ? "ultra" : "max";
-    accMaxConc.value = recommendedMaxConcurrencyForTier("anthropic", accSubscriptionTier.value);
-    if (!accSecret.value.trim()) {
-      accSecret.value = JSON.stringify({
-        claudeAiOauth: {
-          accessToken: "sk-ant-oat01-replace-me",
-          refreshToken: "sk-ant-ort01-replace-me",
-          subscriptionType: accSubscriptionTier.value,
-        },
-      });
-    }
-    return;
-  }
-  if (preset === "codex_pro_5x" || preset === "codex_pro_10x" || preset === "codex_pro_25x") {
-    const tier: SubscriptionTier =
-      preset === "codex_pro_25x" ? "pro_25x" : preset === "codex_pro_10x" ? "pro_10x" : "pro_5x";
-    accPlatform.value = "codex";
-    accMode.value = "stealth_http";
-    accAuthKind.value = "oauth";
-    accSubscriptionTier.value = tier;
-    accMaxConc.value = recommendedMaxConcurrencyForTier("codex", tier);
-    if (!accSecret.value.trim()) {
-      accSecret.value = JSON.stringify({
-        tokens: {
-          access_token: "eyJhbGciOi-replace-me",
-          refresh_token: "rt_replace_me",
-          account_id: "acct_chatgpt_replace_me",
-          plan_type: tier,
-        },
-      });
-    }
-    return;
-  }
-  accPlatform.value = "antigravity";
-  accMode.value = "vm_slot";
-  accAuthKind.value = "vm_cli_seed";
-  accSubscriptionTier.value = "pro";
-  accMaxConc.value = recommendedMaxConcurrencyForTier("antigravity", "pro");
-  if (!accSecret.value.trim()) {
-    accSecret.value = JSON.stringify({
-      accessToken: "ya29.replace-me",
-      refreshToken: "1//replace-me",
-      projectId: "rising-fact-p41fc",
-    });
-  }
+function authKindLabel(kind: string): string {
+  const key = `accounts.authKinds.${kind}`;
+  return te(key) ? t(key) : kind;
 }
 
 function formatTierBadge(acc: UpstreamAccount): string {
@@ -187,171 +93,463 @@ function tierTone(acc: UpstreamAccount): Tone {
   return "neutral";
 }
 
-const filteredAccounts = computed(() => {
-  if (modeFilter.value === "all") return accounts.value;
-  return accounts.value.filter((a) => a.executionMode === modeFilter.value);
+const MODE_ICON: Record<ExecutionMode, IconName> = {
+  stealth_http: "shield",
+  direct_api: "plug",
+  vm_slot: "server",
+};
+
+function lastTestStripClass(acc: UpstreamAccount): string {
+  if (!acc.lastTest) return "bg-surface-2/60 text-fg-subtle";
+  if (acc.lastTest.ok) return "bg-success/[0.07] text-fg-muted";
+  return "bg-danger/[0.07] text-danger ring-1 ring-inset ring-danger/15";
+}
+
+/* ---------------- Relative time for the last-test column ---------------- */
+
+const now = ref(Date.now());
+const clock = window.setInterval(() => (now.value = Date.now()), 30_000);
+onBeforeUnmount(() => window.clearInterval(clock));
+
+function relativeTime(iso: string): string {
+  const diffSec = Math.max(0, Math.floor((now.value - new Date(iso).getTime()) / 1000));
+  if (diffSec < 60) return t("accounts.lastTest.justNow");
+  if (diffSec < 3600) return t("accounts.lastTest.minutesAgo", { n: Math.floor(diffSec / 60) });
+  if (diffSec < 86400) return t("accounts.lastTest.hoursAgo", { n: Math.floor(diffSec / 3600) });
+  return t("accounts.lastTest.daysAgo", { n: Math.floor(diffSec / 86400) });
+}
+
+function formatDuration(ms: number): string {
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/* ---------------- Filters ---------------- */
+
+const search = ref("");
+const platformFilter = ref<"all" | Provider>("all");
+const groupFilter = ref<string>(typeof route.query.groupId === "string" ? route.query.groupId : "all");
+const statusFilter = ref<"all" | AccountStatus>("all");
+const modeFilter = ref<"all" | ExecutionMode>("all");
+
+watch(
+  () => route.query.groupId,
+  (groupId) => {
+    groupFilter.value = typeof groupId === "string" && groupId ? groupId : "all";
+  },
+);
+
+/** All filters except the execution mode (the segmented control shows counts per mode). */
+const baseFiltered = computed(() => {
+  const q = search.value.trim().toLowerCase();
+  return accounts.value.filter((a) => {
+    if (platformFilter.value !== "all" && a.platform !== platformFilter.value) return false;
+    if (groupFilter.value !== "all" && a.groupId !== groupFilter.value) return false;
+    if (statusFilter.value !== "all" && a.status !== statusFilter.value) return false;
+    if (!q) return true;
+    return [a.name, a.notes, a.id, a.credentialPreview].some((v) => v.toLowerCase().includes(q));
+  });
 });
 
+const filteredAccounts = computed(() =>
+  modeFilter.value === "all" ? baseFiltered.value : baseFiltered.value.filter((a) => a.executionMode === modeFilter.value),
+);
+
 const modeOptions = computed(() => {
-  const count = (m: ExecutionMode) => accounts.value.filter((a) => a.executionMode === m).length;
+  const count = (m: ExecutionMode) => baseFiltered.value.filter((a) => a.executionMode === m).length;
   return [
-    { value: "all" as const, label: "全部", count: accounts.value.length },
-    { value: "stealth_http" as const, label: "stealth_http", count: count("stealth_http") },
-    { value: "vm_slot" as const, label: "vm_slot", count: count("vm_slot") },
-    { value: "direct_api" as const, label: "direct_api", count: count("direct_api") },
+    { value: "all" as const, label: t("common.all"), count: baseFiltered.value.length },
+    ...EXECUTION_MODES.map((m) => ({ value: m, label: executionModeLabel(m), count: count(m) })),
   ];
 });
 
+/* ---------------- Pagination ---------------- */
+
+const page = ref(1);
+const pageCount = computed(() => Math.max(1, Math.ceil(filteredAccounts.value.length / PAGE_SIZE)));
+const pagedAccounts = computed(() =>
+  filteredAccounts.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE),
+);
+
+watch([search, platformFilter, groupFilter, statusFilter, modeFilter], () => {
+  page.value = 1;
+});
+watch(pageCount, (count) => {
+  if (page.value > count) page.value = count;
+});
+
+/* ---------------- Selection + bulk actions ---------------- */
+
+const selected = ref(new Set<string>());
+const selectedCount = computed(() => selected.value.size);
+const allPageSelected = computed(
+  () => pagedAccounts.value.length > 0 && pagedAccounts.value.every((a) => selected.value.has(a.id)),
+);
+const somePageSelected = computed(
+  () => !allPageSelected.value && pagedAccounts.value.some((a) => selected.value.has(a.id)),
+);
+
+function togglePage() {
+  const next = new Set(selected.value);
+  if (allPageSelected.value) {
+    for (const a of pagedAccounts.value) next.delete(a.id);
+  } else {
+    for (const a of pagedAccounts.value) next.add(a.id);
+  }
+  selected.value = next;
+}
+
+function toggleOne(id: string) {
+  const next = new Set(selected.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  selected.value = next;
+}
+
+function clearSelection() {
+  selected.value = new Set();
+}
+
+const bulkGroupId = ref("");
+const bulkBusy = ref(false);
+
+function reportBulk(result: AccountBulkResult) {
+  const message = t("accounts.bulk.result", { success: result.success, failed: result.failed });
+  if (result.failed > 0) toast.warning(message);
+  else toast.success(message);
+}
+
+async function runBulk(path: string, body: Record<string, unknown>) {
+  errorMessage.value = null;
+  bulkBusy.value = true;
+  try {
+    const res = await auth.apiFetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountIds: [...selected.value], ...body }),
+    });
+    const data = (await res.json()) as AccountBulkResult & { message?: string };
+    if (!res.ok) {
+      errorMessage.value = data.message ?? t("accounts.bulk.failed");
+      return;
+    }
+    reportBulk(data);
+    clearSelection();
+    await refreshPool(true);
+  } finally {
+    bulkBusy.value = false;
+  }
+}
+
+function bulkSetStatus(status: AccountStatus) {
+  void runBulk("/api/v1/admin/accounts/bulk-update", { patch: { status } });
+}
+
+function bulkMove() {
+  if (!bulkGroupId.value) return;
+  void runBulk("/api/v1/admin/accounts/bulk-update", { patch: { groupId: bulkGroupId.value } });
+}
+
+function bulkDelete() {
+  void runBulk("/api/v1/admin/accounts/batch-delete", {});
+}
+
+/* ---------------- Stats ---------------- */
+
 const activeAccounts = computed(() => accounts.value.filter((a) => a.status === "active").length);
-const enabledGroups = computed(() => groups.value.filter((g) => g.enabled).length);
-const totalWeight = computed(() => accounts.value.reduce((s, a) => s + (a.status === "active" ? a.tierMultiplier : 0), 0));
+const totalWeight = computed(() =>
+  accounts.value.reduce((s, a) => s + (a.status === "active" ? a.tierMultiplier : 0), 0),
+);
 const totalConcurrency = computed(() =>
   accounts.value.reduce((s, a) => s + (a.status === "active" ? a.maxConcurrency : 0), 0),
 );
+const failedTests = computed(() => accounts.value.filter((a) => a.lastTest?.ok === false).length);
 
-async function refreshPool() {
+/* ---------------- Loading ---------------- */
+
+async function refreshPool(silent = false) {
   errorMessage.value = null;
-  loading.value = true;
+  if (!silent) loading.value = true;
   try {
     const [gRes, aRes] = await Promise.all([
       auth.apiFetch("/api/v1/admin/groups"),
       auth.apiFetch("/api/v1/admin/accounts"),
     ]);
     if (gRes.ok) {
-      const data = (await gRes.json()) as { groups: GroupItem[] };
-      groups.value = data.groups;
-      if (!accGroupId.value && groups.value.length > 0) {
-        accGroupId.value = groups.value[0]!.id;
-      }
+      groups.value = ((await gRes.json()) as { groups: GroupItem[] }).groups;
     }
     if (aRes.ok) {
-      const data = (await aRes.json()) as { accounts: UpstreamAccount[] };
-      accounts.value = data.accounts;
+      accounts.value = ((await aRes.json()) as { accounts: UpstreamAccount[] }).accounts;
+      const ids = new Set(accounts.value.map((a) => a.id));
+      const kept = [...selected.value].filter((id) => ids.has(id));
+      if (kept.length !== selected.value.size) selected.value = new Set(kept);
+    } else {
+      errorMessage.value = t("accounts.errors.loadFailed");
     }
+  } catch (err) {
+    errorMessage.value = err instanceof Error ? err.message : t("accounts.errors.loadFailed");
   } finally {
     loading.value = false;
   }
 }
 
-async function handleCreateGroup() {
-  errorMessage.value = null;
-  const res = await auth.apiFetch("/api/v1/admin/groups", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: groupName.value,
-      platform: groupPlatform.value,
-      subscriptionType: groupSubType.value,
-      rateMultiplier: groupMultiplier.value,
-    }),
-  });
-  const data = (await res.json()) as { message?: string };
-  if (!res.ok) {
-    errorMessage.value = data.message ?? "创建分组失败";
-    return;
-  }
-  groupName.value = "";
-  groupDrawerOpen.value = false;
-  await refreshPool();
-}
+/* ---------------- Row actions ---------------- */
 
-async function toggleGroup(group: GroupItem) {
-  errorMessage.value = null;
-  const res = await auth.apiFetch(`/api/v1/admin/groups/${group.id}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled: !group.enabled }),
-  });
-  if (!res.ok) {
-    const data = (await res.json()) as { message?: string };
-    errorMessage.value = data.message ?? "更新分组失败";
-    return;
-  }
-  await refreshPool();
-}
-
-async function removeGroup(groupId: string) {
-  errorMessage.value = null;
-  const res = await auth.apiFetch(`/api/v1/admin/groups/${groupId}`, { method: "DELETE" });
-  if (!res.ok) {
-    const data = (await res.json()) as { message?: string };
-    errorMessage.value = data.message ?? "删除分组失败";
-    return;
-  }
-  await refreshPool();
-}
-
-async function handleCreateAccount() {
-  errorMessage.value = null;
-  const res = await auth.apiFetch("/api/v1/admin/accounts", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: accName.value,
-      groupId: accGroupId.value,
-      platform: accPlatform.value,
-      executionMode: accMode.value,
-      authKind: accAuthKind.value,
-      subscriptionTier: accSubscriptionTier.value,
-      credentialSecret: accSecret.value,
-      maxConcurrency: accMaxConc.value,
-      priority: accPriority.value,
-    }),
-  });
-  const data = (await res.json()) as { message?: string };
-  if (!res.ok) {
-    errorMessage.value = data.message ?? "添加账号失败";
-    return;
-  }
-  accName.value = "";
-  accSecret.value = "";
-  accountDrawerOpen.value = false;
-  await refreshPool();
-}
-
-async function changeAccountTier(acc: UpstreamAccount, nextTier: SubscriptionTier) {
+async function patchAccount(acc: UpstreamAccount, patch: UpdateAccountRequest, fallback: string): Promise<boolean> {
   errorMessage.value = null;
   const res = await auth.apiFetch(`/api/v1/admin/accounts/${acc.id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      subscriptionTier: nextTier,
-      maxConcurrency: recommendedMaxConcurrencyForTier(acc.platform, nextTier),
-    }),
+    body: JSON.stringify(patch),
   });
   if (!res.ok) {
-    const data = (await res.json()) as { message?: string };
-    errorMessage.value = data.message ?? "更新订阅档位失败";
-    return;
+    const data = (await res.json().catch(() => ({}))) as { message?: string };
+    errorMessage.value = data.message ?? fallback;
+    return false;
   }
-  await refreshPool();
+  return true;
 }
 
 async function toggleAccountStatus(acc: UpstreamAccount) {
-  errorMessage.value = null;
-  const nextStatus = acc.status === "active" ? "paused" : "active";
-  const res = await auth.apiFetch(`/api/v1/admin/accounts/${acc.id}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status: nextStatus }),
-  });
-  if (!res.ok) {
-    const data = (await res.json()) as { message?: string };
-    errorMessage.value = data.message ?? "更新账号状态失败";
-    return;
+  const status: AccountStatus = acc.status === "active" ? "paused" : "active";
+  if (await patchAccount(acc, { status }, t("accounts.errors.updateStatus"))) {
+    await refreshPool(true);
   }
-  await refreshPool();
 }
 
-async function removeAccount(accountId: string) {
+async function removeAccount(acc: UpstreamAccount) {
   errorMessage.value = null;
-  const res = await auth.apiFetch(`/api/v1/admin/accounts/${accountId}`, { method: "DELETE" });
+  const res = await auth.apiFetch(`/api/v1/admin/accounts/${acc.id}`, { method: "DELETE" });
   if (!res.ok) {
-    const data = (await res.json()) as { message?: string };
-    errorMessage.value = data.message ?? "删除账号失败";
+    const data = (await res.json().catch(() => ({}))) as { message?: string };
+    errorMessage.value = data.message ?? t("accounts.errors.deleteAccount");
     return;
   }
-  await refreshPool();
+  toast.success(t("accounts.toast.deleted"));
+  await refreshPool(true);
+}
+
+const testOpen = ref(false);
+const testTarget = ref<UpstreamAccount | null>(null);
+
+function openTest(acc: UpstreamAccount) {
+  if (acc.executionMode === "vm_slot") return;
+  testTarget.value = acc;
+  testOpen.value = true;
+}
+
+/* ---------------- Create / edit drawer ---------------- */
+
+const drawerOpen = ref(false);
+const editing = ref<UpstreamAccount | null>(null);
+const saving = ref(false);
+
+const formName = ref("");
+const formNotes = ref("");
+const formGroupId = ref("");
+const formPlatform = ref<Provider>("anthropic");
+const formMode = ref<ExecutionMode>("stealth_http");
+const formAuthKind = ref<AccountAuthKind>("oauth");
+const formTier = ref<SubscriptionTier>("max");
+const formSecret = ref("");
+const formMaxConc = ref(12);
+const formPriority = ref(100);
+const formStatus = ref<AccountStatus>("active");
+
+const tierOptions = computed(() => allowedSubscriptionTiersForProvider(formPlatform.value));
+
+type SubscriptionPreset =
+  | "claude_max"
+  | "claude_ultra"
+  | "codex_pro_5x"
+  | "codex_pro_10x"
+  | "codex_pro_25x"
+  | "antigravity";
+
+// Preset labels are product/plan brand names and stay untranslated.
+const presets: { key: SubscriptionPreset; label: string; tone: Tone }[] = [
+  { key: "claude_max", label: "Claude Max · 5x", tone: "warning" },
+  { key: "claude_ultra", label: "Claude Ultra · 20x", tone: "warning" },
+  { key: "codex_pro_5x", label: "Codex Pro · 5x", tone: "success" },
+  { key: "codex_pro_10x", label: "Codex Pro · 10x", tone: "success" },
+  { key: "codex_pro_25x", label: "Codex Pro · 25x", tone: "success" },
+  { key: "antigravity", label: "Antigravity VM", tone: "violet" },
+];
+
+const presetToneClass: Record<string, string> = {
+  warning: "border-warning/30 bg-warning/[0.07] text-warning hover:bg-warning/15",
+  success: "border-success/30 bg-success/[0.07] text-success hover:bg-success/15",
+  violet: "border-violet/30 bg-violet/[0.07] text-violet hover:bg-violet/15",
+};
+
+function defaultGroupId(): string {
+  if (groupFilter.value !== "all" && groups.value.some((g) => g.id === groupFilter.value)) return groupFilter.value;
+  return groups.value[0]?.id ?? "";
+}
+
+function openCreate() {
+  editing.value = null;
+  formName.value = "";
+  formNotes.value = "";
+  formGroupId.value = defaultGroupId();
+  formPlatform.value = "anthropic";
+  formMode.value = "stealth_http";
+  formAuthKind.value = "oauth";
+  formTier.value = "max";
+  formSecret.value = "";
+  formMaxConc.value = recommendedMaxConcurrencyForTier("anthropic", "max");
+  formPriority.value = 100;
+  formStatus.value = "active";
+  drawerOpen.value = true;
+}
+
+function openEdit(acc: UpstreamAccount) {
+  editing.value = acc;
+  formName.value = acc.name;
+  formNotes.value = acc.notes;
+  formGroupId.value = acc.groupId;
+  formPlatform.value = acc.platform;
+  formMode.value = acc.executionMode;
+  formAuthKind.value = acc.authKind;
+  formTier.value = acc.subscriptionTier;
+  formSecret.value = "";
+  formMaxConc.value = acc.maxConcurrency;
+  formPriority.value = acc.priority;
+  formStatus.value = acc.status;
+  drawerOpen.value = true;
+}
+
+function onPlatformChange() {
+  const valid = tierOptions.value.some((o) => o.tier === formTier.value);
+  if (!valid) {
+    if (formPlatform.value === "anthropic") {
+      formTier.value = "max";
+    } else if (formPlatform.value === "codex" || formPlatform.value === "openai") {
+      formTier.value = "pro_5x";
+    } else if (formPlatform.value === "antigravity") {
+      formTier.value = "pro";
+    } else {
+      formTier.value = "standard";
+    }
+  }
+  formMaxConc.value = recommendedMaxConcurrencyForTier(formPlatform.value, formTier.value);
+}
+
+function onTierChange() {
+  formMaxConc.value = recommendedMaxConcurrencyForTier(formPlatform.value, formTier.value);
+}
+
+function applySubscriptionTemplate(preset: SubscriptionPreset) {
+  if (preset === "claude_max" || preset === "claude_ultra") {
+    formPlatform.value = "anthropic";
+    formMode.value = "stealth_http";
+    formAuthKind.value = "oauth";
+    formTier.value = preset === "claude_ultra" ? "ultra" : "max";
+    formMaxConc.value = recommendedMaxConcurrencyForTier("anthropic", formTier.value);
+    if (!formSecret.value.trim()) {
+      formSecret.value = JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "sk-ant-oat01-replace-me",
+          refreshToken: "sk-ant-ort01-replace-me",
+          subscriptionType: formTier.value,
+        },
+      });
+    }
+    return;
+  }
+  if (preset === "codex_pro_5x" || preset === "codex_pro_10x" || preset === "codex_pro_25x") {
+    const tier: SubscriptionTier =
+      preset === "codex_pro_25x" ? "pro_25x" : preset === "codex_pro_10x" ? "pro_10x" : "pro_5x";
+    formPlatform.value = "codex";
+    formMode.value = "stealth_http";
+    formAuthKind.value = "oauth";
+    formTier.value = tier;
+    formMaxConc.value = recommendedMaxConcurrencyForTier("codex", tier);
+    if (!formSecret.value.trim()) {
+      formSecret.value = JSON.stringify({
+        tokens: {
+          access_token: "eyJhbGciOi-replace-me",
+          refresh_token: "rt_replace_me",
+          account_id: "acct_chatgpt_replace_me",
+          plan_type: tier,
+        },
+      });
+    }
+    return;
+  }
+  formPlatform.value = "antigravity";
+  formMode.value = "vm_slot";
+  formAuthKind.value = "vm_cli_seed";
+  formTier.value = "pro";
+  formMaxConc.value = recommendedMaxConcurrencyForTier("antigravity", "pro");
+  if (!formSecret.value.trim()) {
+    formSecret.value = JSON.stringify({
+      accessToken: "ya29.replace-me",
+      refreshToken: "1//replace-me",
+      projectId: "rising-fact-p41fc",
+    });
+  }
+}
+
+function buildPatch(acc: UpstreamAccount): UpdateAccountRequest {
+  const patch: UpdateAccountRequest = {};
+  const name = formName.value.trim();
+  const notes = formNotes.value.trim();
+  if (name !== acc.name) patch.name = name;
+  if (notes !== acc.notes) patch.notes = notes;
+  if (formGroupId.value !== acc.groupId) patch.groupId = formGroupId.value;
+  if (formMode.value !== acc.executionMode) patch.executionMode = formMode.value;
+  if (formAuthKind.value !== acc.authKind) patch.authKind = formAuthKind.value;
+  if (formTier.value !== acc.subscriptionTier) patch.subscriptionTier = formTier.value;
+  if (formMaxConc.value !== acc.maxConcurrency) patch.maxConcurrency = formMaxConc.value;
+  if (formPriority.value !== acc.priority) patch.priority = formPriority.value;
+  if (formStatus.value !== acc.status) patch.status = formStatus.value;
+  if (formSecret.value.trim()) patch.credentialSecret = formSecret.value.trim();
+  return patch;
+}
+
+async function submitForm() {
+  errorMessage.value = null;
+  saving.value = true;
+  try {
+    const target = editing.value;
+    if (target) {
+      const patch = buildPatch(target);
+      if (Object.keys(patch).length === 0) {
+        drawerOpen.value = false;
+        return;
+      }
+      if (!(await patchAccount(target, patch, t("accounts.errors.updateAccount")))) return;
+      toast.success(t("accounts.toast.updated"));
+    } else {
+      const res = await auth.apiFetch("/api/v1/admin/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: formName.value.trim(),
+          notes: formNotes.value.trim(),
+          groupId: formGroupId.value,
+          platform: formPlatform.value,
+          executionMode: formMode.value,
+          authKind: formAuthKind.value,
+          subscriptionTier: formTier.value,
+          credentialSecret: formSecret.value,
+          maxConcurrency: formMaxConc.value,
+          priority: formPriority.value,
+        }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { message?: string };
+        errorMessage.value = data.message ?? t("accounts.errors.createAccount");
+        return;
+      }
+      toast.success(t("accounts.toast.created"));
+    }
+    formSecret.value = "";
+    drawerOpen.value = false;
+    await refreshPool(true);
+  } finally {
+    saving.value = false;
+  }
 }
 
 onMounted(() => {
@@ -361,122 +559,180 @@ onMounted(() => {
 
 <template>
   <div class="space-y-6">
-    <PageHeader title="号池与分组" description="管理路由分组与上游账号；凭据以 AES-256-GCM 密文入库，按档位权重参与调度。">
+    <PageHeader :title="t('nav.accounts')">
       <template #actions>
-        <button type="button" class="btn btn-secondary" :disabled="loading" @click="refreshPool">
+        <button type="button" class="btn btn-secondary" :disabled="loading" @click="refreshPool()">
           <UiIcon name="refresh" :size="15" :spin="loading" />
-          刷新
+          {{ t("common.refresh") }}
         </button>
-        <button type="button" class="btn btn-secondary" @click="groupDrawerOpen = true">
-          <UiIcon name="layers" :size="15" />
-          新增分组
-        </button>
-        <button type="button" class="btn btn-primary" @click="accountDrawerOpen = true">
+        <button type="button" class="btn btn-primary" @click="openCreate">
           <UiIcon name="plus" :size="15" />
-          添加账号
+          {{ t("accounts.actions.addAccount") }}
         </button>
       </template>
     </PageHeader>
 
     <div class="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
-      <StatCard label="活跃账号" :value="`${activeAccounts} / ${accounts.length}`" icon="users" tone="success" />
-      <StatCard label="启用分组" :value="`${enabledGroups} / ${groups.length}`" icon="layers" tone="accent" />
-      <StatCard label="调度总权重" :value="`${totalWeight}x`" icon="gauge" tone="violet" hint="活跃账号档位倍率之和" />
-      <StatCard label="可用并发" :value="totalConcurrency" icon="zap" tone="info" hint="活跃账号并发上限之和" />
+      <StatCard
+        :label="t('accounts.stats.activeAccounts')"
+        :value="`${activeAccounts} / ${accounts.length}`"
+        icon="users"
+        tone="success"
+      />
+      <StatCard :label="t('accounts.stats.totalWeight')" :value="`${totalWeight}x`" icon="gauge" tone="violet" />
+      <StatCard :label="t('accounts.stats.concurrency')" :value="totalConcurrency" icon="zap" tone="info" />
+      <StatCard
+        :label="t('accounts.stats.failedTests')"
+        :value="failedTests"
+        icon="alert"
+        :tone="failedTests > 0 ? 'danger' : 'neutral'"
+      />
     </div>
 
-    <!-- Groups -->
-    <UiCard icon="layers" title="路由分组" description="API Key 绑定分组，分组决定上游平台与计费倍率">
-      <EmptyState v-if="groups.length === 0" compact icon="layers" title="暂无分组">
-        <button type="button" class="btn btn-primary btn-sm" @click="groupDrawerOpen = true">
-          <UiIcon name="plus" :size="14" />
-          新增分组
-        </button>
-      </EmptyState>
-      <div v-else class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        <div
-          v-for="g in groups"
-          :key="g.id"
-          class="flex flex-col rounded-lg border border-line bg-surface-2/30 p-4 transition-colors hover:border-line-strong"
-          :class="g.enabled ? '' : 'opacity-70'"
-        >
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0">
-              <p class="truncate text-sm font-medium text-fg">{{ g.name }}</p>
-              <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle">{{ g.id }}</p>
-            </div>
-            <UiSwitch :model-value="g.enabled" :label="g.enabled ? '已启用' : '已禁用'" @update:model-value="toggleGroup(g)" />
-          </div>
-          <div class="mt-3 flex flex-wrap items-center gap-1.5">
-            <UiBadge tone="accent" mono>{{ g.platform }}</UiBadge>
-            <UiBadge>{{ g.subscriptionType === "subscription" ? "订阅套餐" : "按量扣费" }}</UiBadge>
-          </div>
-          <div class="mt-3 flex items-end justify-between border-t border-line/70 pt-3">
-            <dl class="flex gap-5">
-              <div>
-                <dt class="text-2xs text-fg-subtle">倍率</dt>
-                <dd class="font-mono text-sm font-medium text-fg">{{ g.rateMultiplier }}x</dd>
-              </div>
-              <div>
-                <dt class="text-2xs text-fg-subtle">账号</dt>
-                <dd class="font-mono text-sm font-medium text-fg">{{ g.accountCount }}</dd>
-              </div>
-            </dl>
-            <ConfirmButton icon-only @confirm="removeGroup(g.id)" />
-          </div>
-        </div>
-      </div>
-    </UiCard>
-
-    <!-- Accounts -->
-    <UiCard icon="users" title="上游号池" description="按优先级与档位权重加权调度，5h / 7d 窗口达到 95% 水位提前冷却" flush>
+    <UiCard icon="users" :title="t('accounts.list.title')" flush>
       <template #actions>
         <SegmentedControl v-model="modeFilter" :options="modeOptions" />
       </template>
+
+      <!-- Filters -->
+      <div class="flex flex-wrap items-center gap-2 border-b border-line/70 px-5 py-3">
+        <label class="relative min-w-[13rem] flex-1">
+          <UiIcon
+            name="search"
+            :size="14"
+            class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-subtle"
+          />
+          <input
+            v-model="search"
+            type="search"
+            class="input input-sm pl-8"
+            :placeholder="t('accounts.filters.search')"
+            :aria-label="t('common.search')"
+          />
+        </label>
+        <select v-model="platformFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('accounts.form.platform')">
+          <option value="all">{{ t("accounts.filters.allPlatforms") }}</option>
+          <option v-for="p in PROVIDER_OPTIONS" :key="p.value" :value="p.value">{{ p.label }}</option>
+        </select>
+        <select v-model="groupFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('accounts.form.group')">
+          <option value="all">{{ t("accounts.filters.allGroups") }}</option>
+          <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
+        </select>
+        <select v-model="statusFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('common.status')">
+          <option value="all">{{ t("accounts.filters.allStatuses") }}</option>
+          <option v-for="s in ACCOUNT_STATUSES" :key="s" :value="s">{{ accountStatusLabel(s) }}</option>
+        </select>
+        <label
+          v-if="pagedAccounts.length > 0"
+          class="ml-auto inline-flex cursor-pointer select-none items-center gap-2 whitespace-nowrap rounded-md px-1.5 py-1 text-xs font-medium text-fg-muted transition-colors hover:text-fg"
+        >
+          <input
+            type="checkbox"
+            class="checkbox"
+            :checked="allPageSelected"
+            :indeterminate="somePageSelected"
+            @change="togglePage"
+          />
+          {{ t("accounts.card.selectPage") }}
+        </label>
+      </div>
+
+      <!-- Bulk actions -->
+      <div
+        v-if="selectedCount > 0"
+        class="flex flex-wrap items-center gap-2 border-b border-line/70 bg-accent/[0.06] px-5 py-2.5"
+      >
+        <span class="text-sm font-medium text-fg">{{ t("accounts.bulk.selected", { count: selectedCount }) }}</span>
+        <div class="ml-auto flex flex-wrap items-center gap-2">
+          <button type="button" class="btn btn-secondary btn-sm" :disabled="bulkBusy" @click="bulkSetStatus('active')">
+            <UiIcon name="play" :size="13" />
+            {{ t("accounts.bulk.enable") }}
+          </button>
+          <button type="button" class="btn btn-secondary btn-sm" :disabled="bulkBusy" @click="bulkSetStatus('paused')">
+            <UiIcon name="stop" :size="13" />
+            {{ t("accounts.bulk.pause") }}
+          </button>
+          <div class="flex items-center gap-1">
+            <select v-model="bulkGroupId" class="select input-sm w-40" :aria-label="t('accounts.bulk.moveTo')">
+              <option value="" disabled>{{ t("accounts.bulk.moveTo") }}</option>
+              <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
+            </select>
+            <button type="button" class="btn btn-secondary btn-sm" :disabled="bulkBusy || !bulkGroupId" @click="bulkMove">
+              {{ t("accounts.bulk.move") }}
+            </button>
+          </div>
+          <ConfirmButton size="sm" :label="t('accounts.bulk.delete')" :disabled="bulkBusy" @confirm="bulkDelete" />
+          <button type="button" class="btn btn-ghost btn-sm" @click="clearSelection">
+            {{ t("accounts.bulk.clear") }}
+          </button>
+        </div>
+      </div>
+
       <EmptyState
         v-if="filteredAccounts.length === 0"
         icon="users"
-        :title="accounts.length === 0 ? '号池为空' : '没有符合筛选条件的账号'"
-        :description="accounts.length === 0 ? '添加第一个上游账号，网关即可开始调度请求。' : undefined"
+        :title="accounts.length === 0 ? t('accounts.list.empty') : t('accounts.list.noMatch')"
       >
-        <button v-if="accounts.length === 0" type="button" class="btn btn-primary btn-sm" @click="accountDrawerOpen = true">
+        <button v-if="accounts.length === 0" type="button" class="btn btn-primary btn-sm" @click="openCreate">
           <UiIcon name="plus" :size="14" />
-          添加账号
+          {{ t("accounts.actions.addAccount") }}
         </button>
       </EmptyState>
+
       <div v-else class="table-wrap">
         <table class="data-table">
           <thead>
             <tr>
-              <th>账号</th>
-              <th>平台 / 档位</th>
-              <th>执行 / 认证</th>
-              <th>窗口用量</th>
-              <th class="text-right">并发 / 优先级</th>
-              <th>状态</th>
-              <th class="text-right">操作</th>
+              <th class="w-10">
+                <input
+                  type="checkbox"
+                  class="checkbox"
+                  :checked="allFilteredSelected"
+                  :indeterminate="someFilteredSelected"
+                  :aria-label="t('accounts.table.selectAll')"
+                  @change="toggleAll"
+                />
+              </th>
+              <th>{{ t("accounts.table.account") }}</th>
+              <th>{{ t("accounts.table.platformTier") }}</th>
+              <th>{{ t("accounts.table.modeAuth") }}</th>
+              <th>{{ t("accounts.table.usage") }}</th>
+              <th class="text-right">{{ t("accounts.table.concurrencyPriority") }}</th>
+              <th>{{ t("common.status") }}</th>
+              <th>{{ t("accounts.table.lastTest") }}</th>
+              <th class="text-right">{{ t("common.actions") }}</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="acc in filteredAccounts" :key="acc.id">
+            <tr v-for="acc in pagedAccounts" :key="acc.id" :class="selected.has(acc.id) ? 'bg-accent/[0.04]' : ''">
+              <td>
+                <input
+                  type="checkbox"
+                  class="checkbox"
+                  :checked="selected.has(acc.id)"
+                  :aria-label="t('accounts.table.selectRow', { name: acc.name })"
+                  @change="toggleOne(acc.id)"
+                />
+              </td>
               <td class="max-w-[16rem]">
-                <p class="truncate font-medium text-fg">{{ acc.name }}</p>
+                <p class="truncate font-medium text-fg" :title="acc.id">{{ acc.name }}</p>
+                <p v-if="acc.notes" class="mt-0.5 truncate text-xs text-fg-muted" :title="acc.notes">{{ acc.notes }}</p>
                 <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle" :title="acc.credentialPreview">
                   {{ acc.groupName }} · {{ acc.credentialPreview }}
                 </p>
               </td>
               <td>
                 <div class="flex flex-col items-start gap-1">
-                  <UiBadge tone="accent" mono>{{ acc.platform }}</UiBadge>
+                  <UiBadge tone="accent">{{ platformLabel(acc.platform) }}</UiBadge>
                   <UiBadge :tone="tierTone(acc)" mono>{{ formatTierBadge(acc) }}</UiBadge>
                 </div>
               </td>
               <td>
-                <p class="text-xs text-fg">{{ EXECUTION_MODE_LABEL[acc.executionMode] ?? acc.executionMode }}</p>
-                <p class="mt-0.5 font-mono text-2xs text-fg-subtle">{{ acc.authKind }}</p>
+                <p class="text-xs text-fg">{{ executionModeLabel(acc.executionMode) }}</p>
+                <p class="mt-0.5 text-2xs text-fg-subtle">{{ authKindLabel(acc.authKind) }}</p>
               </td>
               <td>
-                <div class="flex w-40 flex-col gap-1.5">
+                <div class="flex w-36 flex-col gap-1.5">
                   <UsageMeter label="5h" :bps="acc.window5hUsedBps" />
                   <UsageMeter label="7d" :bps="acc.window7dUsedBps" />
                 </div>
@@ -486,96 +742,97 @@ onMounted(() => {
                 <p class="mt-0.5 text-fg-subtle">#{{ acc.priority }}</p>
               </td>
               <td>
-                <div class="flex flex-col items-start gap-1.5">
-                  <UiSwitch
-                    v-if="acc.status === 'active' || acc.status === 'paused'"
-                    :model-value="acc.status === 'active'"
-                    :label="ACCOUNT_STATUS_LABEL[acc.status]"
-                    @update:model-value="toggleAccountStatus(acc)"
-                  />
-                  <button
-                    v-else
-                    type="button"
-                    class="cursor-pointer"
-                    title="点击恢复为活跃"
-                    @click="toggleAccountStatus(acc)"
+                <UiSwitch
+                  v-if="acc.status === 'active' || acc.status === 'paused'"
+                  :model-value="acc.status === 'active'"
+                  :label="accountStatusLabel(acc.status)"
+                  @update:model-value="toggleAccountStatus(acc)"
+                />
+                <button
+                  v-else
+                  type="button"
+                  class="cursor-pointer"
+                  :title="t('accounts.table.resume')"
+                  @click="toggleAccountStatus(acc)"
+                >
+                  <UiBadge :tone="healthTone(acc.status)" dot>{{ accountStatusLabel(acc.status) }}</UiBadge>
+                </button>
+              </td>
+              <td class="whitespace-nowrap">
+                <template v-if="acc.lastTest">
+                  <span
+                    class="inline-flex flex-col items-start gap-0.5"
+                    :title="acc.lastTest.message || acc.lastTest.model"
                   >
-                    <UiBadge :tone="healthTone(acc.status)" dot>{{ ACCOUNT_STATUS_LABEL[acc.status] ?? acc.status }}</UiBadge>
-                  </button>
-                </div>
+                    <UiBadge :tone="acc.lastTest.ok ? 'success' : 'danger'" dot>
+                      {{ acc.lastTest.ok ? t("accounts.lastTest.ok") : t("accounts.lastTest.failed") }}
+                    </UiBadge>
+                    <span class="font-mono text-2xs text-fg-subtle">
+                      {{ relativeTime(acc.lastTest.atIso) }} · {{ formatDuration(acc.lastTest.durationMs) }}
+                    </span>
+                  </span>
+                </template>
+                <span v-else class="text-xs text-fg-subtle">{{ t("accounts.lastTest.never") }}</span>
               </td>
               <td class="text-right">
                 <div class="inline-flex items-center gap-1">
-                  <select
-                    :value="acc.subscriptionTier"
-                    class="select input-sm w-36 font-mono"
-                    aria-label="订阅档位"
-                    @change="changeAccountTier(acc, ($event.target as HTMLSelectElement).value as SubscriptionTier)"
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon btn-xs"
+                    :disabled="acc.executionMode === 'vm_slot'"
+                    :title="acc.executionMode === 'vm_slot' ? t('accounts.row.vmTestDisabled') : t('accounts.row.test')"
+                    :aria-label="t('accounts.row.test')"
+                    @click="openTest(acc)"
                   >
-                    <option
-                      v-for="opt in allowedSubscriptionTiersForProvider(acc.platform)"
-                      :key="opt.tier"
-                      :value="opt.tier"
-                    >
-                      {{ opt.label }}
-                    </option>
-                  </select>
-                  <ConfirmButton icon-only @confirm="removeAccount(acc.id)" />
+                    <UiIcon name="play" :size="13" />
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon btn-xs"
+                    :title="t('accounts.row.edit')"
+                    :aria-label="t('accounts.row.edit')"
+                    @click="openEdit(acc)"
+                  >
+                    <UiIcon name="pencil" :size="13" />
+                  </button>
+                  <ConfirmButton icon-only @confirm="removeAccount(acc)" />
                 </div>
               </td>
             </tr>
           </tbody>
         </table>
       </div>
+
+      <template v-if="pageCount > 1" #footer>
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-xs text-fg-muted">
+            {{ t("accounts.pagination.summary", { page, pages: pageCount, total: filteredAccounts.length }) }}
+          </span>
+          <div class="flex items-center gap-1.5">
+            <button type="button" class="btn btn-secondary btn-sm" :disabled="page <= 1" @click="page -= 1">
+              <UiIcon name="chevron-right" :size="13" class="rotate-180" />
+              {{ t("accounts.pagination.prev") }}
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm" :disabled="page >= pageCount" @click="page += 1">
+              {{ t("accounts.pagination.next") }}
+              <UiIcon name="chevron-right" :size="13" />
+            </button>
+          </div>
+        </div>
+      </template>
     </UiCard>
 
-    <!-- Create group drawer -->
-    <UiDrawer v-model:open="groupDrawerOpen" title="新增路由分组">
-      <form id="create-group-form" class="space-y-4" @submit.prevent="handleCreateGroup">
-        <FormField label="分组名称" required>
-          <input v-model="groupName" type="text" required placeholder="例如 claude-pro-pool" class="input" />
-        </FormField>
-        <FormField label="平台" hint="composite 分组可通过合成路由规则把模型分流到多个平台">
-          <select v-model="groupPlatform" class="select">
-            <option value="composite">composite（合成路由）</option>
-            <option value="anthropic">anthropic（Claude）</option>
-            <option value="codex">codex（ChatGPT Plus/Pro）</option>
-            <option value="antigravity">antigravity（反重力）</option>
-            <option value="openai">openai</option>
-            <option value="gemini">gemini</option>
-            <option value="grok">grok</option>
-          </select>
-        </FormField>
-        <div class="grid grid-cols-2 gap-3">
-          <FormField label="计费方式">
-            <select v-model="groupSubType" class="select">
-              <option value="balance">按量扣费</option>
-              <option value="subscription">订阅套餐</option>
-            </select>
-          </FormField>
-          <FormField label="费率倍率">
-            <input v-model.number="groupMultiplier" type="number" step="0.1" min="0.01" class="input font-mono" />
-          </FormField>
-        </div>
-      </form>
-      <template #footer>
-        <button type="button" class="btn btn-secondary" @click="groupDrawerOpen = false">取消</button>
-        <button type="submit" form="create-group-form" class="btn btn-primary">创建分组</button>
-      </template>
-    </UiDrawer>
-
-    <!-- Create account drawer -->
+    <!-- Create / edit drawer -->
     <UiDrawer
-      v-model:open="accountDrawerOpen"
-      title="添加上游账号"
-      description="凭据经 AES-256-GCM 加密后入库，列表中只显示脱敏预览"
+      v-model:open="drawerOpen"
+      :title="editing ? t('accounts.form.editTitle') : t('accounts.form.createTitle')"
       width="lg"
     >
-      <form id="create-account-form" class="space-y-5" @submit.prevent="handleCreateAccount">
-        <div>
+      <form id="account-form" class="space-y-5" @submit.prevent="submitForm">
+        <div v-if="!editing">
           <p class="label flex items-center gap-1.5">
             <UiIcon name="sparkles" :size="13" />
-            订阅档位快速预设
+            {{ t("accounts.form.presets") }}
           </p>
           <div class="flex flex-wrap gap-1.5">
             <button
@@ -592,58 +849,93 @@ onMounted(() => {
         </div>
 
         <div class="grid gap-4 sm:grid-cols-2">
-          <FormField label="账号别名" required>
-            <input v-model="accName" type="text" required placeholder="如 claude-ultra-01" class="input" />
+          <FormField :label="t('accounts.form.name')" required>
+            <input
+              v-model="formName"
+              type="text"
+              required
+              maxlength="64"
+              :placeholder="t('accounts.form.namePlaceholder')"
+              class="input"
+            />
           </FormField>
-          <FormField label="所属分组" required>
-            <select v-model="accGroupId" required class="select">
+          <FormField :label="t('accounts.form.group')" required>
+            <select v-model="formGroupId" required class="select">
               <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
             </select>
           </FormField>
-          <FormField label="平台">
-            <select v-model="accPlatform" class="select" @change="onPlatformChange">
+          <FormField :label="t('accounts.form.platform')">
+            <select v-model="formPlatform" class="select" :disabled="!!editing" @change="onPlatformChange">
               <option v-for="p in PROVIDER_OPTIONS" :key="p.value" :value="p.value">{{ p.label }}</option>
             </select>
           </FormField>
-          <FormField label="订阅档位" hint="切换档位会自动填入推荐并发上限">
-            <select v-model="accSubscriptionTier" class="select" @change="onTierChange">
+          <FormField :label="t('accounts.form.tier')">
+            <select v-model="formTier" class="select" @change="onTierChange">
               <option v-for="opt in tierOptions" :key="opt.tier" :value="opt.tier">{{ opt.label }}</option>
             </select>
           </FormField>
-          <FormField label="执行模式">
-            <select v-model="accMode" class="select">
-              <option value="stealth_http">stealth_http（uTLS + Clash）</option>
-              <option value="vm_slot">vm_slot（KVM / VM 执行槽）</option>
-              <option value="direct_api">direct_api（官方密钥直连）</option>
+          <FormField :label="t('accounts.form.mode')">
+            <select v-model="formMode" class="select">
+              <option v-for="m in EXECUTION_MODES" :key="m" :value="m">{{ executionModeLabel(m) }}</option>
             </select>
           </FormField>
-          <FormField label="认证方式">
-            <select v-model="accAuthKind" class="select">
-              <option value="oauth">oauth（订阅 OAuth）</option>
-              <option value="setup_token">setup_token（sk-ant-oat*）</option>
-              <option value="vm_cli_seed">vm_cli_seed（VM 凭据种子）</option>
-              <option value="api_key">api_key</option>
+          <FormField :label="t('accounts.form.auth')">
+            <select v-model="formAuthKind" class="select">
+              <option v-for="k in AUTH_KINDS" :key="k" :value="k">{{ authKindLabel(k) }}</option>
             </select>
           </FormField>
-          <FormField label="并发上限">
-            <input v-model.number="accMaxConc" type="number" min="1" max="64" class="input font-mono" />
+          <FormField :label="t('accounts.form.concurrency')">
+            <input v-model.number="formMaxConc" type="number" min="1" max="64" class="input font-mono" />
           </FormField>
-          <FormField label="优先级" hint="数值越小越优先">
-            <input v-model.number="accPriority" type="number" min="0" max="10000" class="input font-mono" />
+          <FormField :label="t('accounts.form.priority')">
+            <input v-model.number="formPriority" type="number" min="0" max="10000" class="input font-mono" />
+          </FormField>
+          <FormField v-if="editing" :label="t('accounts.form.status')">
+            <select v-model="formStatus" class="select">
+              <option v-for="s in ACCOUNT_STATUSES" :key="s" :value="s">{{ accountStatusLabel(s) }}</option>
+            </select>
           </FormField>
         </div>
 
-        <FormField label="凭据" required hint="粘贴 .claude/.credentials.json、.codex/auth.json、Antigravity JSON 或 API Key">
-          <textarea v-model="accSecret" rows="6" required spellcheck="false" class="textarea font-mono text-xs" />
+        <FormField :label="t('accounts.form.notes')">
+          <textarea
+            v-model="formNotes"
+            rows="2"
+            maxlength="500"
+            :placeholder="t('accounts.form.notesPlaceholder')"
+            class="textarea"
+          />
         </FormField>
+
+        <label class="block min-w-0">
+          <span class="label flex items-center justify-between gap-3">
+            <span>
+              {{ t("accounts.form.credentials") }}
+              <span v-if="!editing" class="text-danger">*</span>
+            </span>
+            <span v-if="editing" class="truncate font-mono font-normal text-fg-muted">
+              {{ t("accounts.form.credentialsCurrent", { preview: editing.credentialPreview }) }}
+            </span>
+          </span>
+          <textarea
+            v-model="formSecret"
+            rows="6"
+            :required="!editing"
+            spellcheck="false"
+            :placeholder="editing ? t('accounts.form.credentialsKeepPlaceholder') : t('accounts.form.credentialsPlaceholder')"
+            class="textarea font-mono text-xs"
+          />
+        </label>
       </form>
       <template #footer>
-        <button type="button" class="btn btn-secondary" @click="accountDrawerOpen = false">取消</button>
-        <button type="submit" form="create-account-form" class="btn btn-primary">
-          <UiIcon name="lock" :size="14" />
-          加密入库
+        <button type="button" class="btn btn-secondary" @click="drawerOpen = false">{{ t("common.cancel") }}</button>
+        <button type="submit" form="account-form" class="btn btn-primary" :disabled="saving">
+          <UiIcon :name="saving ? 'loader' : 'lock'" :size="14" :spin="saving" />
+          {{ t("accounts.actions.saveAccount") }}
         </button>
       </template>
     </UiDrawer>
+
+    <AccountTestModal v-model:open="testOpen" :account="testTarget" @tested="refreshPool(true)" />
   </div>
 </template>

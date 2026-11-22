@@ -24,7 +24,11 @@ export default {
           subtle: token("fg-subtle"),
         },
         accent: {
+          /** Text, icons, indicators and soft `/10` tints. */
           DEFAULT: token("accent"),
+          /** Solid fills that carry `accent-fg` text (primary buttons, avatars). */
+          solid: token("accent-solid"),
+          hover: token("accent-hover"),
           fg: token("accent-fg"),
         },
         success: token("success"),
@@ -67,11 +71,14 @@ export default {
         "2xs": ["0.6875rem", { lineHeight: "1rem" }],
       },
       boxShadow: {
-        card: "0 1px 2px 0 rgb(var(--shadow) / 0.05), 0 1px 1px 0 rgb(var(--shadow) / 0.03)",
-        pop: "0 12px 32px -8px rgb(var(--shadow) / 0.28), 0 2px 6px -2px rgb(var(--shadow) / 0.12)",
+        card: "0 1px 3px 0 rgb(var(--shadow) / 0.04), 0 1px 2px 0 rgb(var(--shadow) / 0.06)",
+        "card-hover": "0 10px 32px -6px rgb(var(--shadow) / 0.12), 0 2px 6px -2px rgb(var(--shadow) / 0.06)",
+        pop: "0 16px 40px -12px rgb(var(--shadow) / 0.3), 0 2px 6px -2px rgb(var(--shadow) / 0.12)",
+        glow: "0 6px 20px -4px rgb(var(--accent-glow) / 0.45)",
       },
       transitionTimingFunction: {
         out: "cubic-bezier(0.16, 1, 0.3, 1)",
+        nav: "cubic-bezier(0.2, 0, 0, 1)",
       },
       keyframes: {
         "fade-in": { from: { opacity: "0" }, to: { opacity: "1" } },
@@ -79,10 +86,20 @@ export default {
           from: { opacity: "0", transform: "translateY(6px)" },
           to: { opacity: "1", transform: "translateY(0)" },
         },
+        "slide-in-right": {
+          from: { opacity: "0", transform: "translateX(16px)" },
+          to: { opacity: "1", transform: "translateX(0)" },
+        },
+        "scale-in": {
+          from: { opacity: "0", transform: "translateY(-4px) scale(0.97)" },
+          to: { opacity: "1", transform: "translateY(0) scale(1)" },
+        },
       },
       animation: {
         "fade-in": "fade-in 160ms ease-out",
-        "slide-up": "slide-up 200ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "slide-up": "slide-up 220ms cubic-bezier(0.2, 0, 0, 1)",
+        "slide-in-right": "slide-in-right 240ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "scale-in": "scale-in 160ms cubic-bezier(0.16, 1, 0.3, 1)",
       },
     },
   },

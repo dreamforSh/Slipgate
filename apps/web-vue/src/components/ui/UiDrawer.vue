@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
 import UiIcon from "./UiIcon.vue";
 
 const props = withDefaults(
   defineProps<{
     open: boolean;
     title: string;
-    description?: string;
     width?: "md" | "lg" | "xl";
   }>(),
   { width: "md" },
@@ -14,6 +14,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{ (e: "update:open", value: boolean): void; (e: "close"): void }>();
 
+const { t } = useI18n();
 const panel = ref<HTMLElement | null>(null);
 
 const widthClass = { md: "max-w-md", lg: "max-w-xl", xl: "max-w-3xl" };
@@ -78,13 +79,12 @@ onBeforeUnmount(() => {
         <header class="flex items-start justify-between gap-4 border-b border-line px-5 py-4">
           <div class="min-w-0">
             <h2 class="text-base font-semibold text-fg">{{ title }}</h2>
-            <p v-if="description" class="mt-0.5 text-xs text-fg-subtle">{{ description }}</p>
           </div>
           <button
             type="button"
             data-drawer-close
             class="btn btn-ghost btn-icon btn-sm -mr-1.5"
-            aria-label="关闭"
+            :aria-label="t('common.close')"
             @click="close"
           >
             <UiIcon name="x" :size="16" />

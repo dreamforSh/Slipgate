@@ -1,4 +1,5 @@
 import type { Provider } from "@slipgate/contracts";
+import { enumLabel } from "../i18n";
 
 export type Tone = "neutral" | "accent" | "success" | "warning" | "danger" | "info" | "violet";
 
@@ -62,42 +63,13 @@ export function healthTone(status: string | undefined): Tone {
   }
 }
 
-export const SLOT_STATE_LABEL: Record<string, string> = {
-  provisioning: "部署中",
-  ready: "就绪",
-  cooldown_5h: "5h 冷却",
-  cooldown_7d: "7d 冷却",
-  draining: "排空中",
-  stopped: "已停止",
-  auth_expired: "凭据过期",
-  migrating: "迁移中",
-};
-
-export const ACCOUNT_STATUS_LABEL: Record<string, string> = {
-  active: "活跃",
-  paused: "已暂停",
-  cooldown: "冷却中",
-  expired: "已过期",
-};
-
-export const HEALTH_LABEL: Record<string, string> = {
-  healthy: "健康",
-  degraded: "降级",
-  circuit_open: "熔断",
-  unknown: "未探测",
-};
-
-export const PLANE_LABEL: Record<string, string> = {
-  up: "运行中",
-  down: "离线",
-  unknown: "未知",
-};
-
-export const EXECUTION_MODE_LABEL: Record<string, string> = {
-  stealth_http: "Stealth HTTP",
-  vm_slot: "VM Slot",
-  direct_api: "Direct API",
-};
+/* Backend enum → localized label (falls back to the raw value for unknown states). */
+export const slotStateLabel = (state: string | null | undefined) => enumLabel("slotState", state);
+export const accountStatusLabel = (status: string | null | undefined) => enumLabel("accountStatus", status);
+export const healthLabel = (status: string | null | undefined) => enumLabel("health", status);
+export const hostStatusLabel = (status: string | null | undefined) => enumLabel("hostStatus", status);
+export const planeLabel = (status: string | null | undefined) => enumLabel("plane", status);
+export const executionModeLabel = (mode: string | null | undefined) => enumLabel("executionMode", mode);
 
 export const RUNTIME_PROFILE_TONE: Record<string, Tone> = {
   claude_code: "warning",
@@ -105,11 +77,11 @@ export const RUNTIME_PROFILE_TONE: Record<string, Tone> = {
   antigravity: "violet",
 };
 
-/** Upstream providers in display order (values must match ProviderSchema). */
+/** Upstream providers in display order (values must match ProviderSchema). Brand names are not translated. */
 export const PROVIDER_OPTIONS: { value: Provider; label: string }[] = [
-  { value: "anthropic", label: "Anthropic · Claude Code" },
-  { value: "codex", label: "Codex · Codex CLI Responses" },
-  { value: "antigravity", label: "Antigravity · v1internal" },
+  { value: "anthropic", label: "Anthropic Claude" },
+  { value: "codex", label: "OpenAI Codex" },
+  { value: "antigravity", label: "Google Antigravity" },
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Gemini" },
   { value: "grok", label: "Grok" },

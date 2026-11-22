@@ -1,0 +1,86 @@
+import type zh from "../zh-CN/groups";
+
+const en: typeof zh = {
+  groups: {
+    actions: {
+      create: "New group",
+      edit: "Edit",
+      duplicate: "Duplicate",
+      deleteBlocked: "Still used by accounts or keys",
+      viewAccounts: "View accounts in this group",
+    },
+    stats: {
+      groups: "Enabled groups",
+      exclusive: "Exclusive groups",
+      accounts: "Bound accounts",
+      apiKeys: "API keys",
+    },
+    list: {
+      title: "All groups",
+      searchPlaceholder: "Search name, description or ID",
+      empty: "No groups yet",
+      noMatch: "No groups match these filters",
+      clearFilters: "Clear filters",
+    },
+    filters: {
+      allPlatforms: "All platforms",
+      allTypes: "All types",
+    },
+    table: {
+      name: "Group",
+      platform: "Platform",
+      billing: "Billing",
+      rate: "Rate",
+      type: "Type",
+      accounts: "Accounts",
+      apiKeys: "Keys",
+    },
+    billing: {
+      balance: "Pay as you go",
+      subscription: "Subscription",
+    },
+    type: {
+      public: "Public",
+      exclusive: "Exclusive",
+    },
+    platforms: {
+      composite: "Composite routing",
+    },
+    form: {
+      createTitle: "New group",
+      editTitle: "Edit group",
+      name: "Name",
+      namePlaceholder: "e.g. claude-pro",
+      description: "Description",
+      descriptionPlaceholder: "Optional",
+      platform: "Platform",
+      billing: "Billing",
+      rate: "Rate multiplier",
+      sortOrder: "Sort order",
+      allowlist: "Allowed models",
+      allowlistPlaceholder: "One model per line. Leave empty to allow all models.",
+      exclusive: "Exclusive group",
+      enabled: "Enabled",
+      submitCreate: "Create",
+      submitSave: "Save",
+    },
+    notice: {
+      created: "Created group {name}",
+      saved: "Saved group {name}",
+      duplicated: "Duplicated as {name}",
+      deleted: "Group deleted",
+      enabled: "Enabled {name}",
+      disabled: "Disabled {name}",
+    },
+    errors: {
+      load: "Failed to load groups",
+      create: "Failed to create group",
+      save: "Failed to save group",
+      duplicate: "Failed to duplicate group",
+      delete: "Failed to delete group",
+      toggle: "Failed to update group status",
+    },
+  },
+};
+
+export default en;

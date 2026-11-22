@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from "vue-router";
+import { i18n } from "../i18n";
 import { useAuthStore } from "../stores/auth";
 
 const router = createRouter({
@@ -9,43 +10,49 @@ const router = createRouter({
       path: "/setup",
       name: "setup-wizard",
       component: () => import("../views/SetupWizardView.vue"),
-      meta: { layout: "auth", title: "初始化" },
+      meta: { layout: "auth", titleKey: "setup.title" },
     },
     {
       path: "/login",
       name: "auth-login",
       component: () => import("../views/AuthLoginView.vue"),
-      meta: { layout: "auth", title: "登录" },
+      meta: { layout: "auth", titleKey: "auth.login" },
     },
     {
       path: "/admin",
       name: "admin-dashboard",
       component: () => import("../portals/admin/AdminDashboardView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true, title: "系统看板" },
+      meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.dashboard" },
+    },
+    {
+      path: "/admin/groups",
+      name: "admin-groups",
+      component: () => import("../portals/admin/AdminGroupsView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.groups" },
     },
     {
       path: "/admin/accounts",
       name: "admin-accounts",
       component: () => import("../portals/admin/AdminAccountsView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true, title: "号池与分组" },
+      meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.accounts" },
     },
     {
       path: "/admin/clash",
       name: "admin-clash",
       component: () => import("../portals/admin/AdminClashPoolView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true, title: "Clash 出口与 uTLS" },
+      meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.clash" },
     },
     {
       path: "/admin/vms",
       name: "admin-vms",
       component: () => import("../portals/admin/AdminVmFleetView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true, title: "VM 拟真槽舰队" },
+      meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.vms" },
     },
     {
       path: "/user",
       name: "user-console",
       component: () => import("../portals/user/UserConsoleView.vue"),
-      meta: { requiresAuth: true, title: "密钥与配额" },
+      meta: { requiresAuth: true, titleKey: "nav.keys" },
     },
     { path: "/:pathMatch(.*)*", redirect: "/" },
   ],
@@ -81,10 +88,14 @@ router.beforeEach(async (to) => {
   return true;
 });
 
-router.afterEach((to) => {
+/** Keep the tab title in sync with the route and the active locale. */
+export function syncDocumentTitle() {
   const auth = useAuthStore();
   const site = auth.setupStatus?.siteName || "Slipgate";
-  document.title = to.meta.title ? `${to.meta.title} · ${site}` : site;
-});
+  const key = router.currentRoute.value.meta.titleKey;
+  document.title = key ? `${i18n.global.t(key)} · ${site}` : site;
+}
+
+router.afterEach(() => syncDocumentTitle());
 
 export default router;

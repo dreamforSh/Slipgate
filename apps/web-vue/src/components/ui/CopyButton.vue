@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref } from "vue";
+import { useI18n } from "vue-i18n";
 import UiIcon from "./UiIcon.vue";
 
 const props = withDefaults(
@@ -11,6 +12,7 @@ const props = withDefaults(
   { size: "xs" },
 );
 
+const { t } = useI18n();
 const copied = ref(false);
 let timer: number | undefined;
 
@@ -33,11 +35,11 @@ onBeforeUnmount(() => window.clearTimeout(timer));
     type="button"
     class="btn btn-ghost"
     :class="[size === 'xs' ? 'btn-xs' : 'btn-sm', label ? '' : 'btn-icon', copied ? '!text-success' : '']"
-    :title="copied ? '已复制' : '复制'"
-    :aria-label="copied ? '已复制' : '复制'"
+    :title="copied ? t('common.copied') : t('common.copy')"
+    :aria-label="copied ? t('common.copied') : t('common.copy')"
     @click="copy"
   >
     <UiIcon :name="copied ? 'check' : 'copy'" :size="13" />
-    <span v-if="label">{{ copied ? "已复制" : label }}</span>
+    <span v-if="label">{{ copied ? t("common.copied") : label }}</span>
   </button>
 </template>

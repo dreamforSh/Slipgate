@@ -1,0 +1,83 @@
+/** Page copy for the group management view. */
+export default {
+  groups: {
+    actions: {
+      create: "新建分组",
+      edit: "编辑",
+      duplicate: "复制",
+      deleteBlocked: "仍有账号或密钥使用此分组",
+      viewAccounts: "查看该分组的账号",
+    },
+    stats: {
+      groups: "已启用分组",
+      exclusive: "专属分组",
+      accounts: "绑定账号",
+      apiKeys: "API 密钥",
+    },
+    list: {
+      title: "分组列表",
+      searchPlaceholder: "搜索名称、描述或 ID",
+      empty: "还没有分组",
+      noMatch: "没有符合条件的分组",
+      clearFilters: "清除筛选",
+    },
+    filters: {
+      allPlatforms: "全部平台",
+      allTypes: "全部类型",
+    },
+    table: {
+      name: "分组",
+      platform: "平台",
+      billing: "计费方式",
+      rate: "倍率",
+      type: "类型",
+      accounts: "账号",
+      apiKeys: "密钥",
+    },
+    billing: {
+      balance: "按量计费",
+      subscription: "订阅制",
+    },
+    type: {
+      public: "公开",
+      exclusive: "专属",
+    },
+    platforms: {
+      composite: "组合路由",
+    },
+    form: {
+      createTitle: "新建分组",
+      editTitle: "编辑分组",
+      name: "名称",
+      namePlaceholder: "例如 claude-pro",
+      description: "描述",
+      descriptionPlaceholder: "选填",
+      platform: "平台",
+      billing: "计费方式",
+      rate: "倍率",
+      sortOrder: "排序",
+      allowlist: "可用模型",
+      allowlistPlaceholder: "每行一个模型，留空表示全部模型",
+      exclusive: "专属分组",
+      enabled: "启用分组",
+      submitCreate: "创建",
+      submitSave: "保存",
+    },
+    notice: {
+      created: "已创建分组 {name}",
+      saved: "已保存分组 {name}",
+      duplicated: "已复制为 {name}",
+      deleted: "已删除分组",
+      enabled: "已启用 {name}",
+      disabled: "已禁用 {name}",
+    },
+    errors: {
+      load: "加载分组失败",
+      create: "创建分组失败",
+      save: "保存分组失败",
+      duplicate: "复制分组失败",
+      delete: "删除分组失败",
+      toggle: "更新分组状态失败",
+    },
+  },
+};

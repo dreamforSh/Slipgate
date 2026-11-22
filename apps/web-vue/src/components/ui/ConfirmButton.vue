@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
+import { useI18n } from "vue-i18n";
 import UiIcon, { type IconName } from "./UiIcon.vue";
 
 /** Two-step destructive action: first click arms, second click (within 3s) confirms. */
@@ -12,10 +13,14 @@ const props = withDefaults(
     iconOnly?: boolean;
     disabled?: boolean;
   }>(),
-  { label: "删除", confirmLabel: "确认？", icon: "trash", size: "xs", iconOnly: false, disabled: false },
+  { icon: "trash", size: "xs", iconOnly: false, disabled: false },
 );
 
 const emit = defineEmits<{ (e: "confirm"): void }>();
+
+const { t } = useI18n();
+const labelText = computed(() => props.label ?? t("common.delete"));
+const confirmText = computed(() => props.confirmLabel ?? t("common.confirmDelete"));
 
 const armed = ref(false);
 let timer: number | undefined;
@@ -46,12 +51,12 @@ onBeforeUnmount(() => window.clearTimeout(timer));
       iconOnly && !armed ? 'btn-icon' : '',
     ]"
     :disabled="disabled"
-    :title="iconOnly ? label : undefined"
-    :aria-label="armed ? confirmLabel : label"
+    :title="iconOnly ? labelText : undefined"
+    :aria-label="armed ? confirmText : labelText"
     @click="onClick"
     @blur="armed = false"
   >
     <UiIcon :name="armed ? 'alert' : icon" :size="13" />
-    <span v-if="!iconOnly || armed">{{ armed ? confirmLabel : label }}</span>
+    <span v-if="!iconOnly || armed">{{ armed ? confirmText : labelText }}</span>
   </button>
 </template>

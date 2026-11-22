@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
 import type {
   ClashExitNode,
   ClusterNode,
@@ -22,10 +23,45 @@ import UiIcon from "../../components/ui/UiIcon.vue";
 import UiSwitch from "../../components/ui/UiSwitch.vue";
 import UsageMeter from "../../components/ui/UsageMeter.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
-import { RUNTIME_PROFILE_TONE, SLOT_STATE_LABEL, formatUnixMs, healthTone } from "../../lib/format";
+import { RUNTIME_PROFILE_TONE, formatUnixMs, healthLabel, healthTone, hostStatusLabel, slotStateLabel } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 
+const { t } = useI18n();
 const auth = useAuthStore();
+
+type TelemetryMode = "isolated" | "enabled" | "disabled";
+type CleanseMode = "zero" | "official" | "template";
+type HypervisorKind = "docker_hardened" | "kvm_qemu" | "macos_native";
+
+/** Runtime profiles are product names and read the same in every locale. */
+const RUNTIME_LABEL: Record<string, string> = {
+  claude_code: "Claude Code",
+  codex_cli: "Codex CLI",
+  antigravity: "Antigravity",
+};
+const runtimeLabel = (profile: string) => RUNTIME_LABEL[profile] ?? profile;
+const runtimeOptions = Object.entries(RUNTIME_LABEL).map(([value, label]) => ({ value: value as VmRuntimeProfile, label }));
+
+const telemetryOptions = computed(() =>
+  (["isolated", "enabled", "disabled"] as TelemetryMode[]).map((value) => ({
+    value,
+    label: t(`vms.options.telemetry.${value}`),
+  })),
+);
+const cleanseOptions = computed(() =>
+  (["zero", "official", "template"] as CleanseMode[]).map((value) => ({
+    value,
+    label: t(`vms.options.cleanse.${value}`),
+  })),
+);
+const hypervisorOptions = computed(() =>
+  (["docker_hardened", "kvm_qemu", "macos_native"] as HypervisorKind[]).map((value) => ({
+    value,
+    label: t(`vms.options.hypervisor.${value}`),
+  })),
+);
+const cleanseLabel = (mode: string) => cleanseOptions.value.find((o) => o.value === mode)?.label ?? mode;
+const telemetryLabel = (mode: string) => telemetryOptions.value.find((o) => o.value === mode)?.label ?? mode;
 
 const loading = ref(false);
 const busy = ref(false);
@@ -40,7 +76,7 @@ const overview = ref<VmFleetOverview | null>(null);
 const clashNodes = ref<ClashExitNode[]>([]);
 const accounts = ref<UpstreamAccount[]>([]);
 
-// Register SSH Node Form
+// Register SSH node form
 const nodeName = ref("");
 const nodeAddr = ref("");
 const nodeUser = ref("root");
@@ -48,20 +84,20 @@ const nodeArch = ref<"amd64" | "arm64">("amd64");
 const nodeKvm = ref(false);
 const nodeKeyPem = ref("");
 
-// Provision VM Slot Form
+// Provision VM slot form
 const slotIdInput = ref("");
 const provAccountId = ref("");
 const provClashNodeId = ref("");
 const provClusterNodeId = ref("local-node");
-const provHypervisor = ref<"docker_hardened" | "kvm_qemu" | "macos_native">("docker_hardened");
+const provHypervisor = ref<HypervisorKind>("docker_hardened");
 const provRuntimeProfile = ref<VmRuntimeProfile>("claude_code");
 const provMemoryMiB = ref(2048);
 const provMaxSubagents = ref(20);
-const provCleanse = ref<"zero" | "official" | "template">("zero");
-const provTelemetry = ref<"isolated" | "enabled" | "disabled">("isolated");
+const provCleanse = ref<CleanseMode>("zero");
+const provTelemetry = ref<TelemetryMode>("isolated");
 const provTimezone = ref("UTC");
 
-// Selected slot drawers: Seed / Telemetry / Migration / WS Terminal
+// Selected slot drawer (runtime config / telemetry / migration) and WS terminal
 const activeSlotId = ref<string | null>(null);
 const activeSeed = ref<SlotSeedSnapshot | null>(null);
 const seedSettingsJson = ref("{}");
@@ -116,7 +152,7 @@ async function loadFleet() {
       auth.apiFetch("/api/v1/admin/accounts"),
     ]);
     if (!vmRes.ok) {
-      errorMessage.value = await readError(vmRes, "加载 VM 舰队状态失败");
+      errorMessage.value = await readError(vmRes, t("vms.toast.loadFailed"));
       return;
     }
     overview.value = (await vmRes.json()) as VmFleetOverview;
@@ -133,7 +169,7 @@ async function loadFleet() {
       }
     }
   } catch (err) {
-    errorMessage.value = err instanceof Error ? err.message : "加载 VM 舰队异常";
+    errorMessage.value = err instanceof Error ? err.message : t("vms.toast.loadFailed");
   } finally {
     loading.value = false;
   }
@@ -159,14 +195,14 @@ async function registerNode() {
       }),
     });
     if (!res.ok) {
-      errorMessage.value = await readError(res, "注册 SSH 节点失败");
+      errorMessage.value = await readError(res, t("vms.toast.registerNodeFailed"));
       return;
     }
     nodeName.value = "";
     nodeAddr.value = "";
     nodeKeyPem.value = "";
     nodeDrawerOpen.value = false;
-    actionNotice.value = "集群主机节点已注册";
+    actionNotice.value = t("vms.toast.nodeRegistered");
     await loadFleet();
   } finally {
     busy.value = false;
@@ -181,10 +217,10 @@ async function deleteNode(id: string) {
       method: "DELETE",
     });
     if (!res.ok) {
-      errorMessage.value = await readError(res, "删除集群节点失败");
+      errorMessage.value = await readError(res, t("vms.toast.removeNodeFailed"));
       return;
     }
-    actionNotice.value = `节点 ${id} 已移除`;
+    actionNotice.value = t("vms.toast.nodeRemoved", { id });
     await loadFleet();
   } finally {
     busy.value = false;
@@ -226,17 +262,23 @@ async function provisionSlot() {
       }),
     });
     if (!res.ok) {
-      errorMessage.value = await readError(res, "创建拟真 VM 槽失败");
+      errorMessage.value = await readError(res, t("vms.toast.provisionFailed"));
       return;
     }
     slotIdInput.value = "";
     provisionOpen.value = false;
-    actionNotice.value = "VM 完全拟真槽已创建并绑定独立出口 IP";
+    actionNotice.value = t("vms.toast.provisioned");
     await loadFleet();
   } finally {
     busy.value = false;
   }
 }
+
+const SLOT_ACTION_TOAST = {
+  start: { failed: "vms.toast.startFailed", done: "vms.toast.started" },
+  stop: { failed: "vms.toast.stopFailed", done: "vms.toast.stopped" },
+  delete: { failed: "vms.toast.destroyFailed", done: "vms.toast.destroyed" },
+} as const;
 
 async function slotAction(id: string, action: "start" | "stop" | "delete") {
   busy.value = true;
@@ -251,14 +293,14 @@ async function slotAction(id: string, action: "start" | "stop" | "delete") {
       method: action === "delete" ? "DELETE" : "POST",
     });
     if (!res.ok) {
-      errorMessage.value = await readError(res, `槽位 ${action} 操作失败`);
+      errorMessage.value = await readError(res, t(SLOT_ACTION_TOAST[action].failed));
       return;
     }
     if (action === "delete" && activeSlotId.value === id) {
       activeSlotId.value = null;
       activeSeed.value = null;
     }
-    actionNotice.value = `槽位 ${id} ${action} 执行成功`;
+    actionNotice.value = t(SLOT_ACTION_TOAST[action].done, { id });
     await loadFleet();
   } finally {
     busy.value = false;
@@ -272,7 +314,7 @@ async function inspectSlotSeed(slot: VmSlotSummary) {
   errorMessage.value = null;
   const res = await auth.apiFetch(`/api/v1/admin/vms/${encodeURIComponent(slot.slotId)}/seed`);
   if (!res.ok) {
-    errorMessage.value = await readError(res, "读取 Seed 配置失败");
+    errorMessage.value = await readError(res, t("vms.toast.configLoadFailed"));
     return;
   }
   const snap = (await res.json()) as SlotSeedSnapshot;
@@ -369,17 +411,17 @@ async function saveSlotSeed() {
       },
     );
     if (!res.ok) {
-      errorMessage.value = await readError(res, "保存 Seed 配置失败");
+      errorMessage.value = await readError(res, t("vms.toast.configSaveFailed"));
       return;
     }
     activeSeed.value = (await res.json()) as SlotSeedSnapshot;
-    actionNotice.value = `槽位 ${activeSlotId.value} Seed 已下发并落盘`;
+    actionNotice.value = t("vms.toast.configSaved", { id: activeSlotId.value });
   } finally {
     busy.value = false;
   }
 }
 
-async function updateSlotTelemetry(slot: VmSlotSummary, nextMode: "isolated" | "enabled" | "disabled") {
+async function updateSlotTelemetry(slot: VmSlotSummary, nextMode: TelemetryMode) {
   busy.value = true;
   errorMessage.value = null;
   try {
@@ -395,10 +437,10 @@ async function updateSlotTelemetry(slot: VmSlotSummary, nextMode: "isolated" | "
       },
     );
     if (!res.ok) {
-      errorMessage.value = await readError(res, "切换遥测策略失败");
+      errorMessage.value = await readError(res, t("vms.toast.telemetryFailed"));
       return;
     }
-    actionNotice.value = `槽位 ${slot.slotId} telemetry -> ${nextMode}`;
+    actionNotice.value = t("vms.toast.telemetryUpdated", { id: slot.slotId, mode: telemetryLabel(nextMode) });
     await loadFleet();
   } finally {
     busy.value = false;
@@ -422,10 +464,14 @@ async function migrateActiveSlot() {
       },
     );
     if (!res.ok) {
-      errorMessage.value = await readError(res, "KVM 迁移/扩容失败");
+      errorMessage.value = await readError(res, t("vms.toast.migrateFailed"));
       return;
     }
-    actionNotice.value = `槽位 ${activeSlotId.value} 已迁移到 ${migTargetNode.value} (${migTargetMem.value} MiB)`;
+    actionNotice.value = t("vms.toast.migrated", {
+      id: activeSlotId.value,
+      node: migTargetNode.value,
+      memory: migTargetMem.value,
+    });
     await loadFleet();
   } finally {
     busy.value = false;
@@ -448,7 +494,7 @@ function closeTerminalPanel() {
 async function connectTerminal(slotId: string) {
   closeWebSocket();
   wsSlotId.value = slotId;
-  wsLogs.value = [`[client] 正在为 ${slotId} 签发一次性 WS 诊断票据...`];
+  wsLogs.value = [t("vms.terminal.connecting", { slot: slotId })];
   errorMessage.value = null;
   await nextTick();
   terminalPanel.value?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -458,7 +504,7 @@ async function connectTerminal(slotId: string) {
     { method: "POST" },
   );
   if (!res.ok) {
-    errorMessage.value = await readError(res, "获取 WebSocket 终端票据失败");
+    errorMessage.value = await readError(res, t("vms.toast.terminalFailed"));
     return;
   }
   const ticket = (await res.json()) as VmTerminalTicketResponse;
@@ -485,7 +531,7 @@ async function connectTerminal(slotId: string) {
   };
   wsConn.onclose = () => {
     wsConnected.value = false;
-    wsLogs.value.push("[client] WebSocket 连接已关闭");
+    wsLogs.value.push(t("vms.terminal.closed"));
   };
 }
 
@@ -525,72 +571,49 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="space-y-6">
-    <PageHeader
-      title="VM 拟真槽舰队"
-      description="在隔离的 KVM / 容器槽位中运行官方 CLI。每槽绑定独立出口、固化不可变硬件指纹，支持 Seed 热同步与排空迁移。"
-    >
-      <template #meta>
-        <UiBadge :tone="overview?.runtime.guestdAvailable ? 'success' : 'neutral'" dot>
-          guestd {{ overview?.runtime.guestdAvailable ? "就绪" : "沙盒模式" }}
-        </UiBadge>
-        <UiBadge :tone="overview?.invariants.oneSlotOneEgress ? 'success' : 'warning'">
-          1-Slot-1-Egress {{ overview?.invariants.oneSlotOneEgress ? "强制" : "关闭" }}
-        </UiBadge>
-        <UiBadge v-if="overview?.invariants.zeroPromptInjection" tone="accent">Zero-Injection</UiBadge>
-      </template>
+    <PageHeader :title="t('nav.vms')">
       <template #actions>
         <button type="button" class="btn btn-secondary" :disabled="loading" @click="loadFleet">
           <UiIcon name="refresh" :size="15" :spin="loading" />
-          刷新
+          {{ t("common.refresh") }}
         </button>
         <button type="button" class="btn btn-secondary" @click="nodeDrawerOpen = true">
           <UiIcon name="network" :size="15" />
-          注册节点
+          {{ t("vms.registerNode") }}
         </button>
         <button type="button" class="btn btn-primary" @click="provisionOpen = true">
           <UiIcon name="plus" :size="15" />
-          部署槽位
+          {{ t("vms.deploySlot") }}
         </button>
       </template>
     </PageHeader>
 
     <div class="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
-      <StatCard label="集群节点" :value="nodeList().length" icon="network" tone="accent" />
-      <StatCard label="就绪槽位" :value="`${readySlots} / ${slotList().length}`" icon="server" tone="success" />
-      <StatCard
-        label="活跃 Subagents"
-        :value="`${activeSubagents} / ${maxSubagents}`"
-        icon="activity"
-        tone="info"
-        :hint="`默认每槽 ${overview?.invariants.maxSubagentsDefault ?? 20} 路`"
-      />
-      <StatCard label="迁移任务" :value="overview?.migrations.length ?? 0" icon="migrate" tone="violet" />
+      <StatCard :label="t('vms.stats.nodes')" :value="nodeList().length" icon="network" tone="accent" />
+      <StatCard :label="t('vms.stats.readySlots')" :value="`${readySlots} / ${slotList().length}`" icon="server" tone="success" />
+      <StatCard :label="t('vms.stats.subtasks')" :value="`${activeSubagents} / ${maxSubagents}`" icon="activity" tone="info" />
+      <StatCard :label="t('vms.stats.migrations')" :value="overview?.migrations.length ?? 0" icon="migrate" tone="violet" />
     </div>
 
     <!-- Slots -->
-    <UiCard icon="server" title="VM / 容器槽位" :description="`共 ${slotList().length} 个槽位`" flush>
-      <EmptyState
-        v-if="slotList().length === 0"
-        icon="server"
-        title="还没有部署槽位"
-        description="选择一个已绑定健康出口的上游账号，部署第一个执行槽。"
-      >
+    <UiCard icon="server" :title="t('vms.slots.title')" flush>
+      <EmptyState v-if="slotList().length === 0" icon="server" :title="t('vms.slots.empty')">
         <button type="button" class="btn btn-primary btn-sm" @click="provisionOpen = true">
           <UiIcon name="plus" :size="14" />
-          部署槽位
+          {{ t("vms.deploySlot") }}
         </button>
       </EmptyState>
       <div v-else class="table-wrap">
         <table class="data-table">
           <thead>
             <tr>
-              <th>槽位</th>
-              <th>账号 / 出口</th>
-              <th class="hidden 2xl:table-cell">硬件指纹</th>
-              <th>状态</th>
-              <th>配额窗口</th>
-              <th>Telemetry</th>
-              <th class="text-right">操作</th>
+              <th>{{ t("vms.slots.columns.slot") }}</th>
+              <th>{{ t("vms.slots.columns.accountEgress") }}</th>
+              <th class="hidden 2xl:table-cell">{{ t("vms.slots.columns.fingerprint") }}</th>
+              <th>{{ t("common.status") }}</th>
+              <th>{{ t("vms.slots.columns.quota") }}</th>
+              <th>{{ t("vms.slots.columns.telemetry") }}</th>
+              <th class="text-right">{{ t("common.actions") }}</th>
             </tr>
           </thead>
           <tbody>
@@ -598,7 +621,7 @@ onBeforeUnmount(() => {
               <td>
                 <p class="flex items-center gap-1.5 whitespace-nowrap font-mono text-xs font-medium text-fg">
                   {{ slot.slotId }}
-                  <UiBadge :tone="RUNTIME_PROFILE_TONE[slot.runtimeProfile] ?? 'neutral'">{{ slot.runtimeProfile }}</UiBadge>
+                  <UiBadge :tone="RUNTIME_PROFILE_TONE[slot.runtimeProfile] ?? 'neutral'">{{ runtimeLabel(slot.runtimeProfile) }}</UiBadge>
                 </p>
                 <p class="mt-0.5 whitespace-nowrap font-mono text-2xs text-fg-subtle">
                   {{ slot.clusterNodeId }} · {{ slot.hypervisorKind }} · {{ slot.memoryMiB }} MiB
@@ -617,8 +640,13 @@ onBeforeUnmount(() => {
                 <p class="mt-0.5 font-mono text-2xs text-fg-subtle">{{ slot.persona.macAddress }}</p>
               </td>
               <td>
-                <UiBadge :tone="healthTone(slot.state)" dot>{{ SLOT_STATE_LABEL[slot.state] ?? slot.state }}</UiBadge>
-                <UsageMeter class="mt-2 w-28" label="Subagents" :value="slot.activeSubagents" :max="slot.maxSubagents" />
+                <UiBadge :tone="healthTone(slot.state)" dot>{{ slotStateLabel(slot.state) }}</UiBadge>
+                <UsageMeter
+                  class="mt-2 w-28"
+                  :label="t('vms.slots.subtasks')"
+                  :value="slot.activeSubagents"
+                  :max="slot.maxSubagents"
+                />
               </td>
               <td>
                 <div class="flex w-32 flex-col gap-1.5">
@@ -630,23 +658,23 @@ onBeforeUnmount(() => {
                 <select
                   :value="slot.telemetryMode"
                   class="select input-sm w-28"
-                  aria-label="Telemetry 策略"
+                  :aria-label="t('vms.slots.telemetryPolicy')"
                   :disabled="busy"
-                  @change="updateSlotTelemetry(slot, ($event.target as HTMLSelectElement).value as 'isolated' | 'enabled' | 'disabled')"
+                  @change="updateSlotTelemetry(slot, ($event.target as HTMLSelectElement).value as TelemetryMode)"
                 >
-                  <option value="isolated">isolated</option>
-                  <option value="enabled">enabled</option>
-                  <option value="disabled">disabled</option>
+                  <option v-for="opt in telemetryOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
                 </select>
-                <p class="mt-1 font-mono text-2xs text-fg-subtle">cleanse={{ slot.cleanseMode }}</p>
+                <p class="mt-1 text-2xs text-fg-subtle">
+                  {{ t("vms.slots.promptLine", { mode: cleanseLabel(slot.cleanseMode) }) }}
+                </p>
               </td>
               <td class="text-right">
                 <div class="inline-flex items-center gap-0.5">
                   <button
                     type="button"
                     class="btn btn-ghost btn-icon btn-xs hover:!text-success"
-                    title="启动"
-                    aria-label="启动"
+                    :title="t('vms.slots.start')"
+                    :aria-label="t('vms.slots.start')"
                     :disabled="busy"
                     @click="slotAction(slot.slotId, 'start')"
                   >
@@ -655,8 +683,8 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="btn btn-ghost btn-icon btn-xs hover:!text-warning"
-                    title="停止"
-                    aria-label="停止"
+                    :title="t('vms.slots.stop')"
+                    :aria-label="t('vms.slots.stop')"
                     :disabled="busy"
                     @click="slotAction(slot.slotId, 'stop')"
                   >
@@ -665,8 +693,8 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="btn btn-ghost btn-icon btn-xs"
-                    title="Seed 与迁移"
-                    aria-label="Seed 与迁移"
+                    :title="t('vms.slots.configure')"
+                    :aria-label="t('vms.slots.configure')"
                     @click="inspectSlotSeed(slot)"
                   >
                     <UiIcon name="sliders" :size="13" />
@@ -675,13 +703,19 @@ onBeforeUnmount(() => {
                     type="button"
                     class="btn btn-ghost btn-icon btn-xs"
                     :class="wsSlotId === slot.slotId ? '!text-accent' : ''"
-                    title="诊断终端"
-                    aria-label="诊断终端"
+                    :title="t('vms.slots.terminal')"
+                    :aria-label="t('vms.slots.terminal')"
                     @click="connectTerminal(slot.slotId)"
                   >
                     <UiIcon name="terminal" :size="13" />
                   </button>
-                  <ConfirmButton label="销毁" confirm-label="确认销毁" icon-only :disabled="busy" @confirm="slotAction(slot.slotId, 'delete')" />
+                  <ConfirmButton
+                    :label="t('vms.slots.destroy')"
+                    :confirm-label="t('vms.slots.confirmDestroy')"
+                    icon-only
+                    :disabled="busy"
+                    @confirm="slotAction(slot.slotId, 'delete')"
+                  />
                 </div>
               </td>
             </tr>
@@ -700,9 +734,9 @@ onBeforeUnmount(() => {
         <div class="flex items-center gap-2.5">
           <UiIcon name="terminal" :size="15" class="text-slate-400" />
           <span class="font-mono text-xs text-slate-200">{{ wsSlotId }}</span>
-          <span class="inline-flex items-center gap-1.5 font-mono text-2xs" :class="wsConnected ? 'text-emerald-400' : 'text-slate-500'">
+          <span class="inline-flex items-center gap-1.5 text-2xs" :class="wsConnected ? 'text-emerald-400' : 'text-slate-500'">
             <span class="h-1.5 w-1.5 rounded-full" :class="wsConnected ? 'bg-emerald-400' : 'bg-slate-500'" />
-            {{ wsConnected ? "CONNECTED" : "DISCONNECTED" }}
+            {{ wsConnected ? t("vms.terminal.connected") : t("vms.terminal.disconnected") }}
           </span>
         </div>
         <div class="flex flex-wrap items-center gap-1">
@@ -719,8 +753,8 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="ml-1 inline-flex h-6 w-6 cursor-pointer items-center justify-center rounded text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
-            title="断开并关闭"
-            aria-label="断开并关闭"
+            :title="t('vms.terminal.disconnect')"
+            :aria-label="t('vms.terminal.disconnect')"
             @click="closeTerminalPanel"
           >
             <UiIcon name="x" :size="14" />
@@ -737,39 +771,39 @@ onBeforeUnmount(() => {
           v-model="wsCommand"
           type="text"
           spellcheck="false"
-          placeholder="输入沙盒命令，如 cat etc/machine-id / env / seed"
+          :placeholder="t('vms.terminal.placeholder')"
           class="min-w-0 flex-1 bg-transparent font-mono text-xs text-slate-100 outline-none placeholder:text-slate-600"
-          aria-label="终端命令"
+          :aria-label="t('vms.terminal.command')"
         />
         <button
           type="submit"
           class="h-7 cursor-pointer rounded-md bg-emerald-500/90 px-3 text-xs font-medium text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-40"
           :disabled="!wsConnected"
         >
-          执行
+          {{ t("vms.terminal.run") }}
         </button>
       </form>
     </section>
 
-    <!-- Cluster nodes -->
-    <UiCard icon="network" title="集群主机节点" description="通过无 Agent SSH 纳管的算力主机" flush>
+    <!-- Host nodes -->
+    <UiCard icon="network" :title="t('vms.nodes.title')" flush>
       <template #actions>
         <button type="button" class="btn btn-secondary btn-sm" @click="nodeDrawerOpen = true">
           <UiIcon name="plus" :size="14" />
-          注册节点
+          {{ t("vms.registerNode") }}
         </button>
       </template>
-      <EmptyState v-if="nodeList().length === 0" compact icon="network" title="暂无集群节点" />
+      <EmptyState v-if="nodeList().length === 0" compact icon="network" :title="t('vms.nodes.empty')" />
       <div v-else class="table-wrap">
         <table class="data-table">
           <thead>
             <tr>
-              <th>节点</th>
-              <th>驱动 / 地址</th>
-              <th>架构</th>
-              <th>能力</th>
-              <th>状态</th>
-              <th class="text-right">操作</th>
+              <th>{{ t("vms.nodes.columns.node") }}</th>
+              <th>{{ t("vms.nodes.columns.driver") }}</th>
+              <th>{{ t("vms.nodes.columns.arch") }}</th>
+              <th>{{ t("vms.nodes.columns.capabilities") }}</th>
+              <th>{{ t("common.status") }}</th>
+              <th class="text-right">{{ t("common.actions") }}</th>
             </tr>
           </thead>
           <tbody>
@@ -788,14 +822,21 @@ onBeforeUnmount(() => {
                   <UiBadge v-if="n.dockerCapable" tone="info">Docker</UiBadge>
                   <UiBadge v-if="n.hasSSHKey" tone="neutral">
                     <UiIcon name="lock" :size="10" />
-                    SSH Key
+                    {{ t("vms.nodes.sshKey") }}
                   </UiBadge>
                 </div>
               </td>
-              <td><UiBadge :tone="healthTone(n.status)" dot>{{ n.status }}</UiBadge></td>
+              <td><UiBadge :tone="healthTone(n.status)" dot>{{ hostStatusLabel(n.status) }}</UiBadge></td>
               <td class="text-right">
-                <ConfirmButton v-if="n.id !== 'local-node'" label="移除" confirm-label="确认移除" icon-only :disabled="busy" @confirm="deleteNode(n.id)" />
-                <span v-else class="text-2xs text-fg-subtle">本机</span>
+                <ConfirmButton
+                  v-if="n.id !== 'local-node'"
+                  :label="t('common.remove')"
+                  :confirm-label="t('vms.nodes.confirmRemove')"
+                  icon-only
+                  :disabled="busy"
+                  @confirm="deleteNode(n.id)"
+                />
+                <span v-else class="text-2xs text-fg-subtle">{{ t("vms.nodes.local") }}</span>
               </td>
             </tr>
           </tbody>
@@ -804,21 +845,16 @@ onBeforeUnmount(() => {
     </UiCard>
 
     <!-- Provision drawer -->
-    <UiDrawer
-      v-model:open="provisionOpen"
-      title="部署 VM 执行槽"
-      description="创建后生成不可变 Hardware Persona，并绑定账号的独立出口"
-      width="lg"
-    >
+    <UiDrawer v-model:open="provisionOpen" :title="t('vms.provision.title')" width="lg">
       <form id="provision-form" class="space-y-5" @submit.prevent="provisionSlot">
         <div class="grid gap-4 sm:grid-cols-2">
-          <FormField label="上游账号 ID" required hint="账号需已绑定健康的 Clash 出口">
+          <FormField :label="t('vms.provision.account')" required>
             <input
               v-model="provAccountId"
               type="text"
               list="vm-account-options"
               required
-              placeholder="选择或输入账号 ID"
+              :placeholder="t('vms.provision.accountPlaceholder')"
               class="input font-mono text-xs"
               @change="syncRuntimeFromAccount"
             />
@@ -826,216 +862,232 @@ onBeforeUnmount(() => {
               <option v-for="acc in accounts" :key="acc.id" :value="acc.id">{{ acc.name }} ({{ acc.platform }})</option>
             </datalist>
           </FormField>
-          <FormField label="槽位 ID" hint="留空自动生成">
-            <input v-model="slotIdInput" type="text" class="input font-mono text-xs" />
+          <FormField :label="t('vms.provision.slotId')">
+            <input
+              v-model="slotIdInput"
+              type="text"
+              :placeholder="t('vms.provision.slotIdPlaceholder')"
+              class="input font-mono text-xs"
+            />
           </FormField>
-          <FormField label="集群节点">
+          <FormField :label="t('vms.provision.node')">
             <select v-model="provClusterNodeId" class="select">
-              <option v-for="n in nodeList()" :key="n.id" :value="n.id">{{ n.name }}（{{ n.id }} · {{ n.arch }}）</option>
+              <option v-for="n in nodeList()" :key="n.id" :value="n.id">
+                {{ t("vms.nodes.option", { name: n.name, id: n.id, arch: n.arch }) }}
+              </option>
             </select>
           </FormField>
-          <FormField label="Clash 出口">
+          <FormField :label="t('vms.provision.egress')">
             <select v-model="provClashNodeId" class="select">
-              <option value="">自动读取账号绑定</option>
+              <option value="">{{ t("vms.provision.egressAuto") }}</option>
               <option v-for="cn in clashNodes" :key="cn.nodeId" :value="cn.nodeId">
-                {{ cn.name }} · {{ cn.exitIp || "未探测" }}（{{ cn.healthStatus }}）
+                {{
+                  t("vms.provision.egressOption", {
+                    name: cn.name,
+                    ip: cn.exitIp || t("vms.provision.exitIpUnknown"),
+                    health: healthLabel(cn.healthStatus),
+                  })
+                }}
               </option>
             </select>
           </FormField>
         </div>
 
         <div class="space-y-4 border-t border-line pt-5">
-          <p class="text-2xs font-medium uppercase tracking-wider text-fg-subtle">运行时与资源</p>
+          <p class="text-2xs font-medium uppercase tracking-wider text-fg-subtle">{{ t("vms.provision.runtimeSection") }}</p>
           <div class="grid gap-4 sm:grid-cols-2">
-            <FormField label="Runtime">
+            <FormField :label="t('vms.provision.runtime')">
               <select v-model="provRuntimeProfile" class="select">
-                <option value="claude_code">claude_code</option>
-                <option value="codex_cli">codex_cli</option>
-                <option value="antigravity">antigravity（反重力）</option>
+                <option v-for="opt in runtimeOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
               </select>
             </FormField>
-            <FormField label="Hypervisor">
+            <FormField :label="t('vms.provision.hypervisor')">
               <select v-model="provHypervisor" class="select">
-                <option value="docker_hardened">docker_hardened</option>
-                <option value="kvm_qemu">kvm_qemu</option>
-                <option value="macos_native">macos_native</option>
+                <option v-for="opt in hypervisorOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
               </select>
             </FormField>
           </div>
           <div class="grid gap-4 sm:grid-cols-3">
-            <FormField label="内存 MiB">
+            <FormField :label="t('vms.provision.memory')">
               <input v-model.number="provMemoryMiB" type="number" min="512" class="input font-mono" />
             </FormField>
-            <FormField label="Subagents 上限">
+            <FormField :label="t('vms.provision.maxSubtasks')">
               <input v-model.number="provMaxSubagents" type="number" min="1" max="64" class="input font-mono" />
             </FormField>
-            <FormField label="时区">
+            <FormField :label="t('vms.provision.timezone')">
               <input v-model="provTimezone" type="text" class="input font-mono" />
             </FormField>
           </div>
         </div>
 
         <div class="space-y-4 border-t border-line pt-5">
-          <p class="text-2xs font-medium uppercase tracking-wider text-fg-subtle">策略</p>
+          <p class="text-2xs font-medium uppercase tracking-wider text-fg-subtle">{{ t("vms.provision.policySection") }}</p>
           <div class="grid gap-4 sm:grid-cols-2">
-            <FormField label="Telemetry">
+            <FormField :label="t('vms.provision.telemetry')">
               <select v-model="provTelemetry" class="select">
-                <option value="isolated">isolated</option>
-                <option value="enabled">enabled</option>
-                <option value="disabled">disabled</option>
+                <option v-for="opt in telemetryOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
               </select>
             </FormField>
-            <FormField label="Cleanse">
+            <FormField :label="t('vms.provision.cleanse')">
               <select v-model="provCleanse" class="select">
-                <option value="zero">zero（无头净化）</option>
-                <option value="official">official</option>
-                <option value="template">template</option>
+                <option v-for="opt in cleanseOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
               </select>
             </FormField>
           </div>
         </div>
       </form>
       <template #footer>
-        <button type="button" class="btn btn-secondary" @click="provisionOpen = false">取消</button>
+        <button type="button" class="btn btn-secondary" @click="provisionOpen = false">{{ t("common.cancel") }}</button>
         <button type="submit" form="provision-form" :disabled="busy" class="btn btn-primary">
           <UiIcon v-if="busy" name="loader" :size="14" spin />
-          部署槽位
+          {{ t("vms.deploySlot") }}
         </button>
       </template>
     </UiDrawer>
 
     <!-- Register node drawer -->
-    <UiDrawer v-model:open="nodeDrawerOpen" title="注册 SSH 主机节点" description="无 Agent 纳管，私钥以 AES-256-GCM 加密存储">
+    <UiDrawer v-model:open="nodeDrawerOpen" :title="t('vms.nodeForm.title')">
       <form id="node-form" class="space-y-4" @submit.prevent="registerNode">
-        <FormField label="节点名称" required>
-          <input v-model="nodeName" type="text" required placeholder="如 Tokyo-KVM-02" class="input" />
+        <FormField :label="t('vms.nodeForm.name')" required>
+          <input v-model="nodeName" type="text" required :placeholder="t('vms.nodeForm.namePlaceholder')" class="input" />
         </FormField>
         <div class="grid grid-cols-[minmax(0,1fr)_8rem] gap-3">
-          <FormField label="SSH 地址" required>
+          <FormField :label="t('vms.nodeForm.sshAddr')" required>
             <input v-model="nodeAddr" type="text" required placeholder="host:port" class="input font-mono text-xs" />
           </FormField>
-          <FormField label="用户">
+          <FormField :label="t('vms.nodeForm.sshUser')">
             <input v-model="nodeUser" type="text" placeholder="root" class="input font-mono text-xs" />
           </FormField>
         </div>
         <div class="grid grid-cols-2 gap-3">
-          <FormField label="架构">
+          <FormField :label="t('vms.nodeForm.arch')">
             <select v-model="nodeArch" class="select">
               <option value="amd64">amd64</option>
               <option value="arm64">arm64</option>
             </select>
           </FormField>
           <div>
-            <span class="label">KVM 硬件虚拟化</span>
+            <span class="label">{{ t("vms.nodeForm.kvm") }}</span>
             <div class="flex h-9 items-center">
-              <UiSwitch v-model="nodeKvm" :label="nodeKvm ? '支持' : '不支持'" tone="accent" />
+              <UiSwitch
+                v-model="nodeKvm"
+                :label="nodeKvm ? t('vms.nodeForm.supported') : t('vms.nodeForm.unsupported')"
+                tone="accent"
+              />
             </div>
           </div>
         </div>
-        <FormField label="OpenSSH 私钥" hint="PEM 格式，可留空使用已配置的默认密钥">
-          <textarea v-model="nodeKeyPem" rows="6" spellcheck="false" class="textarea font-mono text-xs" />
+        <FormField :label="t('vms.nodeForm.privateKey')">
+          <textarea
+            v-model="nodeKeyPem"
+            rows="6"
+            spellcheck="false"
+            :placeholder="t('vms.nodeForm.privateKeyPlaceholder')"
+            class="textarea font-mono text-xs"
+          />
         </FormField>
       </form>
       <template #footer>
-        <button type="button" class="btn btn-secondary" @click="nodeDrawerOpen = false">取消</button>
-        <button type="submit" form="node-form" :disabled="busy" class="btn btn-primary">注册节点</button>
+        <button type="button" class="btn btn-secondary" @click="nodeDrawerOpen = false">{{ t("common.cancel") }}</button>
+        <button type="submit" form="node-form" :disabled="busy" class="btn btn-primary">{{ t("vms.registerNode") }}</button>
       </template>
     </UiDrawer>
 
-    <!-- Slot detail drawer: seed + migration -->
-    <UiDrawer
-      v-model:open="slotDrawerOpen"
-      :title="`槽位 ${activeSlotId ?? ''}`"
-      :description="activeSeed ? `Seed 最近同步 ${formatUnixMs(activeSeed.syncedAtUnixMs)}` : '正在读取 Seed 配置…'"
-      width="xl"
-    >
+    <!-- Slot detail drawer: runtime config + migration -->
+    <UiDrawer v-model:open="slotDrawerOpen" :title="t('vms.detail.title', { id: activeSlotId ?? '' })" width="xl">
       <div class="space-y-6">
         <div v-if="activeSlot" class="grid grid-cols-2 gap-3 rounded-lg border border-line bg-surface-2/40 p-3.5 sm:grid-cols-4">
           <div>
-            <p class="text-2xs text-fg-subtle">Runtime</p>
-            <p class="mt-0.5 font-mono text-xs text-fg">{{ activeSeed?.runtimeProfile ?? activeSlot.runtimeProfile }}</p>
+            <p class="text-2xs text-fg-subtle">{{ t("vms.detail.runtime") }}</p>
+            <p class="mt-0.5 text-xs text-fg">{{ runtimeLabel(activeSeed?.runtimeProfile ?? activeSlot.runtimeProfile) }}</p>
           </div>
           <div>
-            <p class="text-2xs text-fg-subtle">状态</p>
-            <p class="mt-0.5"><UiBadge :tone="healthTone(activeSlot.state)" dot>{{ SLOT_STATE_LABEL[activeSlot.state] ?? activeSlot.state }}</UiBadge></p>
+            <p class="text-2xs text-fg-subtle">{{ t("common.status") }}</p>
+            <p class="mt-0.5"><UiBadge :tone="healthTone(activeSlot.state)" dot>{{ slotStateLabel(activeSlot.state) }}</UiBadge></p>
           </div>
           <div>
-            <p class="text-2xs text-fg-subtle">Telemetry 守护进程</p>
-            <p class="mt-0.5 font-mono text-xs text-fg">{{ activeSeed?.telemetryDaemonRunning ? "运行中" : "未运行" }}</p>
+            <p class="text-2xs text-fg-subtle">{{ t("vms.detail.telemetryProcess") }}</p>
+            <p class="mt-0.5 text-xs text-fg">
+              {{ activeSeed?.telemetryDaemonRunning ? t("vms.detail.running") : t("vms.detail.notRunning") }}
+            </p>
           </div>
           <div>
-            <p class="text-2xs text-fg-subtle">MAC</p>
+            <p class="text-2xs text-fg-subtle">{{ t("vms.detail.lastSynced") }}</p>
+            <p class="mt-0.5 font-mono text-xs text-fg">{{ activeSeed ? formatUnixMs(activeSeed.syncedAtUnixMs) : "-" }}</p>
+          </div>
+          <div>
+            <p class="text-2xs text-fg-subtle">{{ t("vms.detail.mac") }}</p>
             <p class="mt-0.5 truncate font-mono text-xs text-fg">{{ activeSlot.persona.macAddress }}</p>
           </div>
-          <div class="col-span-2">
-            <p class="text-2xs text-fg-subtle">Guest Machine-ID</p>
-            <p class="mt-0.5 truncate font-mono text-xs text-fg" :title="activeSlot.persona.guestMachineId">{{ activeSlot.persona.guestMachineId }}</p>
+          <div class="sm:col-span-3">
+            <p class="text-2xs text-fg-subtle">{{ t("vms.detail.machineId") }}</p>
+            <p class="mt-0.5 truncate font-mono text-xs text-fg" :title="activeSlot.persona.guestMachineId">
+              {{ activeSlot.persona.guestMachineId }}
+            </p>
           </div>
-          <div class="col-span-2">
-            <p class="text-2xs text-fg-subtle">SMBIOS UUID</p>
-            <p class="mt-0.5 truncate font-mono text-xs text-fg" :title="activeSlot.persona.smbiosUuid">{{ activeSlot.persona.smbiosUuid }}</p>
+          <div class="col-span-2 sm:col-span-4">
+            <p class="text-2xs text-fg-subtle">{{ t("vms.detail.hardwareUuid") }}</p>
+            <p class="mt-0.5 truncate font-mono text-xs text-fg" :title="activeSlot.persona.smbiosUuid">
+              {{ activeSlot.persona.smbiosUuid }}
+            </p>
           </div>
         </div>
 
         <section>
           <div class="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <h3 class="text-sm font-semibold text-fg">Seed 热同步</h3>
-              <p class="mt-0.5 text-xs text-fg-subtle">修改后保存会热推送到槽内并落盘</p>
-            </div>
+            <h3 class="text-sm font-semibold text-fg">{{ t("vms.detail.configTitle") }}</h3>
             <button
               type="button"
               class="btn btn-secondary btn-xs"
               @click="fillRuntimeSeedTemplate(activeSeed?.runtimeProfile ?? 'claude_code')"
             >
               <UiIcon name="sparkles" :size="13" />
-              填充运行时模板
+              {{ t("vms.detail.fillTemplate") }}
             </button>
           </div>
           <div class="mt-4 space-y-4">
-            <FormField label="settings.json / config.toml 映射">
+            <FormField :label="t('vms.detail.settings')">
               <textarea v-model="seedSettingsJson" rows="7" spellcheck="false" class="textarea font-mono text-xs" />
             </FormField>
-            <FormField label="OAuth 种子 JSON" hint=".credentials.json / .codex/auth.json / .antigravity/oauth_creds.json，AES-GCM 加密落盘">
+            <FormField :label="t('vms.detail.credentials')">
               <textarea v-model="seedAuthJson" rows="6" spellcheck="false" class="textarea font-mono text-xs" />
             </FormField>
-            <FormField label="自定义环境变量 / runtime flag">
+            <FormField :label="t('vms.detail.env')">
               <textarea v-model="seedCustomEnv" rows="3" spellcheck="false" class="textarea font-mono text-xs" />
             </FormField>
             <div class="flex flex-wrap gap-x-6 gap-y-2">
               <label class="flex cursor-pointer items-center gap-2 text-sm text-fg-muted">
                 <input v-model="seedRejectSettings" type="checkbox" class="checkbox" />
-                拒绝客户端设置覆盖
+                {{ t("vms.detail.blockSettings") }}
               </label>
               <label class="flex cursor-pointer items-center gap-2 text-sm text-fg-muted">
                 <input v-model="seedRejectIdentity" type="checkbox" class="checkbox" />
-                拒绝客户端身份覆盖
+                {{ t("vms.detail.blockIdentity") }}
               </label>
             </div>
             <button type="button" :disabled="busy || !activeSeed" class="btn btn-primary" @click="saveSlotSeed">
               <UiIcon :name="busy ? 'loader' : 'check'" :size="14" :spin="busy" />
-              保存并热推送
+              {{ t("vms.detail.saveSync") }}
             </button>
           </div>
         </section>
 
         <section class="border-t border-line pt-6">
-          <h3 class="text-sm font-semibold text-fg">排空迁移 / 内存调整</h3>
-          <p class="mt-0.5 text-xs text-fg-subtle">
-            仅 <span class="code-chip">kvm_qemu</span> 且 Active Subagents 为 0 时可迁移；保留原 AccountID 与 GuestMachineID。
-          </p>
+          <h3 class="text-sm font-semibold text-fg">{{ t("vms.detail.migrateTitle") }}</h3>
           <div class="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem_auto] sm:items-end">
-            <FormField label="目标节点">
+            <FormField :label="t('vms.detail.targetNode')">
               <select v-model="migTargetNode" class="select">
-                <option v-for="n in nodeList()" :key="n.id" :value="n.id">{{ n.name }}（{{ n.id }}）</option>
+                <option v-for="n in nodeList()" :key="n.id" :value="n.id">
+                  {{ t("vms.nodes.optionShort", { name: n.name, id: n.id }) }}
+                </option>
               </select>
             </FormField>
-            <FormField label="目标内存 MiB">
+            <FormField :label="t('vms.detail.targetMemory')">
               <input v-model.number="migTargetMem" type="number" min="512" step="512" class="input font-mono" />
             </FormField>
             <button type="button" :disabled="busy" class="btn btn-secondary" @click="migrateActiveSlot">
               <UiIcon name="migrate" :size="14" />
-              执行迁移
+              {{ t("vms.detail.migrate") }}
             </button>
           </div>
         </section>

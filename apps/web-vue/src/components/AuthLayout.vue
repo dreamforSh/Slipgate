@@ -1,84 +1,76 @@
 <script setup lang="ts">
+import { computed } from "vue";
+import { useI18n } from "vue-i18n";
 import BrandMark from "./BrandMark.vue";
+import LocaleSwitcher from "./LocaleSwitcher.vue";
 import ThemeSwitcher from "./ThemeSwitcher.vue";
 import UiIcon, { type IconName } from "./ui/UiIcon.vue";
 
 defineProps<{ siteName?: string }>();
 
-const features: { icon: IconName; title: string; body: string }[] = [
-  {
-    icon: "zap",
-    title: "双平面热路径",
-    body: "/v1 数据面只经 Go 边缘与 Zig 核心，管理流量走独立控制面。",
-  },
-  {
-    icon: "shield",
-    title: "Fail-Closed 出口",
-    body: "节点失效或出口漂移立即熔断，不会退化到宿主机直连。",
-  },
-  {
-    icon: "wallet",
-    title: "nano-USD 账本",
-    body: "i128 定点复式记账，流式请求预冻结、按 Token 精确结算。",
-  },
-];
+const { t } = useI18n();
+
+const features = computed<{ icon: IconName; label: string }[]>(() => [
+  { icon: "zap", label: t("auth.features.unified") },
+  { icon: "shield", label: t("auth.features.isolated") },
+  { icon: "wallet", label: t("auth.features.billing") },
+]);
 </script>
 
 <template>
-  <div class="grid min-h-screen lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
-    <!-- Brand panel -->
-    <aside class="relative hidden overflow-hidden border-r border-line bg-surface lg:flex lg:flex-col lg:justify-between lg:p-12">
-      <div
-        class="pointer-events-none absolute inset-0 opacity-[0.55] [background-image:linear-gradient(rgb(var(--border))_1px,transparent_1px),linear-gradient(90deg,rgb(var(--border))_1px,transparent_1px)] [background-size:32px_32px] [mask-image:radial-gradient(ellipse_at_top_left,black_20%,transparent_70%)]"
-        aria-hidden="true"
-      />
-      <div class="relative flex items-center gap-3">
-        <BrandMark :size="36" />
-        <div class="leading-tight">
-          <p class="text-base font-semibold text-fg">{{ siteName || "Slipgate" }}</p>
-          <p class="text-xs text-fg-subtle">AI API 统一网关控制台</p>
+  <div class="relative flex min-h-screen flex-col overflow-hidden">
+    <!-- Backdrop: soft wash, glow orbs and a faded grid -->
+    <div class="backdrop absolute inset-0" aria-hidden="true" />
+    <div class="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">
+      <div class="orb absolute -right-40 -top-40 h-96 w-96 rounded-full blur-3xl" />
+      <div class="orb orb-soft absolute -bottom-48 -left-40 h-96 w-96 rounded-full blur-3xl" />
+      <div class="bg-grid absolute inset-0 [mask-image:radial-gradient(ellipse_at_center,black_30%,transparent_75%)]" />
+    </div>
+
+    <header class="relative z-20 flex items-center justify-end gap-1 px-4 py-4 sm:px-6">
+      <LocaleSwitcher />
+      <ThemeSwitcher compact />
+    </header>
+
+    <main class="relative z-10 flex flex-1 items-center justify-center px-4 pb-16">
+      <div class="w-full max-w-md">
+        <div class="mb-8 flex flex-col items-center text-center">
+          <BrandMark :size="56" glow class="mb-4" />
+          <p class="text-gradient text-3xl font-bold tracking-tight">{{ siteName || "Slipgate" }}</p>
         </div>
-      </div>
 
-      <div class="relative max-w-md">
-        <h2 class="text-3xl font-semibold leading-tight tracking-tight text-fg">
-          一个入口，<br />调度所有上游模型。
-        </h2>
-        <p class="mt-3 text-sm leading-relaxed text-fg-muted">
-          多平台配额调度、独立出口池与 VM 执行槽，统一在一个控制台里管理。
-        </p>
-        <ul class="mt-8 space-y-5">
-          <li v-for="f in features" :key="f.title" class="flex gap-3.5">
-            <span
-              class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-accent/10 text-accent ring-1 ring-inset ring-accent/20"
-            >
-              <UiIcon :name="f.icon" :size="17" />
-            </span>
-            <div>
-              <p class="text-sm font-medium text-fg">{{ f.title }}</p>
-              <p class="mt-0.5 text-xs leading-relaxed text-fg-subtle">{{ f.body }}</p>
-            </div>
-          </li>
-        </ul>
-      </div>
-
-      <p class="relative font-mono text-2xs text-fg-subtle">Go Net · Zig Core · Bun BFF · Vue 3</p>
-    </aside>
-
-    <!-- Form panel -->
-    <main class="relative flex flex-col px-5 py-6 sm:px-10">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2.5 lg:invisible">
-          <BrandMark :size="28" />
-          <span class="text-sm font-semibold text-fg">{{ siteName || "Slipgate" }}</span>
-        </div>
-        <ThemeSwitcher compact />
-      </div>
-      <div class="flex flex-1 items-center justify-center py-10">
-        <div class="w-full max-w-sm animate-slide-up">
+        <div class="card glass animate-slide-up p-6 shadow-card-hover sm:p-8">
           <slot />
         </div>
+
+        <ul class="mt-6 flex flex-wrap items-center justify-center gap-2">
+          <li
+            v-for="f in features"
+            :key="f.icon"
+            class="inline-flex items-center gap-1.5 rounded-full bg-surface/70 px-3 py-1 text-xs text-fg-muted ring-1 ring-inset ring-line backdrop-blur"
+          >
+            <UiIcon :name="f.icon" :size="13" class="text-accent" />
+            {{ f.label }}
+          </li>
+        </ul>
       </div>
     </main>
   </div>
 </template>
+
+<style scoped>
+.backdrop {
+  background: linear-gradient(
+    135deg,
+    rgb(var(--bg)) 0%,
+    rgb(var(--accent-glow) / 0.06) 50%,
+    rgb(var(--surface)) 100%
+  );
+}
+.orb {
+  background: rgb(var(--accent-glow) / 0.2);
+}
+.orb-soft {
+  background: rgb(var(--accent-glow) / 0.14);
+}
+</style>

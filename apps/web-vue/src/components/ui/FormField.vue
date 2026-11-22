@@ -2,7 +2,6 @@
 withDefaults(
   defineProps<{
     label: string;
-    hint?: string;
     required?: boolean;
   }>(),
   { required: false },
@@ -16,6 +15,5 @@ withDefaults(
       <span v-if="required" class="text-danger">*</span>
     </span>
     <slot />
-    <span v-if="hint" class="hint block">{{ hint }}</span>
   </label>
 </template>

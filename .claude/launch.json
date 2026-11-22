@@ -12,6 +12,37 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "apps/web-vue", "run", "dev"],
       "port": 5173
+    },
+    {
+      "name": "bff-memory-alt",
+      "runtimeExecutable": "C:\\Users\\xinian\\AppData\\Local\\npm-cache\\_npx\\5c4f1b4a21be27f7\\node_modules\\bun\\bin\\bun.exe",
+      "runtimeArgs": ["services/bff-ts/src/index.ts"],
+      "env": {
+        "SLIPGATE_BFF_PORT": "19182",
+        "SLIPGATE_NET_INTERNAL_URL": "http://127.0.0.1:18180",
+        "SLIPGATE_INTERNAL_TOKEN": "slipgate-dev-internal-token"
+      },
+      "port": 19182
+    },
+    {
+      "name": "net-alt",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["-C", "services/net-go", "run", "./cmd/slipgate", "-standalone", "-allow-degraded"],
+      "env": {
+        "SLIPGATE_LISTEN_ADDR": "127.0.0.1:18180",
+        "SLIPGATE_BFF_ADDR": "127.0.0.1:19182",
+        "SLIPGATE_CORE_IPC": "127.0.0.1:19181",
+        "SLIPGATE_INTERNAL_TOKEN": "slipgate-dev-internal-token",
+        "SLIPGATE_CLASH_MODE": "disabled"
+      },
+      "port": 18180
+    },
+    {
+      "name": "web-vue-alt",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "apps/web-vue", "run", "dev", "--", "--port", "5183", "--strictPort"],
+      "env": { "SLIPGATE_BFF_URL": "http://127.0.0.1:19182" },
+      "port": 5183
     }
   ]
 }

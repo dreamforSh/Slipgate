@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
+import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 import type { AuthSessionResponse } from "@slipgate/contracts";
 import AuthLayout from "../components/AuthLayout.vue";
@@ -8,6 +9,7 @@ import UiAlert from "../components/ui/UiAlert.vue";
 import UiIcon from "../components/ui/UiIcon.vue";
 import { useAuthStore } from "../stores/auth";
 
+const { t } = useI18n();
 const router = useRouter();
 const auth = useAuthStore();
 
@@ -35,14 +37,14 @@ async function handleSubmit() {
     });
     const data = (await res.json()) as AuthSessionResponse & { message?: string; error?: string };
     if (!res.ok) {
-      errorMessage.value = data.message ?? data.error ?? "认证失败";
+      errorMessage.value = data.message ?? data.error ?? t("auth.failed");
       return;
     }
     auth.setSession(data);
     await auth.hydrateSession();
     await router.push(data.user.role === "admin" ? "/admin" : "/user");
   } catch (err) {
-    errorMessage.value = err instanceof Error ? err.message : "网络请求失败";
+    errorMessage.value = err instanceof Error ? err.message : t("common.networkError");
   } finally {
     submitting.value = false;
   }
@@ -51,14 +53,9 @@ async function handleSubmit() {
 
 <template>
   <AuthLayout :site-name="auth.setupStatus?.siteName">
-    <div>
-      <h1 class="text-2xl font-semibold tracking-tight text-fg">
-        {{ mode === "login" ? "登录控制台" : "创建账号" }}
-      </h1>
-      <p class="mt-1.5 text-sm text-fg-muted">
-        {{ mode === "login" ? "使用邮箱和密码登录。" : "注册后即可签发 API Key 并查看用量。" }}
-      </p>
-    </div>
+    <h1 class="text-center text-xl font-semibold tracking-tight text-fg">
+      {{ mode === "login" ? t("auth.loginTitle") : t("auth.registerTitle") }}
+    </h1>
 
     <SegmentedControl
       v-if="canRegister"
@@ -66,30 +63,27 @@ async function handleSubmit() {
       class="mt-6"
       block
       size="md"
-      :options="[
-        { value: 'login', label: '登录' },
-        { value: 'register', label: '注册' },
+:options="[
+        { value: 'login', label: t('auth.login') },
+        { value: 'register', label: t('auth.register') },
       ]"
     />
 
     <form class="mt-6 space-y-4" @submit.prevent="handleSubmit">
       <label class="block">
-        <span class="label">邮箱</span>
+        <span class="label">{{ t("auth.email") }}</span>
         <input
           v-model="email"
           type="email"
           required
           autocomplete="email"
-          placeholder="user@example.com"
+          :placeholder="t('auth.emailPlaceholder')"
           class="input h-10"
         />
       </label>
 
       <label class="block">
-        <span class="label flex items-center justify-between">
-          密码
-          <span v-if="mode === 'register'" class="font-normal text-fg-subtle">至少 8 位</span>
-        </span>
+        <span class="label">{{ t("auth.password") }}</span>
         <span class="relative block">
           <input
             v-model="password"
@@ -97,12 +91,13 @@ async function handleSubmit() {
             :minlength="mode === 'register' ? 8 : 1"
             required
             :autocomplete="mode === 'login' ? 'current-password' : 'new-password'"
+            :placeholder="mode === 'login' ? t('auth.passwordPlaceholder') : t('auth.newPasswordPlaceholder')"
             class="input h-10 pr-10"
           />
           <button
             type="button"
             class="absolute inset-y-0 right-0 flex w-10 cursor-pointer items-center justify-center text-fg-subtle transition-colors hover:text-fg"
-            :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+            :aria-label="showPassword ? t('auth.hidePassword') : t('auth.showPassword')"
             @click="showPassword = !showPassword"
           >
             <UiIcon :name="showPassword ? 'eye-off' : 'eye'" :size="16" />
@@ -114,12 +109,12 @@ async function handleSubmit() {
 
       <button type="submit" :disabled="submitting" class="btn btn-primary h-10 w-full">
         <UiIcon v-if="submitting" name="loader" :size="16" spin />
-        {{ submitting ? "提交中…" : mode === "login" ? "登录" : "注册并登录" }}
+        {{ submitting ? t("common.submitting") : mode === "login" ? t("auth.submitLogin") : t("auth.submitRegister") }}
       </button>
     </form>
 
-    <p v-if="!canRegister" class="mt-6 text-center text-xs text-fg-subtle">
-      本站已关闭自助注册，如需账号请联系管理员。
+    <p v-if="!canRegister" class="mt-6 text-center text-xs text-fg-muted">
+      {{ t("auth.registrationClosed") }}
     </p>
   </AuthLayout>
 </template>
