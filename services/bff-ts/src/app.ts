@@ -754,7 +754,9 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
     if (claims.role !== "admin") {
-      const group = (await store.listGroups(true)).find((g) => g.id === parsed.data.groupId);
+      // Look across disabled groups too: an enabled-only lookup misses a disabled exclusive
+      // group and would skip this guard, leaving only the store's enabled check in the way.
+      const group = (await store.listGroups()).find((g) => g.id === parsed.data.groupId);
       if (group?.isExclusive) {
         return c.json({ error: "forbidden", message: "This group is reserved for administrators" }, 403);
       }

@@ -1030,32 +1030,44 @@ export class PostgresControlStore implements ControlStore {
     keyPrefix: string,
     keyHash: Uint8Array,
   ): Promise<ApiKeyItem> {
+    const id = `key_${crypto.randomUUID()}`;
     try {
-      const id = `key_${crypto.randomUUID()}`;
-      await this.sql`
-        INSERT INTO core.api_keys (
-          id, name, user_id, group_id, key_prefix, key_hash_blake3,
-          rpm_limit, concurrency_limit, ip_allowlist, enabled, expires_at
-        )
-        VALUES (
-          ${id},
-          ${req.name},
-          ${userId},
-          ${req.groupId},
-          ${keyPrefix},
-          ${Buffer.from(keyHash)},
-          ${req.rpmLimit},
-          ${req.concurrencyLimit},
-          ${this.sql.json(req.ipAllowlist)},
-          TRUE,
-          ${req.expiresAtIso ? new Date(req.expiresAtIso) : null}
-        )
-      `;
-      const keys = await this.listUserApiKeys(userId);
-      return keys.find((k) => k.id === id)!;
+      await this.sql.begin(async (txRaw) => {
+        const tx = txRaw as unknown as SqlExecutor;
+        // Same contract as MemoryControlStore: keys may only be minted on an existing,
+        // enabled group. FOR SHARE holds off a concurrent disable/delete until commit.
+        const groups = await tx<{ id: string }[]>`
+          SELECT id FROM core.groups WHERE id = ${req.groupId} AND enabled FOR SHARE
+        `;
+        if (groups.length === 0) {
+          throw new StoreError("bad_request", `Group ${req.groupId} is unavailable`);
+        }
+        await tx`
+          INSERT INTO core.api_keys (
+            id, name, user_id, group_id, key_prefix, key_hash_blake3,
+            rpm_limit, concurrency_limit, ip_allowlist, enabled, expires_at
+          )
+          VALUES (
+            ${id},
+            ${req.name},
+            ${userId},
+            ${req.groupId},
+            ${keyPrefix},
+            ${Buffer.from(keyHash)},
+            ${req.rpmLimit},
+            ${req.concurrencyLimit},
+            ${this.sql.json(req.ipAllowlist)},
+            TRUE,
+            ${req.expiresAtIso ? new Date(req.expiresAtIso) : null}
+          )
+        `;
+      });
     } catch (err) {
+      if (err instanceof StoreError) throw err;
       mapPgError(err);
     }
+    const keys = await this.listUserApiKeys(userId);
+    return keys.find((k) => k.id === id)!;
   }
 
   async updateUserApiKey(

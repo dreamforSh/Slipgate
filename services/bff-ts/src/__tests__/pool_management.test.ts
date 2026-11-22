@@ -157,6 +157,35 @@ describe("group management", () => {
     );
     expect(keyCount?.apiKeyCount).toBe(1);
   });
+
+  it("refuses API keys on missing or disabled groups, keeping disabled exclusive groups admin-only", async () => {
+    const { admin, user, call } = await bootstrap();
+    const disabled = await createGroup(call, admin, { name: "paused-pool", platform: "composite", enabled: false });
+    const disabledVip = await createGroup(call, admin, {
+      name: "paused-vip",
+      platform: "composite",
+      isExclusive: true,
+      enabled: false,
+    });
+
+    for (const headers of [user, admin]) {
+      const res = await call("POST", "/api/v1/user/api-keys", headers, { name: "k", groupId: disabled.id });
+      expect(res.status).toBe(400);
+      const missing = await call("POST", "/api/v1/user/api-keys", headers, { name: "k", groupId: "grp_missing" });
+      expect(missing.status).toBe(400);
+    }
+
+    // The exclusivity guard must still fire while the group is disabled, so re-enabling it
+    // later cannot hand a regular user a key on an admin-reserved group.
+    const vipDenied = await call("POST", "/api/v1/user/api-keys", user, { name: "k", groupId: disabledVip.id });
+    expect(vipDenied.status).toBe(403);
+    const vipAdmin = await call("POST", "/api/v1/user/api-keys", admin, { name: "k", groupId: disabledVip.id });
+    expect(vipAdmin.status).toBe(400);
+
+    const groups = (await call<{ groups: GroupItem[] }>("GET", "/api/v1/admin/groups", admin)).body.groups;
+    expect(groups.find((g) => g.id === disabled.id)?.apiKeyCount).toBe(0);
+    expect(groups.find((g) => g.id === disabledVip.id)?.apiKeyCount).toBe(0);
+  });
 });
 
 describe("account management", () => {
