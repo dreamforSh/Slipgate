@@ -6,7 +6,7 @@ import type {
   UpstreamAccount,
 } from "@slipgate/contracts";
 import type { Tone } from "../../../lib/format";
-import type { IconName } from "../../ui/UiIcon.vue";
+import type { IconName } from "../../ui/icons";
 
 export const ACCOUNT_STATUSES: AccountStatus[] = ["active", "paused", "cooldown", "expired"];
 export const EXECUTION_MODES: ExecutionMode[] = ["stealth_http", "direct_api", "vm_slot"];
