@@ -49,6 +49,8 @@ export default {
         capabilities: "能力",
       },
       sshKey: "SSH 密钥",
+      hostKeyPending: "主机公钥待首次连接锁定",
+      hostKeyPendingHint: "首次连接时会记录服务器出示的主机公钥，之后公钥不符将拒绝连接",
       local: "本机",
       confirmRemove: "确认移除？",
       option: "{name}（{id} · {arch}）",
@@ -87,6 +89,9 @@ export default {
       unsupported: "不支持",
       privateKey: "SSH 私钥",
       privateKeyPlaceholder: "留空则使用默认密钥",
+      hostKey: "SSH 主机公钥（可选）",
+      hostKeyPlaceholder: "ssh-ed25519 AAAA…（可直接粘贴 ssh-keyscan 输出）",
+      hostKeyHint: "留空时首次连接自动锁定服务器公钥；同一地址重新注册会保留已锁定的公钥。服务器重装后请在此填写新公钥。",
     },
     detail: {
       title: "槽位 {id}",

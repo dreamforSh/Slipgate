@@ -216,12 +216,47 @@ export async function credentialFingerprint(canonicalSecret: string, vaultSecret
   return toHex(new Uint8Array(sig));
 }
 
+/** Token fields of JSON credentials, in the order the data plane's vault prefers them. */
+const PREVIEW_TOKEN_KEYS = ["apiKey", "api_key", "accessToken", "access_token", "setupToken", "setup_token", "sessionKey", "token"];
+
+/**
+ * The token a JSON credential (sub2api / CPA auth file, `.claude/.credentials.json`,
+ * `.codex/auth.json`) is used with, so its preview shows the key and not `{"emai...`.
+ */
+function primaryJsonToken(trimmed: string): string | null {
+  if (!trimmed.startsWith("{")) return null;
+  let doc: unknown;
+  try {
+    doc = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  const rec = doc && typeof doc === "object" && !Array.isArray(doc) ? (doc as Record<string, unknown>) : null;
+  if (!rec) return null;
+  const nested = ["claudeAiOauth", "tokens", "token"].flatMap((key) => {
+    const value = rec[key];
+    return value && typeof value === "object" && !Array.isArray(value) ? [value as Record<string, unknown>] : [];
+  });
+  for (const source of [rec, ...nested]) {
+    for (const key of PREVIEW_TOKEN_KEYS) {
+      const value = source[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+  }
+  const openAiKey = rec.OPENAI_API_KEY;
+  return typeof openAiKey === "string" && openAiKey.trim() ? openAiKey.trim() : null;
+}
+
+/** `https://relay|key` (a key behind a custom base URL) previews the key, not the URL scheme. */
+const RELAY_SECRET = /^https?:\/\/[^|\s]+\|(.+)$/s;
+
 export function maskSecret(raw: string): string {
   const trimmed = raw.trim();
-  if (trimmed.length < 14) {
+  const shown = primaryJsonToken(trimmed) ?? RELAY_SECRET.exec(trimmed)?.[1]?.trim() ?? trimmed;
+  if (shown.length < 14) {
     return "****";
   }
-  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
+  return `${shown.slice(0, 6)}...${shown.slice(-4)}`;
 }
 
 export async function generateApiKey(): Promise<{

@@ -1,6 +1,8 @@
 import { join } from "node:path";
 
 const root = process.cwd();
+// Local dev runs on the built-in secrets; release entrypoints refuse them without this flag.
+const devEnv = { ...process.env, SLIPGATE_ALLOW_INSECURE_SECRETS: "true" };
 
 const procs = [
   Bun.spawn(["bun", "run", "--cwd", "apps/web-vue", "dev"], {
@@ -10,6 +12,7 @@ const procs = [
   }),
   Bun.spawn(["bun", "run", "--cwd", "services/bff-ts", "dev"], {
     cwd: root,
+    env: devEnv,
     stdout: "inherit",
     stderr: "inherit",
   }),
@@ -25,7 +28,7 @@ const procs = [
     {
       cwd: join(root, "services", "net-go"),
       env: {
-        ...process.env,
+        ...devEnv,
         SLIPGATE_MODE: "dev",
         SLIPGATE_DEV_UI_URL: "http://127.0.0.1:5173",
       },

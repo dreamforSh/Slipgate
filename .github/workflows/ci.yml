@@ -117,9 +117,28 @@ jobs:
           docker run --rm --entrypoint /usr/local/bin/slipgate-core slipgate:ci --version
           docker run --rm --entrypoint /usr/local/share/slipgate/guest/slipgate-guestd slipgate:ci --version
           docker run --rm --entrypoint /usr/local/bin/slipgate-bff slipgate:ci --version
+      - name: Verify startup refuses weak secrets
+        run: |
+          set +e
+          timeout 60 docker run --rm slipgate:ci >/tmp/no_secrets.log 2>&1
+          NO_SECRET_CODE=$?
+          timeout 60 docker run --rm --entrypoint /usr/local/bin/slipgate-bff \
+            -e SLIPGATE_JWT_SECRET=change-me-32-byte-jwt-secret -e SLIPGATE_VAULT_SECRET=change-me-32-byte-vault-secret \
+            slipgate:ci >/tmp/bff_placeholder.log 2>&1
+          BFF_PLACEHOLDER_CODE=$?
+          set -e
+          cat /tmp/no_secrets.log /tmp/bff_placeholder.log
+          # 124 would mean timeout killed a container that kept running.
+          [ "$NO_SECRET_CODE" -ne 0 ] && [ "$NO_SECRET_CODE" -ne 124 ]
+          [ "$BFF_PLACEHOLDER_CODE" -ne 0 ] && [ "$BFF_PLACEHOLDER_CODE" -ne 124 ]
+          grep -q 'refusing to start' /tmp/no_secrets.log
+          grep -q 'refusing to start' /tmp/bff_placeholder.log
       - name: Verify single-service 3-plane boot & dual-plane routing
         run: |
-          docker run -d --name sg-smoke -p 18080:8080 slipgate:ci
+          docker run -d --name sg-smoke -p 18080:8080 \
+            -e SLIPGATE_JWT_SECRET="$(openssl rand -hex 32)" \
+            -e SLIPGATE_VAULT_SECRET="$(openssl rand -hex 32)" \
+            slipgate:ci
           trap 'docker logs sg-smoke || true; docker rm -f sg-smoke >/dev/null 2>&1 || true' EXIT
 
           for i in $(seq 1 30); do

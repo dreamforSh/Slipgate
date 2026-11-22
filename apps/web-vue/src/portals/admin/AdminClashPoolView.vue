@@ -11,6 +11,9 @@ import type {
   TlsProfile,
   UpstreamAccount,
 } from "@slipgate/contracts";
+import { isStaticIpSubscription } from "@slipgate/contracts";
+import ClashNodeCard from "../../components/admin/clash/ClashNodeCard.vue";
+import ClashSubscriptionCard from "../../components/admin/clash/ClashSubscriptionCard.vue";
 import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import FormField from "../../components/ui/FormField.vue";
@@ -24,6 +27,8 @@ import UiIcon from "../../components/ui/UiIcon.vue";
 import UiSwitch from "../../components/ui/UiSwitch.vue";
 import UiTabs from "../../components/ui/UiTabs.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
+import { useNow } from "../../composables/useNow";
+import { usePersistentState } from "../../composables/usePersistentState";
 import { healthLabel, healthTone } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 
@@ -54,6 +59,15 @@ const subDrawerOpen = ref(false);
 const tlsDrawerOpen = ref(false);
 
 useFeedbackToasts(errorMessage, actionNotice);
+
+type ViewMode = "card" | "table";
+/** Nodes and subscriptions share one table/card preference, cards first (as in linksyncx). */
+const viewMode = usePersistentState<ViewMode>("slipgate.clash.view", "card", (v): v is ViewMode => v === "card" || v === "table");
+const viewOptions = computed(() => [
+  { value: "card" as const, label: t("clash.view.card") },
+  { value: "table" as const, label: t("clash.view.table") },
+]);
+const now = useNow();
 
 const runtime = ref<ClashRuntimeStatus | null>(null);
 const subscriptions = ref<ClashSubscription[]>([]);
@@ -94,17 +108,36 @@ const tlsCurvesRaw = ref("");
 const tlsKeySharesRaw = ref("");
 const tlsExtensionsRaw = ref("");
 
-const healthyCount = computed(() => nodes.value.filter((n) => n.healthStatus === "healthy").length);
-const driftCount = computed(() => nodes.value.filter((n) => n.driftUnconfirmed).length);
+// Static IPs share the exit pool but are managed on the IP page; this page shows subscription exits.
+const clashSubscriptions = computed(() => subscriptions.value.filter((s) => !isStaticIpSubscription(s.id)));
+const clashNodes = computed(() => nodes.value.filter((n) => !isStaticIpSubscription(n.subscriptionId)));
+const staticNodes = computed(() => nodes.value.filter((n) => isStaticIpSubscription(n.subscriptionId)));
+const healthyCount = computed(() => clashNodes.value.filter((n) => n.healthStatus === "healthy").length);
+const driftCount = computed(() => clashNodes.value.filter((n) => n.driftUnconfirmed).length);
 const accountNameById = computed(() => new Map(accounts.value.map((a) => [a.id, a.name])));
 const nodeNameById = computed(() => new Map(nodes.value.map((n) => [n.nodeId, n.name])));
+const subscriptionNameById = computed(() => new Map(subscriptions.value.map((s) => [s.id, s.name])));
+const accountNamesByNode = computed(() => {
+  const map = new Map<string, string[]>();
+  for (const b of bindings.value) {
+    const list = map.get(b.nodeId) ?? [];
+    list.push(accountNameById.value.get(b.accountId) ?? b.accountId);
+    map.set(b.nodeId, list);
+  }
+  return map;
+});
+const nodesBySubscription = computed(() => {
+  const map = new Map<string, ClashExitNode[]>();
+  for (const n of clashNodes.value) map.set(n.subscriptionId, [...(map.get(n.subscriptionId) ?? []), n]);
+  return map;
+});
 
 const tabs = computed(() => [
-  { key: "nodes" as const, label: t("clash.tabs.nodes"), count: nodes.value.length, icon: "radar" as const },
+  { key: "nodes" as const, label: t("clash.tabs.nodes"), count: clashNodes.value.length, icon: "radar" as const },
   {
     key: "subscriptions" as const,
     label: t("clash.tabs.subscriptions"),
-    count: subscriptions.value.length,
+    count: clashSubscriptions.value.length,
     icon: "download" as const,
   },
   { key: "bindings" as const, label: t("clash.tabs.bindings"), count: bindings.value.length, icon: "link" as const },
@@ -522,7 +555,7 @@ onMounted(() => {
 
 <template>
   <div class="space-y-6">
-    <PageHeader :title="t('nav.clash')">
+    <PageHeader :title="t('nav.proxyClash')">
       <template #meta>
         <UiBadge v-if="runtime" :tone="runtime.ready ? 'success' : 'warning'" dot :pulse="runtime.ready">
           {{ runtime.ready ? t("clash.runtime.ready") : t("clash.runtime.notReady") }}
@@ -533,7 +566,12 @@ onMounted(() => {
           <UiIcon name="refresh" :size="15" :spin="loading" />
           {{ t("common.refresh") }}
         </button>
-        <button type="button" class="btn btn-primary" :disabled="busyAction || nodes.length === 0" @click="probeNodes([])">
+        <button
+          type="button"
+          class="btn btn-primary"
+          :disabled="busyAction || clashNodes.length === 0"
+          @click="probeNodes(clashNodes.map((n) => n.nodeId))"
+        >
           <UiIcon :name="busyAction ? 'loader' : 'radar'" :size="15" :spin="busyAction" />
           {{ t("clash.actions.checkAll") }}
         </button>
@@ -542,7 +580,7 @@ onMounted(() => {
 
     <div class="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
       <StatCard :label="t('clash.stats.listeners')" :value="runtime?.activeListeners ?? 0" icon="plug" tone="accent" />
-      <StatCard :label="t('clash.stats.healthy')" :value="`${healthyCount} / ${nodes.length}`" icon="radar" tone="success" />
+      <StatCard :label="t('clash.stats.healthy')" :value="`${healthyCount} / ${clashNodes.length}`" icon="radar" tone="success" />
       <StatCard
         :label="t('clash.stats.exitChanged')"
         :value="driftCount"
@@ -563,12 +601,30 @@ onMounted(() => {
 
       <!-- Nodes -->
       <div v-if="activeTab === 'nodes'">
-        <EmptyState v-if="nodes.length === 0" icon="radar" :title="t('clash.nodes.empty')">
+        <div v-if="clashNodes.length" class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-3">
+          <span class="text-xs text-fg-muted">{{ t("clash.nodes.summary", { total: clashNodes.length, healthy: healthyCount }) }}</span>
+          <SegmentedControl v-model="viewMode" :options="viewOptions" />
+        </div>
+        <EmptyState v-if="clashNodes.length === 0" icon="radar" :title="t('clash.nodes.empty')">
           <button type="button" class="btn btn-primary btn-sm" @click="activeTab = 'subscriptions'; subDrawerOpen = true">
             <UiIcon name="plus" :size="14" />
             {{ t("clash.actions.addSubscription") }}
           </button>
         </EmptyState>
+        <div v-else-if="viewMode === 'card'" class="grid gap-4 p-5 sm:grid-cols-2 xl:grid-cols-3">
+          <ClashNodeCard
+            v-for="n in clashNodes"
+            :key="n.nodeId"
+            :node="n"
+            :subscription-name="subscriptionNameById.get(n.subscriptionId) ?? n.subscriptionId"
+            :account-names="accountNamesByNode.get(n.nodeId) ?? []"
+            :busy="busyAction"
+            :now="now"
+            @toggle="toggleNodeEnabled(n)"
+            @probe="probeNodes([n.nodeId])"
+            @accept-exit="confirmDrift(n.nodeId)"
+          />
+        </div>
         <div v-else class="table-wrap">
           <table class="data-table">
             <thead>
@@ -584,7 +640,7 @@ onMounted(() => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="n in nodes" :key="n.nodeId" :class="(n.enabled ?? true) ? '' : 'opacity-60'">
+              <tr v-for="n in clashNodes" :key="n.nodeId" :class="(n.enabled ?? true) ? '' : 'opacity-60'">
                 <td class="max-w-[14rem]">
                   <p class="truncate font-medium text-fg">{{ n.name }}</p>
                   <p v-if="n.lastError" class="mt-0.5 truncate text-2xs text-danger" :title="n.lastError">{{ n.lastError }}</p>
@@ -638,17 +694,33 @@ onMounted(() => {
 
       <!-- Subscriptions -->
       <div v-else-if="activeTab === 'subscriptions'">
-        <div class="flex flex-wrap items-center justify-end gap-3 border-b border-line px-5 py-3">
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-3">
+          <SegmentedControl v-if="clashSubscriptions.length" v-model="viewMode" :options="viewOptions" />
+          <span v-else />
           <button type="button" class="btn btn-primary btn-sm" @click="subDrawerOpen = true">
             <UiIcon name="plus" :size="14" />
             {{ t("clash.actions.addSubscription") }}
           </button>
         </div>
         <EmptyState
-          v-if="!loading && subscriptions.length === 0"
+          v-if="!loading && clashSubscriptions.length === 0"
           icon="download"
           :title="t('clash.subscriptions.empty')"
         />
+        <div v-else-if="viewMode === 'card'" class="grid gap-4 p-5 sm:grid-cols-2 xl:grid-cols-3">
+          <ClashSubscriptionCard
+            v-for="sub in clashSubscriptions"
+            :key="sub.id"
+            :sub="sub"
+            :nodes="nodesBySubscription.get(sub.id) ?? []"
+            :status-label="syncStatusLabel(sub.lastSyncStatus)"
+            :busy="busyAction"
+            :now="now"
+            @refresh="syncSubscription(sub.id, false)"
+            @force-refresh="syncSubscription(sub.id, true)"
+            @delete="deleteSubscription(sub.id)"
+          />
+        </div>
         <div v-else class="table-wrap">
           <table class="data-table">
             <thead>
@@ -661,7 +733,7 @@ onMounted(() => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="sub in subscriptions" :key="sub.id">
+              <tr v-for="sub in clashSubscriptions" :key="sub.id">
                 <td class="font-medium text-fg">{{ sub.name }}</td>
                 <td><UiBadge>{{ t(`clash.subscriptions.sourceKind.${sub.sourceKind}`) }}</UiBadge></td>
                 <td>
@@ -711,15 +783,19 @@ onMounted(() => {
           </FormField>
           <FormField :label="t('clash.bindings.node')" required>
             <select v-model="bindNodeId" required class="select">
-              <option v-for="n in nodes" :key="n.nodeId" :value="n.nodeId">
-                {{
-                  t("clash.bindings.nodeOption", {
-                    name: n.name,
-                    ip: n.exitIp || t("clash.nodes.unprobed"),
-                    health: healthLabel(n.healthStatus),
-                  })
-                }}
-              </option>
+              <template v-for="group in [{ key: 'clash', label: t('clash.bindings.groupClash'), list: clashNodes }, { key: 'ip', label: t('clash.bindings.groupStatic'), list: staticNodes }]" :key="group.key">
+                <optgroup v-if="group.list.length" :label="group.label">
+                  <option v-for="n in group.list" :key="n.nodeId" :value="n.nodeId">
+                    {{
+                      t("clash.bindings.nodeOption", {
+                        name: n.name,
+                        ip: n.exitIp || t("clash.nodes.unprobed"),
+                        health: healthLabel(n.healthStatus),
+                      })
+                    }}
+                  </option>
+                </optgroup>
+              </template>
             </select>
           </FormField>
           <FormField :label="t('clash.bindings.profile')">

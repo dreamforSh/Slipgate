@@ -54,9 +54,12 @@ const autoPause = ref(true);
 const saving = ref(false);
 const error = ref<string | null>(null);
 
-const platforms = computed(() => [...new Set(props.accounts.map((a) => a.platform))]);
+/** API keys carry no plan: the tier never applies to them, so it is offered for subscriptions only. */
+const subscriptionAccounts = computed(() => props.accounts.filter((a) => a.authKind !== "api_key"));
+const apiKeyCount = computed(() => props.accounts.length - subscriptionAccounts.value.length);
+const platforms = computed(() => [...new Set(subscriptionAccounts.value.map((a) => a.platform))]);
 
-/** Tiers every selected platform accepts, in the first platform's display order. */
+/** Tiers every selected subscription platform accepts, in the first platform's display order. */
 const sharedTiers = computed(() => {
   const [first, ...rest] = platforms.value;
   if (!first) return [];
@@ -87,7 +90,7 @@ function buildPatch(): AccountBulkPatch {
   if (apply.group && groupId.value) patch.groupId = groupId.value;
   if (apply.status) patch.status = status.value;
   if (apply.mode) patch.executionMode = executionMode.value;
-  if (apply.tier && sharedTiers.value.length) patch.subscriptionTier = tier.value;
+  if (apply.tier && sharedTiers.value.length && subscriptionAccounts.value.length) patch.subscriptionTier = tier.value;
   if (apply.concurrency) patch.maxConcurrency = concurrency.value;
   if (apply.priority) patch.priority = priority.value;
   if (apply.expires) {
@@ -107,23 +110,31 @@ async function submit() {
   }
   saving.value = true;
   error.value = null;
-  const ids = props.accounts.map((a) => a.id);
+  // API-key accounts get the same patch minus the tier; skip them when nothing else is left.
+  const { subscriptionTier, ...keyPatch } = patch;
+  const keyIds = new Set(props.accounts.filter((a) => a.authKind === "api_key").map((a) => a.id));
+  const batches: { ids: string[]; patch: AccountBulkPatch }[] = [
+    { ids: props.accounts.filter((a) => !keyIds.has(a.id)).map((a) => a.id), patch },
+    { ids: [...keyIds], patch: subscriptionTier === undefined ? patch : keyPatch },
+  ].filter((b) => b.ids.length && Object.keys(b.patch).length);
   const total: AccountBulkResult = { success: 0, failed: 0, results: [] };
   try {
-    for (let offset = 0; offset < ids.length; offset += 500) {
-      const res = await auth.apiFetch("/api/v1/admin/accounts/bulk-update", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accountIds: ids.slice(offset, offset + 500), patch }),
-      });
-      const data = (await res.json().catch(() => ({}))) as AccountBulkResult & { message?: string };
-      if (!res.ok) {
-        error.value = data.message ?? t("accounts.bulk.failed");
-        return;
+    for (const batch of batches) {
+      for (let offset = 0; offset < batch.ids.length; offset += 500) {
+        const res = await auth.apiFetch("/api/v1/admin/accounts/bulk-update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ accountIds: batch.ids.slice(offset, offset + 500), patch: batch.patch }),
+        });
+        const data = (await res.json().catch(() => ({}))) as AccountBulkResult & { message?: string };
+        if (!res.ok) {
+          error.value = data.message ?? t("accounts.bulk.failed");
+          return;
+        }
+        total.success += data.success;
+        total.failed += data.failed;
+        total.results.push(...data.results);
       }
-      total.success += data.success;
-      total.failed += data.failed;
-      total.results.push(...data.results);
     }
     emit("done", total);
     emit("update:open", false);
@@ -174,7 +185,7 @@ const rowClass = (on: boolean) =>
         </select>
       </div>
 
-      <div :class="rowClass(apply.tier)">
+      <div v-if="subscriptionAccounts.length" :class="rowClass(apply.tier)">
         <input id="be-tier" v-model="apply.tier" type="checkbox" class="checkbox" :disabled="!sharedTiers.length" />
         <label for="be-tier" class="text-sm font-medium text-fg">{{ t("accounts.bulkEdit.tier") }}</label>
         <div class="min-w-0">
@@ -188,6 +199,9 @@ const rowClass = (on: boolean) =>
           </select>
           <p v-if="!sharedTiers.length" class="mt-1 text-2xs text-warning">{{ t("accounts.bulkEdit.tierUnavailable") }}</p>
           <p v-else-if="platforms.length > 1" class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.bulkEdit.tierMixed") }}</p>
+          <p v-if="sharedTiers.length && apiKeyCount" class="mt-1 text-2xs text-fg-subtle">
+            {{ t("accounts.bulkEdit.tierSkipsKeys", { count: apiKeyCount }) }}
+          </p>
         </div>
       </div>
 

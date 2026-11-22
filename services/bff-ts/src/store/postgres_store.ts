@@ -1,9 +1,11 @@
 import postgres from "postgres";
 import {
+  AccountAuthKindSchema,
   effectiveAccountStatus,
   formatNanoUsd,
   isSubscriptionTierAllowedForProvider,
   SubscriptionTierSchema,
+  effectiveSubscriptionTier,
   subscriptionTierMultiplier,
   type AccountTestResult,
   type AccountUsageSummaryItem,
@@ -124,6 +126,12 @@ export class PostgresControlStore implements ControlStore {
 
       CREATE INDEX IF NOT EXISTS idx_core_accounts_credential_fingerprint
           ON core.accounts (credential_fingerprint);
+
+      -- API keys carry no plan. Rows written before that rule (or switched to api_key without
+      -- a tier change) drop back to standard so the scheduler weighs them 1x.
+      UPDATE core.accounts
+          SET subscription_tier = 'standard', updated_at = NOW()
+          WHERE auth_kind = 'api_key' AND subscription_tier <> 'standard';
 
       ALTER TABLE IF EXISTS core.account_window_quotas
           ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
@@ -728,7 +736,10 @@ export class PostgresControlStore implements ControlStore {
     `;
     const nowMs = Date.now();
     return rows.map((r) => {
-      const subscriptionTier = SubscriptionTierSchema.catch("standard").parse(r.subscription_tier);
+      const subscriptionTier = effectiveSubscriptionTier(
+        r.auth_kind,
+        SubscriptionTierSchema.catch("standard").parse(r.subscription_tier),
+      );
       const lifecycle = {
         status: r.status,
         expiresAtIso: r.expires_at ? toIso(r.expires_at) : null,
@@ -793,7 +804,7 @@ export class PostgresControlStore implements ControlStore {
           ${req.platform},
           ${req.executionMode},
           ${req.authKind},
-          ${req.subscriptionTier},
+          ${effectiveSubscriptionTier(req.authKind, req.subscriptionTier)},
           ${Buffer.from(credential.encrypted)},
           ${credential.preview},
           ${credential.fingerprint},
@@ -846,7 +857,11 @@ export class PostgresControlStore implements ControlStore {
             group_id = COALESCE(${req.groupId ?? null}, group_id),
             execution_mode = COALESCE(${req.executionMode ?? null}, execution_mode),
             auth_kind = COALESCE(${req.authKind ?? null}, auth_kind),
-            subscription_tier = COALESCE(${req.subscriptionTier ?? null}, subscription_tier),
+            -- The right-hand auth_kind is the old value, so COALESCE yields the resulting kind.
+            subscription_tier = CASE
+              WHEN COALESCE(${req.authKind ?? null}, auth_kind) = 'api_key' THEN 'standard'
+              ELSE COALESCE(${req.subscriptionTier ?? null}, subscription_tier)
+            END,
             max_concurrency = COALESCE(${req.maxConcurrency ?? null}, max_concurrency),
             priority = COALESCE(${req.priority ?? null}, priority),
             status = COALESCE(${req.status ?? null}, status),
@@ -1284,8 +1299,9 @@ export class PostgresControlStore implements ControlStore {
       })),
       routes,
       accounts: accRows.map((a) => {
-        const subscriptionTier = SubscriptionTierSchema.catch("standard").parse(
-          a.subscription_tier,
+        const subscriptionTier = effectiveSubscriptionTier(
+          AccountAuthKindSchema.catch("oauth").parse(a.auth_kind),
+          SubscriptionTierSchema.catch("standard").parse(a.subscription_tier),
         );
         return {
           id: a.id,

@@ -1,7 +1,6 @@
 package vmslot
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,13 +19,78 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/ssh"
-
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
 )
 
 var safeSegmentRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// ErrInvalidSlotID rejects slot ids that are unsafe as a path segment or shell word.
+var ErrInvalidSlotID = errors.New("vmslot: invalid slot id")
+
+var slotIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// ValidSlotID reports whether id is safe as one path segment on every driver: it starts with a
+// letter or digit (never ".", ".." or an option-like "-x") and never contains "..".
+func ValidSlotID(id string) bool {
+	return slotIDRe.MatchString(id) && !strings.Contains(id, "..")
+}
+
+// Jailed slot console, shared by LocalSlotDriver and AgentlessSSHDriver.
+const (
+	consoleDeniedChars = ";|&`$><\r\n"
+	consoleHelpText    = "Built-in jailed commands: help, status, runtime, uname -a, machine-id, persona, seed, env, ls [dir], cat <rel-path>, ping\n"
+)
+
+func consoleMetacharDenied() DriverExecResult {
+	return DriverExecResult{
+		Stderr:   "permission denied: shell metacharacters are disabled in jailed slot console",
+		ExitCode: 1,
+	}
+}
+
+func consoleUnsupported(op string) DriverExecResult {
+	return DriverExecResult{
+		Stderr:   fmt.Sprintf("unsupported command %q in jailed slot console (type 'help')\n", op),
+		ExitCode: 127,
+	}
+}
+
+func consoleStatusLine(node ClusterNode, slot Slot) string {
+	return fmt.Sprintf(
+		"slot=%s runtime=%s state=%s node=%s (%s) hypervisor=%s exit_ip=%s subagents=%d/%d daemon=%s endpoint=%s\n",
+		slot.ID, effectiveRuntimeProfile(slot.RuntimeProfile), slot.State, node.ID, node.Arch, slot.Hypervisor, slot.ExitIP,
+		slot.ActiveSubagents, slot.MaxSubagents, defaultIfEmpty(slot.DaemonVersion, "sandbox-ready"), slot.GuestUDSPath,
+	)
+}
+
+func consoleSeedSummary(seed SlotSeed) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "# telemetryMode=%s rejectClientSettings=%v rejectClientIdentity=%v syncedAt=%d\n",
+		seed.TelemetryMode, seed.RejectClientSettings, seed.RejectClientIdentity, seed.SyncedAtUnixMs)
+	fmt.Fprintf(&out, "--- settings.json ---\n%s\n--- custom_setting.env ---\n%s\n",
+		seed.SettingsJSONRaw, seed.CustomSettingRaw)
+	return out.String()
+}
+
+func consoleEnvSummary(slot Slot, seed SlotSeed) string {
+	return fmt.Sprintf(
+		"SLIPGATE_SLOT_ID=%s\nSLIPGATE_GUEST_MACHINE_ID=%s\nSLIPGATE_CLEANSE_MODE=%s\nSLIPGATE_TELEMETRY_MODE=%s\n%s",
+		slot.ID, slot.Persona.GuestMachineID, slot.CleanseMode, slot.Telemetry, redactProxyEnv(seed.ProxyEnvRaw),
+	)
+}
+
+// runtimeSettingsRelPath is the runtime's settings file relative to the slot root.
+func runtimeSettingsRelPath(slot Slot) string {
+	switch effectiveRuntimeProfile(slot.RuntimeProfile) {
+	case RuntimeCodexCLI:
+		return "home/runner/.codex/config.toml"
+	case RuntimeAntigravity:
+		return "home/runner/.antigravity/settings.json"
+	default:
+		return "home/runner/.claude/settings.json"
+	}
+}
 
 // DriverExecResult captures stdout, stderr, and exit status from a sandboxed or SSH slot command.
 type DriverExecResult struct {
@@ -74,8 +138,8 @@ func (d *LocalSlotDriver) GuestdAvailable() bool {
 }
 
 func (d *LocalSlotDriver) slotRootDir(slotID string) (string, error) {
-	if !safeSegmentRe.MatchString(slotID) || strings.Contains(slotID, "..") {
-		return "", fmt.Errorf("%w: unsafe slot id %q", ErrInvalidHardwarePersona, slotID)
+	if !ValidSlotID(slotID) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidSlotID, slotID)
 	}
 	return filepath.Join(d.vmDataDir, "slots", slotID), nil
 }
@@ -295,11 +359,8 @@ func (d *LocalSlotDriver) ExecTerminalCommand(ctx context.Context, node ClusterN
 	if trimmed == "" {
 		return DriverExecResult{}, nil
 	}
-	if strings.ContainsAny(trimmed, ";|&`$><\r\n") {
-		return DriverExecResult{
-			Stderr:   "permission denied: shell metacharacters are disabled in jailed slot console",
-			ExitCode: 1,
-		}, nil
+	if strings.ContainsAny(trimmed, consoleDeniedChars) {
+		return consoleMetacharDenied(), nil
 	}
 
 	rootDir := slot.RootDir
@@ -316,29 +377,13 @@ func (d *LocalSlotDriver) ExecTerminalCommand(ctx context.Context, node ClusterN
 
 	switch op {
 	case "help":
-		return DriverExecResult{
-			Stdout: "Built-in jailed commands: help, status, runtime, uname -a, machine-id, persona, seed, env, ls [dir], cat <rel-path>, ping\n",
-		}, nil
+		return DriverExecResult{Stdout: consoleHelpText}, nil
 
 	case "status":
-		return DriverExecResult{
-			Stdout: fmt.Sprintf(
-				"slot=%s runtime=%s state=%s node=%s (%s) hypervisor=%s exit_ip=%s subagents=%d/%d daemon=%s endpoint=%s\n",
-				slot.ID, effectiveRuntimeProfile(slot.RuntimeProfile), slot.State, node.ID, node.Arch, slot.Hypervisor, slot.ExitIP,
-				slot.ActiveSubagents, slot.MaxSubagents, defaultIfEmpty(slot.DaemonVersion, "sandbox-ready"), slot.GuestUDSPath,
-			),
-		}, nil
+		return DriverExecResult{Stdout: consoleStatusLine(node, slot)}, nil
 
 	case "runtime":
-		rp := effectiveRuntimeProfile(slot.RuntimeProfile)
-		switch rp {
-		case RuntimeCodexCLI:
-			return readJailedFile(rootDir, "home/runner/.codex/config.toml", false)
-		case RuntimeAntigravity:
-			return readJailedFile(rootDir, "home/runner/.antigravity/settings.json", false)
-		default:
-			return readJailedFile(rootDir, "home/runner/.claude/settings.json", false)
-		}
+		return readJailedFile(rootDir, runtimeSettingsRelPath(slot), false)
 
 	case "uname":
 		return DriverExecResult{
@@ -352,20 +397,10 @@ func (d *LocalSlotDriver) ExecTerminalCommand(ctx context.Context, node ClusterN
 		return readJailedFile(rootDir, "persona.json", false)
 
 	case "seed":
-		var out strings.Builder
-		fmt.Fprintf(&out, "# telemetryMode=%s rejectClientSettings=%v rejectClientIdentity=%v syncedAt=%d\n",
-			seed.TelemetryMode, seed.RejectClientSettings, seed.RejectClientIdentity, seed.SyncedAtUnixMs)
-		fmt.Fprintf(&out, "--- settings.json ---\n%s\n--- custom_setting.env ---\n%s\n",
-			seed.SettingsJSONRaw, seed.CustomSettingRaw)
-		return DriverExecResult{Stdout: out.String()}, nil
+		return DriverExecResult{Stdout: consoleSeedSummary(seed)}, nil
 
 	case "env":
-		return DriverExecResult{
-			Stdout: fmt.Sprintf(
-				"SLIPGATE_SLOT_ID=%s\nSLIPGATE_GUEST_MACHINE_ID=%s\nSLIPGATE_CLEANSE_MODE=%s\nSLIPGATE_TELEMETRY_MODE=%s\n%s",
-				slot.ID, slot.Persona.GuestMachineID, slot.CleanseMode, slot.Telemetry, redactProxyEnv(seed.ProxyEnvRaw),
-			),
-		}, nil
+		return DriverExecResult{Stdout: consoleEnvSummary(slot, seed)}, nil
 
 	case "ping":
 		if strings.HasPrefix(slot.GuestUDSPath, "tcp://") || strings.HasPrefix(slot.GuestUDSPath, "unix://") {
@@ -412,10 +447,7 @@ func (d *LocalSlotDriver) ExecTerminalCommand(ctx context.Context, node ClusterN
 		return readJailedFile(rootDir, rel, redact)
 
 	default:
-		return DriverExecResult{
-			Stderr:   fmt.Sprintf("unsupported command %q in jailed slot console (type 'help')\n", op),
-			ExitCode: 127,
-		}, nil
+		return consoleUnsupported(op), nil
 	}
 }
 
@@ -635,145 +667,6 @@ func buildLaunchCommandPreview(slot Slot, rootDir string) string {
 			slot.ID, slot.MemoryMiB, slot.Persona.MACAddress, filepath.Join(rootDir, "etc", "machine-id"), filepath.Join(rootDir, "home", "runner"), slot.Persona.GuestMachineID, rp,
 		)
 	}
-}
-
-// AgentlessSSHDriver provisions and inspects slots over standard OpenSSH without pre-installing a remote daemon.
-type AgentlessSSHDriver struct{}
-
-func NewAgentlessSSHDriver() *AgentlessSSHDriver {
-	return &AgentlessSSHDriver{}
-}
-
-func (d *AgentlessSSHDriver) dialSSH(node ClusterNode) (*ssh.Client, error) {
-	if strings.TrimSpace(node.SSHAddr) == "" {
-		return nil, errors.New("vmslot: sshAddr is required")
-	}
-	if strings.TrimSpace(node.SSHKeyPEM) == "" {
-		return nil, errors.New("vmslot: ssh private key is required for agentless ssh driver")
-	}
-	signer, err := ssh.ParsePrivateKey([]byte(node.SSHKeyPEM))
-	if err != nil {
-		return nil, fmt.Errorf("vmslot: parse ssh private key: %w", err)
-	}
-	addr := node.SSHAddr
-	if _, _, splitErr := net.SplitHostPort(addr); splitErr != nil {
-		addr = net.JoinHostPort(addr, "22")
-	}
-	user := defaultIfEmpty(node.SSHUser, "root")
-	cfg := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Explicit TOFUless support for dynamic admin-registered cluster nodes.
-		Timeout:         10 * time.Second,
-	}
-	return ssh.Dial("tcp", addr, cfg)
-}
-
-func (d *AgentlessSSHDriver) runRemote(ctx context.Context, node ClusterNode, script string) (DriverExecResult, error) {
-	client, err := d.dialSSH(node)
-	if err != nil {
-		return DriverExecResult{}, err
-	}
-	defer client.Close()
-
-	session, err := client.NewSession()
-	if err != nil {
-		return DriverExecResult{}, err
-	}
-	defer session.Close()
-
-	var stdout, stderr bytes.Buffer
-	session.Stdout = &stdout
-	session.Stderr = &stderr
-
-	done := make(chan error, 1)
-	go func() {
-		done <- session.Run(script)
-	}()
-
-	select {
-	case <-ctx.Done():
-		_ = session.Signal(ssh.SIGKILL)
-		return DriverExecResult{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: 124}, ctx.Err()
-	case runErr := <-done:
-		code := 0
-		if runErr != nil {
-			code = 1
-			var exitErr *ssh.ExitError
-			if errors.As(runErr, &exitErr) {
-				code = exitErr.ExitStatus()
-			}
-		}
-		return DriverExecResult{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: code}, runErr
-	}
-}
-
-func (d *AgentlessSSHDriver) MaterializeSlot(ctx context.Context, node ClusterNode, slot Slot, seed SlotSeed, target *clashpool.DialTarget) (Slot, error) {
-	slotDir := fmt.Sprintf("/var/lib/slipgate/slots/%s", slot.ID)
-	proxyEnv := seed.ProxyEnvRaw
-	if proxyEnv == "" && target != nil && target.SOCKSAddr != "" {
-		proxyEnv = fmt.Sprintf("ALL_PROXY=socks5h://%s:%s@%s", target.SocksUsername, target.SocksPassword, target.SOCKSAddr)
-	}
-	rp := effectiveRuntimeProfile(slot.RuntimeProfile)
-	runtimeSetup := fmt.Sprintf("mkdir -p %s/home/runner/.claude", slotDir)
-	switch rp {
-	case RuntimeCodexCLI:
-		runtimeSetup = fmt.Sprintf("mkdir -p %s/home/runner/.codex", slotDir)
-	case RuntimeAntigravity:
-		runtimeSetup = fmt.Sprintf("mkdir -p %s/home/runner/.antigravity %s/home/runner/.config/antigravity && printf '%%s\\n' %q > %s/home/runner/.antigravity/machineid && chmod 444 %s/home/runner/.antigravity/machineid", slotDir, slotDir, slot.Persona.GuestMachineID, slotDir, slotDir)
-	}
-	script := fmt.Sprintf(
-		"set -e; umask 077; mkdir -p %s/etc %s/seed; printf '%%s\\n' %q > %s/etc/machine-id; chmod 444 %s/etc/machine-id; printf '%%s' %q > %s/seed/proxy.env; %s",
-		slotDir, slotDir, slot.Persona.GuestMachineID, slotDir, slotDir, proxyEnv, slotDir, runtimeSetup,
-	)
-	if _, err := d.runRemote(ctx, node, script); err != nil {
-		return slot, err
-	}
-	slot.RootDir = slotDir
-	return slot, nil
-}
-
-func (d *AgentlessSSHDriver) StartSlot(ctx context.Context, node ClusterNode, slot Slot) (Slot, error) {
-	if _, err := d.runRemote(ctx, node, fmt.Sprintf("test -r /var/lib/slipgate/slots/%s/etc/machine-id", slot.ID)); err != nil {
-		return slot, err
-	}
-	now := time.Now().UTC()
-	slot.State = StateReady
-	slot.DaemonVersion = "ssh-agentless"
-	slot.GuestUDSPath = fmt.Sprintf("ssh://%s/var/lib/slipgate/slots/%s", node.SSHAddr, slot.ID)
-	slot.LastHeartbeat = &now
-	return slot, nil
-}
-
-func (d *AgentlessSSHDriver) StopSlot(ctx context.Context, node ClusterNode, slot Slot) error {
-	_, err := d.runRemote(ctx, node, fmt.Sprintf("docker stop slipgate-%s >/dev/null 2>&1 || true", slot.ID))
-	return err
-}
-
-func (d *AgentlessSSHDriver) SyncSeed(ctx context.Context, node ClusterNode, slot Slot, seed SlotSeed, _ *clashpool.DialTarget) error {
-	slotDir := fmt.Sprintf("/var/lib/slipgate/slots/%s", slot.ID)
-	script := fmt.Sprintf(
-		"mkdir -p %s/seed && printf '%%s' %q > %s/seed/settings.json && printf '%%s' %q > %s/seed/custom_setting.env",
-		slotDir, seed.SettingsJSONRaw, slotDir, seed.CustomSettingRaw, slotDir,
-	)
-	_, err := d.runRemote(ctx, node, script)
-	return err
-}
-
-func (d *AgentlessSSHDriver) ExecTerminalCommand(ctx context.Context, node ClusterNode, slot Slot, _ SlotSeed, command string) (DriverExecResult, error) {
-	if strings.ContainsAny(command, ";|&`$><\r\n") {
-		return DriverExecResult{Stderr: "disallowed shell metacharacters", ExitCode: 1}, nil
-	}
-	res, err := d.runRemote(ctx, node, fmt.Sprintf("cd /var/lib/slipgate/slots/%s && %s", slot.ID, command))
-	if err != nil && res.ExitCode == 0 {
-		res.ExitCode = 1
-	}
-	return res, nil
-}
-
-func (d *AgentlessSSHDriver) DestroySlot(ctx context.Context, node ClusterNode, slot Slot) error {
-	_, err := d.runRemote(ctx, node, fmt.Sprintf("chmod 644 /var/lib/slipgate/slots/%s/etc/machine-id /var/lib/slipgate/slots/%s/home/runner/.antigravity/machineid 2>/dev/null || true; rm -rf /var/lib/slipgate/slots/%s", slot.ID, slot.ID, slot.ID))
-	return err
 }
 
 func defaultIfEmpty(val, fallback string) string {

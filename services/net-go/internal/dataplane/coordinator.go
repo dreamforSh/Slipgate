@@ -225,15 +225,15 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 	}
 
 	return &Coordinator{
-		coreIPC:         opts.CoreIPC,
-		bffOrigin:       bffOrigin,
-		internalToken:   opts.InternalToken,
-		vault:           NewVault(opts.VaultSecret),
-		pool:            opts.ClashPool,
-		stealth:         opts.StealthDialer,
-		vmSlots:         opts.VMSlots,
-		directClient:    directClient,
-		bffClient:       &http.Client{Timeout: 5 * time.Second},
+		coreIPC:          opts.CoreIPC,
+		bffOrigin:        bffOrigin,
+		internalToken:    opts.InternalToken,
+		vault:            NewVault(opts.VaultSecret),
+		pool:             opts.ClashPool,
+		stealth:          opts.StealthDialer,
+		vmSlots:          opts.VMSlots,
+		directClient:     directClient,
+		bffClient:        &http.Client{Timeout: 5 * time.Second},
 		logger:           logger,
 		keyIPAllowlists:  make(map[string][]string),
 		accountAuthKinds: make(map[string]string),
@@ -527,32 +527,33 @@ type coreTurnEvalRequest struct {
 }
 
 type coreDispatchDirective struct {
-	Engine        string   `json:"engine"`
-	Action        string   `json:"action"`
-	Status        int      `json:"status"`
-	HoldID        uint64   `json:"holdId"`
-	UserID        string   `json:"userId"`
-	APIKeyID      string   `json:"apiKeyId"`
-	GroupID       string   `json:"groupId"`
-	AccountID     string   `json:"accountId"`
+	Engine           string   `json:"engine"`
+	Action           string   `json:"action"`
+	Status           int      `json:"status"`
+	HoldID           uint64   `json:"holdId"`
+	UserID           string   `json:"userId"`
+	APIKeyID         string   `json:"apiKeyId"`
+	GroupID          string   `json:"groupId"`
+	AccountID        string   `json:"accountId"`
 	Provider         string   `json:"provider"`
 	ExecutionMode    string   `json:"executionMode"`
 	AuthKind         string   `json:"authKind"`
 	SubscriptionTier string   `json:"subscriptionTier"`
 	TierMultiplier   uint16   `json:"tierMultiplier"`
 	PublicModel      string   `json:"publicModel"`
-	UpstreamModel string   `json:"upstreamModel"`
-	CleanseMode   string   `json:"cleanseMode"`
-	HoldNanoUSD   string   `json:"holdNanoUsd"`
-	Models        []string `json:"models"`
-	ErrorType     string   `json:"errorType"`
-	ErrorCode     string   `json:"errorCode"`
-	Message       string   `json:"message"`
-	RiskTriggered bool     `json:"riskTriggered"`
-	SubjectKind   string   `json:"subjectKind"`
-	SubjectHash   string   `json:"subjectHash"`
-	StrikeLevel   uint8    `json:"strikeLevel"`
-	BanDuration   string   `json:"banDuration"`
+	UpstreamModel    string   `json:"upstreamModel"`
+	CleanseMode      string   `json:"cleanseMode"`
+	HoldNanoUSD      string   `json:"holdNanoUsd"`
+	Models           []string `json:"models"`
+	ErrorType        string   `json:"errorType"`
+	ErrorCode        string   `json:"errorCode"`
+	Message          string   `json:"message"`
+	RiskTriggered    bool     `json:"riskTriggered"`
+	SubjectKind      string   `json:"subjectKind"`
+	SubjectHash      string   `json:"subjectHash"`
+	StrikeLevel      uint8    `json:"strikeLevel"`
+	BanDuration      string   `json:"banDuration"`
+	RetryAfterMs     uint64   `json:"retryAfterMs"`
 }
 
 type coreSettleReport struct {
@@ -581,8 +582,15 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	streamID := c.streamSeq.Add(1)
 	requestID := sanitizeRequestID(r.Header.Get("X-Request-Id"), streamID)
 	w.Header().Set("X-Request-Id", requestID)
+	// Anthropic SDKs read request-id, OpenAI SDKs x-request-id.
+	w.Header().Set("Request-Id", requestID)
 
 	ingressCodec, _, _ := DetectIngressCodec(r.URL.Path, r.URL.RawQuery)
+	if !isSupportedDataPlaneRoute(r.Method, r.URL.Path) {
+		WriteProtocolError(w, ingressCodec, http.StatusNotFound, "not_found_error", "unsupported_endpoint",
+			"Slipgate does not serve "+r.Method+" "+r.URL.Path)
+		return
+	}
 
 	var rawBody []byte
 	if r.Body != nil {
@@ -612,6 +620,8 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			WriteProtocolError(w, ingressCodec, http.StatusBadRequest, "invalid_request_error", "malformed_json", parseErr.Error())
 			return
 		}
+		turn.AnthropicVersion = r.Header.Get("anthropic-version")
+		turn.AnthropicBeta = r.Header.Get("anthropic-beta")
 	}
 
 	clientIP := extractClientIP(r)
@@ -664,17 +674,22 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	case "models":
 		items := make([]map[string]any, 0, len(directive.Models))
 		for _, id := range directive.Models {
-			items = append(items, map[string]any{
-				"id":       id,
-				"object":   "model",
-				"created":  1735689600,
-				"owned_by": "slipgate",
-			})
+			items = append(items, modelObject(id))
 		}
-		writeJSONResponse(w, http.StatusOK, map[string]any{
-			"object": "list",
-			"data":   items,
-		})
+		list := map[string]any{"object": "list", "data": items, "has_more": false}
+		if len(directive.Models) > 0 {
+			list["first_id"] = directive.Models[0]
+			list["last_id"] = directive.Models[len(directive.Models)-1]
+		}
+		writeJSONResponse(w, http.StatusOK, list)
+		return
+
+	case "model":
+		if len(directive.Models) == 0 {
+			WriteProtocolError(w, turn.IngressCodec, http.StatusNotFound, "not_found_error", "model_not_found", "Model is not available to this API key")
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, modelObject(directive.Models[0]))
 		return
 
 	case "reject":
@@ -688,6 +703,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 				SourceRequestID: requestID,
 			})
 		}
+		setRetryAfter(w.Header(), directive.RetryAfterMs)
 		WriteProtocolError(w, turn.IngressCodec, directive.Status, directive.ErrorType, directive.ErrorCode, directive.Message)
 		return
 
@@ -744,6 +760,19 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	if !c.isClientIPAllowed(directive.APIKeyID, clientIP) {
 		settleHold(RelayMetrics{UpstreamStatus: http.StatusForbidden})
 		WriteProtocolError(w, turn.IngressCodec, http.StatusForbidden, "permission_error", "ip_not_allowed", "client IP is not in API key allowlist")
+		return
+	}
+
+	// Token counting only exists natively on Anthropic; every other upstream gets the local estimate
+	// (slipgate-core takes no hold for counting, so nothing is billed either way).
+	if turn.IngressCodec == CodecAnthropicCountTokens && !strings.EqualFold(directive.Provider, "anthropic") {
+		writeJSONResponse(w, http.StatusOK, map[string]any{"input_tokens": turn.EstimatedInputTokens})
+		settleHold(RelayMetrics{UpstreamStatus: http.StatusOK})
+		return
+	}
+	if turn.IngressCodec == CodecGeminiGenerate && strings.HasSuffix(r.URL.Path, ":countTokens") {
+		writeJSONResponse(w, http.StatusOK, map[string]any{"totalTokens": turn.EstimatedInputTokens})
+		settleHold(RelayMetrics{UpstreamStatus: http.StatusOK})
 		return
 	}
 
@@ -1023,6 +1052,47 @@ func (c *Coordinator) postInternalJSONBounded(path string, payload any) {
 	case <-done:
 	case <-timer.C:
 	}
+}
+
+// modelObject serves both SDK families: OpenAI reads id/object/created/owned_by, Anthropic reads
+// id/type/display_name/created_at.
+func modelObject(id string) map[string]any {
+	return map[string]any{
+		"id":           id,
+		"object":       "model",
+		"created":      1735689600,
+		"owned_by":     "slipgate",
+		"type":         "model",
+		"display_name": id,
+		"created_at":   "2025-01-01T00:00:00Z",
+	}
+}
+
+// isSupportedDataPlaneRoute lists the AI endpoints the DataPlane implements. Anything else under
+// /v1 (embeddings, images, files, ...) gets a clean 404 instead of being misread as a chat turn.
+func isSupportedDataPlaneRoute(method, path string) bool {
+	if path == "/mcp" || strings.HasPrefix(path, "/mcp/") {
+		return true
+	}
+	if method == http.MethodGet {
+		return path == "/v1/models" || strings.HasPrefix(path, "/v1/models/")
+	}
+	if method != http.MethodPost {
+		return false
+	}
+	switch strings.TrimSuffix(path, "/") {
+	case "/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens":
+		return true
+	}
+	if rest, ok := strings.CutPrefix(path, "/v1beta/models/"); ok {
+		if idx := strings.LastIndexByte(rest, ':'); idx > 0 {
+			switch rest[idx+1:] {
+			case "generateContent", "streamGenerateContent", "countTokens":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractAPIKey(r *http.Request) string {

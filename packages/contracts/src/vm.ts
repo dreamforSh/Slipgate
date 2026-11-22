@@ -13,6 +13,9 @@ export const ClusterNodeSchema = z.object({
   sshAddr: z.string(),
   sshUser: z.string(),
   hasSSHKey: z.boolean().default(false),
+  /** Pinned server host key ("<type> <base64>"); absent until set or seen on first connect. */
+  sshHostKey: z.string().optional(),
+  sshHostKeyFingerprint: z.string().optional(),
   arch: z.string(),
   kvmCapable: z.boolean(),
   dockerCapable: z.boolean(),
@@ -31,6 +34,11 @@ export const CreateClusterNodeRequestSchema = z.object({
   sshAddr: z.string().trim().min(1).max(255),
   sshUser: z.string().trim().min(1).max(64).default("root"),
   sshKeyPem: z.string().max(16384).optional(),
+  /**
+   * Server host key to pin (authorized_keys or `ssh-keyscan` line). Omitted, the first connection
+   * pins the key the server presents; an existing pin is kept while sshAddr is unchanged.
+   */
+  sshHostKey: z.string().trim().max(16384).optional(),
   arch: z.enum(["amd64", "arm64"]).default("amd64"),
   kvmCapable: z.boolean().default(false),
   dockerCapable: z.boolean().default(true),

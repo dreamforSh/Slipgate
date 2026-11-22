@@ -50,6 +50,8 @@ const en: typeof zh = {
         capabilities: "Capabilities",
       },
       sshKey: "SSH key",
+      hostKeyPending: "Host key pinned on first connect",
+      hostKeyPendingHint: "The first connection records the host key the server presents; later connections with a different key are refused",
       local: "Local",
       confirmRemove: "Remove?",
       option: "{name} ({id} · {arch})",
@@ -88,6 +90,9 @@ const en: typeof zh = {
       unsupported: "Not supported",
       privateKey: "SSH private key",
       privateKeyPlaceholder: "Leave blank to use the default key",
+      hostKey: "SSH host key (optional)",
+      hostKeyPlaceholder: "ssh-ed25519 AAAA… (ssh-keyscan output works too)",
+      hostKeyHint: "Leave blank to pin the server's key on first connect; re-registering the same address keeps the pin. After rebuilding a server, paste its new key here.",
     },
     detail: {
       title: "Slot {id}",

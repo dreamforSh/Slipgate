@@ -2,6 +2,7 @@ import { PluginRegistry } from "@slipgate/plugin-sdk";
 import { createBffApp } from "./app.ts";
 import { MemoryControlStore } from "./store/memory_store.ts";
 import { PostgresControlStore } from "./store/postgres_store.ts";
+import { allowInsecureSecrets, secretProblems } from "./security/secrets.ts";
 import type { ControlStore } from "./store/types.ts";
 
 const VERSION = "0.1.0";
@@ -9,6 +10,22 @@ const VERSION = "0.1.0";
 if (process.argv.includes("--version")) {
   console.log(`slipgate-bff ${VERSION}`);
   process.exit(0);
+}
+
+const weakSecrets = secretProblems(process.env);
+if (weakSecrets.length > 0) {
+  const summary = weakSecrets.join("; ");
+  if (!allowInsecureSecrets(process.env)) {
+    console.error(
+      `[security] slipgate-bff refusing to start: ${summary}. Generate each secret with \`openssl rand -hex 32\` ` +
+        "(keep SLIPGATE_VAULT_SECRET stable once accounts exist: it decrypts stored credentials), " +
+        "or set SLIPGATE_ALLOW_INSECURE_SECRETS=true for local development only.",
+    );
+    process.exit(1);
+  }
+  console.warn(
+    `[security] WARNING: slipgate-bff running with weak secrets because SLIPGATE_ALLOW_INSECURE_SECRETS=true: ${summary}. Never expose this instance.`,
+  );
 }
 
 function resolveBindAddress(): { hostname: string; port: number } {

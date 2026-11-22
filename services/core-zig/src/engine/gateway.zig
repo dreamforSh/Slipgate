@@ -149,6 +149,8 @@ pub const DispatchResponse = struct {
     subjectHash: []const u8 = "",
     strikeLevel: u8 = 0,
     banDuration: []const u8 = "none",
+    /// Milliseconds the caller should wait before retrying (0 = no hint); Go maps it to Retry-After.
+    retryAfterMs: u64 = 0,
 };
 
 pub const SettleAckResponse = struct {
@@ -234,6 +236,8 @@ const ActiveHold = struct {
     held_nano: i128,
     rate_multiplier_micros: u64,
     is_balance_group: bool,
+    /// Free endpoints (token counting) settle at zero cost whatever usage is reported.
+    is_free: bool = false,
 };
 
 const ModelRate = struct {
@@ -306,14 +310,79 @@ fn detectDistillationSignature(excerpt: []const u8) ?[]const u8 {
 }
 
 fn inferEndpoint(path: []const u8) composite.EndpointKind {
-    if (std.mem.indexOf(u8, path, "/v1/messages/count_tokens") != null) return .count_tokens;
-    if (std.mem.indexOf(u8, path, "/v1/messages") != null) return .messages;
-    if (std.mem.indexOf(u8, path, "/v1/responses") != null) return .responses;
-    if (std.mem.indexOf(u8, path, "/v1/chat/completions") != null) return .chat_completions;
-    if (std.mem.indexOf(u8, path, "/v1/embeddings") != null) return .embeddings;
-    if (std.mem.indexOf(u8, path, "/v1/images") != null) return .images;
-    if (std.mem.startsWith(u8, path, "/v1beta/")) return .gemini;
+    if (std.mem.startsWith(u8, path, "/v1/messages/count_tokens")) return .count_tokens;
+    if (std.mem.startsWith(u8, path, "/v1/messages")) return .messages;
+    if (std.mem.startsWith(u8, path, "/v1/responses")) return .responses;
+    if (std.mem.startsWith(u8, path, "/v1/chat/completions")) return .chat_completions;
+    if (std.mem.startsWith(u8, path, "/v1/embeddings")) return .embeddings;
+    if (std.mem.startsWith(u8, path, "/v1/images")) return .images;
+    if (std.mem.startsWith(u8, path, "/v1beta/")) {
+        if (std.mem.endsWith(u8, path, ":countTokens")) return .count_tokens;
+        return .gemini;
+    }
     return .any;
+}
+
+/// Models advertised by GET /v1/models when a group has neither an allowlist nor exact routes
+/// for them. Each one is listed only if the group can reach an active account of its provider.
+const builtin_model_candidates = [_][]const u8{
+    "claude-fable-5-2",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    "claude-opus-4-5",
+    "claude-haiku-4-5",
+    "gpt-5.5",
+    "gpt-5.4-mini",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-codex",
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "antigravity/claude-sonnet-4-5",
+    "grok-4",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "glm-4.6",
+};
+
+fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn msUntil(now_ms: i64, deadline_ms: i64) u64 {
+    if (deadline_ms <= now_ms) return 1;
+    return @intCast(deadline_ms - now_ms);
+}
+
+fn banRetryAfterMs(d: risk_gate.BanDuration) u64 {
+    return switch (d) {
+        .none, .permanent => 0,
+        .ten_minutes => 10 * 60 * 1000,
+        .twenty_four_hours => 24 * 60 * 60 * 1000,
+    };
+}
+
+/// Builtin-detected models inside a non-composite antigravity/codex group run on that group's
+/// platform; explicit rules and composite groups keep the resolved provider.
+fn effectiveProvider(group: GroupRecord, route_match: composite.RouteMatch) composite.Provider {
+    if (std.mem.eql(u8, group.platform, "composite") or route_match.source != .builtin_detector) {
+        return route_match.provider;
+    }
+    if (std.meta.stringToEnum(composite.Provider, group.platform)) |grp_prov| {
+        if (grp_prov == .antigravity or grp_prov == .codex) return grp_prov;
+    }
+    return route_match.provider;
+}
+
+/// Same eligibility filter the scheduler applies, minus the transient quota/concurrency checks.
+fn accountServes(group: GroupRecord, acc: AccountRecord, provider: composite.Provider) bool {
+    if (!acc.active or acc.platform != provider) return false;
+    if (std.mem.eql(u8, group.platform, "composite")) return true;
+    return std.mem.eql(u8, acc.group_id, group.id);
 }
 
 fn banDurationCode(d: risk_gate.BanDuration) []const u8 {
@@ -580,6 +649,7 @@ pub const GatewayEngine = struct {
                     .subjectKind = "api_key",
                     .subjectHash = api_key.id,
                     .strikeLevel = ban.strikes,
+                    .retryAfterMs = if (ban.banned_until_ms > 0) msUntil(now_ms, ban.banned_until_ms) else 0,
                 }, .{});
             }
         }
@@ -600,28 +670,61 @@ pub const GatewayEngine = struct {
                 .subjectHash = api_key.id,
                 .strikeLevel = ban_res.strikes,
                 .banDuration = banDurationCode(ban_res.duration),
+                .retryAfterMs = banRetryAfterMs(ban_res.duration),
             }, .{});
         }
 
-        // 4. GET /v1/models fast path.
+        // 4. GET /v1/models and /v1/models/{id}: list what this key's group can actually route.
         if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/v1/models")) {
-            const default_models = [_][]const u8{
-                "claude-sonnet-4-5",
-                "claude-opus-4-1",
-                "gpt-5-codex",
-                "gpt-4o",
-                "gpt-4o-mini",
-                "gemini-2.5-pro",
-                "antigravity/claude-sonnet-4-5",
-                "deepseek-chat",
+            const models_group = self.findGroupLocked(api_key.group_id) orelse {
+                return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
+                    .action = "reject",
+                    .status = 403,
+                    .errorType = "permission_error",
+                    .errorCode = "group_unavailable",
+                    .message = "Routing group bound to API key does not exist",
+                }, .{});
             };
+            if (!models_group.enabled) {
+                return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
+                    .action = "reject",
+                    .status = 403,
+                    .errorType = "permission_error",
+                    .errorCode = "group_disabled",
+                    .message = "Routing group is disabled",
+                }, .{});
+            }
+            const models = try self.collectModelsLocked(turn_alloc, models_group);
+            const wanted = std.mem.trim(u8, req.path["/v1/models".len..], "/");
+            if (wanted.len == 0) {
+                return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
+                    .action = "models",
+                    .status = 200,
+                    .userId = api_key.user_id,
+                    .apiKeyId = api_key.id,
+                    .groupId = models_group.id,
+                    .models = models,
+                }, .{});
+            }
+            for (models) |m| {
+                if (std.mem.eql(u8, m, wanted)) {
+                    const one = [_][]const u8{m};
+                    return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
+                        .action = "model",
+                        .status = 200,
+                        .userId = api_key.user_id,
+                        .apiKeyId = api_key.id,
+                        .groupId = models_group.id,
+                        .models = &one,
+                    }, .{});
+                }
+            }
             return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
-                .action = "models",
-                .status = 200,
-                .userId = api_key.user_id,
-                .apiKeyId = api_key.id,
-                .groupId = api_key.group_id,
-                .models = &default_models,
+                .action = "reject",
+                .status = 404,
+                .errorType = "not_found_error",
+                .errorCode = "model_not_found",
+                .message = "Model is not available to this API key",
             }, .{});
         }
 
@@ -640,6 +743,7 @@ pub const GatewayEngine = struct {
                 .errorType = "rate_limit_error",
                 .errorCode = "rpm_limit_exceeded",
                 .message = "API key requests-per-minute limit exceeded",
+                .retryAfterMs = msUntil(now_ms, (current_min + 1) * 60_000),
             }, .{});
         }
         if (rate_ptr.active_inflight >= api_key.concurrency_limit) {
@@ -650,18 +754,12 @@ pub const GatewayEngine = struct {
                 .errorType = "rate_limit_error",
                 .errorCode = "concurrency_limit_exceeded",
                 .message = "API key concurrent request limit exceeded",
+                .retryAfterMs = 1000,
             }, .{});
         }
 
         // 6. Group check & Model allowlist.
-        var matched_group: ?GroupRecord = null;
-        for (self.groups) |g| {
-            if (std.mem.eql(u8, g.id, api_key.group_id)) {
-                matched_group = g;
-                break;
-            }
-        }
-        const group = matched_group orelse {
+        const group = self.findGroupLocked(api_key.group_id) orelse {
             return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
                 .action = "reject",
                 .status = 403,
@@ -710,14 +808,9 @@ pub const GatewayEngine = struct {
         }
 
         // 7. Resolve Composite Route (explicit group rules -> builtin prefixes -> fail-closed UnknownModel).
-        var group_rules = std.ArrayList(composite.RouteRule).init(turn_alloc);
-        for (self.routes) |gr| {
-            if (std.mem.eql(u8, gr.group_id, group.id)) {
-                try group_rules.append(gr.rule);
-            }
-        }
+        const group_rules = try self.groupRulesLocked(turn_alloc, group.id);
         const endpoint_kind = inferEndpoint(req.path);
-        const route_match = composite.resolveRoute(group_rules.items, endpoint_kind, public_model) catch {
+        const route_match = composite.resolveRoute(group_rules, endpoint_kind, public_model) catch {
             return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
                 .action = "reject",
                 .status = 400,
@@ -730,20 +823,10 @@ pub const GatewayEngine = struct {
         // 8. Select healthy schedulable upstream account (priority ASC, lowest inflight, <95% 5h/7d window).
         var chosen_account: ?AccountRecord = null;
         var chosen_inflight: u32 = std.math.maxInt(u32);
-        const is_composite_group = std.mem.eql(u8, group.platform, "composite");
-        var target_provider = route_match.provider;
-        if (!is_composite_group and route_match.source == .builtin_detector) {
-            if (std.meta.stringToEnum(composite.Provider, group.platform)) |grp_prov| {
-                if (grp_prov == .antigravity or grp_prov == .codex) {
-                    target_provider = grp_prov;
-                }
-            }
-        }
+        const target_provider = effectiveProvider(group, route_match);
 
         for (self.accounts) |acc| {
-            if (!acc.active) continue;
-            if (acc.platform != target_provider) continue;
-            if (!is_composite_group and !std.mem.eql(u8, acc.group_id, group.id)) continue;
+            if (!accountServes(group, acc, target_provider)) continue;
             if (!acc.quota_window.isSchedulable()) continue;
 
             const cur_inflight = self.account_inflight.get(acc.id) orelse 0;
@@ -765,11 +848,14 @@ pub const GatewayEngine = struct {
             }, .{});
         };
 
-        // 9. Two-phase i128 nano-USD pre-auth hold on balance groups.
+        // 9. Two-phase i128 nano-USD pre-auth hold on balance groups. Token counting is free:
+        //    it takes no hold and always settles at zero cost.
         const est_in = @max(@as(u64, 16), req.estimatedInputTokens);
-        const est_out = @min(@as(u64, 4096), @max(@as(u64, 64), req.maxTokens));
+        const requested_out = if (req.maxTokens == 0) @as(u64, 1024) else req.maxTokens;
+        const est_out = @min(@as(u64, 4096), @max(@as(u64, 64), requested_out));
         var hold_nano: i128 = 0;
-        const is_balance = group.subscription_type == .balance;
+        const is_free = endpoint_kind == .count_tokens;
+        const is_balance = group.subscription_type == .balance and !is_free;
         if (is_balance) {
             hold_nano = @max(
                 @as(i128, 1_000),
@@ -801,6 +887,7 @@ pub const GatewayEngine = struct {
             .held_nano = hold_nano,
             .rate_multiplier_micros = group.rate_multiplier_micros,
             .is_balance_group = is_balance,
+            .is_free = is_free,
         };
         errdefer self.freeHoldStrings(hold_rec);
         try self.holds.put(hold_id, hold_rec);
@@ -879,7 +966,8 @@ pub const GatewayEngine = struct {
         var settled_cost: i128 = 0;
         var balance_after: i128 = 0;
 
-        const billable_tokens = req.inputTokens > 0 or req.outputTokens > 0 or req.cacheReadTokens > 0 or req.cacheWriteTokens > 0;
+        const billable_tokens = !hold.is_free and
+            (req.inputTokens > 0 or req.outputTokens > 0 or req.cacheReadTokens > 0 or req.cacheWriteTokens > 0);
         if (billable_tokens) {
             settled_cost = computeTurnCostNano(
                 hold.model,
@@ -910,6 +998,63 @@ pub const GatewayEngine = struct {
             .balanceAfterNanoUsd = bal_str,
             .ordinaryUpstream400Exempted = is_ordinary_400,
         }, .{});
+    }
+
+    fn findGroupLocked(self: *GatewayEngine, group_id: []const u8) ?GroupRecord {
+        for (self.groups) |g| {
+            if (std.mem.eql(u8, g.id, group_id)) return g;
+        }
+        return null;
+    }
+
+    fn groupRulesLocked(self: *GatewayEngine, turn_alloc: std.mem.Allocator, group_id: []const u8) ![]const composite.RouteRule {
+        var rules = std.ArrayList(composite.RouteRule).init(turn_alloc);
+        for (self.routes) |gr| {
+            if (std.mem.eql(u8, gr.group_id, group_id)) {
+                try rules.append(gr.rule);
+            }
+        }
+        return rules.items;
+    }
+
+    fn groupReachesProviderLocked(self: *GatewayEngine, group: GroupRecord, provider: composite.Provider) bool {
+        for (self.accounts) |acc| {
+            if (accountServes(group, acc, provider)) return true;
+        }
+        return false;
+    }
+
+    /// Sorted, de-duplicated model ids a group can serve: its allowlist when one is set, otherwise
+    /// its enabled exact routes plus builtin candidates whose provider has an active account.
+    fn collectModelsLocked(self: *GatewayEngine, turn_alloc: std.mem.Allocator, group: GroupRecord) ![]const []const u8 {
+        var out = std.ArrayList([]const u8).init(turn_alloc);
+        if (group.model_allowlist.len > 0) {
+            try out.appendSlice(group.model_allowlist);
+        } else {
+            const rules = try self.groupRulesLocked(turn_alloc, group.id);
+            for (rules) |rule| {
+                if (!rule.enabled or rule.match_type != .exact) continue;
+                if (self.groupReachesProviderLocked(group, rule.target_platform)) {
+                    try out.append(rule.public_model);
+                }
+            }
+            for (builtin_model_candidates) |candidate| {
+                const match = composite.resolveRoute(rules, .any, candidate) catch continue;
+                if (self.groupReachesProviderLocked(group, effectiveProvider(group, match))) {
+                    try out.append(candidate);
+                }
+            }
+        }
+
+        const items = out.items;
+        std.mem.sort([]const u8, items, {}, lessThanStr);
+        var unique: usize = 0;
+        for (items) |m| {
+            if (unique > 0 and std.mem.eql(u8, items[unique - 1], m)) continue;
+            items[unique] = m;
+            unique += 1;
+        }
+        return items[0..unique];
     }
 
     fn recordStrikeLocked(self: *GatewayEngine, subject_id: []const u8, now_ms: i64) !struct { strikes: u8, duration: risk_gate.BanDuration } {
@@ -1148,4 +1293,138 @@ test "subscription tier weights schedule Claude ultra(20x)/max(5x) and Codex pro
     try std.testing.expectEqualStrings("acc_codex_25x", c1.value.accountId);
     try std.testing.expectEqualStrings("pro_25x", c1.value.subscriptionTier);
     try std.testing.expectEqual(@as(u16, 25), c1.value.tierMultiplier);
+}
+
+fn testSyncWithKey(engine: *GatewayEngine, arena: std.mem.Allocator, raw_key: []const u8, catalog: []const u8, key_limits: []const u8) !void {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw_key, &digest, .{});
+    const hex_buf = std.fmt.bytesToHex(digest, .lower);
+    const sync_json = try std.fmt.allocPrint(
+        arena,
+        "{{{s},\"apiKeys\":[{{\"id\":\"key_m\",\"userId\":\"usr_m\",\"groupId\":\"grp_m\",\"keyHashHex\":\"{s}\",{s},\"enabled\":true}}]," ++
+            "\"wallets\":[{{\"userId\":\"usr_m\",\"balanceNanoUsd\":\"1000000000\"}}]}}",
+        .{ catalog, &hex_buf, key_limits },
+    );
+    const ack = try engine.applySyncJson(arena, sync_json);
+    try std.testing.expect(std.mem.indexOf(u8, ack, "\"ok\":true") != null);
+}
+
+test "models endpoint lists only what the key's group can route and retrieves single models" {
+    var engine = GatewayEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw_key = "sk-sg-models0123456789abcdef0123456789abcdef01";
+    try testSyncWithKey(
+        &engine,
+        arena,
+        raw_key,
+        "\"groups\":[{\"id\":\"grp_m\",\"platform\":\"composite\",\"subscriptionType\":\"balance\",\"enabled\":true}]," ++
+            "\"routes\":[{\"id\":\"rt_alias\",\"groupId\":\"grp_m\",\"publicModel\":\"team-sonnet\",\"matchType\":\"exact\",\"targetPlatform\":\"anthropic\",\"upstreamModel\":\"claude-sonnet-4-5\"}," ++
+            "{\"id\":\"rt_prefix\",\"groupId\":\"grp_m\",\"publicModel\":\"claude-\",\"matchType\":\"prefix\",\"targetPlatform\":\"anthropic\"}," ++
+            "{\"id\":\"rt_gem\",\"groupId\":\"grp_m\",\"publicModel\":\"team-gemini\",\"matchType\":\"exact\",\"targetPlatform\":\"gemini\"}]," ++
+            "\"accounts\":[{\"id\":\"acc_a\",\"groupId\":\"grp_m\",\"platform\":\"anthropic\",\"status\":\"active\"}]",
+        "\"rpmLimit\":60,\"concurrencyLimit\":5",
+    );
+
+    const list_req = try std.fmt.allocPrint(arena, "{{\"method\":\"GET\",\"path\":\"/v1/models\",\"apiKey\":\"{s}\"}}", .{raw_key});
+    const listed = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, list_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("models", listed.value.action);
+    var saw_alias = false;
+    var saw_builtin = false;
+    for (listed.value.models, 0..) |m, i| {
+        // Only anthropic has an account: no gemini route, no gpt builtins, no prefix rule text.
+        try std.testing.expect(!std.mem.eql(u8, m, "team-gemini"));
+        try std.testing.expect(!std.mem.startsWith(u8, m, "gpt-"));
+        try std.testing.expect(!std.mem.eql(u8, m, "claude-"));
+        if (std.mem.eql(u8, m, "team-sonnet")) saw_alias = true;
+        if (std.mem.eql(u8, m, "claude-sonnet-5-5")) saw_builtin = true;
+        if (i > 0) try std.testing.expect(std.mem.lessThan(u8, listed.value.models[i - 1], m));
+    }
+    try std.testing.expect(saw_alias);
+    try std.testing.expect(saw_builtin);
+
+    const get_req = try std.fmt.allocPrint(arena, "{{\"method\":\"GET\",\"path\":\"/v1/models/claude-sonnet-5-5\",\"apiKey\":\"{s}\"}}", .{raw_key});
+    const got = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, get_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("model", got.value.action);
+    try std.testing.expectEqual(@as(usize, 1), got.value.models.len);
+    try std.testing.expectEqualStrings("claude-sonnet-5-5", got.value.models[0]);
+
+    const missing_req = try std.fmt.allocPrint(arena, "{{\"method\":\"GET\",\"path\":\"/v1/models/gpt-4o\",\"apiKey\":\"{s}\"}}", .{raw_key});
+    const missing = try engine.evaluateTurnJson(arena, missing_req);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "\"status\":404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "\"errorCode\":\"model_not_found\"") != null);
+}
+
+test "token counting takes no hold and settles at zero cost" {
+    var engine = GatewayEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw_key = "sk-sg-count0123456789abcdef0123456789abcdef012";
+    try testSyncWithKey(
+        &engine,
+        arena,
+        raw_key,
+        "\"groups\":[{\"id\":\"grp_m\",\"platform\":\"composite\",\"subscriptionType\":\"balance\",\"enabled\":true}]," ++
+            "\"accounts\":[{\"id\":\"acc_a\",\"groupId\":\"grp_m\",\"platform\":\"anthropic\",\"status\":\"active\"}]",
+        "\"rpmLimit\":60,\"concurrencyLimit\":5",
+    );
+
+    const count_req = try std.fmt.allocPrint(
+        arena,
+        "{{\"method\":\"POST\",\"path\":\"/v1/messages/count_tokens\",\"apiKey\":\"{s}\",\"model\":\"claude-sonnet-4-5\",\"estimatedInputTokens\":5000}}",
+        .{raw_key},
+    );
+    const disp = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, count_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("dispatch", disp.value.action);
+    try std.testing.expectEqualStrings("0", disp.value.holdNanoUsd);
+
+    const settle = try std.fmt.allocPrint(arena, "{{\"holdId\":{d},\"upstreamStatus\":200,\"inputTokens\":5000}}", .{disp.value.holdId});
+    const ack = try engine.settleTurnJson(arena, settle);
+    try std.testing.expect(std.mem.indexOf(u8, ack, "\"settledCostNanoUsd\":\"0\"") != null);
+    try std.testing.expectEqual(@as(i128, 1_000_000_000), engine.wallets.get("usr_m").?.balance_nano);
+    try std.testing.expectEqual(@as(i128, 0), engine.wallets.get("usr_m").?.held_nano);
+}
+
+test "rate limit rejections carry a retry-after hint" {
+    var engine = GatewayEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw_key = "sk-sg-rpm0123456789abcdef0123456789abcdef01234";
+    try testSyncWithKey(
+        &engine,
+        arena,
+        raw_key,
+        "\"groups\":[{\"id\":\"grp_m\",\"platform\":\"composite\",\"subscriptionType\":\"subscription\",\"enabled\":true}]," ++
+            "\"accounts\":[{\"id\":\"acc_a\",\"groupId\":\"grp_m\",\"platform\":\"anthropic\",\"maxConcurrency\":5,\"status\":\"active\"}]",
+        "\"rpmLimit\":1,\"concurrencyLimit\":5",
+    );
+
+    // 1_700_000_000_000 ms sits 20 s into its minute bucket, so the next bucket opens in 40 s.
+    const req = try std.fmt.allocPrint(
+        arena,
+        "{{\"method\":\"POST\",\"path\":\"/v1/messages\",\"apiKey\":\"{s}\",\"model\":\"claude-sonnet-4-5\",\"nowUnixMs\":1700000000000}}",
+        .{raw_key},
+    );
+    const first = try engine.evaluateTurnJson(arena, req);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"action\":\"dispatch\"") != null);
+    const second = try engine.evaluateTurnJson(arena, req);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"status\":429") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"retryAfterMs\":40000") != null);
+}
+
+test "endpoint inference anchors on the path prefix" {
+    try std.testing.expectEqual(composite.EndpointKind.count_tokens, inferEndpoint("/v1/messages/count_tokens"));
+    try std.testing.expectEqual(composite.EndpointKind.messages, inferEndpoint("/v1/messages"));
+    try std.testing.expectEqual(composite.EndpointKind.any, inferEndpoint("/mcp/v1/messages"));
+    try std.testing.expectEqual(composite.EndpointKind.count_tokens, inferEndpoint("/v1beta/models/gemini-2.5-pro:countTokens"));
+    try std.testing.expectEqual(composite.EndpointKind.gemini, inferEndpoint("/v1beta/models/gemini-2.5-pro:streamGenerateContent"));
 }

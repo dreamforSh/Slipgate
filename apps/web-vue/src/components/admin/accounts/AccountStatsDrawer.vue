@@ -11,9 +11,8 @@ import UiAlert from "../../ui/UiAlert.vue";
 import UiBadge from "../../ui/UiBadge.vue";
 import UiDrawer from "../../ui/UiDrawer.vue";
 import UiIcon from "../../ui/UiIcon.vue";
-import { tierBadge, tierTone } from "./accountDisplay";
+import PlatformTypeBadge from "./PlatformTypeBadge.vue";
 import {
-  PROVIDER_OPTIONS,
   accountStatusLabel,
   formatCompact,
   formatDateTime,
@@ -94,10 +93,6 @@ watch(range, () => {
   if (props.open) void load();
 });
 
-const platformLabel = computed(
-  () => PROVIDER_OPTIONS.find((p) => p.value === props.account?.platform)?.label ?? props.account?.platform ?? "",
-);
-
 const labels = computed(() => {
   const s = stats.value;
   if (!s) return { short: [] as string[], full: [] as string[] };
@@ -173,8 +168,13 @@ const hasTraffic = computed(() => (stats.value?.period.requests ?? 0) > 0);
         <div class="min-w-0">
           <p class="truncate text-base font-semibold text-fg">{{ account.name }}</p>
           <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
-            <UiBadge tone="accent">{{ platformLabel }}</UiBadge>
-            <UiBadge :tone="tierTone(account)" mono>{{ tierBadge(account) }}</UiBadge>
+            <PlatformTypeBadge
+              inline
+              :platform="account.platform"
+              :auth-kind="account.authKind"
+              :subscription-tier="account.subscriptionTier"
+              :tier-multiplier="account.tierMultiplier"
+            />
             <UiBadge :tone="healthTone(account.effectiveStatus)" dot>{{ accountStatusLabel(account.effectiveStatus) }}</UiBadge>
             <span class="text-xs text-fg-muted">{{ account.groupName }}</span>
           </div>
