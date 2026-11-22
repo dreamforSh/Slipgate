@@ -10,6 +10,7 @@ export * from "./clash.ts";
 export * from "./vm.ts";
 export * from "./dataplane.ts";
 export * from "./dashboard.ts";
+export * from "./account_ops.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 

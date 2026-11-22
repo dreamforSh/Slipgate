@@ -3,8 +3,12 @@ import { z } from "zod";
 import {
   AccountBatchDeleteRequestSchema,
   AccountBulkUpdateRequestSchema,
+  AccountExportRequestSchema,
+  AccountImportRequestSchema,
+  AccountStatsRangeSchema,
   AccountTestEventSchema,
   AccountTestRequestSchema,
+  canonicalCredentialText,
   DashboardRangeSchema,
   AuthLoginRequestSchema,
   AuthRegisterRequestSchema,
@@ -30,6 +34,7 @@ import {
   RoutePreviewRequestSchema,
   RoutePreviewResponseSchema,
   SetupInitializeRequestSchema,
+  SLIPGATE_ACCOUNT_EXPORT_TYPE,
   SlotSeedSnapshotSchema,
   SystemUpdateStatusSchema,
   TriggerUpdateSyncRequestSchema,
@@ -42,7 +47,11 @@ import {
   UpdateVmTelemetryRequestSchema,
   VmSlotSummarySchema,
   type AccountBulkResult,
+  type AccountExportFile,
+  type AccountImportResult,
   type AccountTestResult,
+  type AccountUsageSummaryResponse,
+  type CreateAccountRequest,
   type ClashExitNode,
   type ClusterNode,
   type CompositeRouteRule,
@@ -52,9 +61,11 @@ import {
   type VmSlotSummary,
 } from "@slipgate/contracts";
 import { PluginRegistry } from "@slipgate/plugin-sdk";
-import { buildDashboardStats, dashboardWindow, DASHBOARD_MAX_ROWS } from "./dashboard.ts";
+import { buildAccountUsageStats, buildDashboardStats, dashboardWindow, DASHBOARD_MAX_ROWS } from "./dashboard.ts";
 import { requireAdmin, requireAuth, type AuthEnv } from "./middleware/auth.ts";
 import {
+  credentialFingerprint,
+  decryptSecret,
   encryptSecret,
   generateApiKey,
   hashPassword,
@@ -63,7 +74,7 @@ import {
   verifyPassword,
 } from "./security/crypto.ts";
 import { MemoryControlStore } from "./store/memory_store.ts";
-import { StoreError, type ControlStore } from "./store/types.ts";
+import { StoreError, type ControlStore, type StoredCredential } from "./store/types.ts";
 
 export interface BffAppOptions {
   store?: ControlStore;
@@ -194,6 +205,19 @@ function ruleBeats(candidate: CompositeRouteRule, incumbent: CompositeRouteRule)
     return candidate.publicModel.length > incumbent.publicModel.length;
   }
   return candidate.priority < incumbent.priority;
+}
+
+/** `Date#getTimezoneOffset()` from a query string, clamped to real-world offsets. */
+function parseTzOffset(raw: string | undefined): number {
+  const n = Number.parseInt(raw ?? "0", 10);
+  return Number.isFinite(n) ? Math.max(-14 * 60, Math.min(14 * 60, n)) : 0;
+}
+
+function describeIssues(issues: z.ZodIssue[]): string {
+  return issues
+    .slice(0, 3)
+    .map((i) => (i.path.length ? `${i.path.join(".")}: ${i.message}` : i.message))
+    .join("; ");
 }
 
 async function readJsonBody(req: Request): Promise<unknown> {
@@ -497,6 +521,39 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     } catch {
       // DataPlane coordinator also reconciles periodically via background pull.
     }
+  }
+
+  async function fingerprintOf(secret: string): Promise<string> {
+    return credentialFingerprint(canonicalCredentialText(secret), vaultSecret);
+  }
+
+  async function sealCredential(secret: string): Promise<StoredCredential> {
+    const trimmed = secret.trim();
+    return {
+      encrypted: await encryptSecret(trimmed, vaultSecret),
+      preview: maskSecret(trimmed),
+      fingerprint: await fingerprintOf(trimmed),
+    };
+  }
+
+  /** Rows created before fingerprints existed get one on first need (once per process). */
+  let fingerprintBackfill: Promise<void> | null = null;
+  function ensureCredentialFingerprints(): Promise<void> {
+    fingerprintBackfill ??= (async () => {
+      for (const rec of await store.listAccountSecrets()) {
+        if (rec.fingerprint) continue;
+        try {
+          const plain = await decryptSecret(rec.encrypted, vaultSecret);
+          await store.setCredentialFingerprint(rec.accountId, await fingerprintOf(plain));
+        } catch {
+          // Undecryptable with the current vault key: it cannot be matched either way.
+        }
+      }
+    })().catch((err) => {
+      fingerprintBackfill = null;
+      throw err;
+    });
+    return fingerprintBackfill;
   }
 
   app.onError((err, c) => {
@@ -955,9 +1012,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
-    const encrypted = await encryptSecret(parsed.data.credentialSecret, vaultSecret);
-    const preview = maskSecret(parsed.data.credentialSecret);
-    const account = await store.createAccount(parsed.data, encrypted, preview);
+    const account = await store.createAccount(parsed.data, await sealCredential(parsed.data.credentialSecret));
     await syncDataPlaneBestEffort();
     return c.json({ account }, 201);
   });
@@ -969,13 +1024,9 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
-    let encrypted: Uint8Array | undefined;
-    let preview: string | undefined;
-    if (parsed.data.credentialSecret !== undefined) {
-      encrypted = await encryptSecret(parsed.data.credentialSecret, vaultSecret);
-      preview = maskSecret(parsed.data.credentialSecret);
-    }
-    const account = await store.updateAccount(accountId, parsed.data, encrypted, preview);
+    const credential =
+      parsed.data.credentialSecret !== undefined ? await sealCredential(parsed.data.credentialSecret) : undefined;
+    const account = await store.updateAccount(accountId, parsed.data, credential);
     await syncDataPlaneBestEffort();
     return c.json({ account });
   });
@@ -1022,6 +1073,200 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
     return c.json(await runAccountBatch(parsed.data.accountIds, (id) => store.deleteAccount(id)));
+  });
+
+  /** Per-account request / token / cost totals since the viewer's local midnight. */
+  app.get("/api/v1/admin/accounts/usage-today", async (c) => {
+    const nowMs = Date.now();
+    const sinceMs = dashboardWindow("24h", nowMs, parseTzOffset(c.req.query("tz"))).todayStartMs;
+    const sinceIso = new Date(sinceMs).toISOString();
+    const body: AccountUsageSummaryResponse = {
+      generatedAtIso: new Date(nowMs).toISOString(),
+      sinceIso,
+      items: await store.summarizeAccountUsage(sinceIso),
+    };
+    return c.json(body);
+  });
+
+  /** Traffic trend, model mix and error codes of one account. `range` = 24h | 7d | 30d. */
+  app.get("/api/v1/admin/accounts/:accountId/stats", async (c) => {
+    const accountId = c.req.param("accountId");
+    if (!(await store.getAccount(accountId))) {
+      return c.json({ error: "not_found", message: `Account ${accountId} not found` }, 404);
+    }
+    const range = AccountStatsRangeSchema.catch("7d").parse(c.req.query("range") ?? "7d");
+    const tzOffsetMinutes = parseTzOffset(c.req.query("tz"));
+    const nowMs = Date.now();
+    const win = dashboardWindow(range, nowMs, tzOffsetMinutes);
+    const logs = await store.listUsageLogs({
+      accountId,
+      sinceIso: new Date(win.sinceMs).toISOString(),
+      limit: DASHBOARD_MAX_ROWS,
+    });
+    return c.json(
+      buildAccountUsageStats({
+        accountId,
+        range,
+        nowMs,
+        tzOffsetMinutes,
+        logs,
+        truncated: logs.length >= DASHBOARD_MAX_ROWS,
+      }),
+    );
+  });
+
+  /**
+   * Bulk-create accounts (pasted credentials, Slipgate backups, sub2api / linksyncx exports
+   * parsed client-side). Each item is validated and created on its own; duplicates of a
+   * stored credential, or of an earlier item, are skipped when `skipExisting` is set.
+   */
+  app.post("/api/v1/admin/accounts/import", async (c) => {
+    const parsed = AccountImportRequestSchema.safeParse(await readJsonBody(c.req.raw));
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const { accounts: items, skipExisting } = parsed.data;
+    type Prepared =
+      | { ok: false; index: number; name: string; error: string }
+      | { ok: true; index: number; name: string; req: CreateAccountRequest; fingerprint: string };
+    const prepared = await Promise.all(
+      items.map(async (raw, index): Promise<Prepared> => {
+        const rawName = raw && typeof raw === "object" ? (raw as { name?: unknown }).name : undefined;
+        const fallbackName = typeof rawName === "string" && rawName.trim() ? rawName.trim().slice(0, 64) : `#${index + 1}`;
+        const req = CreateAccountRequestSchema.safeParse(raw);
+        if (!req.success) {
+          return { ok: false, index, name: fallbackName, error: describeIssues(req.error.issues) };
+        }
+        const fingerprint = await fingerprintOf(req.data.credentialSecret);
+        return { ok: true, index, name: req.data.name, req: req.data, fingerprint };
+      }),
+    );
+
+    let existing = new Map<string, string>();
+    if (skipExisting) {
+      await ensureCredentialFingerprints();
+      existing = await store.findAccountsByFingerprint(
+        prepared.flatMap((p) => (p.ok ? [p.fingerprint] : [])),
+      );
+    }
+
+    const results: AccountImportResult["results"] = [];
+    const firstInBatch = new Map<string, number>();
+    for (const item of prepared) {
+      if (!item.ok) {
+        results.push({ index: item.index, name: item.name, outcome: "failed", message: item.error });
+        continue;
+      }
+      if (skipExisting) {
+        const holder = existing.get(item.fingerprint);
+        if (holder) {
+          results.push({ index: item.index, name: item.name, outcome: "skipped", duplicateOf: holder });
+          continue;
+        }
+        const earlier = firstInBatch.get(item.fingerprint);
+        if (earlier !== undefined) {
+          results.push({
+            index: item.index,
+            name: item.name,
+            outcome: "skipped",
+            duplicateOfIndex: earlier,
+            message: `duplicate of item #${earlier + 1}`,
+          });
+          continue;
+        }
+      }
+      try {
+        const trimmed = item.req.credentialSecret.trim();
+        const account = await store.createAccount(item.req, {
+          encrypted: await encryptSecret(trimmed, vaultSecret),
+          preview: maskSecret(trimmed),
+          fingerprint: item.fingerprint,
+        });
+        firstInBatch.set(item.fingerprint, item.index);
+        results.push({ index: item.index, name: item.name, outcome: "created", accountId: account.id });
+      } catch (err) {
+        results.push({
+          index: item.index,
+          name: item.name,
+          outcome: "failed",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    const created = results.filter((r) => r.outcome === "created").length;
+    const skipped = results.filter((r) => r.outcome === "skipped").length;
+    if (created > 0) {
+      await syncDataPlaneBestEffort();
+    }
+    const body: AccountImportResult = { created, skipped, failed: results.length - created - skipped, results };
+    return c.json(body);
+  });
+
+  /**
+   * Backup with plaintext credentials. Requires the caller's password even though the
+   * session is already an admin one: a stolen token alone must not dump every upstream key.
+   */
+  app.post("/api/v1/admin/accounts/export", async (c) => {
+    const parsed = AccountExportRequestSchema.safeParse(await readJsonBody(c.req.raw));
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const claims = c.get("authUser");
+    const admin = await store.findUserByEmail(claims.email);
+    // Re-check role and status from the store: the JWT may predate a demotion or suspension.
+    const passwordOk =
+      !!admin?.passwordHash &&
+      admin.id === claims.sub &&
+      admin.role === "admin" &&
+      admin.status === "active" &&
+      (await verifyPassword(parsed.data.password, admin.passwordHash));
+    if (!passwordOk) {
+      return c.json({ error: "invalid_password", message: "Password confirmation failed" }, 403);
+    }
+    const wanted = parsed.data.accountIds ? new Set(parsed.data.accountIds) : null;
+    const accounts = (await store.listAccounts()).filter((a) => !wanted || wanted.has(a.id));
+    const secrets = new Map(
+      (await store.listAccountSecrets(accounts.map((a) => a.id))).map((s) => [s.accountId, s.encrypted]),
+    );
+    const file: AccountExportFile = {
+      type: SLIPGATE_ACCOUNT_EXPORT_TYPE,
+      version: 1,
+      exportedAtIso: new Date().toISOString(),
+      accounts: [],
+      skipped: [],
+    };
+    for (const acc of accounts) {
+      const encrypted = secrets.get(acc.id);
+      let credentialSecret: string | null = null;
+      if (encrypted) {
+        try {
+          credentialSecret = await decryptSecret(encrypted, vaultSecret);
+        } catch {
+          credentialSecret = null;
+        }
+      }
+      if (credentialSecret === null) {
+        file.skipped.push({ name: acc.name, reason: "credential_unreadable" });
+        continue;
+      }
+      file.accounts.push({
+        name: acc.name,
+        notes: acc.notes,
+        groupName: acc.groupName,
+        platform: acc.platform,
+        executionMode: acc.executionMode,
+        authKind: acc.authKind,
+        subscriptionTier: acc.subscriptionTier,
+        maxConcurrency: acc.maxConcurrency,
+        priority: acc.priority,
+        status: acc.status,
+        expiresAtIso: acc.expiresAtIso,
+        autoPauseOnExpired: acc.autoPauseOnExpired,
+        credentialSecret,
+      });
+    }
+    c.header("Cache-Control", "no-store");
+    return c.json(file);
   });
 
   /**
@@ -1154,8 +1399,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
    */
   app.get("/api/v1/admin/dashboard/stats", async (c) => {
     const range = DashboardRangeSchema.catch("7d").parse(c.req.query("range") ?? "7d");
-    const tzRaw = Number.parseInt(c.req.query("tz") ?? "0", 10);
-    const tzOffsetMinutes = Number.isFinite(tzRaw) ? Math.max(-14 * 60, Math.min(14 * 60, tzRaw)) : 0;
+    const tzOffsetMinutes = parseTzOffset(c.req.query("tz"));
     const nowMs = Date.now();
     const win = dashboardWindow(range, nowMs, tzOffsetMinutes);
     const [logs, users, groups, accounts, snapshot] = await Promise.all([

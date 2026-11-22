@@ -26,7 +26,7 @@ withDefaults(
           <h2 class="truncate text-sm font-semibold text-fg">{{ title }}</h2>
         </div>
       </slot>
-      <div v-if="$slots.actions" class="flex flex-wrap items-center gap-2">
+      <div v-if="$slots.actions" class="flex min-w-0 max-w-full flex-wrap items-center gap-2">
         <slot name="actions" />
       </div>
     </header>

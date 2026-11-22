@@ -1,5 +1,6 @@
 import type {
   AccountTestResult,
+  AccountUsageSummaryItem,
   ApiKeyItem,
   CreateAccountRequest,
   CreateApiKeyRequest,
@@ -53,6 +54,27 @@ export interface StoredUserRecord extends UserProfile {
   passwordHash: string | null;
 }
 
+/** Credential material as persisted: AES-GCM blob, display mask and duplicate-detection HMAC. */
+export interface StoredCredential {
+  encrypted: Uint8Array;
+  preview: string;
+  fingerprint: string;
+}
+
+export interface AccountSecretRecord {
+  accountId: string;
+  encrypted: Uint8Array;
+  /** `null` for rows written before fingerprints existed (backfilled at startup). */
+  fingerprint: string | null;
+}
+
+export interface UsageLogFilter {
+  userId?: string;
+  accountId?: string;
+  limit?: number;
+  sinceIso?: string;
+}
+
 export interface ControlStore {
   init(): Promise<void>;
   close(): Promise<void>;
@@ -82,19 +104,18 @@ export interface ControlStore {
 
   listAccounts(filter?: { groupId?: string; executionMode?: string }): Promise<UpstreamAccount[]>;
   getAccount(accountId: string): Promise<UpstreamAccount | null>;
-  createAccount(
-    req: CreateAccountRequest,
-    encryptedSecret: Uint8Array,
-    credentialPreview: string,
-  ): Promise<UpstreamAccount>;
-  updateAccount(
-    accountId: string,
-    req: UpdateAccountRequest,
-    encryptedSecret?: Uint8Array,
-    credentialPreview?: string,
-  ): Promise<UpstreamAccount>;
+  createAccount(req: CreateAccountRequest, credential: StoredCredential): Promise<UpstreamAccount>;
+  /** Omit `credential` to keep the stored one. */
+  updateAccount(accountId: string, req: UpdateAccountRequest, credential?: StoredCredential): Promise<UpstreamAccount>;
   deleteAccount(accountId: string): Promise<void>;
   recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void>;
+  /** Encrypted credentials for export and fingerprint backfill; every account when `accountIds` is omitted. */
+  listAccountSecrets(accountIds?: string[]): Promise<AccountSecretRecord[]>;
+  /** Maps each known fingerprint to the id of an account holding it. */
+  findAccountsByFingerprint(fingerprints: string[]): Promise<Map<string, string>>;
+  setCredentialFingerprint(accountId: string, fingerprint: string): Promise<void>;
+  /** Per-account totals of usage created at or after `sinceIso` (accounts without usage omitted). */
+  summarizeAccountUsage(sinceIso: string): Promise<AccountUsageSummaryItem[]>;
 
   listUserApiKeys(userId: string): Promise<ApiKeyItem[]>;
   createApiKey(
@@ -113,7 +134,7 @@ export interface ControlStore {
   exportDataPlaneSnapshot(): Promise<DataPlaneSyncSnapshot>;
   recordTurnSettlement(ev: TurnSettlementEvent): Promise<UsageLogItem>;
   /** Newest first. With `sinceIso` the row cap rises from 200 to 100k (dashboard aggregation). */
-  listUsageLogs(filter?: { userId?: string; limit?: number; sinceIso?: string }): Promise<UsageLogItem[]>;
+  listUsageLogs(filter?: UsageLogFilter): Promise<UsageLogItem[]>;
 
   recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent>;
   listRiskBanEvents(limit?: number): Promise<RiskBanEvent[]>;

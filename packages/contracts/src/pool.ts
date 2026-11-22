@@ -165,6 +165,44 @@ export type AccountAuthKind = z.infer<typeof AccountAuthKindSchema>;
 export const AccountStatusSchema = z.enum(["active", "paused", "cooldown", "expired"]);
 export type AccountStatus = z.infer<typeof AccountStatusSchema>;
 
+/** Statuses an account may be created or imported with (cooldown/expired are runtime states). */
+export const AccountInitialStatusSchema = z.enum(["active", "paused"]);
+export type AccountInitialStatus = z.infer<typeof AccountInitialStatusSchema>;
+
+/** ISO-8601 instant; offsets are accepted and normalized by `new Date(...)` on the server. */
+export const IsoDateTimeSchema = z.string().datetime({ offset: true });
+
+export interface AccountLifecycleFields {
+  status: AccountStatus;
+  expiresAtIso: string | null;
+  autoPauseOnExpired: boolean;
+  cooldownUntilIso: string | null;
+}
+
+/**
+ * Scheduling status the data plane acts on: the stored status refined by the expiry and
+ * cooldown deadlines, so a lapsed subscription stops and a finished cooldown resumes
+ * without anyone editing the row.
+ *
+ * - `paused` / `expired` set by an admin always win.
+ * - An elapsed `expiresAt` with auto-pause enabled reads as `expired`.
+ * - A future `cooldownUntil` reads as `cooldown`; once it passes the account is `active` again.
+ * - `cooldown` without a deadline stays in cooldown until an admin resumes it.
+ */
+export function effectiveAccountStatus(acc: AccountLifecycleFields, nowMs: number = Date.now()): AccountStatus {
+  if (acc.status === "paused" || acc.status === "expired") return acc.status;
+  if (acc.autoPauseOnExpired && acc.expiresAtIso) {
+    const expiresAt = Date.parse(acc.expiresAtIso);
+    if (Number.isFinite(expiresAt) && expiresAt <= nowMs) return "expired";
+  }
+  if (acc.cooldownUntilIso) {
+    const until = Date.parse(acc.cooldownUntilIso);
+    if (Number.isFinite(until) && until > nowMs) return "cooldown";
+    return "active";
+  }
+  return acc.status === "cooldown" ? "cooldown" : "active";
+}
+
 /** Outcome of the most recent admin connectivity test for an account. */
 export const AccountTestResultSchema = z.object({
   ok: z.boolean(),
@@ -189,10 +227,22 @@ export const UpstreamAccountSchema = z.object({
   credentialPreview: z.string(),
   maxConcurrency: z.number().int().min(1).max(64),
   priority: z.number().int(),
+  /** Stored (admin-set) status. */
   status: AccountStatusSchema,
+  /** What the scheduler acts on; see `effectiveAccountStatus`. */
+  effectiveStatus: AccountStatusSchema,
+  /** Subscription / key expiry; `null` = never expires. */
+  expiresAtIso: z.string().nullable(),
+  /** Stop scheduling once `expiresAtIso` has passed. */
+  autoPauseOnExpired: z.boolean(),
+  /** Temporary unschedulable deadline; the account resumes on its own afterwards. */
+  cooldownUntilIso: z.string().nullable(),
+  cooldownReason: z.string(),
   window5hUsedBps: z.number().int().min(0).max(10000),
   window7dUsedBps: z.number().int().min(0).max(10000),
   lastTest: AccountTestResultSchema.nullable(),
+  /** Time of the most recent settled request routed to this account. */
+  lastUsedAtIso: z.string().nullable(),
   createdAtIso: z.string(),
 });
 export type UpstreamAccount = z.infer<typeof UpstreamAccountSchema>;
@@ -208,10 +258,17 @@ export const CreateAccountRequestSchema = z.object({
   credentialSecret: z.string().trim().min(1),
   maxConcurrency: z.number().int().min(1).max(64).default(5),
   priority: z.number().int().min(0).max(10000).default(100),
+  status: AccountInitialStatusSchema.default("active"),
+  expiresAtIso: IsoDateTimeSchema.nullable().default(null),
+  autoPauseOnExpired: z.boolean().default(true),
 });
 export type CreateAccountRequest = z.infer<typeof CreateAccountRequestSchema>;
 
-/** Platform is fixed at creation time; omit `credentialSecret` to keep the stored credential. */
+/**
+ * Platform is fixed at creation time; omit `credentialSecret` to keep the stored credential.
+ * Setting `status` to anything but `cooldown` clears the cooldown deadline unless
+ * `cooldownUntilIso` is sent in the same patch.
+ */
 export const UpdateAccountRequestSchema = z.object({
   name: z.string().trim().min(1).max(64).optional(),
   notes: z.string().trim().max(500).optional(),
@@ -223,20 +280,34 @@ export const UpdateAccountRequestSchema = z.object({
   maxConcurrency: z.number().int().min(1).max(64).optional(),
   priority: z.number().int().min(0).max(10000).optional(),
   status: AccountStatusSchema.optional(),
+  expiresAtIso: IsoDateTimeSchema.nullable().optional(),
+  autoPauseOnExpired: z.boolean().optional(),
+  cooldownUntilIso: IsoDateTimeSchema.nullable().optional(),
+  cooldownReason: z.string().trim().max(200).optional(),
 });
 export type UpdateAccountRequest = z.infer<typeof UpdateAccountRequestSchema>;
 
 const AccountIdListSchema = z.array(z.string().min(1)).min(1).max(500);
 
+/** Fields the bulk editor may change; credentials, names and notes stay per-account. */
+export const AccountBulkPatchSchema = UpdateAccountRequestSchema.pick({
+  groupId: true,
+  status: true,
+  executionMode: true,
+  subscriptionTier: true,
+  maxConcurrency: true,
+  priority: true,
+  expiresAtIso: true,
+  autoPauseOnExpired: true,
+  cooldownUntilIso: true,
+  cooldownReason: true,
+});
+export type AccountBulkPatch = z.infer<typeof AccountBulkPatchSchema>;
+
 /** Apply the same non-credential changes to many accounts at once. */
 export const AccountBulkUpdateRequestSchema = z.object({
   accountIds: AccountIdListSchema,
-  patch: UpdateAccountRequestSchema.pick({
-    groupId: true,
-    status: true,
-    maxConcurrency: true,
-    priority: true,
-  }).refine((p) => Object.values(p).some((v) => v !== undefined), {
+  patch: AccountBulkPatchSchema.refine((p) => Object.values(p).some((v) => v !== undefined), {
     message: "patch must change at least one field",
   }),
 });

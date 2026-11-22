@@ -1,8 +1,10 @@
 import {
+  effectiveAccountStatus,
   formatNanoUsd,
   isSubscriptionTierAllowedForProvider,
   subscriptionTierMultiplier,
   type AccountTestResult,
+  type AccountUsageSummaryItem,
   type ApiKeyItem,
   type CreateAccountRequest,
   type CreateApiKeyRequest,
@@ -24,7 +26,15 @@ import {
   type UserProfile,
   type WalletSummary,
 } from "@slipgate/contracts";
-import { StoreError, type ControlStore, type StoredUserRecord } from "./types.ts";
+import { normalizeIso, resolveCooldownChange } from "./account_patch.ts";
+import {
+  StoreError,
+  type AccountSecretRecord,
+  type ControlStore,
+  type StoredCredential,
+  type StoredUserRecord,
+  type UsageLogFilter,
+} from "./types.ts";
 
 function bytesToHex(bytes: Uint8Array): string {
   let out = "";
@@ -36,8 +46,9 @@ function bytesToHex(bytes: Uint8Array): string {
 
 type InternalGroup = Omit<GroupItem, "accountCount" | "activeAccountCount" | "apiKeyCount">;
 
-interface InternalAccount extends Omit<UpstreamAccount, "groupName"> {
+interface InternalAccount extends Omit<UpstreamAccount, "groupName" | "effectiveStatus"> {
   credentialsEnc: Uint8Array;
+  credentialFingerprint: string | null;
 }
 
 interface InternalApiKey extends Omit<ApiKeyItem, "groupName"> {
@@ -223,7 +234,7 @@ export class MemoryControlStore implements ControlStore {
     for (const acc of this.accounts.values()) {
       if (acc.groupId !== g.id) continue;
       accountCount += 1;
-      if (acc.status === "active") activeAccountCount += 1;
+      if (effectiveAccountStatus(acc) === "active") activeAccountCount += 1;
     }
     let apiKeyCount = 0;
     for (const key of this.apiKeys.values()) {
@@ -330,32 +341,33 @@ export class MemoryControlStore implements ControlStore {
     });
   }
 
+  private toPublicAccount(acc: InternalAccount, nowMs = Date.now()): UpstreamAccount {
+    const { credentialsEnc: _enc, credentialFingerprint: _fp, ...rest } = acc;
+    return {
+      ...rest,
+      lastTest: acc.lastTest ? { ...acc.lastTest } : null,
+      groupName: this.groups.get(acc.groupId)?.name ?? acc.groupId,
+      effectiveStatus: effectiveAccountStatus(acc, nowMs),
+    };
+  }
+
   async listAccounts(filter?: { groupId?: string; executionMode?: string }): Promise<UpstreamAccount[]> {
+    const nowMs = Date.now();
     const out: UpstreamAccount[] = [];
     for (const acc of this.accounts.values()) {
       if (filter?.groupId && acc.groupId !== filter.groupId) continue;
       if (filter?.executionMode && acc.executionMode !== filter.executionMode) continue;
-      const { credentialsEnc: _, ...rest } = acc;
-      out.push({
-        ...rest,
-        groupName: this.groups.get(acc.groupId)?.name ?? acc.groupId,
-      });
+      out.push(this.toPublicAccount(acc, nowMs));
     }
-    return out;
+    return out.sort((a, b) => a.priority - b.priority || b.createdAtIso.localeCompare(a.createdAtIso));
   }
 
   async getAccount(accountId: string): Promise<UpstreamAccount | null> {
     const acc = this.accounts.get(accountId);
-    if (!acc) return null;
-    const { credentialsEnc: _, ...rest } = acc;
-    return { ...rest, groupName: this.groups.get(acc.groupId)?.name ?? acc.groupId };
+    return acc ? this.toPublicAccount(acc) : null;
   }
 
-  async createAccount(
-    req: CreateAccountRequest,
-    encryptedSecret: Uint8Array,
-    credentialPreview: string,
-  ): Promise<UpstreamAccount> {
+  async createAccount(req: CreateAccountRequest, credential: StoredCredential): Promise<UpstreamAccount> {
     const group = this.groups.get(req.groupId);
     if (!group) {
       throw new StoreError("not_found", `Group ${req.groupId} not found`);
@@ -377,63 +389,68 @@ export class MemoryControlStore implements ControlStore {
       authKind: req.authKind,
       subscriptionTier: req.subscriptionTier,
       tierMultiplier: subscriptionTierMultiplier(req.platform, req.subscriptionTier),
-      credentialPreview,
-      credentialsEnc: encryptedSecret,
+      credentialPreview: credential.preview,
+      credentialsEnc: credential.encrypted,
+      credentialFingerprint: credential.fingerprint,
       maxConcurrency: req.maxConcurrency,
       priority: req.priority,
-      status: "active",
+      status: req.status,
+      expiresAtIso: normalizeIso(req.expiresAtIso) ?? null,
+      autoPauseOnExpired: req.autoPauseOnExpired,
+      cooldownUntilIso: null,
+      cooldownReason: "",
       window5hUsedBps: 0,
       window7dUsedBps: 0,
       lastTest: null,
+      lastUsedAtIso: null,
       createdAtIso: new Date().toISOString(),
     };
     this.accounts.set(id, record);
-    const { credentialsEnc: _, ...rest } = record;
-    return { ...rest, groupName: group.name };
+    return this.toPublicAccount(record);
   }
 
   async updateAccount(
     accountId: string,
     req: UpdateAccountRequest,
-    encryptedSecret?: Uint8Array,
-    credentialPreview?: string,
+    credential?: StoredCredential,
   ): Promise<UpstreamAccount> {
     const acc = this.accounts.get(accountId);
     if (!acc) {
       throw new StoreError("not_found", `Account ${accountId} not found`);
     }
-    if (req.groupId !== undefined) {
-      if (!this.groups.has(req.groupId)) {
-        throw new StoreError("not_found", `Group ${req.groupId} not found`);
-      }
-      acc.groupId = req.groupId;
+    // Validate everything before mutating so a rejected patch leaves the record untouched.
+    if (req.groupId !== undefined && !this.groups.has(req.groupId)) {
+      throw new StoreError("not_found", `Group ${req.groupId} not found`);
     }
+    if (req.subscriptionTier !== undefined && !isSubscriptionTierAllowedForProvider(acc.platform, req.subscriptionTier)) {
+      throw new StoreError(
+        "bad_request",
+        `Subscription tier ${req.subscriptionTier} is not valid for provider ${acc.platform}`,
+      );
+    }
+    if (req.groupId !== undefined) acc.groupId = req.groupId;
     if (req.name !== undefined) acc.name = req.name;
     if (req.notes !== undefined) acc.notes = req.notes;
     if (req.executionMode !== undefined) acc.executionMode = req.executionMode;
     if (req.authKind !== undefined) acc.authKind = req.authKind;
     if (req.subscriptionTier !== undefined) {
-      if (!isSubscriptionTierAllowedForProvider(acc.platform, req.subscriptionTier)) {
-        throw new StoreError(
-          "bad_request",
-          `Subscription tier ${req.subscriptionTier} is not valid for provider ${acc.platform}`,
-        );
-      }
       acc.subscriptionTier = req.subscriptionTier;
       acc.tierMultiplier = subscriptionTierMultiplier(acc.platform, req.subscriptionTier);
     }
     if (req.maxConcurrency !== undefined) acc.maxConcurrency = req.maxConcurrency;
     if (req.priority !== undefined) acc.priority = req.priority;
     if (req.status !== undefined) acc.status = req.status;
-    if (encryptedSecret !== undefined && credentialPreview !== undefined) {
-      acc.credentialsEnc = encryptedSecret;
-      acc.credentialPreview = credentialPreview;
+    if (req.expiresAtIso !== undefined) acc.expiresAtIso = normalizeIso(req.expiresAtIso) ?? null;
+    if (req.autoPauseOnExpired !== undefined) acc.autoPauseOnExpired = req.autoPauseOnExpired;
+    const cooldown = resolveCooldownChange(req);
+    if (cooldown.untilIso !== undefined) acc.cooldownUntilIso = cooldown.untilIso;
+    if (cooldown.reason !== undefined) acc.cooldownReason = cooldown.reason;
+    if (credential) {
+      acc.credentialsEnc = credential.encrypted;
+      acc.credentialPreview = credential.preview;
+      acc.credentialFingerprint = credential.fingerprint;
     }
-    const { credentialsEnc: _, ...rest } = acc;
-    return {
-      ...rest,
-      groupName: this.groups.get(acc.groupId)?.name ?? acc.groupId,
-    };
+    return this.toPublicAccount(acc);
   }
 
   async deleteAccount(accountId: string): Promise<void> {
@@ -445,6 +462,54 @@ export class MemoryControlStore implements ControlStore {
   async recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void> {
     const acc = this.accounts.get(accountId);
     if (acc) acc.lastTest = { ...result };
+  }
+
+  async listAccountSecrets(accountIds?: string[]): Promise<AccountSecretRecord[]> {
+    const wanted = accountIds ? new Set(accountIds) : null;
+    const out: AccountSecretRecord[] = [];
+    for (const acc of this.accounts.values()) {
+      if (wanted && !wanted.has(acc.id)) continue;
+      out.push({ accountId: acc.id, encrypted: acc.credentialsEnc, fingerprint: acc.credentialFingerprint });
+    }
+    return out;
+  }
+
+  async findAccountsByFingerprint(fingerprints: string[]): Promise<Map<string, string>> {
+    const wanted = new Set(fingerprints);
+    const out = new Map<string, string>();
+    for (const acc of this.accounts.values()) {
+      const fp = acc.credentialFingerprint;
+      if (fp && wanted.has(fp) && !out.has(fp)) out.set(fp, acc.id);
+    }
+    return out;
+  }
+
+  async setCredentialFingerprint(accountId: string, fingerprint: string): Promise<void> {
+    const acc = this.accounts.get(accountId);
+    if (acc) acc.credentialFingerprint = fingerprint;
+  }
+
+  async summarizeAccountUsage(sinceIso: string): Promise<AccountUsageSummaryItem[]> {
+    const sinceMs = Date.parse(sinceIso);
+    const byAccount = new Map<string, { requests: number; errors: number; input: number; output: number; cost: bigint }>();
+    for (const log of this.usageLogs) {
+      if (Date.parse(log.createdAtIso) < sinceMs) continue;
+      const entry = byAccount.get(log.accountId) ?? { requests: 0, errors: 0, input: 0, output: 0, cost: 0n };
+      entry.requests += 1;
+      if (log.statusCode >= 400) entry.errors += 1;
+      entry.input += log.inputTokens;
+      entry.output += log.outputTokens;
+      entry.cost += BigInt(log.costNanoUsd);
+      byAccount.set(log.accountId, entry);
+    }
+    return Array.from(byAccount.entries()).map(([accountId, v]) => ({
+      accountId,
+      requests: v.requests,
+      errors: v.errors,
+      inputTokens: v.input,
+      outputTokens: v.output,
+      costNanoUsd: v.cost.toString(),
+    }));
   }
 
   async listUserApiKeys(userId: string): Promise<ApiKeyItem[]> {
@@ -555,8 +620,9 @@ export class MemoryControlStore implements ControlStore {
   }
 
   async exportDataPlaneSnapshot(): Promise<DataPlaneSyncSnapshot> {
+    const nowMs = Date.now();
     return {
-      revisionUnixMs: Date.now(),
+      revisionUnixMs: nowMs,
       groups: Array.from(this.groups.values()).map((g) => ({
         id: g.id,
         platform: g.platform,
@@ -577,7 +643,8 @@ export class MemoryControlStore implements ControlStore {
         credentialsEncHex: bytesToHex(a.credentialsEnc),
         maxConcurrency: a.maxConcurrency,
         priority: a.priority,
-        status: a.status,
+        // The data plane only schedules "active"; expiry and cooldown deadlines resolve here.
+        status: effectiveAccountStatus(a, nowMs),
         window5hUsedBps: a.window5hUsedBps,
         window7dUsedBps: a.window7dUsedBps,
       })),
@@ -615,18 +682,21 @@ export class MemoryControlStore implements ControlStore {
         w.balanceNano -= costNano;
         this.wallets.set(ev.userId, w);
       }
-      const acc = this.accounts.get(ev.accountId);
-      if (acc) {
-        if (ev.window5hUsedBps > 0) acc.window5hUsedBps = ev.window5hUsedBps;
-        if (ev.window7dUsedBps > 0) acc.window7dUsedBps = ev.window7dUsedBps;
-      }
+    }
+
+    const createdAtIso = new Date().toISOString();
+    const acc = this.accounts.get(ev.accountId);
+    if (acc) {
+      if (ev.window5hUsedBps > 0) acc.window5hUsedBps = ev.window5hUsedBps;
+      if (ev.window7dUsedBps > 0) acc.window7dUsedBps = ev.window7dUsedBps;
+      acc.lastUsedAtIso = createdAtIso;
     }
 
     const item: UsageLogItem = {
       ...ev,
       id: `usg_${crypto.randomUUID()}`,
       formattedCostUsd: formatNanoUsd(costNano),
-      createdAtIso: new Date().toISOString(),
+      createdAtIso,
     };
     this.usageByRequestId.set(ev.requestId, item);
     this.usageLogs.unshift(item);
@@ -636,13 +706,14 @@ export class MemoryControlStore implements ControlStore {
     return { ...item };
   }
 
-  async listUsageLogs(filter?: { userId?: string; limit?: number; sinceIso?: string }): Promise<UsageLogItem[]> {
+  async listUsageLogs(filter?: UsageLogFilter): Promise<UsageLogItem[]> {
     const cap = filter?.sinceIso ? 100_000 : 200;
     const limit = Math.max(1, Math.min(cap, filter?.limit ?? 50));
     const sinceMs = filter?.sinceIso ? Date.parse(filter.sinceIso) : Number.NEGATIVE_INFINITY;
     const out: UsageLogItem[] = [];
     for (const item of this.usageLogs) {
       if (filter?.userId && item.userId !== filter.userId) continue;
+      if (filter?.accountId && item.accountId !== filter.accountId) continue;
       if (Date.parse(item.createdAtIso) < sinceMs) continue;
       out.push({ ...item });
       if (out.length >= limit) break;

@@ -123,6 +123,38 @@ export function formatUsd(nano: string | null | undefined): string {
   }).format(usd);
 }
 
+const RELATIVE_UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
+  ["year", 365 * 86_400_000],
+  ["month", 30 * 86_400_000],
+  ["week", 7 * 86_400_000],
+  ["day", 86_400_000],
+  ["hour", 3_600_000],
+  ["minute", 60_000],
+];
+
+/** "3 分钟前" / "in 5 hours" — past or future, in the active locale. */
+export function formatRelative(iso: string | null | undefined, nowMs: number = Date.now()): string {
+  if (!iso) return "-";
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return "-";
+  const diff = at - nowMs;
+  const fmt = new Intl.RelativeTimeFormat(activeLocale(), { numeric: "auto" });
+  for (const [unit, size] of RELATIVE_UNITS) {
+    // Round, not truncate: a cooldown set for 5h a moment ago should still read "in 5 hours".
+    if (Math.abs(diff) >= size) return fmt.format(Math.round(diff / size), unit);
+  }
+  return fmt.format(0, "second");
+}
+
+/** 2026-12-01 in local time. */
+export function formatDateShort(iso: string | null | undefined): string {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "-";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 /** 850ms / 1.2s / 2m 05s */
 export function formatDurationMs(ms: number | null | undefined): string {
   const v = Math.max(0, Math.round(ms ?? 0));

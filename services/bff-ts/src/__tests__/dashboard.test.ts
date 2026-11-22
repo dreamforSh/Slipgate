@@ -48,10 +48,12 @@ const users: UserProfile[] = [
 const groups = [{ id: "g1", name: "main" }, { id: "g2", name: "vip" }] as GroupItem[];
 
 const accounts = [
-  { status: "active", lastTest: { ok: false } },
-  { status: "active", lastTest: null },
-  { status: "paused", lastTest: { ok: true } },
-  { status: "cooldown", lastTest: null },
+  { status: "active", effectiveStatus: "active", lastTest: { ok: false } },
+  { status: "active", effectiveStatus: "active", lastTest: null },
+  { status: "paused", effectiveStatus: "paused", lastTest: { ok: true } },
+  { status: "cooldown", effectiveStatus: "cooldown", lastTest: null },
+  // Stored as active but its subscription lapsed: counted by the effective status.
+  { status: "active", effectiveStatus: "expired", lastTest: null },
 ] as unknown as UpstreamAccount[];
 
 describe("dashboard window", () => {
@@ -130,7 +132,7 @@ describe("buildDashboardStats", () => {
   it("summarizes users, keys and account health", () => {
     expect(stats.users).toEqual({ total: 2, newToday: 1, activeToday: 2 });
     expect(stats.apiKeys).toEqual({ total: 3, enabled: 2 });
-    expect(stats.accounts).toEqual({ total: 4, active: 2, paused: 1, cooldown: 1, expired: 0, failedTests: 1 });
+    expect(stats.accounts).toEqual({ total: 5, active: 2, paused: 1, cooldown: 1, expired: 1, failedTests: 1 });
   });
 });
 

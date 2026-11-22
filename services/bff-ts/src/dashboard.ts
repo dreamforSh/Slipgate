@@ -1,4 +1,6 @@
 import type {
+  AccountStatsRange,
+  AccountUsageStats,
   AdminDashboardStats,
   DashboardRange,
   GroupItem,
@@ -201,7 +203,9 @@ export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats
     costNanoUsd: b.cost.toString(),
   }));
 
-  const countStatus = (status: UpstreamAccount["status"]) => input.accounts.filter((a) => a.status === status).length;
+  // Effective status: a lapsed subscription counts as expired, a finished cooldown as active.
+  const countStatus = (status: UpstreamAccount["status"]) =>
+    input.accounts.filter((a) => a.effectiveStatus === status).length;
 
   return {
     generatedAtIso: new Date(input.nowMs).toISOString(),
@@ -233,5 +237,82 @@ export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats
     models: ranked(models).map(({ key, ...rest }) => ({ model: key, ...rest })),
     topUsers: ranked(users).map(({ key, ...rest }) => ({ userId: key, email: emailById.get(key) ?? key, ...rest })),
     groups: ranked(groups).map(({ key, ...rest }) => ({ groupId: key, name: groupNameById.get(key) ?? key, ...rest })),
+  };
+}
+
+function emptyBuckets(count: number) {
+  return Array.from({ length: count }, () => ({ requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, cost: 0n }));
+}
+
+export interface AccountStatsInputs {
+  accountId: string;
+  range: AccountStatsRange;
+  nowMs: number;
+  tzOffsetMinutes: number;
+  /** This account's usage rows created at or after `dashboardWindow(...).sinceMs`, any order. */
+  logs: UsageLogItem[];
+  truncated: boolean;
+}
+
+/** One account's traffic over a window, bucketed like the admin dashboard. */
+export function buildAccountUsageStats(input: AccountStatsInputs): AccountUsageStats {
+  const win = dashboardWindow(input.range, input.nowMs, input.tzOffsetMinutes);
+  const bucketSize = win.granularity === "hour" ? HOUR_MS : DAY_MS;
+  const today = new TotalsAccumulator();
+  const period = new TotalsAccumulator();
+  const buckets = emptyBuckets(win.bucketStarts.length);
+  const models = new Map<string, Breakdown>();
+  const errorCodes = new Map<number, number>();
+
+  for (const log of input.logs) {
+    const at = Date.parse(log.createdAtIso);
+    if (!Number.isFinite(at) || at > input.nowMs) continue;
+    if (at >= win.todayStartMs) today.add(log);
+    if (at < win.periodStartMs) continue;
+
+    period.add(log);
+    const bucket = buckets[Math.floor((at - win.periodStartMs) / bucketSize)];
+    if (bucket) {
+      bucket.requests += 1;
+      if (log.statusCode >= 400) bucket.errors += 1;
+      bucket.inputTokens += log.inputTokens;
+      bucket.outputTokens += log.outputTokens;
+      bucket.cost += BigInt(log.costNanoUsd);
+    }
+    bump(models, log.publicModel, log);
+    if (log.statusCode >= 400) errorCodes.set(log.statusCode, (errorCodes.get(log.statusCode) ?? 0) + 1);
+  }
+
+  const series: UsageSeriesPoint[] = buckets.map((b, i) => ({
+    startIso: new Date(win.bucketStarts[i]!).toISOString(),
+    requests: b.requests,
+    errors: b.errors,
+    inputTokens: b.inputTokens,
+    outputTokens: b.outputTokens,
+    costNanoUsd: b.cost.toString(),
+  }));
+
+  let peak: AccountUsageStats["peak"] = null;
+  for (const point of series) {
+    if (point.requests > 0 && (!peak || point.requests > peak.requests)) {
+      peak = { startIso: point.startIso, requests: point.requests, costNanoUsd: point.costNanoUsd };
+    }
+  }
+
+  return {
+    generatedAtIso: new Date(input.nowMs).toISOString(),
+    accountId: input.accountId,
+    range: input.range,
+    granularity: win.granularity,
+    truncated: input.truncated,
+    today: today.toJSON(),
+    period: period.toJSON(),
+    activeBuckets: series.filter((p) => p.requests > 0).length,
+    peak,
+    series,
+    models: ranked(models).map(({ key, ...rest }) => ({ model: key, ...rest })),
+    errorCodes: Array.from(errorCodes.entries())
+      .sort(([codeA, a], [codeB, b]) => b - a || codeA - codeB)
+      .map(([statusCode, count]) => ({ statusCode, count })),
   };
 }

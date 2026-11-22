@@ -205,6 +205,17 @@ export async function decryptSecret(blob: Uint8Array, vaultSecret: string): Prom
   return decoder.decode(plain);
 }
 
+/**
+ * Keyed fingerprint of a credential for duplicate detection. HMAC (not a bare hash) so a
+ * leaked fingerprint column cannot be brute-forced offline against short API keys.
+ * Callers pass the canonical form (`canonicalCredentialText`).
+ */
+export async function credentialFingerprint(canonicalSecret: string, vaultSecret: string): Promise<string> {
+  const key = await importHmacKey(`slipgate-credential-fingerprint:${vaultSecret}`, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, toArrayBuffer(encoder.encode(canonicalSecret)));
+  return toHex(new Uint8Array(sig));
+}
+
 export function maskSecret(raw: string): string {
   const trimmed = raw.trim();
   if (trimmed.length < 14) {

@@ -20,6 +20,7 @@ services:
       - ../migrations/net/0005_vm_runtime_profile.sql:/docker-entrypoint-initdb.d/10_net_vm_runtime.sql:ro
       - ../migrations/core/0004_account_subscription_tier.sql:/docker-entrypoint-initdb.d/11_core_sub_tier.sql:ro
       - ../migrations/core/0005_group_account_management.sql:/docker-entrypoint-initdb.d/12_core_group_account_mgmt.sql:ro
+      - ../migrations/core/0006_account_lifecycle.sql:/docker-entrypoint-initdb.d/13_core_account_lifecycle.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slipgate} -d ${POSTGRES_DB:-slipgate}"]
       interval: 5s

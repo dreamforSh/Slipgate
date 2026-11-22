@@ -1,10 +1,12 @@
 import postgres from "postgres";
 import {
+  effectiveAccountStatus,
   formatNanoUsd,
   isSubscriptionTierAllowedForProvider,
   SubscriptionTierSchema,
   subscriptionTierMultiplier,
   type AccountTestResult,
+  type AccountUsageSummaryItem,
   type ApiKeyItem,
   type CreateAccountRequest,
   type CreateApiKeyRequest,
@@ -26,9 +28,21 @@ import {
   type UserProfile,
   type WalletSummary,
 } from "@slipgate/contracts";
-import { StoreError, type ControlStore, type StoredUserRecord } from "./types.ts";
+import { normalizeIso, resolveCooldownChange } from "./account_patch.ts";
+import {
+  StoreError,
+  type AccountSecretRecord,
+  type ControlStore,
+  type StoredCredential,
+  type StoredUserRecord,
+  type UsageLogFilter,
+} from "./types.ts";
 
 type SqlExecutor = ReturnType<typeof postgres>;
+
+function toDateOrNull(iso: string | null | undefined): Date | null {
+  return iso ? new Date(iso) : null;
+}
 
 type SetupSettingsValue = {
   initialized: boolean;
@@ -101,7 +115,22 @@ export class PostgresControlStore implements ControlStore {
           ADD COLUMN IF NOT EXISTS last_test_ok BOOLEAN,
           ADD COLUMN IF NOT EXISTS last_test_model TEXT,
           ADD COLUMN IF NOT EXISTS last_test_duration_ms INTEGER,
-          ADD COLUMN IF NOT EXISTS last_test_message TEXT;
+          ADD COLUMN IF NOT EXISTS last_test_message TEXT,
+          ADD COLUMN IF NOT EXISTS temp_unsched_until TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS temp_unsched_reason TEXT,
+          ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS auto_pause_on_expired BOOLEAN NOT NULL DEFAULT TRUE,
+          ADD COLUMN IF NOT EXISTS credential_fingerprint TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_core_accounts_credential_fingerprint
+          ON core.accounts (credential_fingerprint);
+
+      ALTER TABLE IF EXISTS core.account_window_quotas
+          ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+
+      -- No index builds on core.usage_logs here: this batch runs in one implicit transaction
+      -- before the BFF listens, so scanning a large partition would block settlements.
+      -- Fresh databases get idx_core_usage_logs_account_time from migration 0006.
 
       -- Self-heal jsonb values that older builds double-encoded as JSON strings.
       UPDATE commerce.portal_settings SET value_json = (value_json #>> '{}')::jsonb
@@ -482,7 +511,11 @@ export class PostgresControlStore implements ControlStore {
         g.sort_order,
         g.enabled,
         COUNT(a.id)::text AS account_count,
-        COUNT(a.id) FILTER (WHERE a.status = 'active')::text AS active_account_count,
+        COUNT(a.id) FILTER (
+          WHERE a.status NOT IN ('paused', 'expired')
+            AND NOT (COALESCE(a.auto_pause_on_expired, TRUE) AND a.expires_at IS NOT NULL AND a.expires_at <= NOW())
+            AND CASE WHEN a.temp_unsched_until IS NOT NULL THEN a.temp_unsched_until <= NOW() ELSE a.status = 'active' END
+        )::text AS active_account_count,
         (SELECT COUNT(*) FROM core.api_keys k WHERE k.group_id = g.id)::text AS api_key_count,
         g.created_at
       FROM core.groups g
@@ -643,8 +676,13 @@ export class PostgresControlStore implements ControlStore {
         max_concurrency: number;
         priority: number;
         status: UpstreamAccount["status"];
+        expires_at: Date | null;
+        auto_pause_on_expired: boolean | null;
+        temp_unsched_until: Date | null;
+        temp_unsched_reason: string | null;
         window_5h_used_bps: number | null;
         window_7d_used_bps: number | null;
+        last_used_at: Date | null;
         last_test_at: Date | null;
         last_test_ok: boolean | null;
         last_test_model: string | null;
@@ -667,8 +705,13 @@ export class PostgresControlStore implements ControlStore {
         a.max_concurrency,
         a.priority,
         a.status,
+        a.expires_at,
+        a.auto_pause_on_expired,
+        a.temp_unsched_until,
+        a.temp_unsched_reason,
         q.window_5h_used_bps,
         q.window_7d_used_bps,
+        q.last_used_at,
         a.last_test_at,
         a.last_test_ok,
         a.last_test_model,
@@ -683,8 +726,15 @@ export class PostgresControlStore implements ControlStore {
         AND (${filter.accountId ?? null}::text IS NULL OR a.id = ${filter.accountId ?? null})
       ORDER BY a.priority ASC, a.created_at DESC
     `;
+    const nowMs = Date.now();
     return rows.map((r) => {
       const subscriptionTier = SubscriptionTierSchema.catch("standard").parse(r.subscription_tier);
+      const lifecycle = {
+        status: r.status,
+        expiresAtIso: r.expires_at ? toIso(r.expires_at) : null,
+        autoPauseOnExpired: r.auto_pause_on_expired ?? true,
+        cooldownUntilIso: r.temp_unsched_until ? toIso(r.temp_unsched_until) : null,
+      };
       return {
         id: r.id,
         name: r.name,
@@ -699,7 +749,9 @@ export class PostgresControlStore implements ControlStore {
         credentialPreview: r.credential_preview || "****",
         maxConcurrency: r.max_concurrency,
         priority: r.priority,
-        status: r.status,
+        ...lifecycle,
+        effectiveStatus: effectiveAccountStatus(lifecycle, nowMs),
+        cooldownReason: r.temp_unsched_reason ?? "",
         window5hUsedBps: r.window_5h_used_bps ?? 0,
         window7dUsedBps: r.window_7d_used_bps ?? 0,
         lastTest:
@@ -712,16 +764,13 @@ export class PostgresControlStore implements ControlStore {
                 message: r.last_test_message ?? "",
               }
             : null,
+        lastUsedAtIso: r.last_used_at ? toIso(r.last_used_at) : null,
         createdAtIso: toIso(r.created_at),
       };
     });
   }
 
-  async createAccount(
-    req: CreateAccountRequest,
-    encryptedSecret: Uint8Array,
-    credentialPreview: string,
-  ): Promise<UpstreamAccount> {
+  async createAccount(req: CreateAccountRequest, credential: StoredCredential): Promise<UpstreamAccount> {
     if (!isSubscriptionTierAllowedForProvider(req.platform, req.subscriptionTier)) {
       throw new StoreError(
         "bad_request",
@@ -733,7 +782,8 @@ export class PostgresControlStore implements ControlStore {
       await this.sql`
         INSERT INTO core.accounts (
           id, name, notes, group_id, platform, execution_mode, auth_kind, subscription_tier,
-          credentials_enc, credential_preview, max_concurrency, priority, status
+          credentials_enc, credential_preview, credential_fingerprint, max_concurrency, priority, status,
+          expires_at, auto_pause_on_expired
         )
         VALUES (
           ${id},
@@ -744,11 +794,14 @@ export class PostgresControlStore implements ControlStore {
           ${req.executionMode},
           ${req.authKind},
           ${req.subscriptionTier},
-          ${Buffer.from(encryptedSecret)},
-          ${credentialPreview},
+          ${Buffer.from(credential.encrypted)},
+          ${credential.preview},
+          ${credential.fingerprint},
           ${req.maxConcurrency},
           ${req.priority},
-          'active'
+          ${req.status},
+          ${toDateOrNull(req.expiresAtIso)},
+          ${req.autoPauseOnExpired}
         )
       `;
       const created = await this.getAccount(id);
@@ -765,8 +818,7 @@ export class PostgresControlStore implements ControlStore {
   async updateAccount(
     accountId: string,
     req: UpdateAccountRequest,
-    encryptedSecret?: Uint8Array,
-    credentialPreview?: string,
+    credential?: StoredCredential,
   ): Promise<UpstreamAccount> {
     try {
       if (req.subscriptionTier !== undefined) {
@@ -783,7 +835,10 @@ export class PostgresControlStore implements ControlStore {
           );
         }
       }
-      const secretBuf = encryptedSecret ? Buffer.from(encryptedSecret) : null;
+      const secretBuf = credential ? Buffer.from(credential.encrypted) : null;
+      // Nullable columns need an explicit "was it sent" flag: COALESCE cannot write NULL.
+      const expiresAt = normalizeIso(req.expiresAtIso);
+      const cooldown = resolveCooldownChange(req);
       const rows = await this.sql<{ id: string }[]>`
         UPDATE core.accounts
         SET name = COALESCE(${req.name ?? null}, name),
@@ -795,8 +850,19 @@ export class PostgresControlStore implements ControlStore {
             max_concurrency = COALESCE(${req.maxConcurrency ?? null}, max_concurrency),
             priority = COALESCE(${req.priority ?? null}, priority),
             status = COALESCE(${req.status ?? null}, status),
+            expires_at = CASE
+              WHEN ${expiresAt !== undefined}::boolean THEN ${toDateOrNull(expiresAt)}::timestamptz
+              ELSE expires_at
+            END,
+            auto_pause_on_expired = COALESCE(${req.autoPauseOnExpired ?? null}::boolean, auto_pause_on_expired),
+            temp_unsched_until = CASE
+              WHEN ${cooldown.untilIso !== undefined}::boolean THEN ${toDateOrNull(cooldown.untilIso)}::timestamptz
+              ELSE temp_unsched_until
+            END,
+            temp_unsched_reason = COALESCE(${cooldown.reason ?? null}, temp_unsched_reason),
             credentials_enc = COALESCE(${secretBuf}, credentials_enc),
-            credential_preview = COALESCE(${credentialPreview ?? null}, credential_preview),
+            credential_preview = COALESCE(${credential?.preview ?? null}, credential_preview),
+            credential_fingerprint = COALESCE(${credential?.fingerprint ?? null}, credential_fingerprint),
             updated_at = NOW()
         WHERE id = ${accountId}
         RETURNING id
@@ -830,6 +896,81 @@ export class PostgresControlStore implements ControlStore {
           last_test_message = ${result.message}
       WHERE id = ${accountId}
     `;
+  }
+
+  async listAccountSecrets(accountIds?: string[]): Promise<AccountSecretRecord[]> {
+    type Row = { id: string; credentials_enc: Uint8Array; credential_fingerprint: string | null };
+    const rows = accountIds
+      ? await this.sql<Row[]>`
+          SELECT id, credentials_enc, credential_fingerprint
+          FROM core.accounts
+          WHERE id = ANY(${accountIds}::text[])
+          ORDER BY priority ASC, created_at DESC
+        `
+      : await this.sql<Row[]>`
+          SELECT id, credentials_enc, credential_fingerprint
+          FROM core.accounts
+          ORDER BY priority ASC, created_at DESC
+        `;
+    return rows.map((r) => ({
+      accountId: r.id,
+      encrypted: new Uint8Array(r.credentials_enc),
+      fingerprint: r.credential_fingerprint,
+    }));
+  }
+
+  async findAccountsByFingerprint(fingerprints: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (fingerprints.length === 0) return out;
+    const rows = await this.sql<{ id: string; credential_fingerprint: string }[]>`
+      SELECT id, credential_fingerprint
+      FROM core.accounts
+      WHERE credential_fingerprint = ANY(${fingerprints}::text[])
+      ORDER BY created_at ASC
+    `;
+    for (const r of rows) {
+      if (!out.has(r.credential_fingerprint)) out.set(r.credential_fingerprint, r.id);
+    }
+    return out;
+  }
+
+  async setCredentialFingerprint(accountId: string, fingerprint: string): Promise<void> {
+    await this.sql`
+      UPDATE core.accounts SET credential_fingerprint = ${fingerprint} WHERE id = ${accountId}
+    `;
+  }
+
+  async summarizeAccountUsage(sinceIso: string): Promise<AccountUsageSummaryItem[]> {
+    const rows = await this.sql<
+      {
+        account_id: string;
+        requests: string;
+        errors: string;
+        input_tokens: string;
+        output_tokens: string;
+        cost_nano_usd: string;
+      }[]
+    >`
+      SELECT
+        account_id,
+        COUNT(*)::text AS requests,
+        COUNT(*) FILTER (WHERE status_code >= 400)::text AS errors,
+        COALESCE(SUM(input_tokens), 0)::text AS input_tokens,
+        COALESCE(SUM(output_tokens), 0)::text AS output_tokens,
+        COALESCE(SUM(cost_nano_usd), 0)::text AS cost_nano_usd
+      FROM core.usage_logs
+      WHERE created_at >= ${new Date(sinceIso)}
+      GROUP BY account_id
+    `;
+    return rows.map((r) => ({
+      accountId: r.account_id,
+      requests: Number.parseInt(r.requests, 10),
+      errors: Number.parseInt(r.errors, 10),
+      inputTokens: Number.parseInt(r.input_tokens, 10),
+      outputTokens: Number.parseInt(r.output_tokens, 10),
+      // NUMERIC(39,0) sums print without a fraction; keep only the integer part regardless.
+      costNanoUsd: BigInt(r.cost_nano_usd.split(".")[0] || "0").toString(),
+    }));
   }
 
   async listUserApiKeys(userId: string): Promise<ApiKeyItem[]> {
@@ -1053,7 +1194,10 @@ export class PostgresControlStore implements ControlStore {
           credentials_enc_hex: string;
           max_concurrency: number;
           priority: number;
-          status: string;
+          status: UpstreamAccount["status"];
+          expires_at: Date | null;
+          auto_pause_on_expired: boolean | null;
+          temp_unsched_until: Date | null;
           window_5h_used_bps: number | null;
           window_7d_used_bps: number | null;
         }[]
@@ -1069,6 +1213,9 @@ export class PostgresControlStore implements ControlStore {
           a.max_concurrency,
           a.priority,
           a.status,
+          a.expires_at,
+          a.auto_pause_on_expired,
+          a.temp_unsched_until,
           q.window_5h_used_bps,
           q.window_7d_used_bps
         FROM core.accounts a
@@ -1112,8 +1259,9 @@ export class PostgresControlStore implements ControlStore {
       `,
     ]);
 
+    const nowMs = Date.now();
     return {
-      revisionUnixMs: Date.now(),
+      revisionUnixMs: nowMs,
       groups: groups.map((g) => ({
         id: g.id,
         platform: g.platform,
@@ -1138,7 +1286,16 @@ export class PostgresControlStore implements ControlStore {
           credentialsEncHex: a.credentials_enc_hex,
           maxConcurrency: a.max_concurrency,
           priority: a.priority,
-          status: a.status,
+          // The data plane only schedules "active"; expiry and cooldown deadlines resolve here.
+          status: effectiveAccountStatus(
+            {
+              status: a.status,
+              expiresAtIso: a.expires_at ? toIso(a.expires_at) : null,
+              autoPauseOnExpired: a.auto_pause_on_expired ?? true,
+              cooldownUntilIso: a.temp_unsched_until ? toIso(a.temp_unsched_until) : null,
+            },
+            nowMs,
+          ),
           window5hUsedBps: a.window_5h_used_bps ?? 0,
           window7dUsedBps: a.window_7d_used_bps ?? 0,
         };
@@ -1260,7 +1417,8 @@ export class PostgresControlStore implements ControlStore {
       const totalTokens = ev.inputTokens + ev.outputTokens;
       await tx`
         INSERT INTO core.account_window_quotas (
-          account_id, window_5h_used_bps, window_7d_used_bps, lifetime_tokens, lifetime_cost_nano_usd, updated_at
+          account_id, window_5h_used_bps, window_7d_used_bps, lifetime_tokens, lifetime_cost_nano_usd,
+          last_used_at, updated_at
         )
         VALUES (
           ${ev.accountId},
@@ -1268,6 +1426,7 @@ export class PostgresControlStore implements ControlStore {
           ${ev.window7dUsedBps},
           ${totalTokens},
           ${costNano.toString()}::numeric,
+          NOW(),
           NOW()
         )
         ON CONFLICT (account_id) DO UPDATE SET
@@ -1281,6 +1440,7 @@ export class PostgresControlStore implements ControlStore {
           END,
           lifetime_tokens = core.account_window_quotas.lifetime_tokens + EXCLUDED.lifetime_tokens,
           lifetime_cost_nano_usd = core.account_window_quotas.lifetime_cost_nano_usd + EXCLUDED.lifetime_cost_nano_usd,
+          last_used_at = NOW(),
           updated_at = NOW()
       `;
 
@@ -1293,7 +1453,7 @@ export class PostgresControlStore implements ControlStore {
     });
   }
 
-  async listUsageLogs(filter?: { userId?: string; limit?: number; sinceIso?: string }): Promise<UsageLogItem[]> {
+  async listUsageLogs(filter?: UsageLogFilter): Promise<UsageLogItem[]> {
     const cap = filter?.sinceIso ? 100_000 : 200;
     const limit = Math.max(1, Math.min(cap, filter?.limit ?? 50));
     const since = filter?.sinceIso ? new Date(filter.sinceIso) : null;
@@ -1328,6 +1488,7 @@ export class PostgresControlStore implements ControlStore {
         cost_nano_usd::text, ttft_ms, duration_ms, status_code, created_at
       FROM core.usage_logs
       WHERE (${filter?.userId ?? null}::text IS NULL OR user_id = ${filter?.userId ?? null})
+        AND (${filter?.accountId ?? null}::text IS NULL OR account_id = ${filter?.accountId ?? null})
         AND (${since}::timestamptz IS NULL OR created_at >= ${since}::timestamptz)
       ORDER BY created_at DESC
       LIMIT ${limit}
