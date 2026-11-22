@@ -41,11 +41,20 @@ Slipgate/
 
 ## 快速开始
 
+> **必须先配置密钥**：`SLIPGATE_JWT_SECRET` 与 `SLIPGATE_VAULT_SECRET` 未设置、仍是 `.env.example` 占位值、内置默认值或短于 32 字节时，`slipgate` 与 `slipgate-bff` 会拒绝启动。Compose 部署在 `deploy/` 下执行一次：
+>
+> ```bash
+> cp .env.example .env
+> sed -i "s|^SLIPGATE_JWT_SECRET=.*|SLIPGATE_JWT_SECRET=$(openssl rand -hex 32)|; s|^SLIPGATE_VAULT_SECRET=.*|SLIPGATE_VAULT_SECRET=$(openssl rand -hex 32)|" .env
+> ```
+>
+> `install.sh` 会自动生成。`SLIPGATE_VAULT_SECRET` 用于加密已存储的账户凭据，请备份，且有账户后不要更换。仅本地开发可设置 `SLIPGATE_ALLOW_INSECURE_SECRETS=true`，以警告代替拒绝启动。
+
 ### 方式一：拉取预构建生产镜像一键部署（免源码编译）
 
 ```bash
 cd deploy
-cp .env.example .env
+cp .env.example .env   # 并按上文生成两个密钥
 # 默认拉取 ghcr.io/dreamforsh/slipgate:latest
 docker compose -f docker-compose.prod.yml up -d
 # 若需启用 dev 仓库自动热更新通道：
@@ -66,6 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/dreamforSh/Slipgate/main/deploy/ins
 
 ```bash
 cd deploy
+cp .env.example .env   # 并按上文生成两个密钥
 docker compose up --build -d
 # 访问统一入口：http://127.0.0.1:8080
 # 就绪探针：curl http://127.0.0.1:8080/readyz
@@ -79,7 +89,7 @@ docker compose up --build -d
    ```bash
    echo "<YOUR_GITHUB_PAT>" | docker login ghcr.io -u <YOUR_GITHUB_USER> --password-stdin
    # 下载或克隆 deploy/ 目录后：
-   cd deploy && cp .env.example .env
+   cd deploy && cp .env.example .env   # 并按上文生成两个密钥
    # 若需开启私有仓库 dev 自动热更新，在 .env 中填写 SLIPGATE_GITHUB_TOKEN=<YOUR_GITHUB_PAT>
    SLIPGATE_IMAGE_TAG=dev docker compose -f docker-compose.prod.yml up -d
    ```
@@ -92,7 +102,8 @@ docker compose up --build -d
 3. **服务器克隆私有源码本地构建（无需 GHCR 登录）**：
    ```bash
    git clone git@github.com:dreamforSh/Slipgate.git && cd Slipgate/deploy
-   cp .env.example .env && docker compose up --build -d
+   cp .env.example .env   # 并按上文生成两个密钥
+   docker compose up --build -d
    ```
 
 ---
@@ -122,13 +133,14 @@ bun install
 
 # 一键编译所有层到 bin/ 并启动单服务
 bun run build
-./bin/slipgate
+SLIPGATE_ALLOW_INSECURE_SECRETS=true ./bin/slipgate   # 本地开发；部署时改为设置真实密钥
 ```
 
 Windows PowerShell 若仅安装了 Go / 部分工具链，也可运行分步构建脚本：
 
 ```powershell
 .\scripts\build.ps1
+$env:SLIPGATE_ALLOW_INSECURE_SECRETS = "true"   # 仅本地开发
 .\bin\slipgate.exe --allow-degraded
 ```
 

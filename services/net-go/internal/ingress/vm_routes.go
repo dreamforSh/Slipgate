@@ -371,6 +371,8 @@ func mapVmErrorStatus(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, vmslot.ErrSlotEgressUnavailable):
 		return http.StatusServiceUnavailable
+	case errors.Is(err, vmslot.ErrSSHHostKeyMismatch):
+		return http.StatusBadGateway
 	case errors.Is(err, vmslot.ErrInvalidHardwarePersona),
 		errors.Is(err, vmslot.ErrMigrationUnsupported):
 		return http.StatusBadRequest

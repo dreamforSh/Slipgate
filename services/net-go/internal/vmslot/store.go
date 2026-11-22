@@ -27,21 +27,25 @@ var (
 
 // ClusterNode describes a local or remote agentless-SSH hypervisor host.
 type ClusterNode struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	DriverKind    string            `json:"driverKind"` // "local" | "ssh"
-	SSHAddr       string            `json:"sshAddr"`
-	SSHUser       string            `json:"sshUser"`
-	SSHKeyPEM     string            `json:"sshKeyPem,omitempty"`
-	HasSSHKey     bool              `json:"hasSSHKey"`
-	Arch          string            `json:"arch"`
-	KVMCapable    bool              `json:"kvmCapable"`
-	DockerCapable bool              `json:"dockerCapable"`
-	Status        string            `json:"status"`
-	MaxSlots      int               `json:"maxSlots"`
-	Labels        map[string]string `json:"labels,omitempty"`
-	CreatedAt     time.Time         `json:"createdAtIso"`
-	UpdatedAt     time.Time         `json:"updatedAtIso"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	DriverKind string `json:"driverKind"` // "local" | "ssh"
+	SSHAddr    string `json:"sshAddr"`
+	SSHUser    string `json:"sshUser"`
+	SSHKeyPEM  string `json:"sshKeyPem,omitempty"`
+	HasSSHKey  bool   `json:"hasSSHKey"`
+	// SSHHostKey is the pinned server host key ("<type> <base64>"): admin-supplied or recorded
+	// on first connect. Empty means the next connection pins whatever the server presents.
+	SSHHostKey            string            `json:"sshHostKey,omitempty"`
+	SSHHostKeyFingerprint string            `json:"sshHostKeyFingerprint,omitempty"`
+	Arch                  string            `json:"arch"`
+	KVMCapable            bool              `json:"kvmCapable"`
+	DockerCapable         bool              `json:"dockerCapable"`
+	Status                string            `json:"status"`
+	MaxSlots              int               `json:"maxSlots"`
+	Labels                map[string]string `json:"labels,omitempty"`
+	CreatedAt             time.Time         `json:"createdAtIso"`
+	UpdatedAt             time.Time         `json:"updatedAtIso"`
 }
 
 // SlotSeed holds sanitized environment, settings, auth JSON, and bootstrap scripts synced into a VM slot.
@@ -89,6 +93,9 @@ type VmStore interface {
 	ListClusterNodes(ctx context.Context) ([]ClusterNode, error)
 	GetClusterNode(ctx context.Context, nodeID string) (ClusterNode, error)
 	UpsertClusterNode(ctx context.Context, node ClusterNode) error
+	// PinClusterNodeHostKey stores hostKey only if the node has none yet and returns the key
+	// that is pinned afterwards (the earlier one when another caller won the race).
+	PinClusterNodeHostKey(ctx context.Context, nodeID, hostKey string) (string, error)
 	DeleteClusterNode(ctx context.Context, nodeID string) error
 	ListSlots(ctx context.Context) ([]Slot, error)
 	UpsertSlot(ctx context.Context, slot Slot) error
@@ -122,7 +129,7 @@ func NewMemoryVmStore() *MemoryVmStore {
 }
 
 func (m *MemoryVmStore) Init(context.Context) error { return nil }
-func (m *MemoryVmStore) Close() error              { return nil }
+func (m *MemoryVmStore) Close() error               { return nil }
 
 func (m *MemoryVmStore) ListClusterNodes(context.Context) ([]ClusterNode, error) {
 	m.mu.RLock()
@@ -160,8 +167,25 @@ func (m *MemoryVmStore) UpsertClusterNode(_ context.Context, node ClusterNode) e
 	if node.SSHKeyPEM != "" {
 		node.HasSSHKey = true
 	}
+	node.SSHHostKeyFingerprint = SSHHostKeyFingerprint(node.SSHHostKey)
 	m.nodes[node.ID] = cloneClusterNode(node)
 	return nil
+}
+
+func (m *MemoryVmStore) PinClusterNodeHostKey(_ context.Context, nodeID, hostKey string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node, ok := m.nodes[nodeID]
+	if !ok {
+		return "", ErrClusterNodeNotFound
+	}
+	if node.SSHHostKey == "" {
+		node.SSHHostKey = hostKey
+		node.SSHHostKeyFingerprint = SSHHostKeyFingerprint(hostKey)
+		node.UpdatedAt = time.Now().UTC()
+		m.nodes[nodeID] = node
+	}
+	return node.SSHHostKey, nil
 }
 
 func (m *MemoryVmStore) DeleteClusterNode(_ context.Context, nodeID string) error {
@@ -319,6 +343,7 @@ CREATE TABLE IF NOT EXISTS net.cluster_nodes (
     driver_kind     TEXT NOT NULL DEFAULT 'local',
     ssh_user        TEXT NOT NULL DEFAULT 'root',
     ssh_key_enc     BYTEA,
+    ssh_host_key    TEXT NOT NULL DEFAULT '',
     max_slots       INTEGER NOT NULL DEFAULT 16,
     labels          JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -329,6 +354,7 @@ ALTER TABLE net.cluster_nodes
     ADD COLUMN IF NOT EXISTS driver_kind TEXT NOT NULL DEFAULT 'local',
     ADD COLUMN IF NOT EXISTS ssh_user TEXT NOT NULL DEFAULT 'root',
     ADD COLUMN IF NOT EXISTS ssh_key_enc BYTEA,
+    ADD COLUMN IF NOT EXISTS ssh_host_key TEXT NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS max_slots INTEGER NOT NULL DEFAULT 16,
     ADD COLUMN IF NOT EXISTS labels JSONB NOT NULL DEFAULT '{}'::jsonb;
 
@@ -422,7 +448,7 @@ CREATE TABLE IF NOT EXISTS net.vm_terminal_audit (
 
 func (p *PostgresVmStore) ListClusterNodes(ctx context.Context) ([]ClusterNode, error) {
 	rows, err := p.db.QueryContext(ctx, `
-		SELECT id, name, driver_kind, ssh_addr, ssh_user, ssh_key_enc,
+		SELECT id, name, driver_kind, ssh_addr, ssh_user, ssh_key_enc, ssh_host_key,
 		       arch, kvm_capable, docker_capable, status, max_slots, labels,
 		       created_at, updated_at
 		FROM net.cluster_nodes
@@ -441,12 +467,13 @@ func (p *PostgresVmStore) ListClusterNodes(ctx context.Context) ([]ClusterNode, 
 			labelsRaw []byte
 		)
 		if err := rows.Scan(
-			&n.ID, &n.Name, &n.DriverKind, &n.SSHAddr, &n.SSHUser, &keyEnc,
+			&n.ID, &n.Name, &n.DriverKind, &n.SSHAddr, &n.SSHUser, &keyEnc, &n.SSHHostKey,
 			&n.Arch, &n.KVMCapable, &n.DockerCapable, &n.Status, &n.MaxSlots, &labelsRaw,
 			&n.CreatedAt, &n.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
+		n.SSHHostKeyFingerprint = SSHHostKeyFingerprint(n.SSHHostKey)
 		if len(keyEnc) > 0 {
 			n.HasSSHKey = true
 			if plain, decErr := p.vault.decrypt(keyEnc); decErr == nil {
@@ -496,15 +523,16 @@ func (p *PostgresVmStore) UpsertClusterNode(ctx context.Context, node ClusterNod
 	}
 	_, err := p.db.ExecContext(ctx, `
 		INSERT INTO net.cluster_nodes (
-			id, name, driver_kind, ssh_addr, ssh_user, ssh_key_enc,
+			id, name, driver_kind, ssh_addr, ssh_user, ssh_key_enc, ssh_host_key,
 			arch, kvm_capable, docker_capable, status, max_slots, labels, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $13, $7, $8, $9, $10, $11, $12::jsonb, NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			name = EXCLUDED.name,
 			driver_kind = EXCLUDED.driver_kind,
 			ssh_addr = EXCLUDED.ssh_addr,
 			ssh_user = EXCLUDED.ssh_user,
 			ssh_key_enc = COALESCE(EXCLUDED.ssh_key_enc, net.cluster_nodes.ssh_key_enc),
+			ssh_host_key = EXCLUDED.ssh_host_key,
 			arch = EXCLUDED.arch,
 			kvm_capable = EXCLUDED.kvm_capable,
 			docker_capable = EXCLUDED.docker_capable,
@@ -515,8 +543,25 @@ func (p *PostgresVmStore) UpsertClusterNode(ctx context.Context, node ClusterNod
 	`,
 		node.ID, node.Name, node.DriverKind, node.SSHAddr, node.SSHUser, keyEnc,
 		node.Arch, node.KVMCapable, node.DockerCapable, node.Status, node.MaxSlots, labelsJSON,
+		node.SSHHostKey,
 	)
 	return err
+}
+
+func (p *PostgresVmStore) PinClusterNodeHostKey(ctx context.Context, nodeID, hostKey string) (string, error) {
+	if _, err := p.db.ExecContext(ctx, `
+		UPDATE net.cluster_nodes
+		SET ssh_host_key = $2, updated_at = NOW()
+		WHERE id = $1 AND ssh_host_key = ''
+	`, nodeID, hostKey); err != nil {
+		return "", err
+	}
+	var pinned string
+	err := p.db.QueryRowContext(ctx, `SELECT ssh_host_key FROM net.cluster_nodes WHERE id = $1`, nodeID).Scan(&pinned)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrClusterNodeNotFound
+	}
+	return pinned, err
 }
 
 func (p *PostgresVmStore) DeleteClusterNode(ctx context.Context, nodeID string) error {

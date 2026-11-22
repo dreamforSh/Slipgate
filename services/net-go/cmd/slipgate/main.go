@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -50,6 +51,17 @@ func main() {
 	}
 	if *devMode {
 		cfg.Mode = "dev"
+	}
+
+	if problems := cfg.SecretProblems(); len(problems) > 0 {
+		summary := strings.Join(problems, "; ")
+		if !cfg.AllowInsecureSecrets {
+			logger.Fatalf("[security] refusing to start: %s. Generate each secret with `openssl rand -hex 32` "+
+				"(keep SLIPGATE_VAULT_SECRET stable once accounts exist: it decrypts stored credentials), "+
+				"or set SLIPGATE_ALLOW_INSECURE_SECRETS=true for local development only", summary)
+		}
+		logger.Printf("[security] WARNING: running with weak secrets because SLIPGATE_ALLOW_INSECURE_SECRETS=true: %s. "+
+			"Never expose this instance.", summary)
 	}
 
 	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

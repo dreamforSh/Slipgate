@@ -137,9 +137,22 @@ cp -R "${BUNDLE_DIR}/." "${PREFIX}/"
 chmod 0755 "${PREFIX}/slipgate" "${PREFIX}/slipgate-core" "${PREFIX}/slipgate-guestd" "${PREFIX}/slipgate-bff"
 ln -sf "${PREFIX}/slipgate" /usr/local/bin/slipgate
 
+gen_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+  fi
+}
+
 if [[ ! -f /etc/slipgate/slipgate.env ]]; then
   cp "${PREFIX}/deploy/.env.example" /etc/slipgate/slipgate.env
   chmod 0600 /etc/slipgate/slipgate.env
+  # slipgate refuses to start on the .env.example placeholders, so mint real secrets now.
+  sed -i \
+    -e "s|^SLIPGATE_JWT_SECRET=.*|SLIPGATE_JWT_SECRET=$(gen_secret)|" \
+    -e "s|^SLIPGATE_VAULT_SECRET=.*|SLIPGATE_VAULT_SECRET=$(gen_secret)|" \
+    /etc/slipgate/slipgate.env
   if [[ "$CHANNEL" == "dev" ]]; then
     {
       echo ""
@@ -153,7 +166,8 @@ if [[ ! -f /etc/slipgate/slipgate.env ]]; then
   if [[ -n "$GITHUB_PAT" ]]; then
     echo "SLIPGATE_GITHUB_TOKEN=${GITHUB_PAT}" >> /etc/slipgate/slipgate.env
   fi
-  echo "==> Created default /etc/slipgate/slipgate.env (0600; update secrets & DATABASE_URL before production use)"
+  echo "==> Created /etc/slipgate/slipgate.env (0600) with freshly generated JWT/vault secrets; set DATABASE_URL before production use"
+  echo "    Back up SLIPGATE_VAULT_SECRET: stored account credentials cannot be decrypted without it."
 fi
 
 if [[ "$USE_SYSTEMD" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
