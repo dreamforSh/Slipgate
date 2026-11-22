@@ -1,6 +1,11 @@
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import {
+  AccountBatchDeleteRequestSchema,
+  AccountBulkUpdateRequestSchema,
+  AccountTestEventSchema,
+  AccountTestRequestSchema,
+  DashboardRangeSchema,
   AuthLoginRequestSchema,
   AuthRegisterRequestSchema,
   AuthSessionResponseSchema,
@@ -36,6 +41,8 @@ import {
   UpdateVmSeedRequestSchema,
   UpdateVmTelemetryRequestSchema,
   VmSlotSummarySchema,
+  type AccountBulkResult,
+  type AccountTestResult,
   type ClashExitNode,
   type ClusterNode,
   type CompositeRouteRule,
@@ -45,6 +52,7 @@ import {
   type VmSlotSummary,
 } from "@slipgate/contracts";
 import { PluginRegistry } from "@slipgate/plugin-sdk";
+import { buildDashboardStats, dashboardWindow, DASHBOARD_MAX_ROWS } from "./dashboard.ts";
 import { requireAdmin, requireAuth, type AuthEnv } from "./middleware/auth.ts";
 import {
   encryptSecret,
@@ -656,7 +664,8 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   app.use("/api/v1/user/*", requireAuth(jwtSecret));
 
   app.get("/api/v1/user/groups", async (c) => {
-    const groups = await store.listGroups(true);
+    const claims = c.get("authUser");
+    const groups = (await store.listGroups(true)).filter((g) => claims.role === "admin" || !g.isExclusive);
     return c.json({ groups });
   });
 
@@ -686,6 +695,12 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     const parsed = CreateApiKeyRequestSchema.safeParse(raw);
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    if (claims.role !== "admin") {
+      const group = (await store.listGroups(true)).find((g) => g.id === parsed.data.groupId);
+      if (group?.isExclusive) {
+        return c.json({ error: "forbidden", message: "This group is reserved for administrators" }, 403);
+      }
     }
     const { plaintextKey, keyPrefix, keyHash } = await generateApiKey();
     const item = await store.createApiKey(claims.sub, parsed.data, keyPrefix, keyHash);
@@ -918,6 +933,12 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return c.json({ deleted: true, groupId });
   });
 
+  app.post("/api/v1/admin/groups/:groupId/duplicate", async (c) => {
+    const group = await store.duplicateGroup(c.req.param("groupId"));
+    await syncDataPlaneBestEffort();
+    return c.json({ group }, 201);
+  });
+
   app.get("/api/v1/admin/accounts", async (c) => {
     const groupId = c.req.query("groupId");
     const executionMode = c.req.query("executionMode");
@@ -964,6 +985,199 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     await store.deleteAccount(accountId);
     await syncDataPlaneBestEffort();
     return c.json({ deleted: true, accountId });
+  });
+
+  async function runAccountBatch(
+    accountIds: string[],
+    op: (accountId: string) => Promise<unknown>,
+  ): Promise<AccountBulkResult> {
+    const results: AccountBulkResult["results"] = [];
+    for (const id of new Set(accountIds)) {
+      try {
+        await op(id);
+        results.push({ id, ok: true });
+      } catch (err) {
+        results.push({ id, ok: false, message: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    const success = results.filter((r) => r.ok).length;
+    if (success > 0) {
+      await syncDataPlaneBestEffort();
+    }
+    return { success, failed: results.length - success, results };
+  }
+
+  app.post("/api/v1/admin/accounts/bulk-update", async (c) => {
+    const parsed = AccountBulkUpdateRequestSchema.safeParse(await readJsonBody(c.req.raw));
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const { accountIds, patch } = parsed.data;
+    return c.json(await runAccountBatch(accountIds, (id) => store.updateAccount(id, patch)));
+  });
+
+  app.post("/api/v1/admin/accounts/batch-delete", async (c) => {
+    const parsed = AccountBatchDeleteRequestSchema.safeParse(await readJsonBody(c.req.raw));
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    return c.json(await runAccountBatch(parsed.data.accountIds, (id) => store.deleteAccount(id)));
+  });
+
+  /**
+   * Streams a connectivity test for one non-VM account as text/event-stream.
+   * The request leaves through the Go data plane (account persona, uTLS profile and bound exit IP),
+   * never from the BFF host. The final done/error event is persisted as the account's lastTest.
+   */
+  app.post("/api/v1/admin/accounts/:accountId/test", async (c) => {
+    const accountId = c.req.param("accountId");
+    const bodyText = await c.req.text();
+    let raw: unknown = {};
+    if (bodyText.trim()) {
+      try {
+        raw = JSON.parse(bodyText);
+      } catch {
+        return c.json({ error: "invalid_request", message: "Malformed JSON request body" }, 400);
+      }
+    }
+    const parsed = AccountTestRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const account = await store.getAccount(accountId);
+    if (!account) {
+      return c.json({ error: "not_found", message: `Account ${accountId} not found` }, 404);
+    }
+    if (account.executionMode === "vm_slot") {
+      return c.json({ error: "vm_slot_unsupported", message: "VM slot accounts are tested from their slot" }, 400);
+    }
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    if (!internalUrl || !internalToken) {
+      return c.json(
+        {
+          error: "net_supervisor_unconfigured",
+          message: "Account tests run through the network service, which is not configured in standalone BFF mode",
+        },
+        503,
+      );
+    }
+
+    // Make sure the data plane vault holds the latest credentials before probing.
+    await syncDataPlaneBestEffort();
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(`${internalUrl}/internal/net/accounts/${encodeURIComponent(accountId)}/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Slipgate-Internal-Token": internalToken },
+        body: JSON.stringify(parsed.data),
+        signal: AbortSignal.timeout(120_000),
+      });
+    } catch (err) {
+      return c.json(
+        { error: "net_supervisor_unreachable", message: err instanceof Error ? err.message : String(err) },
+        502,
+      );
+    }
+    const contentType = upstream.headers.get("content-type") ?? "";
+    if (!upstream.ok || !upstream.body || !contentType.includes("text/event-stream")) {
+      const payload = (await upstream.json().catch(() => ({}))) as { error?: string; message?: string };
+      return c.json(
+        { error: payload.error ?? "net_supervisor_error", message: payload.message ?? `HTTP ${upstream.status}` },
+        toForwardStatus(upstream.status),
+      );
+    }
+
+    const startedAt = Date.now();
+    let model = parsed.data.model ?? "";
+    let outcome: AccountTestResult | null = null;
+    let buffered = "";
+    const decoder = new TextDecoder();
+    const observe = (text: string) => {
+      buffered += text;
+      let nl = buffered.indexOf("\n");
+      while (nl >= 0) {
+        const line = buffered.slice(0, nl).trim();
+        buffered = buffered.slice(nl + 1);
+        nl = buffered.indexOf("\n");
+        if (!line.startsWith("data:")) continue;
+        let json: unknown;
+        try {
+          json = JSON.parse(line.slice(5).trim());
+        } catch {
+          continue;
+        }
+        const ev = AccountTestEventSchema.safeParse(json);
+        if (!ev.success) continue;
+        const e = ev.data;
+        if (e.type === "start" && e.model) model = e.model;
+        if (e.type === "done" || e.type === "error") {
+          const ok = e.type === "done" && e.success === true;
+          outcome = {
+            ok,
+            atIso: new Date().toISOString(),
+            model,
+            durationMs: Math.max(0, Math.round(e.durationMs ?? Date.now() - startedAt)),
+            message: ok ? "" : (e.message ?? e.code ?? (e.status ? `HTTP ${e.status}` : "test failed")).slice(0, 500),
+          };
+        }
+      }
+    };
+
+    const relay = upstream.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          controller.enqueue(chunk);
+          observe(decoder.decode(chunk, { stream: true }));
+        },
+        async flush() {
+          observe(decoder.decode());
+          if (outcome) {
+            await store.recordAccountTestResult(accountId, outcome).catch(() => undefined);
+          }
+        },
+      }),
+    );
+    return new Response(relay, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  });
+
+  /**
+   * Aggregated console statistics. `range` = 24h (hourly buckets) | 7d | 30d (daily buckets);
+   * `tz` = the viewer's Date#getTimezoneOffset() so "today" and day buckets follow local time.
+   */
+  app.get("/api/v1/admin/dashboard/stats", async (c) => {
+    const range = DashboardRangeSchema.catch("7d").parse(c.req.query("range") ?? "7d");
+    const tzRaw = Number.parseInt(c.req.query("tz") ?? "0", 10);
+    const tzOffsetMinutes = Number.isFinite(tzRaw) ? Math.max(-14 * 60, Math.min(14 * 60, tzRaw)) : 0;
+    const nowMs = Date.now();
+    const win = dashboardWindow(range, nowMs, tzOffsetMinutes);
+    const [logs, users, groups, accounts, snapshot] = await Promise.all([
+      store.listUsageLogs({ sinceIso: new Date(win.sinceMs).toISOString(), limit: DASHBOARD_MAX_ROWS }),
+      store.listUsers(),
+      store.listGroups(false),
+      store.listAccounts(),
+      store.exportDataPlaneSnapshot(),
+    ]);
+    return c.json(
+      buildDashboardStats({
+        range,
+        nowMs,
+        tzOffsetMinutes,
+        logs,
+        truncated: logs.length >= DASHBOARD_MAX_ROWS,
+        users,
+        groups,
+        accounts,
+        apiKeys: snapshot.apiKeys,
+      }),
+    );
   });
 
   app.get("/api/v1/admin/users", async (c) => {

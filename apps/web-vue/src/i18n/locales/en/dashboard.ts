@@ -3,6 +3,73 @@ import type zh from "../zh-CN/dashboard";
 const en: typeof zh = {
   dashboard: {
     title: "Dashboard",
+    updatedAt: "Updated {time}",
+    loadFailed: "Couldn't load statistics. Retrying automatically.",
+    sections: {
+      system: "System status",
+    },
+    range: {
+      h24: "24 hours",
+      d7: "7 days",
+      d30: "30 days",
+    },
+    metric: {
+      requests: "Requests",
+      tokens: "Tokens",
+      cost: "Spend",
+      input: "Input",
+      output: "Output",
+    },
+    kpi: {
+      todayRequests: "Requests today",
+      vsYesterday: "vs yesterday",
+      noRequestsToday: "No requests today",
+      successRate: "{rate}% success",
+      todayTokens: "Tokens today",
+      tokenSplit: "In {input} · Out {output}",
+      todayCost: "Spend today",
+      periodCost: "Last {range}: {cost}",
+      activeUsers: "Active users today",
+      userSplit: "{new} new · {total} total",
+      throughput: "Live throughput",
+      tpm: "{tpm} tokens / min",
+      avgLatency: "Avg response today",
+      ttft: "First token {ttft}",
+      apiKeys: "API keys",
+      keysHint: "Enabled / total",
+      accounts: "Available accounts",
+      failedTests: "{count} accounts failed their test",
+      allHealthy: "Accounts look healthy",
+    },
+    health: {
+      active: "Active",
+      paused: "Paused",
+      cooldown: "Cooling down",
+      expired: "Expired",
+    },
+    trend: {
+      requests: "Requests over time",
+      tokens: "Tokens over time",
+      cost: "Spend over time",
+      showTable: "Show as table",
+      showChart: "Show as chart",
+      empty: "No requests in this period",
+      time: "Time",
+    },
+    models: {
+      title: "Model usage",
+    },
+    topUsers: {
+      title: "Top spenders",
+    },
+    groups: {
+      title: "Group usage",
+      manage: "Groups",
+    },
+    breakdown: {
+      meta: "{requests} requests · {tokens} tokens · {cost}",
+      empty: "No data yet",
+    },
     planes: {
       net: "Network",
       core: "Core engine",

@@ -2,6 +2,7 @@ import {
   formatNanoUsd,
   isSubscriptionTierAllowedForProvider,
   subscriptionTierMultiplier,
+  type AccountTestResult,
   type ApiKeyItem,
   type CreateAccountRequest,
   type CreateApiKeyRequest,
@@ -33,6 +34,8 @@ function bytesToHex(bytes: Uint8Array): string {
   return out;
 }
 
+type InternalGroup = Omit<GroupItem, "accountCount" | "activeAccountCount" | "apiKeyCount">;
+
 interface InternalAccount extends Omit<UpstreamAccount, "groupName"> {
   credentialsEnc: Uint8Array;
 }
@@ -56,7 +59,7 @@ export class MemoryControlStore implements ControlStore {
   private readonly users = new Map<string, StoredUserRecord>();
   private readonly wallets = new Map<string, InternalWallet>();
   private readonly idempotencyKeys = new Set<string>();
-  private readonly groups = new Map<string, Omit<GroupItem, "accountCount">>();
+  private readonly groups = new Map<string, InternalGroup>();
   private readonly accounts = new Map<string, InternalAccount>();
   private readonly apiKeys = new Map<string, InternalApiKey>();
   private readonly routes = new Map<string, StoredCompositeRoute>();
@@ -105,10 +108,13 @@ export class MemoryControlStore implements ControlStore {
       this.groups.set(defaultGroupId, {
         id: defaultGroupId,
         name: "default-composite",
+        description: "",
         platform: "composite",
         subscriptionType: "balance",
         rateMultiplier: 1,
         modelAllowlist: [],
+        isExclusive: false,
+        sortOrder: 0,
         enabled: true,
         createdAtIso: now,
       });
@@ -211,38 +217,54 @@ export class MemoryControlStore implements ControlStore {
     return this.getWallet(userId);
   }
 
-  async listGroups(enabledOnly = false): Promise<GroupItem[]> {
-    const counts = new Map<string, number>();
+  private withGroupCounts(g: InternalGroup): GroupItem {
+    let accountCount = 0;
+    let activeAccountCount = 0;
     for (const acc of this.accounts.values()) {
-      counts.set(acc.groupId, (counts.get(acc.groupId) ?? 0) + 1);
+      if (acc.groupId !== g.id) continue;
+      accountCount += 1;
+      if (acc.status === "active") activeAccountCount += 1;
     }
+    let apiKeyCount = 0;
+    for (const key of this.apiKeys.values()) {
+      if (key.groupId === g.id) apiKeyCount += 1;
+    }
+    return { ...g, modelAllowlist: [...g.modelAllowlist], accountCount, activeAccountCount, apiKeyCount };
+  }
+
+  private assertGroupNameFree(name: string, exceptId?: string) {
+    for (const [id, g] of this.groups.entries()) {
+      if (id !== exceptId && g.name.toLowerCase() === name.toLowerCase()) {
+        throw new StoreError("conflict", `Group "${name}" already exists`);
+      }
+    }
+  }
+
+  async listGroups(enabledOnly = false): Promise<GroupItem[]> {
     return Array.from(this.groups.values())
       .filter((g) => !enabledOnly || g.enabled)
-      .map((g) => ({
-        ...g,
-        accountCount: counts.get(g.id) ?? 0,
-      }));
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAtIso.localeCompare(b.createdAtIso))
+      .map((g) => this.withGroupCounts(g));
   }
 
   async createGroup(req: CreateGroupRequest): Promise<GroupItem> {
-    for (const g of this.groups.values()) {
-      if (g.name.toLowerCase() === req.name.toLowerCase()) {
-        throw new StoreError("conflict", `Group "${req.name}" already exists`);
-      }
-    }
+    this.assertGroupNameFree(req.name);
     const id = `grp_${crypto.randomUUID()}`;
-    const item = {
+    const item: InternalGroup = {
       id,
       name: req.name,
+      description: req.description,
       platform: req.platform,
       subscriptionType: req.subscriptionType,
       rateMultiplier: req.rateMultiplier,
       modelAllowlist: [...req.modelAllowlist],
+      isExclusive: req.isExclusive,
+      sortOrder: req.sortOrder,
       enabled: req.enabled,
       createdAtIso: new Date().toISOString(),
     };
     this.groups.set(id, item);
-    return { ...item, accountCount: 0 };
+    return this.withGroupCounts(item);
   }
 
   async updateGroup(groupId: string, req: UpdateGroupRequest): Promise<GroupItem> {
@@ -250,19 +272,18 @@ export class MemoryControlStore implements ControlStore {
     if (!existing) {
       throw new StoreError("not_found", `Group ${groupId} not found`);
     }
-    if (req.name) {
-      for (const [id, g] of this.groups.entries()) {
-        if (id !== groupId && g.name.toLowerCase() === req.name.toLowerCase()) {
-          throw new StoreError("conflict", `Group "${req.name}" already exists`);
-        }
-      }
+    if (req.name !== undefined) {
+      this.assertGroupNameFree(req.name, groupId);
       existing.name = req.name;
     }
+    if (req.description !== undefined) existing.description = req.description;
+    if (req.subscriptionType !== undefined) existing.subscriptionType = req.subscriptionType;
     if (req.rateMultiplier !== undefined) existing.rateMultiplier = req.rateMultiplier;
     if (req.modelAllowlist !== undefined) existing.modelAllowlist = [...req.modelAllowlist];
+    if (req.isExclusive !== undefined) existing.isExclusive = req.isExclusive;
+    if (req.sortOrder !== undefined) existing.sortOrder = req.sortOrder;
     if (req.enabled !== undefined) existing.enabled = req.enabled;
-    const all = await this.listGroups();
-    return all.find((g) => g.id === groupId)!;
+    return this.withGroupCounts(existing);
   }
 
   async deleteGroup(groupId: string): Promise<void> {
@@ -287,6 +308,28 @@ export class MemoryControlStore implements ControlStore {
     this.groups.delete(groupId);
   }
 
+  async duplicateGroup(groupId: string): Promise<GroupItem> {
+    const source = this.groups.get(groupId);
+    if (!source) {
+      throw new StoreError("not_found", `Group ${groupId} not found`);
+    }
+    let name = `${source.name}-copy`.slice(0, 64);
+    for (let n = 2; Array.from(this.groups.values()).some((g) => g.name.toLowerCase() === name.toLowerCase()); n++) {
+      name = `${source.name.slice(0, 56)}-copy-${n}`;
+    }
+    return this.createGroup({
+      name,
+      description: source.description,
+      platform: source.platform,
+      subscriptionType: source.subscriptionType,
+      rateMultiplier: source.rateMultiplier,
+      modelAllowlist: [...source.modelAllowlist],
+      isExclusive: source.isExclusive,
+      sortOrder: source.sortOrder,
+      enabled: false,
+    });
+  }
+
   async listAccounts(filter?: { groupId?: string; executionMode?: string }): Promise<UpstreamAccount[]> {
     const out: UpstreamAccount[] = [];
     for (const acc of this.accounts.values()) {
@@ -299,6 +342,13 @@ export class MemoryControlStore implements ControlStore {
       });
     }
     return out;
+  }
+
+  async getAccount(accountId: string): Promise<UpstreamAccount | null> {
+    const acc = this.accounts.get(accountId);
+    if (!acc) return null;
+    const { credentialsEnc: _, ...rest } = acc;
+    return { ...rest, groupName: this.groups.get(acc.groupId)?.name ?? acc.groupId };
   }
 
   async createAccount(
@@ -320,6 +370,7 @@ export class MemoryControlStore implements ControlStore {
     const record: InternalAccount = {
       id,
       name: req.name,
+      notes: req.notes,
       groupId: req.groupId,
       platform: req.platform,
       executionMode: req.executionMode,
@@ -333,6 +384,7 @@ export class MemoryControlStore implements ControlStore {
       status: "active",
       window5hUsedBps: 0,
       window7dUsedBps: 0,
+      lastTest: null,
       createdAtIso: new Date().toISOString(),
     };
     this.accounts.set(id, record);
@@ -357,7 +409,9 @@ export class MemoryControlStore implements ControlStore {
       acc.groupId = req.groupId;
     }
     if (req.name !== undefined) acc.name = req.name;
+    if (req.notes !== undefined) acc.notes = req.notes;
     if (req.executionMode !== undefined) acc.executionMode = req.executionMode;
+    if (req.authKind !== undefined) acc.authKind = req.authKind;
     if (req.subscriptionTier !== undefined) {
       if (!isSubscriptionTierAllowedForProvider(acc.platform, req.subscriptionTier)) {
         throw new StoreError(
@@ -386,6 +440,11 @@ export class MemoryControlStore implements ControlStore {
     if (!this.accounts.delete(accountId)) {
       throw new StoreError("not_found", `Account ${accountId} not found`);
     }
+  }
+
+  async recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void> {
+    const acc = this.accounts.get(accountId);
+    if (acc) acc.lastTest = { ...result };
   }
 
   async listUserApiKeys(userId: string): Promise<ApiKeyItem[]> {
@@ -577,11 +636,14 @@ export class MemoryControlStore implements ControlStore {
     return { ...item };
   }
 
-  async listUsageLogs(filter?: { userId?: string; limit?: number }): Promise<UsageLogItem[]> {
-    const limit = Math.max(1, Math.min(200, filter?.limit ?? 50));
+  async listUsageLogs(filter?: { userId?: string; limit?: number; sinceIso?: string }): Promise<UsageLogItem[]> {
+    const cap = filter?.sinceIso ? 100_000 : 200;
+    const limit = Math.max(1, Math.min(cap, filter?.limit ?? 50));
+    const sinceMs = filter?.sinceIso ? Date.parse(filter.sinceIso) : Number.NEGATIVE_INFINITY;
     const out: UsageLogItem[] = [];
     for (const item of this.usageLogs) {
       if (filter?.userId && item.userId !== filter.userId) continue;
+      if (Date.parse(item.createdAtIso) < sinceMs) continue;
       out.push({ ...item });
       if (out.length >= limit) break;
     }

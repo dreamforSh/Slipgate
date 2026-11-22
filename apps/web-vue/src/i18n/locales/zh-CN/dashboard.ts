@@ -2,6 +2,73 @@
 export default {
   dashboard: {
     title: "仪表盘",
+    updatedAt: "更新于 {time}",
+    loadFailed: "统计数据加载失败，稍后会自动重试",
+    sections: {
+      system: "系统状态",
+    },
+    range: {
+      h24: "24 小时",
+      d7: "7 天",
+      d30: "30 天",
+    },
+    metric: {
+      requests: "请求",
+      tokens: "Token",
+      cost: "消费",
+      input: "输入",
+      output: "输出",
+    },
+    kpi: {
+      todayRequests: "今日请求",
+      vsYesterday: "较昨日",
+      noRequestsToday: "今日暂无请求",
+      successRate: "成功率 {rate}%",
+      todayTokens: "今日 Token",
+      tokenSplit: "输入 {input} · 输出 {output}",
+      todayCost: "今日消费",
+      periodCost: "近 {range} {cost}",
+      activeUsers: "今日活跃用户",
+      userSplit: "新增 {new} · 共 {total}",
+      throughput: "实时吞吐",
+      tpm: "{tpm} Token / 分钟",
+      avgLatency: "今日平均响应",
+      ttft: "首字 {ttft}",
+      apiKeys: "API 密钥",
+      keysHint: "启用 / 全部",
+      accounts: "可用账号",
+      failedTests: "{count} 个账号测试失败",
+      allHealthy: "账号状态正常",
+    },
+    health: {
+      active: "正常",
+      paused: "暂停",
+      cooldown: "冷却",
+      expired: "过期",
+    },
+    trend: {
+      requests: "请求趋势",
+      tokens: "Token 趋势",
+      cost: "消费趋势",
+      showTable: "以表格查看",
+      showChart: "以图表查看",
+      empty: "所选时间内暂无请求",
+      time: "时间",
+    },
+    models: {
+      title: "模型用量",
+    },
+    topUsers: {
+      title: "用户消费排行",
+    },
+    groups: {
+      title: "分组用量",
+      manage: "分组管理",
+    },
+    breakdown: {
+      meta: "{requests} 次请求 · {tokens} Token · {cost}",
+      empty: "暂无数据",
+    },
     planes: {
       net: "网络服务",
       core: "核心引擎",

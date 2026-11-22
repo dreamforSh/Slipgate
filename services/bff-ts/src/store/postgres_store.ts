@@ -4,6 +4,7 @@ import {
   isSubscriptionTierAllowedForProvider,
   SubscriptionTierSchema,
   subscriptionTierMultiplier,
+  type AccountTestResult,
   type ApiKeyItem,
   type CreateAccountRequest,
   type CreateApiKeyRequest,
@@ -76,7 +77,18 @@ export class PostgresControlStore implements ControlStore {
           ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '',
           ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'stealth_http',
           ADD COLUMN IF NOT EXISTS subscription_tier TEXT NOT NULL DEFAULT 'standard',
-          ADD COLUMN IF NOT EXISTS credential_preview TEXT NOT NULL DEFAULT '';
+          ADD COLUMN IF NOT EXISTS credential_preview TEXT NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS last_test_at TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS last_test_ok BOOLEAN,
+          ADD COLUMN IF NOT EXISTS last_test_model TEXT,
+          ADD COLUMN IF NOT EXISTS last_test_duration_ms INTEGER,
+          ADD COLUMN IF NOT EXISTS last_test_message TEXT;
+
+      ALTER TABLE core.groups
+          ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS is_exclusive BOOLEAN NOT NULL DEFAULT FALSE,
+          ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
 
       ALTER TABLE core.api_keys
           ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT 'default';
@@ -409,44 +421,64 @@ export class PostgresControlStore implements ControlStore {
   }
 
   async listGroups(enabledOnly = false): Promise<GroupItem[]> {
+    return this.queryGroups({ enabledOnly });
+  }
+
+  private async queryGroups(filter: { enabledOnly?: boolean; groupId?: string }): Promise<GroupItem[]> {
     const rows = await this.sql<
       {
         id: string;
         name: string;
+        description: string;
         platform: GroupItem["platform"];
         subscription_type: GroupItem["subscriptionType"];
         rate_multiplier: string;
         model_allowlist: string[];
+        is_exclusive: boolean;
+        sort_order: number;
         enabled: boolean;
         account_count: string;
+        active_account_count: string;
+        api_key_count: string;
         created_at: Date;
       }[]
     >`
       SELECT
         g.id,
         g.name,
+        g.description,
         g.platform,
         g.subscription_type,
         g.rate_multiplier::text,
         g.model_allowlist,
+        g.is_exclusive,
+        g.sort_order,
         g.enabled,
         COUNT(a.id)::text AS account_count,
+        COUNT(a.id) FILTER (WHERE a.status = 'active')::text AS active_account_count,
+        (SELECT COUNT(*) FROM core.api_keys k WHERE k.group_id = g.id)::text AS api_key_count,
         g.created_at
       FROM core.groups g
       LEFT JOIN core.accounts a ON a.group_id = g.id
-      WHERE (${!enabledOnly} OR g.enabled = TRUE)
+      WHERE (${!filter.enabledOnly} OR g.enabled = TRUE)
+        AND (${filter.groupId ?? null}::text IS NULL OR g.id = ${filter.groupId ?? null})
       GROUP BY g.id
-      ORDER BY g.created_at ASC
+      ORDER BY g.sort_order ASC, g.created_at ASC
     `;
     return rows.map((r) => ({
       id: r.id,
       name: r.name,
+      description: r.description ?? "",
       platform: r.platform,
       subscriptionType: r.subscription_type,
       rateMultiplier: Number.parseFloat(r.rate_multiplier),
       modelAllowlist: Array.isArray(r.model_allowlist) ? r.model_allowlist : [],
+      isExclusive: Boolean(r.is_exclusive),
+      sortOrder: r.sort_order ?? 0,
       enabled: r.enabled,
       accountCount: Number.parseInt(r.account_count, 10),
+      activeAccountCount: Number.parseInt(r.active_account_count, 10),
+      apiKeyCount: Number.parseInt(r.api_key_count, 10),
       createdAtIso: toIso(r.created_at),
     }));
   }
@@ -454,31 +486,31 @@ export class PostgresControlStore implements ControlStore {
   async createGroup(req: CreateGroupRequest): Promise<GroupItem> {
     try {
       const id = `grp_${crypto.randomUUID()}`;
-      const rows = await this.sql<{ created_at: Date }[]>`
-        INSERT INTO core.groups (id, name, platform, subscription_type, rate_multiplier, model_allowlist, enabled)
+      await this.sql`
+        INSERT INTO core.groups (
+          id, name, description, platform, subscription_type, rate_multiplier,
+          model_allowlist, is_exclusive, sort_order, enabled
+        )
         VALUES (
           ${id},
           ${req.name},
+          ${req.description},
           ${req.platform},
           ${req.subscriptionType},
           ${req.rateMultiplier},
           ${JSON.stringify(req.modelAllowlist)}::jsonb,
+          ${req.isExclusive},
+          ${req.sortOrder},
           ${req.enabled}
         )
-        RETURNING created_at
       `;
-      return {
-        id,
-        name: req.name,
-        platform: req.platform,
-        subscriptionType: req.subscriptionType,
-        rateMultiplier: req.rateMultiplier,
-        modelAllowlist: [...req.modelAllowlist],
-        enabled: req.enabled,
-        accountCount: 0,
-        createdAtIso: toIso(rows[0]?.created_at),
-      };
+      const [created] = await this.queryGroups({ groupId: id });
+      if (!created) {
+        throw new StoreError("not_found", `Group ${id} missing after insert`);
+      }
+      return created;
     } catch (err) {
+      if (err instanceof StoreError) throw err;
       mapPgError(err);
     }
   }
@@ -489,8 +521,12 @@ export class PostgresControlStore implements ControlStore {
       const rows = await this.sql<{ id: string }[]>`
         UPDATE core.groups
         SET name = COALESCE(${req.name ?? null}, name),
+            description = COALESCE(${req.description ?? null}, description),
+            subscription_type = COALESCE(${req.subscriptionType ?? null}, subscription_type),
             rate_multiplier = COALESCE(${req.rateMultiplier ?? null}, rate_multiplier),
             model_allowlist = COALESCE(${allowlistJson}::jsonb, model_allowlist),
+            is_exclusive = COALESCE(${req.isExclusive ?? null}, is_exclusive),
+            sort_order = COALESCE(${req.sortOrder ?? null}, sort_order),
             enabled = COALESCE(${req.enabled ?? null}, enabled),
             updated_at = NOW()
         WHERE id = ${groupId}
@@ -499,8 +535,8 @@ export class PostgresControlStore implements ControlStore {
       if (rows.length === 0) {
         throw new StoreError("not_found", `Group ${groupId} not found`);
       }
-      const list = await this.listGroups();
-      return list.find((g) => g.id === groupId)!;
+      const [updated] = await this.queryGroups({ groupId });
+      return updated!;
     } catch (err) {
       if (err instanceof StoreError) throw err;
       mapPgError(err);
@@ -509,6 +545,13 @@ export class PostgresControlStore implements ControlStore {
 
   async deleteGroup(groupId: string): Promise<void> {
     try {
+      // core.accounts cascades on group delete; refuse instead of silently dropping accounts.
+      const accountRows = await this.sql<{ count: string }[]>`
+        SELECT COUNT(*)::text AS count FROM core.accounts WHERE group_id = ${groupId}
+      `;
+      if (Number.parseInt(accountRows[0]?.count ?? "0", 10) > 0) {
+        throw new StoreError("conflict", "Cannot delete group that still contains accounts");
+      }
       const rows = await this.sql<{ id: string }[]>`
         DELETE FROM core.groups WHERE id = ${groupId} RETURNING id
       `;
@@ -521,11 +564,48 @@ export class PostgresControlStore implements ControlStore {
     }
   }
 
+  async duplicateGroup(groupId: string): Promise<GroupItem> {
+    const [source] = await this.queryGroups({ groupId });
+    if (!source) {
+      throw new StoreError("not_found", `Group ${groupId} not found`);
+    }
+    const taken = new Set((await this.queryGroups({})).map((g) => g.name.toLowerCase()));
+    let name = `${source.name}-copy`.slice(0, 64);
+    for (let n = 2; taken.has(name.toLowerCase()); n++) {
+      name = `${source.name.slice(0, 56)}-copy-${n}`;
+    }
+    return this.createGroup({
+      name,
+      description: source.description,
+      platform: source.platform,
+      subscriptionType: source.subscriptionType,
+      rateMultiplier: source.rateMultiplier,
+      modelAllowlist: [...source.modelAllowlist],
+      isExclusive: source.isExclusive,
+      sortOrder: source.sortOrder,
+      enabled: false,
+    });
+  }
+
   async listAccounts(filter?: { groupId?: string; executionMode?: string }): Promise<UpstreamAccount[]> {
+    return this.queryAccounts(filter ?? {});
+  }
+
+  async getAccount(accountId: string): Promise<UpstreamAccount | null> {
+    const [item] = await this.queryAccounts({ accountId });
+    return item ?? null;
+  }
+
+  private async queryAccounts(filter: {
+    groupId?: string;
+    executionMode?: string;
+    accountId?: string;
+  }): Promise<UpstreamAccount[]> {
     const rows = await this.sql<
       {
         id: string;
         name: string;
+        notes: string | null;
         group_id: string;
         group_name: string;
         platform: UpstreamAccount["platform"];
@@ -538,12 +618,18 @@ export class PostgresControlStore implements ControlStore {
         status: UpstreamAccount["status"];
         window_5h_used_bps: number | null;
         window_7d_used_bps: number | null;
+        last_test_at: Date | null;
+        last_test_ok: boolean | null;
+        last_test_model: string | null;
+        last_test_duration_ms: number | null;
+        last_test_message: string | null;
         created_at: Date;
       }[]
     >`
       SELECT
         a.id,
         COALESCE(NULLIF(a.name, ''), a.id) AS name,
+        a.notes,
         a.group_id,
         g.name AS group_name,
         a.platform,
@@ -556,12 +642,18 @@ export class PostgresControlStore implements ControlStore {
         a.status,
         q.window_5h_used_bps,
         q.window_7d_used_bps,
+        a.last_test_at,
+        a.last_test_ok,
+        a.last_test_model,
+        a.last_test_duration_ms,
+        a.last_test_message,
         a.created_at
       FROM core.accounts a
       JOIN core.groups g ON g.id = a.group_id
       LEFT JOIN core.account_window_quotas q ON q.account_id = a.id
-      WHERE (${filter?.groupId ?? null}::text IS NULL OR a.group_id = ${filter?.groupId ?? null})
-        AND (${filter?.executionMode ?? null}::text IS NULL OR a.execution_mode = ${filter?.executionMode ?? null})
+      WHERE (${filter.groupId ?? null}::text IS NULL OR a.group_id = ${filter.groupId ?? null})
+        AND (${filter.executionMode ?? null}::text IS NULL OR a.execution_mode = ${filter.executionMode ?? null})
+        AND (${filter.accountId ?? null}::text IS NULL OR a.id = ${filter.accountId ?? null})
       ORDER BY a.priority ASC, a.created_at DESC
     `;
     return rows.map((r) => {
@@ -569,6 +661,7 @@ export class PostgresControlStore implements ControlStore {
       return {
         id: r.id,
         name: r.name,
+        notes: r.notes ?? "",
         groupId: r.group_id,
         groupName: r.group_name,
         platform: r.platform,
@@ -582,6 +675,16 @@ export class PostgresControlStore implements ControlStore {
         status: r.status,
         window5hUsedBps: r.window_5h_used_bps ?? 0,
         window7dUsedBps: r.window_7d_used_bps ?? 0,
+        lastTest:
+          r.last_test_at && r.last_test_ok !== null
+            ? {
+                ok: r.last_test_ok,
+                atIso: toIso(r.last_test_at),
+                model: r.last_test_model ?? "",
+                durationMs: r.last_test_duration_ms ?? 0,
+                message: r.last_test_message ?? "",
+              }
+            : null,
         createdAtIso: toIso(r.created_at),
       };
     });
@@ -602,12 +705,13 @@ export class PostgresControlStore implements ControlStore {
       const id = `acc_${crypto.randomUUID()}`;
       await this.sql`
         INSERT INTO core.accounts (
-          id, name, group_id, platform, execution_mode, auth_kind, subscription_tier,
+          id, name, notes, group_id, platform, execution_mode, auth_kind, subscription_tier,
           credentials_enc, credential_preview, max_concurrency, priority, status
         )
         VALUES (
           ${id},
           ${req.name},
+          ${req.notes},
           ${req.groupId},
           ${req.platform},
           ${req.executionMode},
@@ -620,8 +724,7 @@ export class PostgresControlStore implements ControlStore {
           'active'
         )
       `;
-      const items = await this.listAccounts();
-      const created = items.find((item) => item.id === id);
+      const created = await this.getAccount(id);
       if (!created) {
         throw new StoreError("not_found", `Account ${id} missing after insert`);
       }
@@ -657,8 +760,10 @@ export class PostgresControlStore implements ControlStore {
       const rows = await this.sql<{ id: string }[]>`
         UPDATE core.accounts
         SET name = COALESCE(${req.name ?? null}, name),
+            notes = COALESCE(${req.notes ?? null}, notes),
             group_id = COALESCE(${req.groupId ?? null}, group_id),
             execution_mode = COALESCE(${req.executionMode ?? null}, execution_mode),
+            auth_kind = COALESCE(${req.authKind ?? null}, auth_kind),
             subscription_tier = COALESCE(${req.subscriptionTier ?? null}, subscription_tier),
             max_concurrency = COALESCE(${req.maxConcurrency ?? null}, max_concurrency),
             priority = COALESCE(${req.priority ?? null}, priority),
@@ -672,8 +777,7 @@ export class PostgresControlStore implements ControlStore {
       if (rows.length === 0) {
         throw new StoreError("not_found", `Account ${accountId} not found`);
       }
-      const items = await this.listAccounts();
-      return items.find((item) => item.id === accountId)!;
+      return (await this.getAccount(accountId))!;
     } catch (err) {
       if (err instanceof StoreError) throw err;
       mapPgError(err);
@@ -687,6 +791,18 @@ export class PostgresControlStore implements ControlStore {
     if (rows.length === 0) {
       throw new StoreError("not_found", `Account ${accountId} not found`);
     }
+  }
+
+  async recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void> {
+    await this.sql`
+      UPDATE core.accounts
+      SET last_test_at = ${new Date(result.atIso)},
+          last_test_ok = ${result.ok},
+          last_test_model = ${result.model},
+          last_test_duration_ms = ${result.durationMs},
+          last_test_message = ${result.message}
+      WHERE id = ${accountId}
+    `;
   }
 
   async listUserApiKeys(userId: string): Promise<ApiKeyItem[]> {
@@ -1150,8 +1266,10 @@ export class PostgresControlStore implements ControlStore {
     });
   }
 
-  async listUsageLogs(filter?: { userId?: string; limit?: number }): Promise<UsageLogItem[]> {
-    const limit = Math.max(1, Math.min(200, filter?.limit ?? 50));
+  async listUsageLogs(filter?: { userId?: string; limit?: number; sinceIso?: string }): Promise<UsageLogItem[]> {
+    const cap = filter?.sinceIso ? 100_000 : 200;
+    const limit = Math.max(1, Math.min(cap, filter?.limit ?? 50));
+    const since = filter?.sinceIso ? new Date(filter.sinceIso) : null;
     const rows = await this.sql<
       {
         id: string;
@@ -1183,6 +1301,7 @@ export class PostgresControlStore implements ControlStore {
         cost_nano_usd::text, ttft_ms, duration_ms, status_code, created_at
       FROM core.usage_logs
       WHERE (${filter?.userId ?? null}::text IS NULL OR user_id = ${filter?.userId ?? null})
+        AND (${since}::timestamptz IS NULL OR created_at >= ${since}::timestamptz)
       ORDER BY created_at DESC
       LIMIT ${limit}
     `;

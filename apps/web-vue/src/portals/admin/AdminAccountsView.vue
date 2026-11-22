@@ -679,128 +679,150 @@ onMounted(() => {
         </button>
       </EmptyState>
 
-      <div v-else class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th class="w-10">
-                <input
-                  type="checkbox"
-                  class="checkbox"
-                  :checked="allFilteredSelected"
-                  :indeterminate="someFilteredSelected"
-                  :aria-label="t('accounts.table.selectAll')"
-                  @change="toggleAll"
-                />
-              </th>
-              <th>{{ t("accounts.table.account") }}</th>
-              <th>{{ t("accounts.table.platformTier") }}</th>
-              <th>{{ t("accounts.table.modeAuth") }}</th>
-              <th>{{ t("accounts.table.usage") }}</th>
-              <th class="text-right">{{ t("accounts.table.concurrencyPriority") }}</th>
-              <th>{{ t("common.status") }}</th>
-              <th>{{ t("accounts.table.lastTest") }}</th>
-              <th class="text-right">{{ t("common.actions") }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="acc in pagedAccounts" :key="acc.id" :class="selected.has(acc.id) ? 'bg-accent/[0.04]' : ''">
-              <td>
-                <input
-                  type="checkbox"
-                  class="checkbox"
-                  :checked="selected.has(acc.id)"
-                  :aria-label="t('accounts.table.selectRow', { name: acc.name })"
-                  @change="toggleOne(acc.id)"
-                />
-              </td>
-              <td class="max-w-[16rem]">
-                <p class="truncate font-medium text-fg" :title="acc.id">{{ acc.name }}</p>
-                <p v-if="acc.notes" class="mt-0.5 truncate text-xs text-fg-muted" :title="acc.notes">{{ acc.notes }}</p>
-                <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle" :title="acc.credentialPreview">
-                  {{ acc.groupName }} · {{ acc.credentialPreview }}
-                </p>
-              </td>
-              <td>
-                <div class="flex flex-col items-start gap-1">
-                  <UiBadge tone="accent">{{ platformLabel(acc.platform) }}</UiBadge>
-                  <UiBadge :tone="tierTone(acc)" mono>{{ formatTierBadge(acc) }}</UiBadge>
-                </div>
-              </td>
-              <td>
-                <p class="text-xs text-fg">{{ executionModeLabel(acc.executionMode) }}</p>
-                <p class="mt-0.5 text-2xs text-fg-subtle">{{ authKindLabel(acc.authKind) }}</p>
-              </td>
-              <td>
-                <div class="flex w-36 flex-col gap-1.5">
-                  <UsageMeter label="5h" :bps="acc.window5hUsedBps" />
-                  <UsageMeter label="7d" :bps="acc.window7dUsedBps" />
-                </div>
-              </td>
-              <td class="text-right font-mono text-xs tabular-nums">
-                <p class="text-fg">{{ acc.maxConcurrency }}</p>
-                <p class="mt-0.5 text-fg-subtle">#{{ acc.priority }}</p>
-              </td>
-              <td>
-                <UiSwitch
-                  v-if="acc.status === 'active' || acc.status === 'paused'"
-                  :model-value="acc.status === 'active'"
-                  :label="accountStatusLabel(acc.status)"
-                  @update:model-value="toggleAccountStatus(acc)"
-                />
-                <button
-                  v-else
-                  type="button"
-                  class="cursor-pointer"
-                  :title="t('accounts.table.resume')"
-                  @click="toggleAccountStatus(acc)"
-                >
-                  <UiBadge :tone="healthTone(acc.status)" dot>{{ accountStatusLabel(acc.status) }}</UiBadge>
-                </button>
-              </td>
-              <td class="whitespace-nowrap">
-                <template v-if="acc.lastTest">
-                  <span
-                    class="inline-flex flex-col items-start gap-0.5"
-                    :title="acc.lastTest.message || acc.lastTest.model"
-                  >
-                    <UiBadge :tone="acc.lastTest.ok ? 'success' : 'danger'" dot>
-                      {{ acc.lastTest.ok ? t("accounts.lastTest.ok") : t("accounts.lastTest.failed") }}
-                    </UiBadge>
-                    <span class="font-mono text-2xs text-fg-subtle">
-                      {{ relativeTime(acc.lastTest.atIso) }} · {{ formatDuration(acc.lastTest.durationMs) }}
-                    </span>
-                  </span>
-                </template>
-                <span v-else class="text-xs text-fg-subtle">{{ t("accounts.lastTest.never") }}</span>
-              </td>
-              <td class="text-right">
-                <div class="inline-flex items-center gap-1">
-                  <button
-                    type="button"
-                    class="btn btn-ghost btn-icon btn-xs"
-                    :disabled="acc.executionMode === 'vm_slot'"
-                    :title="acc.executionMode === 'vm_slot' ? t('accounts.row.vmTestDisabled') : t('accounts.row.test')"
-                    :aria-label="t('accounts.row.test')"
-                    @click="openTest(acc)"
-                  >
-                    <UiIcon name="play" :size="13" />
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-ghost btn-icon btn-xs"
-                    :title="t('accounts.row.edit')"
-                    :aria-label="t('accounts.row.edit')"
-                    @click="openEdit(acc)"
-                  >
-                    <UiIcon name="pencil" :size="13" />
-                  </button>
-                  <ConfirmButton icon-only @confirm="removeAccount(acc)" />
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+      <div v-else class="grid gap-4 p-4 sm:p-5 md:grid-cols-2 xl:grid-cols-3">
+        <article
+          v-for="acc in pagedAccounts"
+          :key="acc.id"
+          class="card card-hover flex min-w-0 flex-col p-4"
+          :class="[
+            selected.has(acc.id) ? '!border-accent/50 ring-2 ring-accent/30' : '',
+            acc.status === 'active' ? '' : 'opacity-80',
+          ]"
+        >
+          <!-- Header: select, name + group, status -->
+          <div class="flex items-start gap-3">
+            <input
+              type="checkbox"
+              class="checkbox mt-1"
+              :checked="selected.has(acc.id)"
+              :aria-label="t('accounts.card.select', { name: acc.name })"
+              @change="toggleOne(acc.id)"
+            />
+            <div class="min-w-0 flex-1">
+              <p class="truncate text-sm font-semibold text-fg" :title="acc.id">{{ acc.name }}</p>
+              <button
+                type="button"
+                class="mt-0.5 inline-flex max-w-full items-center gap-1 text-xs text-fg-muted transition-colors hover:text-accent"
+                :title="t('accounts.card.filterGroup')"
+                @click="groupFilter = acc.groupId"
+              >
+                <UiIcon name="layers" :size="12" />
+                <span class="truncate">{{ acc.groupName }}</span>
+              </button>
+            </div>
+            <div class="shrink-0">
+              <UiSwitch
+                v-if="acc.status === 'active' || acc.status === 'paused'"
+                :model-value="acc.status === 'active'"
+                :label="accountStatusLabel(acc.status)"
+                @update:model-value="toggleAccountStatus(acc)"
+              />
+              <button
+                v-else
+                type="button"
+                class="cursor-pointer"
+                :title="t('accounts.card.resume')"
+                @click="toggleAccountStatus(acc)"
+              >
+                <UiBadge :tone="healthTone(acc.status)" dot>{{ accountStatusLabel(acc.status) }}</UiBadge>
+              </button>
+            </div>
+          </div>
+
+          <!-- Platform, plan, access mode, auth -->
+          <div class="mt-3 flex flex-wrap items-center gap-1.5">
+            <UiBadge tone="accent">{{ platformLabel(acc.platform) }}</UiBadge>
+            <UiBadge :tone="tierTone(acc)" mono>{{ formatTierBadge(acc) }}</UiBadge>
+            <UiBadge :tone="acc.executionMode === 'vm_slot' ? 'violet' : 'info'">
+              <span class="inline-flex items-center gap-1">
+                <UiIcon :name="MODE_ICON[acc.executionMode]" :size="11" />
+                {{ executionModeLabel(acc.executionMode) }}
+              </span>
+            </UiBadge>
+            <span class="text-2xs text-fg-muted">{{ authKindLabel(acc.authKind) }}</span>
+          </div>
+
+          <!-- Notes + credential -->
+          <p v-if="acc.notes" class="mt-2.5 truncate text-xs text-fg-muted" :title="acc.notes">{{ acc.notes }}</p>
+          <p
+            class="truncate font-mono text-2xs text-fg-subtle"
+            :class="acc.notes ? 'mt-1' : 'mt-2.5'"
+            :title="acc.credentialPreview"
+          >
+            {{ acc.credentialPreview }}
+          </p>
+
+          <!-- Usage windows + limits -->
+          <div class="mt-3 grid grid-cols-2 gap-3">
+            <UsageMeter label="5h" :bps="acc.window5hUsedBps" />
+            <UsageMeter label="7d" :bps="acc.window7dUsedBps" />
+          </div>
+          <dl class="mt-3 grid grid-cols-2 gap-2">
+            <div class="rounded-lg bg-surface-2/60 px-2.5 py-1.5">
+              <dt class="text-2xs text-fg-subtle">{{ t("accounts.card.concurrency") }}</dt>
+              <dd class="font-mono text-sm font-medium tabular-nums text-fg">{{ acc.maxConcurrency }}</dd>
+            </div>
+            <div class="rounded-lg bg-surface-2/60 px-2.5 py-1.5">
+              <dt class="text-2xs text-fg-subtle">{{ t("accounts.card.priority") }}</dt>
+              <dd class="font-mono text-sm font-medium tabular-nums text-fg">#{{ acc.priority }}</dd>
+            </div>
+          </dl>
+
+          <div class="flex-1" />
+
+          <!-- Last test -->
+          <div
+            class="mt-3 flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-xs"
+            :class="lastTestStripClass(acc)"
+            :title="acc.lastTest ? acc.lastTest.message || acc.lastTest.model : undefined"
+          >
+            <span class="inline-flex min-w-0 items-center gap-1.5">
+              <UiIcon
+                :name="!acc.lastTest ? 'clock' : acc.lastTest.ok ? 'check-circle' : 'x-circle'"
+                :size="13"
+                :class="acc.lastTest?.ok ? 'text-success' : ''"
+              />
+              <span class="truncate font-medium">
+                {{
+                  !acc.lastTest
+                    ? t("accounts.lastTest.never")
+                    : acc.lastTest.ok
+                      ? t("accounts.lastTest.ok")
+                      : t("accounts.lastTest.failed")
+                }}
+              </span>
+            </span>
+            <span v-if="acc.lastTest" class="shrink-0 font-mono text-2xs opacity-80">
+              {{ relativeTime(acc.lastTest.atIso) }} · {{ formatDuration(acc.lastTest.durationMs) }}
+            </span>
+          </div>
+
+          <!-- Actions -->
+          <div class="mt-3 flex items-center gap-1 border-t border-line/70 pt-3">
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm text-accent hover:!bg-accent/10 hover:!text-accent"
+              :disabled="acc.executionMode === 'vm_slot'"
+              :title="acc.executionMode === 'vm_slot' ? t('accounts.row.vmTestDisabled') : undefined"
+              @click="openTest(acc)"
+            >
+              <UiIcon name="play" :size="13" />
+              {{ t("accounts.row.test") }}
+            </button>
+            <div class="ml-auto flex items-center gap-1">
+              <button
+                type="button"
+                class="btn btn-ghost btn-icon btn-sm"
+                :title="t('accounts.row.edit')"
+                :aria-label="t('accounts.row.edit')"
+                @click="openEdit(acc)"
+              >
+                <UiIcon name="pencil" :size="14" />
+              </button>
+              <ConfirmButton icon-only size="sm" @confirm="removeAccount(acc)" />
+            </div>
+          </div>
+        </article>
       </div>
 
       <template v-if="pageCount > 1" #footer>

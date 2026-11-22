@@ -35,16 +35,13 @@ export default {
       empty: "暂无账号",
       noMatch: "没有符合条件的账号",
     },
-    table: {
-      account: "账号",
-      platformTier: "平台 / 套餐",
-      modeAuth: "接入方式 / 认证",
-      usage: "窗口用量",
-      concurrencyPriority: "并发 / 优先级",
-      lastTest: "最近测试",
+    card: {
+      selectPage: "全选本页",
+      select: "选择 {name}",
+      filterGroup: "只看此分组",
       resume: "点击恢复使用",
-      selectAll: "全选",
-      selectRow: "选择 {name}",
+      concurrency: "并发",
+      priority: "优先级",
     },
     lastTest: {
       never: "未测试",

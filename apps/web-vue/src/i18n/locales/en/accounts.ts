@@ -36,16 +36,13 @@ const en: typeof zh = {
       empty: "No accounts yet",
       noMatch: "No accounts match the filters",
     },
-    table: {
-      account: "Account",
-      platformTier: "Platform / plan",
-      modeAuth: "Access / auth",
-      usage: "Window usage",
-      concurrencyPriority: "Concurrency / priority",
-      lastTest: "Last test",
+    card: {
+      selectPage: "Select page",
+      select: "Select {name}",
+      filterGroup: "Show only this group",
       resume: "Click to resume",
-      selectAll: "Select all",
-      selectRow: "Select {name}",
+      concurrency: "Concurrency",
+      priority: "Priority",
     },
     lastTest: {
       never: "Not tested",

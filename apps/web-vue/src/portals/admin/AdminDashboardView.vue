@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type {
+  AdminDashboardStats,
   ClashExitNode,
+  DashboardRange,
   ClashRuntimeStatus,
   GroupItem,
   Provider,
@@ -14,9 +16,12 @@ import type {
 } from "@slipgate/contracts";
 import { useI18n } from "vue-i18n";
 import { RouterLink } from "vue-router";
+import BarList, { type BarListItem } from "../../components/charts/BarList.vue";
+import TrendChart, { type TrendSeries } from "../../components/charts/TrendChart.vue";
 import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
+import SegmentedControl from "../../components/ui/SegmentedControl.vue";
 import StatCard from "../../components/ui/StatCard.vue";
 import UiAlert from "../../components/ui/UiAlert.vue";
 import UiBadge from "../../components/ui/UiBadge.vue";
@@ -27,8 +32,12 @@ import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import {
   PROVIDER_OPTIONS,
   RUNTIME_PROFILE_TONE,
+  formatCompact,
   formatDateTime,
+  formatDurationMs,
   formatNumber,
+  formatUsd,
+  nanoToUsd,
   healthLabel,
   healthTone,
   planeLabel,
@@ -38,7 +47,7 @@ import {
 import { useAuthStore } from "../../stores/auth";
 
 const auth = useAuthStore();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 
 interface ReadinessState {
   ready: boolean;
@@ -70,6 +79,172 @@ const loading = ref(false);
 const routeFormOpen = ref(false);
 
 useFeedbackToasts(updateError);
+
+/* ---------------- Usage statistics ---------------- */
+
+const stats = ref<AdminDashboardStats | null>(null);
+const statsLoading = ref(false);
+const statsError = ref(false);
+const range = ref<DashboardRange>("7d");
+const trendMetric = ref<"requests" | "tokens" | "cost">("requests");
+const trendAsTable = ref(false);
+const AUTO_REFRESH_MS = 60_000;
+let refreshTimer: number | undefined;
+
+const rangeOptions = computed(() => [
+  { value: "24h" as const, label: t("dashboard.range.h24") },
+  { value: "7d" as const, label: t("dashboard.range.d7") },
+  { value: "30d" as const, label: t("dashboard.range.d30") },
+]);
+const metricOptions = computed(() => [
+  { value: "requests" as const, label: t("dashboard.metric.requests") },
+  { value: "tokens" as const, label: t("dashboard.metric.tokens") },
+  { value: "cost" as const, label: t("dashboard.metric.cost") },
+]);
+
+async function loadStats() {
+  statsLoading.value = true;
+  try {
+    const tz = new Date().getTimezoneOffset();
+    const res = await auth.apiFetch(`/api/v1/admin/dashboard/stats?range=${range.value}&tz=${tz}`);
+    if (!res.ok) {
+      statsError.value = true;
+      return;
+    }
+    stats.value = (await res.json()) as AdminDashboardStats;
+    statsError.value = false;
+  } catch {
+    statsError.value = true;
+  } finally {
+    statsLoading.value = false;
+  }
+}
+
+function setRange(next: DashboardRange) {
+  range.value = next;
+  void loadStats();
+}
+
+function refreshAll() {
+  void loadStats();
+  void loadOverview();
+}
+
+/** Relative change; null when the reference period is empty. */
+function change(current: number, previous: number): number | null {
+  if (previous <= 0) return null;
+  return (current - previous) / previous;
+}
+
+const updatedAt = computed(() =>
+  stats.value
+    ? new Date(stats.value.generatedAtIso).toLocaleTimeString(locale.value, { hour: "2-digit", minute: "2-digit" })
+    : "",
+);
+
+const todayTokens = computed(() => (stats.value ? stats.value.today.inputTokens + stats.value.today.outputTokens : 0));
+const successRate = computed(() => {
+  const s = stats.value?.today;
+  if (!s || s.requests === 0) return null;
+  return (s.requests - s.errors) / s.requests;
+});
+
+const healthSegments = computed(() => {
+  const a = stats.value?.accounts;
+  if (!a) return [];
+  return [
+    { key: "active", label: t("dashboard.health.active"), value: a.active, color: "rgb(var(--success))" },
+    { key: "paused", label: t("dashboard.health.paused"), value: a.paused, color: "rgb(var(--fg-subtle))" },
+    { key: "cooldown", label: t("dashboard.health.cooldown"), value: a.cooldown, color: "rgb(var(--warning))" },
+    { key: "expired", label: t("dashboard.health.expired"), value: a.expired, color: "rgb(var(--danger))" },
+  ].filter((s) => s.value > 0);
+});
+
+const trendLabels = computed(() => {
+  const s = stats.value;
+  if (!s) return { short: [] as string[], full: [] as string[] };
+  const hourly = s.granularity === "hour";
+  const short = s.series.map((p) => {
+    const d = new Date(p.startIso);
+    return hourly
+      ? d.toLocaleTimeString(locale.value, { hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString(locale.value, { month: "numeric", day: "numeric" });
+  });
+  const full = s.series.map((p) => {
+    const d = new Date(p.startIso);
+    return hourly
+      ? d.toLocaleString(locale.value, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString(locale.value, { year: "numeric", month: "long", day: "numeric", weekday: "short" });
+  });
+  return { short, full };
+});
+
+const trendSeries = computed<TrendSeries[]>(() => {
+  const points = stats.value?.series ?? [];
+  if (trendMetric.value === "tokens") {
+    return [
+      { key: "in", label: t("dashboard.metric.input"), color: "rgb(var(--viz-1))", values: points.map((p) => p.inputTokens) },
+      { key: "out", label: t("dashboard.metric.output"), color: "rgb(var(--viz-2))", values: points.map((p) => p.outputTokens) },
+    ];
+  }
+  if (trendMetric.value === "cost") {
+    return [{ key: "cost", label: t("dashboard.metric.cost"), color: "rgb(var(--viz-1))", values: points.map((p) => nanoToUsd(p.costNanoUsd)) }];
+  }
+  return [{ key: "req", label: t("dashboard.metric.requests"), color: "rgb(var(--viz-1))", values: points.map((p) => p.requests) }];
+});
+
+const usdFormat = (usd: number) =>
+  new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: usd < 1 ? 4 : 2 }).format(usd);
+const usdAxis = (usd: number) =>
+  usd >= 1000
+    ? `$${formatCompact(usd)}`
+    : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: usd < 1 ? 2 : 0 }).format(usd);
+const trendFormat = computed(() => (trendMetric.value === "cost" ? usdFormat : (v: number) => formatNumber(v)));
+const trendAxisFormat = computed(() => (trendMetric.value === "cost" ? usdAxis : (v: number) => formatCompact(v)));
+
+const trendTitle = computed(() =>
+  trendMetric.value === "tokens"
+    ? t("dashboard.trend.tokens")
+    : trendMetric.value === "cost"
+      ? t("dashboard.trend.cost")
+      : t("dashboard.trend.requests"),
+);
+
+function breakdownMeta(row: { requests: number; tokens: number; costNanoUsd: string }) {
+  return t("dashboard.breakdown.meta", {
+    requests: formatCompact(row.requests),
+    tokens: formatCompact(row.tokens),
+    cost: formatUsd(row.costNanoUsd),
+  });
+}
+
+const modelItems = computed<BarListItem[]>(() =>
+  (stats.value?.models ?? []).map((m) => ({
+    key: m.model,
+    label: m.model,
+    value: m.tokens,
+    valueText: formatCompact(m.tokens),
+    meta: breakdownMeta(m),
+  })),
+);
+const userItems = computed<BarListItem[]>(() =>
+  (stats.value?.topUsers ?? []).map((u) => ({
+    key: u.userId,
+    label: u.email,
+    value: nanoToUsd(u.costNanoUsd),
+    valueText: formatUsd(u.costNanoUsd),
+    meta: breakdownMeta(u),
+  })),
+);
+const groupItems = computed<BarListItem[]>(() =>
+  (stats.value?.groups ?? []).map((g) => ({
+    key: g.groupId,
+    label: g.name,
+    value: g.tokens,
+    valueText: formatCompact(g.tokens),
+    meta: breakdownMeta(g),
+  })),
+);
 
 const planes = computed<{ key: string; label: string; icon: IconName }[]>(() => [
   { key: "net", label: t("dashboard.planes.net"), icon: "globe" },
@@ -237,19 +412,232 @@ async function runRoutePreview() {
 
 onMounted(() => {
   void loadOverview();
+  void loadStats();
+  // Keep the numbers fresh while the page is open; skip ticks while the tab is hidden.
+  refreshTimer = window.setInterval(() => {
+    if (document.visibilityState === "visible") void loadStats();
+  }, AUTO_REFRESH_MS);
 });
+
+onBeforeUnmount(() => window.clearInterval(refreshTimer));
 </script>
 
 <template>
   <div class="space-y-6">
     <PageHeader :title="t('dashboard.title')">
+      <template #meta>
+        <span v-if="updatedAt" class="inline-flex items-center gap-1.5 text-xs text-fg-subtle">
+          <span class="relative inline-flex h-1.5 w-1.5">
+            <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+            <span class="relative inline-flex h-1.5 w-1.5 rounded-full bg-success" />
+          </span>
+          {{ t("dashboard.updatedAt", { time: updatedAt }) }}
+        </span>
+      </template>
       <template #actions>
-        <button type="button" class="btn btn-secondary" :disabled="loading" @click="loadOverview">
-          <UiIcon name="refresh" :size="15" :spin="loading" />
+        <SegmentedControl :model-value="range" :options="rangeOptions" size="md" @update:model-value="setRange" />
+        <button type="button" class="btn btn-secondary" :disabled="loading || statsLoading" @click="refreshAll">
+          <UiIcon name="refresh" :size="15" :spin="loading || statsLoading" />
           {{ t("common.refresh") }}
         </button>
       </template>
     </PageHeader>
+
+    <UiAlert v-if="statsError && !stats" tone="warning">{{ t("dashboard.loadFailed") }}</UiAlert>
+
+    <!-- Usage KPIs -->
+    <div
+      class="grid grid-cols-2 gap-3 transition-opacity sm:gap-4 xl:grid-cols-4"
+      :class="statsLoading && stats ? 'opacity-70' : ''"
+    >
+      <StatCard
+        :label="t('dashboard.kpi.todayRequests')"
+        :value="formatCompact(stats?.today.requests ?? 0)"
+        icon="activity"
+        tone="accent"
+        :delta="stats ? change(stats.today.requests, stats.yesterday.requests) : null"
+        :delta-label="t('dashboard.kpi.vsYesterday')"
+      >
+        <template #hint>
+          {{
+            successRate === null
+              ? t("dashboard.kpi.noRequestsToday")
+              : t("dashboard.kpi.successRate", { rate: (successRate * 100).toFixed(1) })
+          }}
+        </template>
+      </StatCard>
+      <StatCard
+        :label="t('dashboard.kpi.todayTokens')"
+        :value="formatCompact(todayTokens)"
+        icon="braces"
+        tone="info"
+        :delta="stats ? change(todayTokens, stats.yesterday.inputTokens + stats.yesterday.outputTokens) : null"
+        :delta-label="t('dashboard.kpi.vsYesterday')"
+        :hint="
+          t('dashboard.kpi.tokenSplit', {
+            input: formatCompact(stats?.today.inputTokens ?? 0),
+            output: formatCompact(stats?.today.outputTokens ?? 0),
+          })
+        "
+      />
+      <StatCard
+        :label="t('dashboard.kpi.todayCost')"
+        :value="formatUsd(stats?.today.costNanoUsd ?? '0')"
+        icon="wallet"
+        tone="success"
+        :delta="stats ? change(nanoToUsd(stats.today.costNanoUsd), nanoToUsd(stats.yesterday.costNanoUsd)) : null"
+        :delta-label="t('dashboard.kpi.vsYesterday')"
+        :hint="t('dashboard.kpi.periodCost', { range: rangeOptions.find((o) => o.value === range)?.label, cost: formatUsd(stats?.period.costNanoUsd ?? '0') })"
+      />
+      <StatCard
+        :label="t('dashboard.kpi.activeUsers')"
+        :value="formatCompact(stats?.users.activeToday ?? 0)"
+        icon="users"
+        tone="violet"
+        :hint="t('dashboard.kpi.userSplit', { new: stats?.users.newToday ?? 0, total: stats?.users.total ?? 0 })"
+      />
+      <StatCard
+        :label="t('dashboard.kpi.throughput')"
+        :value="`${formatCompact(stats?.throughput.rpm ?? 0)} RPM`"
+        icon="zap"
+        tone="warning"
+        :hint="t('dashboard.kpi.tpm', { tpm: formatCompact(stats?.throughput.tpm ?? 0) })"
+      />
+      <StatCard
+        :label="t('dashboard.kpi.avgLatency')"
+        :value="stats?.today.avgDurationMs ? formatDurationMs(stats.today.avgDurationMs) : '-'"
+        icon="clock"
+        tone="info"
+        :hint="
+          stats?.today.avgTtftMs
+            ? t('dashboard.kpi.ttft', { ttft: formatDurationMs(stats.today.avgTtftMs) })
+            : t('dashboard.kpi.noRequestsToday')
+        "
+      />
+      <StatCard
+        :label="t('dashboard.kpi.apiKeys')"
+        :value="`${stats?.apiKeys.enabled ?? 0} / ${stats?.apiKeys.total ?? 0}`"
+        icon="key"
+        tone="accent"
+        :hint="t('dashboard.kpi.keysHint')"
+      />
+      <StatCard
+        :label="t('dashboard.kpi.accounts')"
+        :value="`${stats?.accounts.active ?? 0} / ${stats?.accounts.total ?? 0}`"
+        icon="layers"
+        :tone="(stats?.accounts.failedTests ?? 0) > 0 ? 'danger' : 'success'"
+      >
+        <template #hint>
+          <RouterLink to="/admin/accounts" class="hover:text-fg">
+            {{
+              (stats?.accounts.failedTests ?? 0) > 0
+                ? t("dashboard.kpi.failedTests", { count: stats?.accounts.failedTests })
+                : t("dashboard.kpi.allHealthy")
+            }}
+          </RouterLink>
+        </template>
+        <template #footer>
+          <div
+            v-if="healthSegments.length"
+            class="mt-3 flex h-2 w-full gap-0.5 overflow-hidden rounded-full"
+            role="img"
+            :aria-label="healthSegments.map((s) => `${s.label} ${s.value}`).join(', ')"
+          >
+            <span
+              v-for="seg in healthSegments"
+              :key="seg.key"
+              class="h-full first:rounded-l-full last:rounded-r-full"
+              :style="{ flexGrow: seg.value, background: seg.color }"
+              :title="`${seg.label} ${seg.value}`"
+            />
+          </div>
+          <div v-if="healthSegments.length" class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-fg-muted">
+            <span v-for="seg in healthSegments" :key="seg.key" class="inline-flex items-center gap-1">
+              <span class="inline-block h-2 w-2 rounded-full" :style="{ background: seg.color }" />
+              {{ seg.label }} {{ seg.value }}
+            </span>
+          </div>
+        </template>
+      </StatCard>
+    </div>
+
+    <!-- Trend + model distribution -->
+    <div class="grid gap-6 xl:grid-cols-3" :class="statsLoading && stats ? 'opacity-70 transition-opacity' : 'transition-opacity'">
+      <UiCard class="xl:col-span-2" icon="activity" :title="trendTitle">
+        <template #actions>
+          <SegmentedControl v-model="trendMetric" :options="metricOptions" />
+          <button
+            type="button"
+            class="btn btn-ghost btn-icon btn-sm"
+            :aria-pressed="trendAsTable"
+            :title="trendAsTable ? t('dashboard.trend.showChart') : t('dashboard.trend.showTable')"
+            :aria-label="trendAsTable ? t('dashboard.trend.showChart') : t('dashboard.trend.showTable')"
+            @click="trendAsTable = !trendAsTable"
+          >
+            <UiIcon :name="trendAsTable ? 'activity' : 'list'" :size="15" />
+          </button>
+        </template>
+        <EmptyState
+          v-if="stats && stats.period.requests === 0"
+          compact
+          icon="activity"
+          :title="t('dashboard.trend.empty')"
+        />
+        <div v-else-if="trendAsTable" class="table-wrap max-h-72 overflow-y-auto">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>{{ t("dashboard.trend.time") }}</th>
+                <th v-for="s in trendSeries" :key="s.key" class="text-right">{{ s.label }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(label, i) in trendLabels.full" :key="label">
+                <td class="whitespace-nowrap text-xs text-fg-muted">{{ label }}</td>
+                <td v-for="s in trendSeries" :key="s.key" class="text-right font-mono text-xs tabular-nums">
+                  {{ trendFormat(s.values[i] ?? 0) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <TrendChart
+          v-else
+          :labels="trendLabels.short"
+          :titles="trendLabels.full"
+          :series="trendSeries"
+          :format="trendFormat"
+          :axis-format="trendAxisFormat"
+          :chart-label="trendTitle"
+        />
+      </UiCard>
+
+      <UiCard icon="sparkles" :title="t('dashboard.models.title')">
+        <EmptyState v-if="!modelItems.length" compact icon="sparkles" :title="t('dashboard.breakdown.empty')" />
+        <BarList v-else :items="modelItems" />
+      </UiCard>
+    </div>
+
+    <!-- Top users + groups -->
+    <div class="grid gap-6 lg:grid-cols-2">
+      <UiCard icon="users" :title="t('dashboard.topUsers.title')">
+        <EmptyState v-if="!userItems.length" compact icon="users" :title="t('dashboard.breakdown.empty')" />
+        <BarList v-else :items="userItems" />
+      </UiCard>
+      <UiCard icon="layers" :title="t('dashboard.groups.title')">
+        <template #actions>
+          <RouterLink to="/admin/groups" class="btn btn-ghost btn-sm">
+            {{ t("dashboard.groups.manage") }}
+            <UiIcon name="chevron-right" :size="14" />
+          </RouterLink>
+        </template>
+        <EmptyState v-if="!groupItems.length" compact icon="layers" :title="t('dashboard.breakdown.empty')" />
+        <BarList v-else :items="groupItems" />
+      </UiCard>
+    </div>
+
+    <!-- System status -->
+    <h2 class="pt-2 text-sm font-semibold text-fg">{{ t("dashboard.sections.system") }}</h2>
 
     <!-- Plane health -->
     <div class="grid gap-4 md:grid-cols-3">
@@ -303,55 +691,59 @@ onMounted(() => {
       />
     </div>
 
-    <!-- Hot update -->
-    <UiCard icon="branch" :title="t('dashboard.update.title')">
-      <template #actions>
-        <UiBadge :tone="updateStatus?.mode === 'dev' ? 'success' : 'neutral'" dot>
-          {{ updateStatus?.mode === "dev" ? t("dashboard.update.devChannel") : t("dashboard.update.stable") }}
-        </UiBadge>
-        <UiBadge v-if="updateStatus?.updateAvailable" tone="accent">{{ t("dashboard.update.available") }}</UiBadge>
-        <button type="button" class="btn btn-secondary btn-sm" :disabled="updateBusy" @click="triggerRepoSync(true)">
-          <UiIcon name="search" :size="14" />
-          {{ t("dashboard.update.check") }}
-        </button>
-        <button type="button" class="btn btn-primary btn-sm" :disabled="updateBusy" @click="triggerRepoSync(false)">
-          <UiIcon :name="updateBusy ? 'loader' : 'download'" :size="14" :spin="updateBusy" />
-          {{ t("dashboard.update.now") }}
-        </button>
-      </template>
-      <dl class="kv grid-cols-2 sm:grid-cols-3 lg:grid-cols-6">
-        <div>
-          <dt>{{ t("dashboard.update.repo") }}</dt>
-          <dd :title="updateStatus?.repo">{{ updateStatus?.repo ?? "dreamforSh/Slipgate" }}</dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.branchVersion") }}</dt>
-          <dd>{{ updateStatus?.branch ?? "main" }} · {{ updateStatus?.version ?? "0.1.0" }}</dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.commit") }}</dt>
-          <dd>
-            {{ shortHash(updateStatus?.activeCommit ?? "dev") }}
-            <span v-if="updateStatus?.remoteCommit" class="text-accent">→ {{ shortHash(updateStatus.remoteCommit) }}</span>
-          </dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.strategyState") }}</dt>
-          <dd>{{ updateStatus?.resolvedStrategy ?? "release" }} · {{ updateStatus?.state ?? "idle" }}</dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.reloads") }}</dt>
-          <dd>{{ updateStatus?.reloadCount ?? 0 }}</dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.console") }}</dt>
-          <dd>{{ updateStatus?.webUiOverridden ? t("dashboard.update.consoleLive") : t("dashboard.update.consoleBuiltin") }}</dd>
-        </div>
-      </dl>
-      <UiAlert v-if="updateError || updateStatus?.lastError" tone="danger" class="mt-4">
-        <span class="font-mono text-xs">{{ updateError ?? updateStatus?.lastError }}</span>
-      </UiAlert>
-    </UiCard>
+    <!-- Egress & VM -->
+    <div class="grid gap-6 xl:grid-cols-2">
+      <UiCard icon="globe" :title="t('nav.clash')" flush>
+        <template #actions>
+          <RouterLink to="/admin/clash" class="btn btn-ghost btn-sm">
+            {{ t("dashboard.clash.manage") }}
+            <UiIcon name="chevron-right" :size="14" />
+          </RouterLink>
+        </template>
+        <EmptyState v-if="clashNodes.length === 0" compact icon="globe" :title="t('dashboard.clash.empty')" />
+        <ul v-else class="divide-y divide-line/70">
+          <li v-for="node in clashNodes.slice(0, 6)" :key="node.nodeId" class="flex items-center gap-3 px-5 py-3">
+            <div class="min-w-0 flex-1">
+              <p class="truncate text-sm font-medium text-fg">{{ node.name }}</p>
+              <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle">
+                :{{ node.listenerPort }} → {{ node.exitIp || t("dashboard.clash.notProbed") }} · {{ node.latencyMs }}ms
+              </p>
+            </div>
+            <span class="font-mono text-2xs text-fg-subtle">{{ node.boundAccounts }}/{{ node.maxAccounts }}</span>
+            <UiBadge :tone="healthTone(node.healthStatus)" dot>{{ healthLabel(node.healthStatus) }}</UiBadge>
+          </li>
+        </ul>
+      </UiCard>
+
+      <UiCard icon="server" :title="t('nav.vms')" flush>
+        <template #actions>
+          <RouterLink to="/admin/vms" class="btn btn-ghost btn-sm">
+            {{ t("dashboard.clash.manage") }}
+            <UiIcon name="chevron-right" :size="14" />
+          </RouterLink>
+        </template>
+        <EmptyState v-if="vmSlots.length === 0" compact icon="server" :title="t('dashboard.vms.empty')" />
+        <ul v-else class="divide-y divide-line/70">
+          <li v-for="slot in vmSlots.slice(0, 6)" :key="slot.slotId" class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-2 px-5 py-3 sm:grid-cols-[minmax(0,1fr)_7rem_7rem_auto]">
+            <div class="min-w-0">
+              <p class="flex items-center gap-1.5 truncate font-mono text-xs font-medium text-fg">
+                {{ slot.slotId }}
+                <UiBadge :tone="RUNTIME_PROFILE_TONE[slot.runtimeProfile] ?? 'neutral'">{{ slot.runtimeProfile }}</UiBadge>
+              </p>
+              <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle">{{ slot.hypervisorKind }} · {{ slot.exitIp }}</p>
+            </div>
+            <UsageMeter class="hidden sm:block" label="5h" :bps="slot.window5hUsedBps" />
+            <UsageMeter
+              class="hidden sm:block"
+              :label="t('dashboard.vms.concurrency')"
+              :value="slot.activeSubagents"
+              :max="slot.maxSubagents"
+            />
+            <UiBadge :tone="healthTone(slot.state)" dot>{{ slotStateLabel(slot.state) }}</UiBadge>
+          </li>
+        </ul>
+      </UiCard>
+    </div>
 
     <!-- Routing -->
     <div class="grid gap-6 xl:grid-cols-3">
@@ -488,60 +880,6 @@ onMounted(() => {
       </UiCard>
     </div>
 
-    <!-- Egress & VM -->
-    <div class="grid gap-6 xl:grid-cols-2">
-      <UiCard icon="globe" :title="t('nav.clash')" flush>
-        <template #actions>
-          <RouterLink to="/admin/clash" class="btn btn-ghost btn-sm">
-            {{ t("dashboard.clash.manage") }}
-            <UiIcon name="chevron-right" :size="14" />
-          </RouterLink>
-        </template>
-        <EmptyState v-if="clashNodes.length === 0" compact icon="globe" :title="t('dashboard.clash.empty')" />
-        <ul v-else class="divide-y divide-line/70">
-          <li v-for="node in clashNodes.slice(0, 6)" :key="node.nodeId" class="flex items-center gap-3 px-5 py-3">
-            <div class="min-w-0 flex-1">
-              <p class="truncate text-sm font-medium text-fg">{{ node.name }}</p>
-              <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle">
-                :{{ node.listenerPort }} → {{ node.exitIp || t("dashboard.clash.notProbed") }} · {{ node.latencyMs }}ms
-              </p>
-            </div>
-            <span class="font-mono text-2xs text-fg-subtle">{{ node.boundAccounts }}/{{ node.maxAccounts }}</span>
-            <UiBadge :tone="healthTone(node.healthStatus)" dot>{{ healthLabel(node.healthStatus) }}</UiBadge>
-          </li>
-        </ul>
-      </UiCard>
-
-      <UiCard icon="server" :title="t('nav.vms')" flush>
-        <template #actions>
-          <RouterLink to="/admin/vms" class="btn btn-ghost btn-sm">
-            {{ t("dashboard.clash.manage") }}
-            <UiIcon name="chevron-right" :size="14" />
-          </RouterLink>
-        </template>
-        <EmptyState v-if="vmSlots.length === 0" compact icon="server" :title="t('dashboard.vms.empty')" />
-        <ul v-else class="divide-y divide-line/70">
-          <li v-for="slot in vmSlots.slice(0, 6)" :key="slot.slotId" class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-2 px-5 py-3 sm:grid-cols-[minmax(0,1fr)_7rem_7rem_auto]">
-            <div class="min-w-0">
-              <p class="flex items-center gap-1.5 truncate font-mono text-xs font-medium text-fg">
-                {{ slot.slotId }}
-                <UiBadge :tone="RUNTIME_PROFILE_TONE[slot.runtimeProfile] ?? 'neutral'">{{ slot.runtimeProfile }}</UiBadge>
-              </p>
-              <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle">{{ slot.hypervisorKind }} · {{ slot.exitIp }}</p>
-            </div>
-            <UsageMeter class="hidden sm:block" label="5h" :bps="slot.window5hUsedBps" />
-            <UsageMeter
-              class="hidden sm:block"
-              :label="t('dashboard.vms.concurrency')"
-              :value="slot.activeSubagents"
-              :max="slot.maxSubagents"
-            />
-            <UiBadge :tone="healthTone(slot.state)" dot>{{ slotStateLabel(slot.state) }}</UiBadge>
-          </li>
-        </ul>
-      </UiCard>
-    </div>
-
     <!-- Risk -->
     <UiCard icon="shield-alert" :title="t('dashboard.risk.title')" flush>
       <EmptyState v-if="riskEvents.length === 0" compact icon="shield" :title="t('dashboard.risk.empty')" />
@@ -605,6 +943,56 @@ onMounted(() => {
           </tbody>
         </table>
       </div>
+    </UiCard>
+
+    <!-- Hot update -->
+    <UiCard icon="branch" :title="t('dashboard.update.title')">
+      <template #actions>
+        <UiBadge :tone="updateStatus?.mode === 'dev' ? 'success' : 'neutral'" dot>
+          {{ updateStatus?.mode === "dev" ? t("dashboard.update.devChannel") : t("dashboard.update.stable") }}
+        </UiBadge>
+        <UiBadge v-if="updateStatus?.updateAvailable" tone="accent">{{ t("dashboard.update.available") }}</UiBadge>
+        <button type="button" class="btn btn-secondary btn-sm" :disabled="updateBusy" @click="triggerRepoSync(true)">
+          <UiIcon name="search" :size="14" />
+          {{ t("dashboard.update.check") }}
+        </button>
+        <button type="button" class="btn btn-primary btn-sm" :disabled="updateBusy" @click="triggerRepoSync(false)">
+          <UiIcon :name="updateBusy ? 'loader' : 'download'" :size="14" :spin="updateBusy" />
+          {{ t("dashboard.update.now") }}
+        </button>
+      </template>
+      <dl class="kv grid-cols-2 sm:grid-cols-3 lg:grid-cols-6">
+        <div>
+          <dt>{{ t("dashboard.update.repo") }}</dt>
+          <dd :title="updateStatus?.repo">{{ updateStatus?.repo ?? "dreamforSh/Slipgate" }}</dd>
+        </div>
+        <div>
+          <dt>{{ t("dashboard.update.branchVersion") }}</dt>
+          <dd>{{ updateStatus?.branch ?? "main" }} · {{ updateStatus?.version ?? "0.1.0" }}</dd>
+        </div>
+        <div>
+          <dt>{{ t("dashboard.update.commit") }}</dt>
+          <dd>
+            {{ shortHash(updateStatus?.activeCommit ?? "dev") }}
+            <span v-if="updateStatus?.remoteCommit" class="text-accent">→ {{ shortHash(updateStatus.remoteCommit) }}</span>
+          </dd>
+        </div>
+        <div>
+          <dt>{{ t("dashboard.update.strategyState") }}</dt>
+          <dd>{{ updateStatus?.resolvedStrategy ?? "release" }} · {{ updateStatus?.state ?? "idle" }}</dd>
+        </div>
+        <div>
+          <dt>{{ t("dashboard.update.reloads") }}</dt>
+          <dd>{{ updateStatus?.reloadCount ?? 0 }}</dd>
+        </div>
+        <div>
+          <dt>{{ t("dashboard.update.console") }}</dt>
+          <dd>{{ updateStatus?.webUiOverridden ? t("dashboard.update.consoleLive") : t("dashboard.update.consoleBuiltin") }}</dd>
+        </div>
+      </dl>
+      <UiAlert v-if="updateError || updateStatus?.lastError" tone="danger" class="mt-4">
+        <span class="font-mono text-xs">{{ updateError ?? updateStatus?.lastError }}</span>
+      </UiAlert>
     </UiCard>
   </div>
 </template>

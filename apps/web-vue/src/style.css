@@ -34,6 +34,9 @@
     --info: 2 118 178;
     --violet: 124 58 237;
     --shadow: 15 23 42;
+    /* Chart series (dataviz reference palette, validated on these surfaces) */
+    --viz-1: 42 120 214;
+    --viz-2: 235 104 52;
   }
 
   .dark {
@@ -58,6 +61,8 @@
     --info: 56 189 248;
     --violet: 167 139 250;
     --shadow: 0 0 0;
+    --viz-1: 57 135 229;
+    --viz-2: 217 89 38;
   }
 
   html {

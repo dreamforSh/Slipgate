@@ -136,6 +136,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /internal/net/dataplane/sync", s.handleInternalDataPlaneSync)
 	s.registerClashInternalRoutes(mux)
 	s.registerVmInternalRoutes(mux)
+	s.registerAccountInternalRoutes(mux)
 
 	// DataPlane AI hot paths strictly bypass the TypeScript BFF.
 	mux.HandleFunc("/v1/", s.handleDataPlane)

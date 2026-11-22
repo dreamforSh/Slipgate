@@ -1,4 +1,5 @@
 import type {
+  AccountTestResult,
   ApiKeyItem,
   CreateAccountRequest,
   CreateApiKeyRequest,
@@ -76,8 +77,11 @@ export interface ControlStore {
   createGroup(req: CreateGroupRequest): Promise<GroupItem>;
   updateGroup(groupId: string, req: UpdateGroupRequest): Promise<GroupItem>;
   deleteGroup(groupId: string): Promise<void>;
+  /** Copy a group's settings into a new, disabled group (accounts and keys are not copied). */
+  duplicateGroup(groupId: string): Promise<GroupItem>;
 
   listAccounts(filter?: { groupId?: string; executionMode?: string }): Promise<UpstreamAccount[]>;
+  getAccount(accountId: string): Promise<UpstreamAccount | null>;
   createAccount(
     req: CreateAccountRequest,
     encryptedSecret: Uint8Array,
@@ -90,6 +94,7 @@ export interface ControlStore {
     credentialPreview?: string,
   ): Promise<UpstreamAccount>;
   deleteAccount(accountId: string): Promise<void>;
+  recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void>;
 
   listUserApiKeys(userId: string): Promise<ApiKeyItem[]>;
   createApiKey(
@@ -107,7 +112,8 @@ export interface ControlStore {
 
   exportDataPlaneSnapshot(): Promise<DataPlaneSyncSnapshot>;
   recordTurnSettlement(ev: TurnSettlementEvent): Promise<UsageLogItem>;
-  listUsageLogs(filter?: { userId?: string; limit?: number }): Promise<UsageLogItem[]>;
+  /** Newest first. With `sinceIso` the row cap rises from 200 to 100k (dashboard aggregation). */
+  listUsageLogs(filter?: { userId?: string; limit?: number; sinceIso?: string }): Promise<UsageLogItem[]>;
 
   recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent>;
   listRiskBanEvents(limit?: number): Promise<RiskBanEvent[]>;

@@ -1,5 +1,5 @@
 import type { Provider } from "@slipgate/contracts";
-import { enumLabel } from "../i18n";
+import { enumLabel, i18n } from "../i18n";
 
 export type Tone = "neutral" | "accent" | "success" | "warning" | "danger" | "info" | "violet";
 
@@ -91,3 +91,44 @@ export const PROVIDER_OPTIONS: { value: Provider; label: string }[] = [
   { value: "minimax", label: "MiniMax" },
   { value: "qwen", label: "Qwen" },
 ];
+
+/* ---------------- Dashboard number formatting ---------------- */
+
+function activeLocale(): string {
+  return i18n.global.locale.value;
+}
+
+/** 1,284 / 12.9K / 3.4M (zh: 1.3万) — for standalone figures and axis ticks. */
+export function formatCompact(n: number | null | undefined): string {
+  const v = n ?? 0;
+  if (Math.abs(v) < 10_000) return v.toLocaleString(activeLocale(), { maximumFractionDigits: 1 });
+  return new Intl.NumberFormat(activeLocale(), { notation: "compact", maximumFractionDigits: 1 }).format(v);
+}
+
+/** nano-USD integer string → dollars as a float (display only, never for accounting). */
+export function nanoToUsd(nano: string | null | undefined): number {
+  if (!nano) return 0;
+  return Number(BigInt(nano)) / 1e9;
+}
+
+/** $1,234.56 for larger amounts, more precision for sub-dollar values. */
+export function formatUsd(nano: string | null | undefined): string {
+  const usd = nanoToUsd(nano);
+  const digits = usd === 0 ? 2 : usd < 0.01 ? 6 : usd < 1 ? 4 : 2;
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: Math.min(2, digits),
+    maximumFractionDigits: digits,
+  }).format(usd);
+}
+
+/** 850ms / 1.2s / 2m 05s */
+export function formatDurationMs(ms: number | null | undefined): string {
+  const v = Math.max(0, Math.round(ms ?? 0));
+  if (v < 1000) return `${v}ms`;
+  if (v < 60_000) return `${(v / 1000).toFixed(v < 10_000 ? 2 : 1)}s`;
+  const m = Math.floor(v / 60_000);
+  const s = Math.round((v % 60_000) / 1000);
+  return `${m}m ${String(s).padStart(2, "0")}s`;
+}

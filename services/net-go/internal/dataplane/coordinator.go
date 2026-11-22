@@ -195,6 +195,7 @@ type Coordinator struct {
 	keyIPAllowlists    map[string][]string
 	accountAuthKinds   map[string]string
 	accountTiers       map[string]string
+	accountMetas       map[string]accountMeta
 	lastCoreSyncJSON   []byte
 	lastRevisionUnixMs int64
 }
@@ -237,6 +238,7 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		keyIPAllowlists:  make(map[string][]string),
 		accountAuthKinds: make(map[string]string),
 		accountTiers:     make(map[string]string),
+		accountMetas:     make(map[string]accountMeta),
 	}
 }
 
@@ -319,6 +321,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 
 	nextAuthKinds := make(map[string]string, len(snap.Accounts))
 	nextTiers := make(map[string]string, len(snap.Accounts))
+	nextMetas := make(map[string]accountMeta, len(snap.Accounts))
 	coreAccounts := make([]coreAccount, 0, len(snap.Accounts))
 	for _, a := range snap.Accounts {
 		authKind := firstNonEmpty(a.AuthKind, "api_key")
@@ -330,6 +333,13 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		}
 		nextAuthKinds[a.ID] = authKind
 		nextTiers[a.ID] = subTier
+		nextMetas[a.ID] = accountMeta{
+			Platform:         a.Platform,
+			ExecutionMode:    a.ExecutionMode,
+			AuthKind:         authKind,
+			SubscriptionTier: subTier,
+			TierMultiplier:   tierMult,
+		}
 		coreAccounts = append(coreAccounts, coreAccount{
 			ID:               a.ID,
 			GroupID:          a.GroupID,
@@ -398,6 +408,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	c.keyIPAllowlists = nextIPAllowlists
 	c.accountAuthKinds = nextAuthKinds
 	c.accountTiers = nextTiers
+	c.accountMetas = nextMetas
 	c.lastCoreSyncJSON = corePayload
 	c.lastRevisionUnixMs = snap.RevisionUnixMs
 	c.mu.Unlock()
