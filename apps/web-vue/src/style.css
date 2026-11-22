@@ -245,6 +245,10 @@
     @apply h-4 w-4 cursor-pointer rounded border-line-strong;
     accent-color: rgb(var(--accent-solid));
   }
+  .radio {
+    @apply h-4 w-4 cursor-pointer border-line-strong;
+    accent-color: rgb(var(--accent-solid));
+  }
 
   /* Data table */
   .table-wrap {

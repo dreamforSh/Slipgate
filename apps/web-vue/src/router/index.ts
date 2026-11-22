@@ -36,12 +36,21 @@ const router = createRouter({
       component: () => import("../portals/admin/AdminAccountsView.vue"),
       meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.accounts" },
     },
+    { path: "/admin/proxy", redirect: "/admin/proxy/clash" },
     {
-      path: "/admin/clash",
-      name: "admin-clash",
+      path: "/admin/proxy/clash",
+      name: "admin-proxy-clash",
       component: () => import("../portals/admin/AdminClashPoolView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.clash" },
+      meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.proxyClash" },
     },
+    {
+      path: "/admin/proxy/ips",
+      name: "admin-proxy-ips",
+      component: () => import("../portals/admin/AdminProxyIpsView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true, titleKey: "nav.proxyIps" },
+    },
+    // The proxy pool used to live here; keep old bookmarks working.
+    { path: "/admin/clash", redirect: "/admin/proxy/clash" },
     {
       path: "/admin/vms",
       name: "admin-vms",

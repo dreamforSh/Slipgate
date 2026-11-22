@@ -2,6 +2,7 @@ import {
   effectiveAccountStatus,
   formatNanoUsd,
   isSubscriptionTierAllowedForProvider,
+  effectiveSubscriptionTier,
   subscriptionTierMultiplier,
   type AccountTestResult,
   type AccountUsageSummaryItem,
@@ -378,6 +379,7 @@ export class MemoryControlStore implements ControlStore {
         `Subscription tier ${req.subscriptionTier} is not valid for provider ${req.platform}`,
       );
     }
+    const subscriptionTier = effectiveSubscriptionTier(req.authKind, req.subscriptionTier);
     const id = `acc_${crypto.randomUUID()}`;
     const record: InternalAccount = {
       id,
@@ -387,8 +389,8 @@ export class MemoryControlStore implements ControlStore {
       platform: req.platform,
       executionMode: req.executionMode,
       authKind: req.authKind,
-      subscriptionTier: req.subscriptionTier,
-      tierMultiplier: subscriptionTierMultiplier(req.platform, req.subscriptionTier),
+      subscriptionTier,
+      tierMultiplier: subscriptionTierMultiplier(req.platform, subscriptionTier),
       credentialPreview: credential.preview,
       credentialsEnc: credential.encrypted,
       credentialFingerprint: credential.fingerprint,
@@ -433,9 +435,11 @@ export class MemoryControlStore implements ControlStore {
     if (req.notes !== undefined) acc.notes = req.notes;
     if (req.executionMode !== undefined) acc.executionMode = req.executionMode;
     if (req.authKind !== undefined) acc.authKind = req.authKind;
-    if (req.subscriptionTier !== undefined) {
-      acc.subscriptionTier = req.subscriptionTier;
-      acc.tierMultiplier = subscriptionTierMultiplier(acc.platform, req.subscriptionTier);
+    // Re-derived on every patch: switching to an API key drops the plan even without a tier.
+    const nextTier = effectiveSubscriptionTier(acc.authKind, req.subscriptionTier ?? acc.subscriptionTier);
+    if (nextTier !== acc.subscriptionTier) {
+      acc.subscriptionTier = nextTier;
+      acc.tierMultiplier = subscriptionTierMultiplier(acc.platform, nextTier);
     }
     if (req.maxConcurrency !== undefined) acc.maxConcurrency = req.maxConcurrency;
     if (req.priority !== undefined) acc.priority = req.priority;

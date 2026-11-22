@@ -25,33 +25,6 @@ export const EXPIRING_SOON_MS = 7 * DAY_MS;
 /** Quick cooldown presets (hours) for the row menu and bulk bar. */
 export const COOLDOWN_PRESETS_HOURS = [1, 5, 24, 168] as const;
 
-export function tierBadge(acc: Pick<UpstreamAccount, "subscriptionTier" | "tierMultiplier">): string {
-  switch (acc.subscriptionTier) {
-    case "ultra":
-      return `ULTRA · ${acc.tierMultiplier}x`;
-    case "max":
-      return `MAX · ${acc.tierMultiplier}x`;
-    case "pro_25x":
-      return "PRO 25x";
-    case "pro_10x":
-      return "PRO 10x";
-    case "pro_5x":
-      return "PRO 5x";
-    case "plus":
-      return `PLUS · ${acc.tierMultiplier}x`;
-    case "pro":
-      return `PRO · ${acc.tierMultiplier}x`;
-    default:
-      return `STD · ${acc.tierMultiplier}x`;
-  }
-}
-
-export function tierTone(acc: Pick<UpstreamAccount, "tierMultiplier">): Tone {
-  if (acc.tierMultiplier >= 20) return "violet";
-  if (acc.tierMultiplier >= 5) return "success";
-  return "neutral";
-}
-
 export type ExpiryState = "none" | "ok" | "soon" | "expired";
 
 export function expiryState(acc: Pick<UpstreamAccount, "expiresAtIso">, nowMs: number): ExpiryState {

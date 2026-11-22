@@ -18,6 +18,8 @@ interface NavItem {
   label: string;
   icon: IconName;
   exact?: boolean;
+  /** A collapsible group: the parent only toggles; `to` is where the icon rail sends a click. */
+  children?: NavItem[];
 }
 interface NavSection {
   title: string;
@@ -33,7 +35,15 @@ const sections = computed<NavSection[]>(() => {
         { to: "/admin", label: t("nav.dashboard"), icon: "dashboard", exact: true },
         { to: "/admin/groups", label: t("nav.groups"), icon: "layers" },
         { to: "/admin/accounts", label: t("nav.accounts"), icon: "users" },
-        { to: "/admin/clash", label: t("nav.clash"), icon: "globe" },
+        {
+          to: "/admin/proxy",
+          label: t("nav.proxy"),
+          icon: "globe",
+          children: [
+            { to: "/admin/proxy/clash", label: t("nav.proxyClash"), icon: "network" },
+            { to: "/admin/proxy/ips", label: t("nav.proxyIps"), icon: "route" },
+          ],
+        },
         { to: "/admin/vms", label: t("nav.vms"), icon: "server" },
       ],
     });
@@ -49,7 +59,29 @@ function isActive(item: NavItem) {
   return item.exact ? route.path === item.to : route.path === item.to || route.path.startsWith(`${item.to}/`);
 }
 
+/* ---------------- Collapsible groups ---------------- */
+// A group follows the route (open while one of its pages is active) until the admin toggles
+// it; that choice then wins, so an active group can still be folded away.
+const groupOverrides = ref(new Map<string, boolean>());
+
+function isGroupExpanded(item: NavItem) {
+  return groupOverrides.value.get(item.to) ?? isActive(item);
+}
+
+function onGroupClick(item: NavItem) {
+  if (rail.value) {
+    // The icon rail has no room for children: jump to the active child or the first one.
+    const target = item.children?.find(isActive) ?? item.children?.[0];
+    if (target) void router.push(target.to);
+    return;
+  }
+  const next = new Map(groupOverrides.value);
+  next.set(item.to, !isGroupExpanded(item));
+  groupOverrides.value = next;
+}
+
 const activeSection = computed(() => sections.value.find((s) => s.items.some(isActive)));
+const activeGroup = computed(() => activeSection.value?.items.find((i) => i.children?.length && isActive(i)) ?? null);
 const pageTitle = computed(() =>
   route.meta.titleKey ? t(route.meta.titleKey) : (activeSection.value?.items.find(isActive)?.label ?? ""),
 );
@@ -180,7 +212,42 @@ async function handleLogout() {
           </p>
           <ul class="space-y-1">
             <li v-for="item in section.items" :key="item.to">
+              <template v-if="item.children?.length">
+                <button
+                  type="button"
+                  class="nav-link w-full"
+                  :class="{ 'nav-link-active': isActive(item) && (rail || !isGroupExpanded(item)), 'nav-link-rail': rail }"
+                  :title="rail ? item.label : undefined"
+                  :aria-expanded="rail ? undefined : isGroupExpanded(item)"
+                  @click="onGroupClick(item)"
+                >
+                  <UiIcon :name="item.icon" :size="18" />
+                  <span class="fade-x flex min-w-0 flex-1 items-center justify-between gap-2" :class="{ 'fade-x-hidden': rail }">
+                    <span class="truncate">{{ item.label }}</span>
+                    <UiIcon
+                      name="chevron-down"
+                      :size="14"
+                      class="shrink-0 text-fg-subtle transition-transform duration-200"
+                      :class="isGroupExpanded(item) ? 'rotate-180' : ''"
+                    />
+                  </span>
+                </button>
+                <ul v-if="!rail && isGroupExpanded(item)" class="mb-1 ml-[1.35rem] mt-1 space-y-0.5 border-l border-line/80 pl-2">
+                  <li v-for="child in item.children" :key="child.to">
+                    <RouterLink
+                      :to="child.to"
+                      class="nav-link nav-link-child"
+                      :class="{ 'nav-link-active': isActive(child) }"
+                      :aria-current="isActive(child) ? 'page' : undefined"
+                    >
+                      <UiIcon :name="child.icon" :size="15" />
+                      <span class="truncate">{{ child.label }}</span>
+                    </RouterLink>
+                  </li>
+                </ul>
+              </template>
               <RouterLink
+                v-else
                 :to="item.to"
                 class="nav-link"
                 :class="{ 'nav-link-active': isActive(item), 'nav-link-rail': rail }"
@@ -231,6 +298,10 @@ async function handleLogout() {
             <nav :aria-label="t('nav.breadcrumb')" class="hidden min-w-0 items-center gap-1.5 text-sm sm:flex">
               <template v-if="activeSection">
                 <span class="whitespace-nowrap text-fg-subtle">{{ activeSection.title }}</span>
+                <UiIcon name="chevron-right" :size="14" class="text-fg-subtle/70" />
+              </template>
+              <template v-if="activeGroup">
+                <span class="whitespace-nowrap text-fg-subtle">{{ activeGroup.label }}</span>
                 <UiIcon name="chevron-right" :size="14" class="text-fg-subtle/70" />
               </template>
               <span class="truncate font-semibold tracking-tight text-fg">{{ pageTitle }}</span>
@@ -385,6 +456,9 @@ async function handleLogout() {
 }
 .nav-link:hover > svg {
   @apply text-fg-muted;
+}
+.nav-link-child {
+  @apply h-8 gap-2.5 text-[13px];
 }
 .nav-link-rail {
   @apply gap-0;

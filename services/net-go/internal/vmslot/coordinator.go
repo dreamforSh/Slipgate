@@ -59,12 +59,16 @@ type OverviewRuntime struct {
 
 // RegisterClusterNodeInput defines inputs for creating/updating a remote agentless SSH node.
 type RegisterClusterNodeInput struct {
-	ID            string            `json:"id,omitempty"`
-	Name          string            `json:"name"`
-	DriverKind    string            `json:"driverKind,omitempty"` // "ssh" | "local"
-	SSHAddr       string            `json:"sshAddr"`
-	SSHUser       string            `json:"sshUser,omitempty"`
-	SSHKeyPEM     string            `json:"sshKeyPem,omitempty"`
+	ID         string `json:"id,omitempty"`
+	Name       string `json:"name"`
+	DriverKind string `json:"driverKind,omitempty"` // "ssh" | "local"
+	SSHAddr    string `json:"sshAddr"`
+	SSHUser    string `json:"sshUser,omitempty"`
+	SSHKeyPEM  string `json:"sshKeyPem,omitempty"`
+	// SSHHostKey optionally pins the server host key (authorized_keys or ssh-keyscan line).
+	// Left empty, an existing pin is kept while sshAddr is unchanged; otherwise the first
+	// connection pins the key the server presents.
+	SSHHostKey    string            `json:"sshHostKey,omitempty"`
 	Arch          string            `json:"arch,omitempty"`
 	KVMCapable    bool              `json:"kvmCapable"`
 	DockerCapable bool              `json:"dockerCapable"`
@@ -139,7 +143,7 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		clashPool: opts.ClashPool,
 		store:     opts.Store,
 		localDrv:  NewLocalSlotDriver(opts.VMDataDir, opts.GuestdBin),
-		sshDrv:    NewAgentlessSSHDriver(),
+		sshDrv:    NewAgentlessSSHDriver(opts.Store.PinClusterNodeHostKey),
 		logger:    opts.Logger,
 		tickets:   make(map[string]TerminalTicket),
 	}
@@ -258,6 +262,17 @@ func (c *Coordinator) RegisterClusterNode(ctx context.Context, in RegisterCluste
 	if maxSlots <= 0 {
 		maxSlots = 16
 	}
+	hostKey := ""
+	if strings.TrimSpace(in.SSHHostKey) != "" {
+		normalized, err := NormalizeSSHHostKey(in.SSHHostKey)
+		if err != nil {
+			return ClusterNode{}, err
+		}
+		hostKey = normalized
+	} else if existing, err := c.store.GetClusterNode(ctx, id); err == nil && existing.SSHAddr == in.SSHAddr {
+		// Same host: keep trusting the key pinned earlier. A new address starts over.
+		hostKey = existing.SSHHostKey
+	}
 	node := ClusterNode{
 		ID:            id,
 		Name:          in.Name,
@@ -266,6 +281,7 @@ func (c *Coordinator) RegisterClusterNode(ctx context.Context, in RegisterCluste
 		SSHUser:       defaultIfEmpty(in.SSHUser, "root"),
 		SSHKeyPEM:     in.SSHKeyPEM,
 		HasSSHKey:     strings.TrimSpace(in.SSHKeyPEM) != "",
+		SSHHostKey:    hostKey,
 		Arch:          arch,
 		KVMCapable:    in.KVMCapable,
 		DockerCapable: in.DockerCapable || !in.KVMCapable,
@@ -303,6 +319,14 @@ func (c *Coordinator) ProvisionSlot(ctx context.Context, in ProvisionSlotInput) 
 	if in.AccountID == "" {
 		return Slot{}, fmt.Errorf("%w: accountId is required", ErrInvalidHardwarePersona)
 	}
+	// The id becomes a directory name and a remote path, so reject unsafe ids before anything else.
+	slotID := strings.TrimSpace(in.ID)
+	if slotID == "" {
+		slotID = "vm-" + randomHex(4)
+	}
+	if !ValidSlotID(slotID) {
+		return Slot{}, fmt.Errorf("%w: %q (use letters, digits, '.', '_' or '-', starting with a letter or digit)", ErrInvalidSlotID, slotID)
+	}
 	if in.ClusterNodeID == "" {
 		in.ClusterNodeID = LocalNodeID
 	}
@@ -333,11 +357,6 @@ func (c *Coordinator) ProvisionSlot(ctx context.Context, in ProvisionSlotInput) 
 				ExitIP:        clashNode.ExitIP,
 			}
 		}
-	}
-
-	slotID := strings.TrimSpace(in.ID)
-	if slotID == "" {
-		slotID = "vm-" + randomHex(4)
 	}
 
 	var persona HardwarePersona

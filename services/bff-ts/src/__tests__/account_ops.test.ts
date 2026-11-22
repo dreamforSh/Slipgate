@@ -11,6 +11,7 @@ import {
   type UpstreamAccount,
 } from "@slipgate/contracts";
 import { createBffApp } from "../app.ts";
+import { maskSecret } from "../security/crypto.ts";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const HOUR = 3_600_000;
@@ -188,8 +189,9 @@ describe("account lifecycle", () => {
     const env = await bootstrap();
     const { admin, call } = env;
     const g = await env.createGroup("g");
-    const claude = await env.createAccount({ name: "claude", groupId: g.id });
-    const codex = await env.createAccount({ name: "codex", groupId: g.id, platform: "codex" });
+    // Subscription accounts: API keys never take a tier (see "API keys carry no plan").
+    const claude = await env.createAccount({ name: "claude", groupId: g.id, authKind: "oauth" });
+    const codex = await env.createAccount({ name: "codex", groupId: g.id, platform: "codex", authKind: "oauth" });
     const until = new Date(Date.now() + HOUR).toISOString();
 
     const bulk = await call<AccountBulkResult>("POST", "/api/v1/admin/accounts/bulk-update", admin, {
@@ -309,12 +311,75 @@ describe("account import and export", () => {
 
     // Re-importing the backup is idempotent: every credential is already stored.
     const parsed = parseAccountImportFile(all.body);
-    expect(parsed.format).toBe("slipgate");
+    expect(parsed.formats).toEqual(["slipgate"]);
     const again = await call<AccountImportResult>("POST", "/api/v1/admin/accounts/import", admin, {
       accounts: parsed.drafts.map((d) => ({ ...d, groupId: g.id })),
     });
     expect(again.body).toMatchObject({ created: 0, skipped: 2, failed: 0 });
     expect(again.body.results.find((r) => r.name === "claude-1")?.duplicateOf).toBe(a.id);
+  });
+});
+
+describe("API keys carry no plan", () => {
+  it("stores and schedules API-key accounts as standard on every write path", async () => {
+    const env = await bootstrap("tier-internal-token");
+    const { app, admin, call } = env;
+    const g = await env.createGroup("g");
+
+    // Create: a tier sent with an API key is dropped.
+    const key = await env.createAccount({ name: "key", groupId: g.id, subscriptionTier: "max" });
+    expect(key).toMatchObject({ authKind: "api_key", subscriptionTier: "standard", tierMultiplier: 1 });
+
+    // PATCH: still standard when only the tier is sent.
+    const patched = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${key.id}`, admin, {
+      subscriptionTier: "ultra",
+    });
+    expect(patched.status).toBe(200);
+    expect(patched.body.account).toMatchObject({ subscriptionTier: "standard", tierMultiplier: 1 });
+
+    // Switching a subscription to an API key drops its plan without a tier in the patch.
+    const oauth = await env.createAccount({ name: "oauth", groupId: g.id, authKind: "oauth", subscriptionTier: "ultra" });
+    expect(oauth).toMatchObject({ subscriptionTier: "ultra", tierMultiplier: 20 });
+    const switched = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${oauth.id}`, admin, {
+      authKind: "api_key",
+    });
+    expect(switched.body.account).toMatchObject({ authKind: "api_key", subscriptionTier: "standard", tierMultiplier: 1 });
+
+    // Bulk: subscriptions take the tier, API keys keep standard and still count as updated.
+    const sub = await env.createAccount({ name: "sub", groupId: g.id, authKind: "oauth", subscriptionTier: "pro" });
+    const bulk = await call<AccountBulkResult>("POST", "/api/v1/admin/accounts/bulk-update", admin, {
+      accountIds: [key.id, sub.id],
+      patch: { subscriptionTier: "max" },
+    });
+    expect(bulk.body).toMatchObject({ success: 2, failed: 0 });
+    const byId = new Map((await env.listAccounts()).map((a) => [a.id, a]));
+    expect(byId.get(key.id)?.subscriptionTier).toBe("standard");
+    expect(byId.get(sub.id)?.subscriptionTier).toBe("max");
+
+    // Import goes through the same path.
+    const imported = await call<AccountImportResult>("POST", "/api/v1/admin/accounts/import", admin, {
+      accounts: [
+        {
+          name: "imported-key",
+          groupId: g.id,
+          platform: "anthropic",
+          executionMode: "direct_api",
+          authKind: "api_key",
+          subscriptionTier: "ultra",
+          credentialSecret: "sk-ant-imported-key-123",
+        },
+      ],
+    });
+    expect(imported.body.created).toBe(1);
+    expect((await env.listAccounts()).find((a) => a.name === "imported-key")?.subscriptionTier).toBe("standard");
+
+    // The data plane snapshot schedules them at 1x.
+    const res = await app.request("/api/v1/internal/dataplane/snapshot", {
+      headers: { "X-Slipgate-Internal-Token": "tier-internal-token" },
+    });
+    const snap = (await res.json()) as DataPlaneSyncSnapshot;
+    expect(snap.accounts.find((a) => a.id === key.id)?.subscriptionTier).toBe("standard");
+    expect(snap.accounts.find((a) => a.id === oauth.id)?.subscriptionTier).toBe("standard");
   });
 });
 
@@ -381,5 +446,20 @@ describe("account usage", () => {
     expect(idleStats.body.series).toHaveLength(30);
 
     expect((await call("GET", "/api/v1/admin/accounts/acc_missing/stats", admin)).status).toBe(404);
+  });
+});
+
+describe("credential previews", () => {
+  it("mask the token of JSON credentials instead of the JSON text", () => {
+    expect(maskSecret("sk-ant-api03-0123456789")).toBe("sk-ant...6789");
+    expect(maskSecret("https://relay.example.com|sk-ant-api03-0123456789")).toBe("sk-ant...6789");
+    expect(maskSecret('{"email":"a@example.com","access_token":"sk-ant-oat01-abcdefgh","type":"claude"}')).toBe("sk-ant...efgh");
+    // Gemini CLI auth files nest the token; Claude Code / Codex CLI files use their own wrappers.
+    expect(maskSecret('{"email":"g@example.com","token":{"access_token":"ya29.a0AfH6SMBxyz9876"}}')).toBe("ya29.a...9876");
+    expect(maskSecret('{"claudeAiOauth":{"accessToken":"sk-ant-oat01-zzzz1234"}}')).toBe("sk-ant...1234");
+    expect(maskSecret('{"tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.x.sig9"}}')).toBe("eyJhbG...sig9");
+    // Short tokens stay fully hidden; JSON without a known token falls back to the text.
+    expect(maskSecret('{"api_key":"short"}')).toBe("****");
+    expect(maskSecret('{"unknown_field":"value-value-value"}')).toBe('{"unkn...ue"}');
   });
 });

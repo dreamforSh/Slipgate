@@ -693,9 +693,9 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
 
     <!-- Egress & VM -->
     <div class="grid gap-6 xl:grid-cols-2">
-      <UiCard icon="globe" :title="t('nav.clash')" flush>
+      <UiCard icon="globe" :title="t('nav.proxyClash')" flush>
         <template #actions>
-          <RouterLink to="/admin/clash" class="btn btn-ghost btn-sm">
+          <RouterLink to="/admin/proxy/clash" class="btn btn-ghost btn-sm">
             {{ t("dashboard.clash.manage") }}
             <UiIcon name="chevron-right" :size="14" />
           </RouterLink>

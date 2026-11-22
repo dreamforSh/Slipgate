@@ -6,9 +6,10 @@ import UiBadge from "../../ui/UiBadge.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UsageMeter from "../../ui/UsageMeter.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
-import { EXPIRY_TONE, MODE_ICON, expiryState, tierBadge, tierTone } from "./accountDisplay";
+import PlatformTypeBadge from "./PlatformTypeBadge.vue";
+import { EXPIRY_TONE, MODE_ICON, expiryState } from "./accountDisplay";
+import { platformStyle } from "../../../lib/platformStyle";
 import {
-  PROVIDER_OPTIONS,
   executionModeLabel,
   formatCompact,
   formatDateShort,
@@ -35,11 +36,18 @@ const emit = defineEmits<{
 const { t, te } = useI18n();
 
 const acc = computed(() => props.account);
-const platformLabel = computed(() => PROVIDER_OPTIONS.find((p) => p.value === acc.value.platform)?.label ?? acc.value.platform);
+const platform = computed(() => platformStyle(acc.value.platform));
 const authLabel = computed(() => {
   const key = `accounts.authKinds.${acc.value.authKind}`;
   return te(key) ? t(key) : acc.value.authKind;
 });
+
+/** Dot color of the access-mode line under the platform badge. */
+const MODE_DOT: Record<string, string> = {
+  stealth_http: "bg-info",
+  direct_api: "bg-success",
+  vm_slot: "bg-violet",
+};
 const expiry = computed(() => expiryState(acc.value, props.now));
 
 const todayTitle = computed(() => {
@@ -64,12 +72,15 @@ const lastTestClass = computed(() => {
 
 <template>
   <article
-    class="card card-hover flex min-w-0 flex-col p-4"
+    class="card card-hover relative flex min-w-0 flex-col p-4 pt-5"
     :class="[
-      selected ? '!border-accent/50 ring-2 ring-accent/30' : '',
+      selected ? '!border-accent/50 ring-2 ring-accent/30' : platform.border,
       acc.effectiveStatus === 'active' ? '' : 'opacity-80',
     ]"
   >
+    <!-- Platform accent bar (inset by the border, so it follows the rounded corners) -->
+    <div class="pointer-events-none absolute inset-x-0 top-0 h-1 rounded-t-[11px]" :class="platform.bar" aria-hidden="true" />
+
     <!-- Header: select, name + group, scheduling -->
     <div class="flex items-start gap-3">
       <input
@@ -104,17 +115,23 @@ const lastTestClass = computed(() => {
       </div>
     </div>
 
-    <!-- Platform, plan, access mode, auth -->
-    <div class="mt-3 flex flex-wrap items-center gap-1.5">
-      <UiBadge tone="accent">{{ platformLabel }}</UiBadge>
-      <UiBadge :tone="tierTone(acc)" mono>{{ tierBadge(acc) }}</UiBadge>
-      <UiBadge :tone="acc.executionMode === 'vm_slot' ? 'violet' : 'info'">
-        <span class="inline-flex items-center gap-1">
-          <UiIcon :name="MODE_ICON[acc.executionMode]" :size="11" />
-          {{ executionModeLabel(acc.executionMode) }}
-        </span>
-      </UiBadge>
-      <span class="text-2xs text-fg-muted">{{ authLabel }}</span>
+    <!-- Platform + auth type, plan, access mode -->
+    <div class="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1.5">
+      <PlatformTypeBadge
+        inline
+        :platform="acc.platform"
+        :auth-kind="acc.authKind"
+        :subscription-tier="acc.subscriptionTier"
+        :tier-multiplier="acc.tierMultiplier"
+      />
+      <span
+        class="inline-flex items-center gap-1.5 text-2xs font-medium text-fg-muted"
+        :title="`${executionModeLabel(acc.executionMode)} · ${authLabel}`"
+      >
+        <span class="h-1.5 w-1.5 rounded-full" :class="MODE_DOT[acc.executionMode]" />
+        <UiIcon :name="MODE_ICON[acc.executionMode]" :size="11" />
+        {{ executionModeLabel(acc.executionMode) }}
+      </span>
     </div>
 
     <!-- Notes + credential -->

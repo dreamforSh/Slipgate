@@ -83,6 +83,7 @@ const nodeUser = ref("root");
 const nodeArch = ref<"amd64" | "arm64">("amd64");
 const nodeKvm = ref(false);
 const nodeKeyPem = ref("");
+const nodeHostKey = ref("");
 
 // Provision VM slot form
 const slotIdInput = ref("");
@@ -189,6 +190,7 @@ async function registerNode() {
         sshAddr: nodeAddr.value,
         sshUser: nodeUser.value || "root",
         sshKeyPem: nodeKeyPem.value || undefined,
+        sshHostKey: nodeHostKey.value.trim() || undefined,
         arch: nodeArch.value,
         kvmCapable: nodeKvm.value,
         dockerCapable: true,
@@ -201,6 +203,7 @@ async function registerNode() {
     nodeName.value = "";
     nodeAddr.value = "";
     nodeKeyPem.value = "";
+    nodeHostKey.value = "";
     nodeDrawerOpen.value = false;
     actionNotice.value = t("vms.toast.nodeRegistered");
     await loadFleet();
@@ -825,6 +828,14 @@ onBeforeUnmount(() => {
                     {{ t("vms.nodes.sshKey") }}
                   </UiBadge>
                 </div>
+                <p
+                  v-if="n.driverKind === 'ssh'"
+                  class="mt-1 max-w-[16rem] truncate font-mono text-2xs"
+                  :class="n.sshHostKeyFingerprint ? 'text-fg-subtle' : 'text-warning'"
+                  :title="n.sshHostKeyFingerprint || t('vms.nodes.hostKeyPendingHint')"
+                >
+                  {{ n.sshHostKeyFingerprint || t("vms.nodes.hostKeyPending") }}
+                </p>
               </td>
               <td><UiBadge :tone="healthTone(n.status)" dot>{{ hostStatusLabel(n.status) }}</UiBadge></td>
               <td class="text-right">
@@ -985,6 +996,16 @@ onBeforeUnmount(() => {
             :placeholder="t('vms.nodeForm.privateKeyPlaceholder')"
             class="textarea font-mono text-xs"
           />
+        </FormField>
+        <FormField :label="t('vms.nodeForm.hostKey')">
+          <textarea
+            v-model="nodeHostKey"
+            rows="2"
+            spellcheck="false"
+            :placeholder="t('vms.nodeForm.hostKeyPlaceholder')"
+            class="textarea font-mono text-xs"
+          />
+          <span class="mt-1 block text-2xs text-fg-subtle">{{ t("vms.nodeForm.hostKeyHint") }}</span>
         </FormField>
       </form>
       <template #footer>
