@@ -36,6 +36,24 @@ type SetupSettingsValue = {
   allowRegistration: boolean;
 };
 
+/**
+ * Older builds bound `JSON.stringify(x)` to jsonb parameters, which postgres.js encoded a second
+ * time, storing a JSON *string*. Decode such values so existing rows keep working.
+ */
+function jsonColumn<T>(value: unknown): T | undefined {
+  if (typeof value !== "string") return value as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+function jsonArray(value: unknown): string[] {
+  const decoded = jsonColumn<unknown>(value);
+  return Array.isArray(decoded) ? (decoded as string[]) : [];
+}
+
 function mapPgError(err: unknown): never {
   const pgCode = (err as { code?: string })?.code;
   const message = err instanceof Error ? err.message : "Database error";
@@ -85,6 +103,14 @@ export class PostgresControlStore implements ControlStore {
           ADD COLUMN IF NOT EXISTS last_test_duration_ms INTEGER,
           ADD COLUMN IF NOT EXISTS last_test_message TEXT;
 
+      -- Self-heal jsonb values that older builds double-encoded as JSON strings.
+      UPDATE commerce.portal_settings SET value_json = (value_json #>> '{}')::jsonb
+       WHERE jsonb_typeof(value_json) = 'string' AND left(btrim(value_json #>> '{}'), 1) IN ('{', '[');
+      UPDATE core.groups SET model_allowlist = (model_allowlist #>> '{}')::jsonb
+       WHERE jsonb_typeof(model_allowlist) = 'string' AND left(btrim(model_allowlist #>> '{}'), 1) = '[';
+      UPDATE core.api_keys SET ip_allowlist = (ip_allowlist #>> '{}')::jsonb
+       WHERE jsonb_typeof(ip_allowlist) = 'string' AND left(btrim(ip_allowlist #>> '{}'), 1) = '[';
+
       ALTER TABLE core.groups
           ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '',
           ADD COLUMN IF NOT EXISTS is_exclusive BOOLEAN NOT NULL DEFAULT FALSE,
@@ -100,14 +126,15 @@ export class PostgresControlStore implements ControlStore {
   }
 
   async getSetupStatus(): Promise<SetupStatus> {
-    const rows = await this.sql<{ value_json: SetupSettingsValue }[]>`
+    const rows = await this.sql<{ value_json: unknown }[]>`
       SELECT value_json FROM commerce.portal_settings WHERE key = 'setup_state'
     `;
-    if (rows.length > 0 && rows[0]?.value_json) {
+    const state = jsonColumn<SetupSettingsValue>(rows[0]?.value_json);
+    if (state && typeof state === "object") {
       return {
-        initialized: Boolean(rows[0].value_json.initialized),
-        siteName: rows[0].value_json.siteName || "Slipgate Gateway",
-        allowRegistration: Boolean(rows[0].value_json.allowRegistration),
+        initialized: Boolean(state.initialized),
+        siteName: state.siteName || "Slipgate Gateway",
+        allowRegistration: Boolean(state.allowRegistration),
       };
     }
 
@@ -172,7 +199,7 @@ export class PostgresControlStore implements ControlStore {
         };
         await tx`
           INSERT INTO commerce.portal_settings (key, value_json, updated_at)
-          VALUES ('setup_state', ${JSON.stringify(setupState)}::jsonb, NOW())
+          VALUES ('setup_state', ${this.sql.json(setupState)}, NOW())
           ON CONFLICT (key) DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = NOW()
         `;
 
@@ -400,7 +427,7 @@ export class PostgresControlStore implements ControlStore {
           'credit',
           ${amountNanoUsd.toString()}::numeric,
           ${updated[0]!.balance_nano_usd}::numeric,
-          ${JSON.stringify({ reason })}::jsonb
+          ${this.sql.json({ reason })}
         )
       `;
 
@@ -410,7 +437,7 @@ export class PostgresControlStore implements ControlStore {
           ${`obx_${crypto.randomUUID()}`},
           'core.v1.CreditWallet',
           ${userId},
-          ${JSON.stringify({ idempotencyKey, amountNanoUsd: amountNanoUsd.toString(), reason })}::jsonb,
+          ${this.sql.json({ idempotencyKey, amountNanoUsd: amountNanoUsd.toString(), reason })},
           'dispatched',
           NOW()
         )
@@ -472,7 +499,7 @@ export class PostgresControlStore implements ControlStore {
       platform: r.platform,
       subscriptionType: r.subscription_type,
       rateMultiplier: Number.parseFloat(r.rate_multiplier),
-      modelAllowlist: Array.isArray(r.model_allowlist) ? r.model_allowlist : [],
+      modelAllowlist: jsonArray(r.model_allowlist),
       isExclusive: Boolean(r.is_exclusive),
       sortOrder: r.sort_order ?? 0,
       enabled: r.enabled,
@@ -498,7 +525,7 @@ export class PostgresControlStore implements ControlStore {
           ${req.platform},
           ${req.subscriptionType},
           ${req.rateMultiplier},
-          ${JSON.stringify(req.modelAllowlist)}::jsonb,
+          ${this.sql.json(req.modelAllowlist)},
           ${req.isExclusive},
           ${req.sortOrder},
           ${req.enabled}
@@ -517,7 +544,7 @@ export class PostgresControlStore implements ControlStore {
 
   async updateGroup(groupId: string, req: UpdateGroupRequest): Promise<GroupItem> {
     try {
-      const allowlistJson = req.modelAllowlist ? JSON.stringify(req.modelAllowlist) : null;
+      const allowlistJson = req.modelAllowlist ? this.sql.json(req.modelAllowlist) : null;
       const rows = await this.sql<{ id: string }[]>`
         UPDATE core.groups
         SET name = COALESCE(${req.name ?? null}, name),
@@ -849,7 +876,7 @@ export class PostgresControlStore implements ControlStore {
       keyPrefix: r.key_prefix,
       rpmLimit: r.rpm_limit,
       concurrencyLimit: r.concurrency_limit,
-      ipAllowlist: Array.isArray(r.ip_allowlist) ? r.ip_allowlist : [],
+      ipAllowlist: jsonArray(r.ip_allowlist),
       enabled: r.enabled,
       expiresAtIso: r.expires_at ? toIso(r.expires_at) : null,
       createdAtIso: toIso(r.created_at),
@@ -878,7 +905,7 @@ export class PostgresControlStore implements ControlStore {
           ${Buffer.from(keyHash)},
           ${req.rpmLimit},
           ${req.concurrencyLimit},
-          ${JSON.stringify(req.ipAllowlist)}::jsonb,
+          ${this.sql.json(req.ipAllowlist)},
           TRUE,
           ${req.expiresAtIso ? new Date(req.expiresAtIso) : null}
         )
@@ -1123,7 +1150,7 @@ export class PostgresControlStore implements ControlStore {
         keyHashHex: k.key_hash_hex,
         rpmLimit: k.rpm_limit,
         concurrencyLimit: k.concurrency_limit,
-        ipAllowlist: Array.isArray(k.ip_allowlist) ? k.ip_allowlist : [],
+        ipAllowlist: jsonArray(k.ip_allowlist),
         enabled: k.enabled,
         expiresAtIso: k.expires_at ? toIso(k.expires_at) : null,
       })),
@@ -1186,13 +1213,13 @@ export class PostgresControlStore implements ControlStore {
               ${(-costNano).toString()}::numeric,
               ${updatedWallet[0]!.balance_nano_usd}::numeric,
               ${ev.requestId},
-              ${JSON.stringify({
+              ${this.sql.json({
                 accountId: ev.accountId,
                 publicModel: ev.publicModel,
                 upstreamModel: ev.upstreamModel,
                 inputTokens: ev.inputTokens,
                 outputTokens: ev.outputTokens,
-              })}::jsonb
+              })}
             )
           `;
         }
