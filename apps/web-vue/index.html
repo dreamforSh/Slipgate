@@ -3,9 +3,24 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Slipgate Control Console</title>
+  <meta name="color-scheme" content="light dark" />
+  <title>Slipgate 控制台</title>
+  <link
+    rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Cpath d='M9 24V14a7 7 0 0 1 14 0v10' fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round'/%3E%3Cpath d='M13.5 24v-5h5v5' fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+  />
+  <script>
+    // Apply the saved theme before first paint to avoid a light/dark flash.
+    (function () {
+      try {
+        var mode = localStorage.getItem("slipgate_theme") || "system";
+        var dark = mode === "dark" || (mode === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.classList.add("dark");
+      } catch (e) {}
+    })();
+  </script>
 </head>
-<body class="bg-slate-950 text-slate-100 antialiased">
+<body>
   <div id="app"></div>
   <script type="module" src="/src/main.ts"></script>
 </body>

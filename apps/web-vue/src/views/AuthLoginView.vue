@@ -2,6 +2,10 @@
 import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
 import type { AuthSessionResponse } from "@slipgate/contracts";
+import AuthLayout from "../components/AuthLayout.vue";
+import SegmentedControl from "../components/ui/SegmentedControl.vue";
+import UiAlert from "../components/ui/UiAlert.vue";
+import UiIcon from "../components/ui/UiIcon.vue";
 import { useAuthStore } from "../stores/auth";
 
 const router = useRouter();
@@ -10,6 +14,7 @@ const auth = useAuthStore();
 const mode = ref<"login" | "register">("login");
 const email = ref("");
 const password = ref("");
+const showPassword = ref(false);
 const submitting = ref(false);
 const errorMessage = ref<string | null>(null);
 
@@ -45,65 +50,76 @@ async function handleSubmit() {
 </script>
 
 <template>
-  <div class="mx-auto max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 shadow-xl">
-    <div class="flex items-center justify-between">
-      <h2 class="text-xl font-bold text-white">
-        {{ mode === "login" ? "登录 Slipgate" : "注册账号" }}
-      </h2>
-      <div v-if="canRegister" class="flex gap-1 rounded-lg bg-slate-950 p-1 text-xs">
-        <button
-          type="button"
-          class="rounded px-2.5 py-1 transition"
-          :class="mode === 'login' ? 'bg-sky-500 text-slate-950 font-semibold' : 'text-slate-400'"
-          @click="mode = 'login'"
-        >
-          登录
-        </button>
-        <button
-          type="button"
-          class="rounded px-2.5 py-1 transition"
-          :class="mode === 'register' ? 'bg-sky-500 text-slate-950 font-semibold' : 'text-slate-400'"
-          @click="mode = 'register'"
-        >
-          注册
-        </button>
-      </div>
+  <AuthLayout :site-name="auth.setupStatus?.siteName">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight text-fg">
+        {{ mode === "login" ? "登录控制台" : "创建账号" }}
+      </h1>
+      <p class="mt-1.5 text-sm text-fg-muted">
+        {{ mode === "login" ? "使用邮箱和密码登录。" : "注册后即可签发 API Key 并查看用量。" }}
+      </p>
     </div>
 
+    <SegmentedControl
+      v-if="canRegister"
+      v-model="mode"
+      class="mt-6"
+      block
+      size="md"
+      :options="[
+        { value: 'login', label: '登录' },
+        { value: 'register', label: '注册' },
+      ]"
+    />
+
     <form class="mt-6 space-y-4" @submit.prevent="handleSubmit">
-      <div>
-        <label class="block text-xs font-medium text-slate-300">邮箱</label>
+      <label class="block">
+        <span class="label">邮箱</span>
         <input
           v-model="email"
           type="email"
           required
+          autocomplete="email"
           placeholder="user@example.com"
-          class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:border-sky-500 focus:outline-none"
+          class="input h-10"
         />
-      </div>
+      </label>
 
-      <div>
-        <label class="block text-xs font-medium text-slate-300">密码</label>
-        <input
-          v-model="password"
-          type="password"
-          :minlength="mode === 'register' ? 8 : 1"
-          required
-          class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:border-sky-500 focus:outline-none"
-        />
-      </div>
+      <label class="block">
+        <span class="label flex items-center justify-between">
+          密码
+          <span v-if="mode === 'register'" class="font-normal text-fg-subtle">至少 8 位</span>
+        </span>
+        <span class="relative block">
+          <input
+            v-model="password"
+            :type="showPassword ? 'text' : 'password'"
+            :minlength="mode === 'register' ? 8 : 1"
+            required
+            :autocomplete="mode === 'login' ? 'current-password' : 'new-password'"
+            class="input h-10 pr-10"
+          />
+          <button
+            type="button"
+            class="absolute inset-y-0 right-0 flex w-10 cursor-pointer items-center justify-center text-fg-subtle transition-colors hover:text-fg"
+            :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+            @click="showPassword = !showPassword"
+          >
+            <UiIcon :name="showPassword ? 'eye-off' : 'eye'" :size="16" />
+          </button>
+        </span>
+      </label>
 
-      <p v-if="errorMessage" class="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300">
-        {{ errorMessage }}
-      </p>
+      <UiAlert v-if="errorMessage" tone="danger">{{ errorMessage }}</UiAlert>
 
-      <button
-        type="submit"
-        :disabled="submitting"
-        class="w-full rounded-lg bg-sky-500 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
-      >
-        {{ submitting ? "提交中..." : mode === "login" ? "立即登录" : "注册并登录" }}
+      <button type="submit" :disabled="submitting" class="btn btn-primary h-10 w-full">
+        <UiIcon v-if="submitting" name="loader" :size="16" spin />
+        {{ submitting ? "提交中…" : mode === "login" ? "登录" : "注册并登录" }}
       </button>
     </form>
-  </div>
+
+    <p v-if="!canRegister" class="mt-6 text-center text-xs text-fg-subtle">
+      本站已关闭自助注册，如需账号请联系管理员。
+    </p>
+  </AuthLayout>
 </template>

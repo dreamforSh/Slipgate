@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import type {
   AccountExitBinding,
   ClashExitNode,
@@ -10,6 +10,20 @@ import type {
   TlsProfile,
   UpstreamAccount,
 } from "@slipgate/contracts";
+import ConfirmButton from "../../components/ui/ConfirmButton.vue";
+import EmptyState from "../../components/ui/EmptyState.vue";
+import FormField from "../../components/ui/FormField.vue";
+import PageHeader from "../../components/ui/PageHeader.vue";
+import SegmentedControl from "../../components/ui/SegmentedControl.vue";
+import StatCard from "../../components/ui/StatCard.vue";
+import UiBadge from "../../components/ui/UiBadge.vue";
+import UiCard from "../../components/ui/UiCard.vue";
+import UiDrawer from "../../components/ui/UiDrawer.vue";
+import UiIcon from "../../components/ui/UiIcon.vue";
+import UiSwitch from "../../components/ui/UiSwitch.vue";
+import UiTabs from "../../components/ui/UiTabs.vue";
+import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
+import { HEALTH_LABEL, healthTone, shortHash } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 
 const auth = useAuthStore();
@@ -27,10 +41,17 @@ interface ClashOverviewPayload {
   };
 }
 
+type TabKey = "nodes" | "subscriptions" | "bindings" | "profiles";
+
 const loading = ref(false);
 const busyAction = ref(false);
 const errorMessage = ref<string | null>(null);
 const actionNotice = ref<string | null>(null);
+const activeTab = ref<TabKey>("nodes");
+const subDrawerOpen = ref(false);
+const tlsDrawerOpen = ref(false);
+
+useFeedbackToasts(errorMessage, actionNotice);
 
 const runtime = ref<ClashRuntimeStatus | null>(null);
 const subscriptions = ref<ClashSubscription[]>([]);
@@ -68,6 +89,18 @@ const tlsCiphersRaw = ref("");
 const tlsCurvesRaw = ref("");
 const tlsKeySharesRaw = ref("");
 const tlsExtensionsRaw = ref("");
+
+const healthyCount = computed(() => nodes.value.filter((n) => n.healthStatus === "healthy").length);
+const driftCount = computed(() => nodes.value.filter((n) => n.driftUnconfirmed).length);
+const accountNameById = computed(() => new Map(accounts.value.map((a) => [a.id, a.name])));
+const nodeNameById = computed(() => new Map(nodes.value.map((n) => [n.nodeId, n.name])));
+
+const tabs = computed(() => [
+  { key: "nodes" as const, label: "出口节点", count: nodes.value.length, icon: "radar" as const },
+  { key: "subscriptions" as const, label: "订阅源", count: subscriptions.value.length, icon: "download" as const },
+  { key: "bindings" as const, label: "账号绑定", count: bindings.value.length, icon: "link" as const },
+  { key: "profiles" as const, label: "uTLS 模板", count: profiles.value.length, icon: "fingerprint" as const },
+]);
 
 async function loadOverview() {
   loading.value = true;
@@ -147,6 +180,7 @@ async function createSubscription() {
     }
     subName.value = "";
     subSource.value = "";
+    subDrawerOpen.value = false;
     actionNotice.value = "订阅已保存并完成 mihomo 配置下发";
     await loadOverview();
   } finally {
@@ -352,6 +386,11 @@ function resetTlsForm() {
   tlsExtensionsRaw.value = "";
 }
 
+function openCreateTlsProfile() {
+  resetTlsForm();
+  tlsDrawerOpen.value = true;
+}
+
 function startEditTlsProfile(p: TlsProfile) {
   editingProfileId.value = p.id;
   tlsName.value = p.name;
@@ -365,6 +404,7 @@ function startEditTlsProfile(p: TlsProfile) {
   tlsCurvesRaw.value = (p.curves ?? []).join(",");
   tlsKeySharesRaw.value = (p.keyShareGroups ?? []).join(",");
   tlsExtensionsRaw.value = (p.extensions ?? []).join(",");
+  tlsDrawerOpen.value = true;
 }
 
 async function saveTlsProfile() {
@@ -402,6 +442,7 @@ async function saveTlsProfile() {
       return;
     }
     resetTlsForm();
+    tlsDrawerOpen.value = false;
     actionNotice.value = isEdit ? "uTLS 模板已更新" : "uTLS 模板已创建";
     await loadOverview();
   } finally {
@@ -433,379 +474,426 @@ onMounted(() => {
 
 <template>
   <div class="space-y-6">
-    <!-- Embedded mihomo Runtime Header -->
-    <section class="rounded-xl border border-slate-800 bg-slate-900 p-6">
-      <div class="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <div class="flex items-center gap-2">
-            <h2 class="text-base font-semibold text-white">Clash (mihomo) 独立出口内核</h2>
-            <span
-              :class="
-                runtime?.ready
-                  ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300'
-                  : 'border-amber-500/30 bg-amber-500/15 text-amber-300'
-              "
-              class="rounded-full border px-2.5 py-0.5 text-xs font-medium"
-            >
-              {{ runtime?.ready ? "EMBEDDED READY" : runtime?.mode ?? "UNKNOWN" }}
-            </span>
-          </div>
-          <p class="mt-1 font-mono text-xs text-slate-400">
-            内核版本: {{ runtime?.version || "-" }} · 监听槽位: {{ runtime?.activeListeners ?? 0 }} ·
-            活跃节点: {{ runtime?.activeProxies ?? 0 }} ·
-            配置摘要: {{ runtime?.configHash ? runtime.configHash.slice(0, 12) : "-" }} ·
-            策略: Fail-Closed (MATCH,REJECT · 1 号 1 IP)
-          </p>
-        </div>
-        <div class="flex items-center gap-2">
-          <button
-            type="button"
-            :disabled="busyAction"
-            class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-medium text-slate-200 hover:border-sky-500 disabled:opacity-50"
-            @click="loadOverview"
-          >
-            刷新状态
-          </button>
-          <button
-            type="button"
-            :disabled="busyAction || nodes.length === 0"
-            class="rounded-lg bg-sky-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-sky-400 disabled:opacity-50"
-            @click="probeNodes([])"
-          >
-            全部节点测速 + IP 核验
-          </button>
-        </div>
-      </div>
-      <p v-if="errorMessage" class="mt-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
-        {{ errorMessage }}
-      </p>
-      <p v-if="actionNotice" class="mt-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
-        {{ actionNotice }}
-      </p>
-    </section>
-
-    <!-- Subscriptions -->
-    <section class="grid gap-6 md:grid-cols-5">
-      <form
-        class="space-y-3 rounded-xl border border-slate-800 bg-slate-900 p-6 md:col-span-2"
-        @submit.prevent="createSubscription"
-      >
-        <h3 class="text-sm font-semibold text-white">添加 Clash 订阅源</h3>
-        <input
-          v-model="subName"
-          type="text"
-          required
-          placeholder="订阅名称（如 Tokyo-ISP）"
-          class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:border-sky-500 focus:outline-none"
-        />
-        <select
-          v-model="subKind"
-          class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
-        >
-          <option value="url">远程订阅 URL（Clash YAML / Base64 / URI）</option>
-          <option value="inline">内联配置（直接粘贴 Clash YAML / 分享链接）</option>
-        </select>
-        <input
-          v-if="subKind === 'url'"
-          v-model="subSource"
-          type="url"
-          required
-          placeholder="https://example.com/sub?token=..."
-          class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white focus:border-sky-500 focus:outline-none"
-        />
-        <textarea
-          v-else
-          v-model="subSource"
-          rows="4"
-          required
-          placeholder="proxies:&#10;  - name: Tokyo-01&#10;    type: socks5&#10;    server: 203.0.113.10&#10;    port: 1080"
-          class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white focus:border-sky-500 focus:outline-none"
-        />
-        <input
-          v-model="subExclude"
-          type="text"
-          placeholder="过滤正则（如 剩余流量|到期时间|官网）"
-          class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-        />
-        <button
-          type="submit"
-          :disabled="busyAction"
-          class="w-full rounded-lg bg-sky-500 py-2 text-sm font-medium text-slate-950 hover:bg-sky-400 disabled:opacity-50"
-        >
-          保存并下发至 mihomo
+    <PageHeader
+      title="Clash 出口与 uTLS"
+      description="内嵌 mihomo 为每个账号提供独占的本地 SOCKS5 监听与出口 IP，策略 Fail-Closed（MATCH,REJECT · 1 号 1 IP）。"
+    >
+      <template #meta>
+        <UiBadge :tone="runtime?.ready ? 'success' : 'warning'" dot :pulse="runtime?.ready">
+          {{ runtime?.ready ? "内核就绪" : runtime?.mode ?? "状态未知" }}
+        </UiBadge>
+        <span class="code-chip">mihomo {{ runtime?.version || "-" }}</span>
+        <span class="code-chip">config {{ shortHash(runtime?.configHash) }}</span>
+      </template>
+      <template #actions>
+        <button type="button" class="btn btn-secondary" :disabled="loading || busyAction" @click="loadOverview">
+          <UiIcon name="refresh" :size="15" :spin="loading" />
+          刷新
         </button>
-      </form>
+        <button type="button" class="btn btn-primary" :disabled="busyAction || nodes.length === 0" @click="probeNodes([])">
+          <UiIcon :name="busyAction ? 'loader' : 'radar'" :size="15" :spin="busyAction" />
+          全部测速 + IP 核验
+        </button>
+      </template>
+    </PageHeader>
 
-      <div class="rounded-xl border border-slate-800 bg-slate-900 p-6 md:col-span-3">
-        <h3 class="text-sm font-semibold text-white">已接入订阅（50% 骤降保护）</h3>
-        <div class="mt-4 space-y-2.5">
-          <p v-if="!loading && subscriptions.length === 0" class="text-xs text-slate-400">
-            暂未添加 Clash 订阅，请在左侧添加远程订阅 URL 或粘贴节点配置。
-          </p>
-          <div
-            v-for="sub in subscriptions"
-            :key="sub.id"
-            class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs"
-          >
-            <div>
-              <p class="font-medium text-white">
-                {{ sub.name }}
-                <span class="ml-2 rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[11px] text-slate-300">
-                  {{ sub.sourceKind }}
-                </span>
-              </p>
-              <p class="mt-1 font-mono text-slate-400">
-                状态: {{ sub.lastSyncStatus }} · 节点数: {{ sub.lastNodeCount }}
-              </p>
-            </div>
-            <div class="flex items-center gap-2">
-              <button
-                type="button"
-                class="rounded border border-slate-700 px-2.5 py-1 text-slate-200 hover:border-sky-500"
-                @click="syncSubscription(sub.id, false)"
-              >
-                同步
-              </button>
-              <button
-                type="button"
-                class="rounded border border-amber-500/40 px-2.5 py-1 text-amber-300 hover:bg-amber-500/10"
-                @click="syncSubscription(sub.id, true)"
-              >
-                强制同步
-              </button>
-              <button
-                type="button"
-                class="rounded border border-rose-500/40 px-2.5 py-1 text-rose-300 hover:bg-rose-500/10"
-                @click="deleteSubscription(sub.id)"
-              >
-                删除
-              </button>
-            </div>
-          </div>
+    <div class="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
+      <StatCard label="监听槽位" :value="runtime?.activeListeners ?? 0" icon="plug" tone="accent" hint="每槽独占 127.0.0.1:port" />
+      <StatCard label="健康节点" :value="`${healthyCount} / ${nodes.length}`" icon="radar" tone="success" />
+      <StatCard
+        label="出口 IP 漂移待确认"
+        :value="driftCount"
+        icon="alert"
+        :tone="driftCount > 0 ? 'danger' : 'neutral'"
+        hint="未确认前对应槽位熔断"
+      />
+      <StatCard label="账号绑定" :value="bindings.length" icon="link" tone="info" :hint="`活跃代理 ${runtime?.activeProxies ?? 0}`" />
+    </div>
+
+    <div class="card">
+      <UiTabs v-model="activeTab" :tabs="tabs" class="px-3" />
+
+      <!-- Nodes -->
+      <div v-if="activeTab === 'nodes'">
+        <EmptyState
+          v-if="nodes.length === 0"
+          icon="radar"
+          title="还没有出口节点"
+          description="添加 Clash 订阅后，mihomo 会为每个节点生成独立的本地监听槽位。"
+        >
+          <button type="button" class="btn btn-primary btn-sm" @click="activeTab = 'subscriptions'; subDrawerOpen = true">
+            <UiIcon name="plus" :size="14" />
+            添加订阅
+          </button>
+        </EmptyState>
+        <div v-else class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>节点</th>
+                <th>协议 / 上游</th>
+                <th>本地监听</th>
+                <th>出口 IP</th>
+                <th>延迟 / 健康</th>
+                <th>绑定</th>
+                <th>启用</th>
+                <th class="text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="n in nodes" :key="n.nodeId" :class="(n.enabled ?? true) ? '' : 'opacity-60'">
+                <td class="max-w-[14rem]">
+                  <p class="truncate font-medium text-fg">{{ n.name }}</p>
+                  <p v-if="n.lastError" class="mt-0.5 truncate text-2xs text-danger" :title="n.lastError">{{ n.lastError }}</p>
+                </td>
+                <td class="whitespace-nowrap font-mono text-xs text-fg-muted">
+                  {{ n.proxyType || "-" }} · {{ n.server || "-" }}:{{ n.serverPort || "-" }}
+                </td>
+                <td><span class="code-chip">127.0.0.1:{{ n.listenerPort }}</span></td>
+                <td class="whitespace-nowrap">
+                  <span class="font-mono text-xs" :class="n.exitIp ? 'text-fg' : 'text-fg-subtle'">{{ n.exitIp || "待探测" }}</span>
+                  <UiBadge v-if="n.driftUnconfirmed" tone="danger" class="ml-1.5">漂移熔断</UiBadge>
+                </td>
+                <td class="whitespace-nowrap">
+                  <div class="flex items-center gap-2">
+                    <span class="font-mono text-xs tabular-nums text-fg-muted">{{ n.latencyMs }}ms</span>
+                    <UiBadge :tone="healthTone(n.healthStatus)" dot>{{ HEALTH_LABEL[n.healthStatus] ?? n.healthStatus }}</UiBadge>
+                  </div>
+                </td>
+                <td class="font-mono text-xs tabular-nums">{{ n.boundAccounts }}/{{ n.maxAccounts }}</td>
+                <td>
+                  <UiSwitch
+                    :model-value="n.enabled ?? true"
+                    :disabled="busyAction"
+                    :label="(n.enabled ?? true) ? '停用节点' : '启用节点'"
+                    hide-label
+                    @update:model-value="toggleNodeEnabled(n)"
+                  />
+                </td>
+                <td class="text-right">
+                  <div class="inline-flex gap-1">
+                    <button
+                      v-if="n.driftUnconfirmed"
+                      type="button"
+                      class="btn btn-xs bg-warning/10 text-warning hover:bg-warning/20"
+                      :disabled="busyAction"
+                      @click="confirmDrift(n.nodeId)"
+                    >
+                      确认漂移
+                    </button>
+                    <button type="button" class="btn btn-ghost btn-xs" :disabled="busyAction" @click="probeNodes([n.nodeId])">
+                      <UiIcon name="radar" :size="13" />
+                      探测
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
-    </section>
 
-    <!-- Materialized Exit Nodes -->
-    <section class="rounded-xl border border-slate-800 bg-slate-900 p-6">
-      <div class="flex items-center justify-between">
-        <h3 class="text-sm font-semibold text-white">独立本地 SOCKS5 监听池（{{ nodes.length }} 个槽位）</h3>
-        <span class="font-mono text-xs text-slate-400">每槽独占 127.0.0.1:port + 随机凭证</span>
+      <!-- Subscriptions -->
+      <div v-else-if="activeTab === 'subscriptions'">
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-3">
+          <p class="text-xs text-fg-subtle">同步时节点数骤降超过 50% 会被拦截（骤降保护），可用「强制同步」覆盖。</p>
+          <button type="button" class="btn btn-primary btn-sm" @click="subDrawerOpen = true">
+            <UiIcon name="plus" :size="14" />
+            添加订阅
+          </button>
+        </div>
+        <EmptyState
+          v-if="!loading && subscriptions.length === 0"
+          icon="download"
+          title="暂未接入订阅"
+          description="支持远程订阅 URL（Clash YAML / Base64 / URI）或直接粘贴节点配置。"
+        />
+        <div v-else class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>来源</th>
+                <th>同步状态</th>
+                <th class="text-right">节点数</th>
+                <th class="text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="sub in subscriptions" :key="sub.id">
+                <td class="font-medium text-fg">{{ sub.name }}</td>
+                <td><UiBadge mono>{{ sub.sourceKind }}</UiBadge></td>
+                <td>
+                  <UiBadge :tone="healthTone(sub.lastSyncStatus)" dot>{{ sub.lastSyncStatus }}</UiBadge>
+                </td>
+                <td class="text-right font-mono text-xs tabular-nums">{{ sub.lastNodeCount }}</td>
+                <td class="text-right">
+                  <div class="inline-flex gap-1">
+                    <button type="button" class="btn btn-ghost btn-xs" :disabled="busyAction" @click="syncSubscription(sub.id, false)">
+                      <UiIcon name="refresh" :size="13" />
+                      同步
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-xs text-warning hover:bg-warning/10"
+                      :disabled="busyAction"
+                      @click="syncSubscription(sub.id, true)"
+                    >
+                      强制同步
+                    </button>
+                    <ConfirmButton icon-only :disabled="busyAction" @confirm="deleteSubscription(sub.id)" />
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
-      <div class="mt-4 overflow-x-auto">
-        <table class="w-full text-left text-xs">
-          <thead class="border-b border-slate-800 text-slate-400">
-            <tr>
-              <th class="py-2 pr-3">节点名称</th>
-              <th class="py-2 pr-3">协议 / 上游</th>
-              <th class="py-2 pr-3">本地监听</th>
-              <th class="py-2 pr-3">真实出口 IP</th>
-              <th class="py-2 pr-3">延迟 / 健康</th>
-              <th class="py-2 pr-3">绑定占用</th>
-              <th class="py-2 text-right">操作</th>
-            </tr>
-          </thead>
-          <tbody class="divide-y divide-slate-800/70">
-            <tr v-for="n in nodes" :key="n.nodeId" class="text-slate-200">
-              <td class="py-2.5 pr-3 font-medium text-white">{{ n.name }}</td>
-              <td class="py-2.5 pr-3 font-mono text-slate-400">
-                {{ n.proxyType || "-" }} · {{ n.server || "-" }}:{{ n.serverPort || "-" }}
-              </td>
-              <td class="py-2.5 pr-3 font-mono text-sky-300">127.0.0.1:{{ n.listenerPort }}</td>
-              <td class="py-2.5 pr-3 font-mono">
-                {{ n.exitIp || "待探测" }}
-                <span
-                  v-if="n.driftUnconfirmed"
-                  class="ml-1 rounded bg-rose-500/20 px-1.5 py-0.5 text-[10px] text-rose-300"
-                >
-                  IP漂移熔断
-                </span>
-              </td>
-              <td class="py-2.5 pr-3 font-mono">
-                {{ n.latencyMs }}ms ·
-                <span :class="n.healthStatus === 'healthy' ? 'text-emerald-300' : 'text-amber-300'">
-                  {{ n.healthStatus }}
-                </span>
-              </td>
-              <td class="py-2.5 pr-3 font-mono">{{ n.boundAccounts }}/{{ n.maxAccounts }}</td>
-              <td class="py-2.5 text-right">
-                <div class="inline-flex gap-1.5">
-                  <button
-                    type="button"
-                    class="rounded border border-slate-700 px-2 py-1 hover:border-sky-500"
-                    @click="probeNodes([n.nodeId])"
-                  >
-                    探测
-                  </button>
-                  <button
-                    v-if="n.driftUnconfirmed"
-                    type="button"
-                    class="rounded border border-amber-500/50 px-2 py-1 text-amber-300"
-                    @click="confirmDrift(n.nodeId)"
-                  >
-                    确认漂移
-                  </button>
-                  <button
-                    type="button"
-                    class="rounded border border-slate-700 px-2 py-1"
-                    @click="toggleNodeEnabled(n)"
-                  >
-                    {{ (n.enabled ?? true) ? "停用" : "启用" }}
-                  </button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
 
-    <!-- Bindings & Live uTLS Outbound Verification -->
-    <section class="grid gap-6 md:grid-cols-2">
-      <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
-        <h3 class="text-sm font-semibold text-white">账号 ↔ 独立出口 + uTLS 指纹绑定</h3>
-        <form class="mt-4 space-y-3" @submit.prevent="bindAccount">
-          <div class="grid gap-3 sm:grid-cols-2">
-            <div>
-              <label class="text-xs text-slate-400">账号 ID</label>
-              <input
-                v-model="bindAccountId"
-                list="slipgate-account-ids"
-                required
-                placeholder="输入或选择账号 ID"
-                class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-              />
-              <datalist id="slipgate-account-ids">
-                <option v-for="acc in accounts" :key="acc.id" :value="acc.id">
-                  {{ acc.name }} ({{ acc.platform }})
-                </option>
-              </datalist>
-            </div>
-            <div>
-              <label class="text-xs text-slate-400">Clash 出口槽位</label>
-              <select
-                v-model="bindNodeId"
-                required
-                class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-              >
-                <option v-for="n in nodes" :key="n.nodeId" :value="n.nodeId">
-                  {{ n.name }} ({{ n.exitIp || "未探测" }} · {{ n.healthStatus }})
-                </option>
-              </select>
-            </div>
+      <!-- Bindings -->
+      <div v-else-if="activeTab === 'bindings'" class="grid gap-0 lg:grid-cols-[22rem_minmax(0,1fr)]">
+        <form class="space-y-4 border-b border-line p-5 lg:border-b-0 lg:border-r" @submit.prevent="bindAccount">
+          <div>
+            <h3 class="text-sm font-semibold text-fg">绑定独立出口</h3>
+            <p class="mt-0.5 text-xs text-fg-subtle">为账号指定出口槽位与 uTLS ClientHello 模板</p>
           </div>
-          <div class="grid gap-3 sm:grid-cols-2">
-            <div>
-              <label class="text-xs text-slate-400">uTLS ClientHello 指纹模板</label>
-              <select
-                v-model="bindProfileId"
-                class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-              >
-                <option v-for="p in profiles" :key="p.id" :value="p.id">
-                  {{ p.name }} ({{ p.alpnProtocols.join(",") }})
-                </option>
-              </select>
-            </div>
-            <label class="mt-5 flex items-center gap-2 text-xs text-slate-300">
-              <input v-model="bindShadow" type="checkbox" class="rounded border-slate-700 bg-slate-950" />
-              影子跟随号（允许复用到同一 Exit IP）
-            </label>
-          </div>
-          <button
-            type="submit"
-            :disabled="busyAction"
-            class="w-full rounded-lg bg-emerald-500 py-2 text-xs font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
-          >
-            绑定账号独立出口
+          <FormField label="账号 ID" required>
+            <input
+              v-model="bindAccountId"
+              list="slipgate-account-ids"
+              required
+              placeholder="输入或选择账号 ID"
+              class="input font-mono text-xs"
+            />
+            <datalist id="slipgate-account-ids">
+              <option v-for="acc in accounts" :key="acc.id" :value="acc.id">{{ acc.name }} ({{ acc.platform }})</option>
+            </datalist>
+          </FormField>
+          <FormField label="出口槽位" required>
+            <select v-model="bindNodeId" required class="select">
+              <option v-for="n in nodes" :key="n.nodeId" :value="n.nodeId">
+                {{ n.name }}（{{ n.exitIp || "未探测" }} · {{ HEALTH_LABEL[n.healthStatus] ?? n.healthStatus }}）
+              </option>
+            </select>
+          </FormField>
+          <FormField label="uTLS 指纹模板">
+            <select v-model="bindProfileId" class="select">
+              <option v-for="p in profiles" :key="p.id" :value="p.id">{{ p.name }}（{{ p.alpnProtocols.join(",") }}）</option>
+            </select>
+          </FormField>
+          <label class="flex cursor-pointer items-start gap-2.5 rounded-lg border border-line bg-surface-2/40 px-3 py-2.5">
+            <input v-model="bindShadow" type="checkbox" class="checkbox mt-0.5" />
+            <span>
+              <span class="block text-sm text-fg">影子跟随号</span>
+              <span class="block text-xs text-fg-subtle">允许与主号复用同一出口 IP</span>
+            </span>
+          </label>
+          <button type="submit" :disabled="busyAction" class="btn btn-primary w-full">
+            <UiIcon name="link" :size="14" />
+            绑定出口
           </button>
         </form>
 
-        <div class="mt-5 space-y-2">
-          <div class="flex items-center gap-2">
-            <span class="text-xs text-slate-400">测试目标:</span>
-            <input
-              v-model="testTargetUrl"
-              type="url"
-              class="flex-1 rounded border border-slate-700 bg-slate-950 px-2.5 py-1 font-mono text-xs text-slate-200"
-            />
+        <div class="min-w-0">
+          <div class="flex flex-col gap-2 border-b border-line px-5 py-3 sm:flex-row sm:items-center">
+            <span class="shrink-0 text-xs text-fg-subtle">出站实测目标</span>
+            <input v-model="testTargetUrl" type="url" class="input input-sm font-mono" aria-label="出站实测目标 URL" />
           </div>
-          <div
-            v-for="b in bindings"
-            :key="b.accountId"
-            class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs"
-          >
-            <div>
-              <p class="font-mono text-white">
-                {{ b.accountId }} → {{ b.nodeId }}
-              </p>
-              <p class="font-mono text-slate-400">
-                IP: {{ b.boundExitIp || "-" }} · uTLS: {{ b.utlsProfileId || "chrome-131" }}
-                {{ b.isShadowFollower ? " · Shadow" : "" }}
-              </p>
-            </div>
-            <div class="flex gap-1.5">
-              <button
-                type="button"
-                class="rounded bg-sky-500/20 px-2.5 py-1 text-sky-300 hover:bg-sky-500/30"
-                @click="runOutboundTest(b.accountId, b.utlsProfileId)"
-              >
-                实测 uTLS 出站
-              </button>
-              <button
-                type="button"
-                class="rounded border border-rose-500/40 px-2.5 py-1 text-rose-300"
-                @click="unbindAccount(b.accountId)"
-              >
-                解绑
-              </button>
-            </div>
-          </div>
-        </div>
 
-        <div
-          v-if="outboundResult"
-          class="mt-4 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 font-mono text-xs text-emerald-200"
-        >
-          <p>
-            HTTP {{ outboundResult.statusCode }} · {{ outboundResult.tlsVersion }} · ALPN={{ outboundResult.negotiatedAlpn || "http/1.1" }} ·
-            Exit={{ outboundResult.exitIp }} ({{ outboundResult.latencyMs }}ms)
-          </p>
-          <p class="mt-1 truncate text-slate-300">{{ outboundResult.bodySnippet }}</p>
+          <div
+            v-if="outboundResult"
+            class="m-5 mb-0 animate-fade-in overflow-hidden rounded-lg border border-success/30"
+          >
+            <div class="flex flex-wrap items-center gap-2 bg-success/[0.08] px-3.5 py-2 text-xs">
+              <UiIcon name="check-circle" :size="14" class="text-success" />
+              <span class="font-medium text-success">出站成功</span>
+              <UiBadge tone="success" mono>HTTP {{ outboundResult.statusCode }}</UiBadge>
+              <UiBadge mono>{{ outboundResult.tlsVersion }}</UiBadge>
+              <UiBadge mono>ALPN {{ outboundResult.negotiatedAlpn || "http/1.1" }}</UiBadge>
+              <span class="ml-auto font-mono text-fg-muted">{{ outboundResult.exitIp }} · {{ outboundResult.latencyMs }}ms</span>
+            </div>
+            <pre class="max-h-28 overflow-auto whitespace-pre-wrap break-all bg-surface-2/50 px-3.5 py-2.5 font-mono text-2xs text-fg-muted">{{ outboundResult.bodySnippet }}</pre>
+          </div>
+
+          <EmptyState v-if="bindings.length === 0" compact icon="link" title="暂无绑定" description="在左侧为账号绑定出口槽位。" />
+          <div v-else class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>账号</th>
+                  <th>出口槽位</th>
+                  <th>出口 IP</th>
+                  <th>uTLS</th>
+                  <th class="text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="b in bindings" :key="b.accountId">
+                  <td class="max-w-[12rem]">
+                    <p class="truncate text-sm text-fg">{{ accountNameById.get(b.accountId) ?? b.accountId }}</p>
+                    <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle">{{ b.accountId }}</p>
+                  </td>
+                  <td class="max-w-[10rem] truncate text-xs text-fg-muted">{{ nodeNameById.get(b.nodeId) ?? b.nodeId }}</td>
+                  <td class="whitespace-nowrap font-mono text-xs">
+                    {{ b.boundExitIp || "-" }}
+                    <UiBadge v-if="b.isShadowFollower" tone="violet" class="ml-1">Shadow</UiBadge>
+                  </td>
+                  <td><span class="code-chip">{{ b.utlsProfileId || "chrome-131" }}</span></td>
+                  <td class="text-right">
+                    <div class="inline-flex gap-1">
+                      <button
+                        type="button"
+                        class="btn btn-ghost btn-xs"
+                        :disabled="busyAction"
+                        @click="runOutboundTest(b.accountId, b.utlsProfileId)"
+                      >
+                        <UiIcon name="zap" :size="13" />
+                        实测
+                      </button>
+                      <ConfirmButton label="解绑" confirm-label="确认解绑" icon="unlink" icon-only :disabled="busyAction" @confirm="unbindAccount(b.accountId)" />
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
 
-      <!-- uTLS Profiles -->
-      <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
-        <div class="flex items-center justify-between gap-2">
-          <h3 class="text-sm font-semibold text-white">
-            uTLS ClientHello 线级指纹模板
-          </h3>
-          <button
-            type="button"
-            class="rounded border border-slate-700 px-2 py-1 text-[11px] text-sky-300 hover:border-sky-500"
-            @click="fillClaudeBunWirePreset"
-          >
-            填充 Claude Bun PQ 参数
+      <!-- TLS profiles -->
+      <div v-else>
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-3">
+          <p class="text-xs text-fg-subtle">内置模板只读；自定义模板支持线级参数（Curves / KeyShare / Extensions）。</p>
+          <button type="button" class="btn btn-primary btn-sm" @click="openCreateTlsProfile">
+            <UiIcon name="plus" :size="14" />
+            新建模板
           </button>
         </div>
-        <form class="mt-4 space-y-3" @submit.prevent="saveTlsProfile">
-          <div class="grid gap-3 sm:grid-cols-2">
-            <input
-              v-model="tlsName"
-              type="text"
-              required
-              placeholder="模板名称（如 Claude-PQ-Linux）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-            />
-            <select
-              v-model="tlsPreset"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-            >
-              <option value="auto">auto (Rendezvous Sticky)</option>
+        <EmptyState v-if="profiles.length === 0" icon="fingerprint" title="暂无 uTLS 模板" />
+        <div v-else class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>模板</th>
+                <th>Preset</th>
+                <th>ALPN</th>
+                <th>KeyShare</th>
+                <th>类型</th>
+                <th class="text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="p in profiles" :key="p.id">
+                <td>
+                  <p class="flex items-center gap-1.5 font-medium text-fg">
+                    {{ p.name }}
+                    <UiBadge v-if="p.enableGrease" tone="success">GREASE</UiBadge>
+                  </p>
+                  <p class="mt-0.5 font-mono text-2xs text-fg-subtle">{{ p.id }}</p>
+                </td>
+                <td><span class="code-chip">{{ p.clientHelloPreset }}</span></td>
+                <td class="font-mono text-xs text-fg-muted">{{ p.alpnProtocols.join(", ") }}</td>
+                <td class="font-mono text-xs text-fg-muted">
+                  {{ p.keyShareGroups && p.keyShareGroups.length > 0 ? p.keyShareGroups.join(",") : "-" }}
+                </td>
+                <td>
+                  <UiBadge :tone="p.builtIn ? 'neutral' : 'accent'">{{ p.builtIn ? "内置" : "自定义" }}</UiBadge>
+                </td>
+                <td class="text-right">
+                  <div v-if="!p.builtIn" class="inline-flex gap-1">
+                    <button type="button" class="btn btn-ghost btn-xs" @click="startEditTlsProfile(p)">
+                      <UiIcon name="pencil" :size="13" />
+                      编辑
+                    </button>
+                    <ConfirmButton icon-only :disabled="busyAction" @confirm="deleteTlsProfile(p.id)" />
+                  </div>
+                  <span v-else class="text-2xs text-fg-subtle">只读</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add subscription drawer -->
+    <UiDrawer v-model:open="subDrawerOpen" title="添加 Clash 订阅源" description="保存后立即解析并下发至内嵌 mihomo">
+      <form id="create-sub-form" class="space-y-4" @submit.prevent="createSubscription">
+        <FormField label="订阅名称" required>
+          <input v-model="subName" type="text" required placeholder="如 Tokyo-ISP" class="input" />
+        </FormField>
+        <div>
+          <span class="label">来源类型</span>
+          <SegmentedControl
+            v-model="subKind"
+            block
+            size="md"
+            :options="[
+              { value: 'url', label: '远程订阅 URL' },
+              { value: 'inline', label: '内联配置' },
+            ]"
+          />
+        </div>
+        <FormField v-if="subKind === 'url'" label="订阅地址" required hint="支持 Clash YAML / Base64 / URI 列表">
+          <input
+            v-model="subSource"
+            type="url"
+            required
+            placeholder="https://example.com/sub?token=..."
+            class="input font-mono text-xs"
+          />
+        </FormField>
+        <FormField v-else label="节点配置" required hint="直接粘贴 Clash YAML 或分享链接">
+          <textarea
+            v-model="subSource"
+            rows="8"
+            required
+            spellcheck="false"
+            placeholder="proxies:&#10;  - name: Tokyo-01&#10;    type: socks5&#10;    server: 203.0.113.10&#10;    port: 1080"
+            class="textarea font-mono text-xs"
+          />
+        </FormField>
+        <FormField label="过滤正则" hint="名称匹配该正则的节点会被丢弃">
+          <input v-model="subExclude" type="text" placeholder="剩余流量|到期时间|官网" class="input font-mono text-xs" />
+        </FormField>
+      </form>
+      <template #footer>
+        <button type="button" class="btn btn-secondary" @click="subDrawerOpen = false">取消</button>
+        <button type="submit" form="create-sub-form" :disabled="busyAction" class="btn btn-primary">
+          <UiIcon v-if="busyAction" name="loader" :size="14" spin />
+          保存并下发
+        </button>
+      </template>
+    </UiDrawer>
+
+    <!-- TLS profile drawer -->
+    <UiDrawer
+      v-model:open="tlsDrawerOpen"
+      :title="editingProfileId ? '编辑 uTLS 模板' : '新建 uTLS 模板'"
+      :description="editingProfileId ? `正在编辑 ${editingProfileId}` : 'ClientHello 线级指纹参数'"
+      width="lg"
+      @close="resetTlsForm"
+    >
+      <form id="tls-profile-form" class="space-y-5" @submit.prevent="saveTlsProfile">
+        <div class="flex items-center justify-between gap-3 rounded-lg border border-dashed border-line px-3.5 py-2.5">
+          <p class="text-xs text-fg-subtle">一键填入 Claude Bun（PQ X25519MLKEM768）线级参数</p>
+          <button type="button" class="btn btn-secondary btn-xs" @click="fillClaudeBunWirePreset">
+            <UiIcon name="sparkles" :size="13" />
+            填充
+          </button>
+        </div>
+
+        <div class="grid gap-4 sm:grid-cols-2">
+          <FormField label="模板名称" required>
+            <input v-model="tlsName" type="text" required placeholder="如 Claude-PQ-Linux" class="input" />
+          </FormField>
+          <FormField label="ClientHello Preset">
+            <select v-model="tlsPreset" class="select">
+              <option value="auto">auto（Rendezvous Sticky）</option>
               <option value="custom_wire">custom_wire</option>
-              <option value="claude_bun_21">claude_bun_21 (PQ X25519MLKEM768)</option>
-              <option value="codex_rustls">codex_rustls (Rust reqwest/rustls)</option>
-              <option value="antigravity_ide">antigravity_ide (Electron PQ + ALPS)</option>
+              <option value="claude_bun_21">claude_bun_21（PQ X25519MLKEM768）</option>
+              <option value="codex_rustls">codex_rustls（Rust reqwest/rustls）</option>
+              <option value="antigravity_ide">antigravity_ide（Electron PQ + ALPS）</option>
               <option value="chrome_auto">chrome_auto</option>
               <option value="firefox_auto">firefox_auto</option>
               <option value="safari_auto">safari_auto</option>
@@ -814,136 +902,60 @@ onMounted(() => {
               <option value="randomized">randomized</option>
               <option value="claude_cli">claude_cli</option>
             </select>
-          </div>
-          <div class="grid gap-3 sm:grid-cols-3">
-            <input
-              v-model="tlsAlpnRaw"
-              type="text"
-              placeholder="ALPN（如 h2,http/1.1）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-            />
-            <select
-              v-model="tlsOsHint"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-            >
-              <option value="">OS Hint: 任意</option>
+          </FormField>
+          <FormField label="ALPN" hint="逗号分隔">
+            <input v-model="tlsAlpnRaw" type="text" placeholder="h2,http/1.1" class="input font-mono text-xs" />
+          </FormField>
+          <FormField label="OS Hint">
+            <select v-model="tlsOsHint" class="select">
+              <option value="">任意</option>
               <option value="linux">linux</option>
-              <option value="darwin">darwin (macOS)</option>
+              <option value="darwin">darwin（macOS）</option>
               <option value="windows">windows</option>
               <option value="ios">ios</option>
             </select>
-            <label class="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200">
-              <input v-model="tlsEnableGrease" type="checkbox" />
-              启用 GREASE
-            </label>
-          </div>
-          <div class="grid gap-3 sm:grid-cols-2">
-            <input
-              v-model="tlsCurvesRaw"
-              type="text"
-              placeholder="Curves 十进制/0x十六进制（如 4588,29,23,24）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-            />
-            <input
-              v-model="tlsKeySharesRaw"
-              type="text"
-              placeholder="KeyShare 必须属于 Curves（如 4588,29）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-            />
-          </div>
-          <div class="grid gap-3 sm:grid-cols-2">
-            <input
-              v-model="tlsExtensionsRaw"
-              type="text"
-              placeholder="Extensions IDs（含 10 与 51, 可含 0xfe0d）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-            />
-            <input
-              v-model="tlsCiphersRaw"
-              type="text"
-              placeholder="CipherSuites（留空继承 BoringSSL 默认）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-            />
-          </div>
-          <div class="grid gap-3 sm:grid-cols-2">
-            <input
-              v-model="tlsUA"
-              type="text"
-              placeholder="User-Agent 模板（可选）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-            />
-            <input
-              v-model="tlsJA3"
-              type="text"
-              placeholder="备注 JA3 摘要（可选）"
-              class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white"
-            />
-          </div>
-          <div class="flex gap-2">
-            <button
-              type="submit"
-              :disabled="busyAction"
-              class="flex-1 rounded-lg border border-sky-500/40 bg-sky-500/15 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/25"
-            >
-              {{ editingProfileId ? `保存更新 (${editingProfileId})` : "新增自定义指纹模板" }}
-            </button>
-            <button
-              v-if="editingProfileId"
-              type="button"
-              class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300"
-              @click="resetTlsForm"
-            >
-              取消
-            </button>
-          </div>
-        </form>
+          </FormField>
+        </div>
 
-        <div class="mt-4 space-y-2">
-          <div
-            v-for="p in profiles"
-            :key="p.id"
-            class="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs"
-          >
-            <div>
-              <p class="font-medium text-white">
-                {{ p.name }}
-                <span class="ml-1 font-mono text-slate-400">({{ p.id }})</span>
-                <span v-if="p.enableGrease" class="ml-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">
-                  GREASE
-                </span>
-              </p>
-              <p class="mt-0.5 font-mono text-slate-400">
-                Preset: {{ p.clientHelloPreset }} · ALPN: {{ p.alpnProtocols.join(", ") }}
-                <span v-if="p.keyShareGroups && p.keyShareGroups.length > 0">
-                  · KS: [{{ p.keyShareGroups.join(",") }}]
-                </span>
-              </p>
-            </div>
-            <span
-              v-if="p.builtIn"
-              class="rounded bg-slate-800 px-2 py-0.5 text-[11px] text-slate-300"
-            >
-              内置
-            </span>
-            <div v-else class="flex gap-2">
-              <button
-                type="button"
-                class="rounded border border-sky-500/40 px-2 py-1 text-sky-300"
-                @click="startEditTlsProfile(p)"
-              >
-                编辑
-              </button>
-              <button
-                type="button"
-                class="rounded border border-rose-500/40 px-2 py-1 text-rose-300"
-                @click="deleteTlsProfile(p.id)"
-              >
-                删除
-              </button>
-            </div>
+        <div class="flex items-center justify-between rounded-lg border border-line bg-surface-2/40 px-3.5 py-2.5">
+          <span class="text-sm text-fg">启用 GREASE</span>
+          <UiSwitch v-model="tlsEnableGrease" label="启用 GREASE" tone="accent" hide-label />
+        </div>
+
+        <div class="space-y-4 border-t border-line pt-5">
+          <p class="text-2xs font-medium uppercase tracking-wider text-fg-subtle">线级参数（十进制或 0x 十六进制）</p>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <FormField label="Curves">
+              <input v-model="tlsCurvesRaw" type="text" placeholder="4588,29,23,24" class="input font-mono text-xs" />
+            </FormField>
+            <FormField label="KeyShare" hint="必须属于 Curves">
+              <input v-model="tlsKeySharesRaw" type="text" placeholder="4588,29" class="input font-mono text-xs" />
+            </FormField>
+            <FormField label="Extensions" hint="需包含 10 与 51，可含 0xfe0d">
+              <input v-model="tlsExtensionsRaw" type="text" class="input font-mono text-xs" />
+            </FormField>
+            <FormField label="CipherSuites" hint="留空继承 BoringSSL 默认">
+              <input v-model="tlsCiphersRaw" type="text" class="input font-mono text-xs" />
+            </FormField>
           </div>
         </div>
-      </div>
-    </section>
+
+        <div class="space-y-4 border-t border-line pt-5">
+          <p class="text-2xs font-medium uppercase tracking-wider text-fg-subtle">可选</p>
+          <FormField label="User-Agent 模板">
+            <input v-model="tlsUA" type="text" class="input font-mono text-xs" />
+          </FormField>
+          <FormField label="JA3 摘要备注">
+            <input v-model="tlsJA3" type="text" class="input font-mono text-xs" />
+          </FormField>
+        </div>
+      </form>
+      <template #footer>
+        <button type="button" class="btn btn-secondary" @click="tlsDrawerOpen = false">取消</button>
+        <button type="submit" form="tls-profile-form" :disabled="busyAction" class="btn btn-primary">
+          {{ editingProfileId ? "保存更新" : "创建模板" }}
+        </button>
+      </template>
+    </UiDrawer>
   </div>
 </template>

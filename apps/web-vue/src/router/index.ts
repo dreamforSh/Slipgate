@@ -1,49 +1,53 @@
 import { createRouter, createWebHistory } from "vue-router";
-import AdminAccountsView from "../portals/admin/AdminAccountsView.vue";
-import AdminClashPoolView from "../portals/admin/AdminClashPoolView.vue";
-import AdminDashboardView from "../portals/admin/AdminDashboardView.vue";
-import AdminVmFleetView from "../portals/admin/AdminVmFleetView.vue";
-import UserConsoleView from "../portals/user/UserConsoleView.vue";
 import { useAuthStore } from "../stores/auth";
-import AuthLoginView from "../views/AuthLoginView.vue";
-import SetupWizardView from "../views/SetupWizardView.vue";
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: "/", redirect: "/user" },
-    { path: "/setup", name: "setup-wizard", component: SetupWizardView },
-    { path: "/login", name: "auth-login", component: AuthLoginView },
+    {
+      path: "/setup",
+      name: "setup-wizard",
+      component: () => import("../views/SetupWizardView.vue"),
+      meta: { layout: "auth", title: "初始化" },
+    },
+    {
+      path: "/login",
+      name: "auth-login",
+      component: () => import("../views/AuthLoginView.vue"),
+      meta: { layout: "auth", title: "登录" },
+    },
     {
       path: "/admin",
       name: "admin-dashboard",
-      component: AdminDashboardView,
-      meta: { requiresAuth: true, requiresAdmin: true },
+      component: () => import("../portals/admin/AdminDashboardView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true, title: "系统看板" },
     },
     {
       path: "/admin/accounts",
       name: "admin-accounts",
-      component: AdminAccountsView,
-      meta: { requiresAuth: true, requiresAdmin: true },
+      component: () => import("../portals/admin/AdminAccountsView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true, title: "号池与分组" },
     },
     {
       path: "/admin/clash",
       name: "admin-clash",
-      component: AdminClashPoolView,
-      meta: { requiresAuth: true, requiresAdmin: true },
+      component: () => import("../portals/admin/AdminClashPoolView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true, title: "Clash 出口与 uTLS" },
     },
     {
       path: "/admin/vms",
       name: "admin-vms",
-      component: AdminVmFleetView,
-      meta: { requiresAuth: true, requiresAdmin: true },
+      component: () => import("../portals/admin/AdminVmFleetView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true, title: "VM 拟真槽舰队" },
     },
     {
       path: "/user",
       name: "user-console",
-      component: UserConsoleView,
-      meta: { requiresAuth: true },
+      component: () => import("../portals/user/UserConsoleView.vue"),
+      meta: { requiresAuth: true, title: "密钥与配额" },
     },
+    { path: "/:pathMatch(.*)*", redirect: "/" },
   ],
 });
 
@@ -75,6 +79,12 @@ router.beforeEach(async (to) => {
   }
 
   return true;
+});
+
+router.afterEach((to) => {
+  const auth = useAuthStore();
+  const site = auth.setupStatus?.siteName || "Slipgate";
+  document.title = to.meta.title ? `${to.meta.title} · ${site}` : site;
 });
 
 export default router;

@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "bff-memory",
+      "runtimeExecutable": "C:\\Users\\xinian\\AppData\\Local\\npm-cache\\_npx\\5c4f1b4a21be27f7\\node_modules\\bun\\bin\\bun.exe",
+      "runtimeArgs": ["services/bff-ts/src/index.ts"],
+      "port": 19082
+    },
+    {
+      "name": "web-vue",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "apps/web-vue", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}
