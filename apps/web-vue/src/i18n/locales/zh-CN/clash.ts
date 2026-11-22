@@ -1,6 +1,10 @@
 /** Page copy for the proxy pool (Clash egress) view. */
 export default {
   clash: {
+    view: {
+      card: "卡片",
+      table: "表格",
+    },
     runtime: {
       ready: "内核就绪",
       notReady: "内核未就绪",
@@ -48,6 +52,16 @@ export default {
       exitChanged: "出口已变化",
       enableNode: "启用节点",
       disableNode: "禁用节点",
+      summary: "{total} 个节点 · {healthy} 个健康",
+      card: {
+        listener: "端口 {port}",
+        disabled: "已停用",
+        latency: "延迟",
+        bound: "绑定",
+        server: "服务器",
+        neverProbed: "未检测",
+        idle: "空闲",
+      },
     },
     subscriptions: {
       empty: "还没有 Clash 订阅",
@@ -68,6 +82,15 @@ export default {
         fetch_error: "拉取失败",
         parse_error: "解析失败",
         error: "同步失败",
+      },
+      card: {
+        inlineLines: "{count} 行配置",
+        nodes: "节点",
+        healthy: "健康",
+        bound: "已绑定",
+        healthRate: "健康率",
+        lastSync: "上次同步 {time}",
+        neverSynced: "从未同步",
       },
     },
     bindings: {

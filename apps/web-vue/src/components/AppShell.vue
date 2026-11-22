@@ -80,6 +80,31 @@ function onGroupClick(item: NavItem) {
   groupOverrides.value = next;
 }
 
+/* ---------------- Rail flyouts ---------------- */
+// The icon rail has no labels: hovering (or focusing) an item shows its name, and a group
+// opens a small menu of its pages. Flyouts live on the <aside> (not inside the scrolling
+// nav, which would clip them) and are placed next to the hovered row.
+const asideEl = ref<HTMLElement | null>(null);
+const flyout = ref<{ item: NavItem; top: number } | null>(null);
+let flyoutTimer: number | undefined;
+
+function showFlyout(item: NavItem, ev: Event) {
+  if (!rail.value || !asideEl.value) return;
+  window.clearTimeout(flyoutTimer);
+  const row = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+  flyout.value = { item, top: row.top - asideEl.value.getBoundingClientRect().top };
+}
+
+function hideFlyout(delay = 120) {
+  window.clearTimeout(flyoutTimer);
+  // A short grace period lets the pointer cross the gap into a group menu.
+  flyoutTimer = window.setTimeout(() => (flyout.value = null), delay);
+}
+
+function keepFlyout() {
+  window.clearTimeout(flyoutTimer);
+}
+
 const activeSection = computed(() => sections.value.find((s) => s.items.some(isActive)));
 const activeGroup = computed(() => activeSection.value?.items.find((i) => i.children?.length && isActive(i)) ?? null);
 const pageTitle = computed(() =>
@@ -157,8 +182,11 @@ watch(
   () => {
     mobileOpen.value = false;
     menuOpen.value = false;
+    flyout.value = null;
   },
 );
+watch(rail, () => (flyout.value = null));
+onBeforeUnmount(() => window.clearTimeout(flyoutTimer));
 
 async function handleLogout() {
   menuOpen.value = false;
@@ -184,6 +212,7 @@ async function handleLogout() {
 
     <!-- Sidebar -->
     <aside
+      ref="asideEl"
       class="sidebar fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-line/80 bg-surface lg:z-30"
       :class="[
         rail ? 'lg:w-[72px]' : 'lg:w-64',
@@ -211,13 +240,20 @@ async function handleLogout() {
             <span class="fade-x" :class="{ 'fade-x-hidden': rail }" :aria-hidden="rail">{{ section.title }}</span>
           </p>
           <ul class="space-y-1">
-            <li v-for="item in section.items" :key="item.to">
+            <li
+              v-for="item in section.items"
+              :key="item.to"
+              @mouseenter="showFlyout(item, $event)"
+              @mouseleave="hideFlyout()"
+              @focusin="showFlyout(item, $event)"
+              @focusout="hideFlyout(0)"
+            >
               <template v-if="item.children?.length">
                 <button
                   type="button"
                   class="nav-link w-full"
                   :class="{ 'nav-link-active': isActive(item) && (rail || !isGroupExpanded(item)), 'nav-link-rail': rail }"
-                  :title="rail ? item.label : undefined"
+                  :aria-label="rail ? item.label : undefined"
                   :aria-expanded="rail ? undefined : isGroupExpanded(item)"
                   @click="onGroupClick(item)"
                 >
@@ -251,7 +287,7 @@ async function handleLogout() {
                 :to="item.to"
                 class="nav-link"
                 :class="{ 'nav-link-active': isActive(item), 'nav-link-rail': rail }"
-                :title="rail ? item.label : undefined"
+                :aria-label="rail ? item.label : undefined"
                 :aria-current="isActive(item) ? 'page' : undefined"
               >
                 <UiIcon :name="item.icon" :size="18" />
@@ -262,8 +298,37 @@ async function handleLogout() {
         </div>
       </nav>
 
+      <!-- Rail flyout: item name, or a group's pages -->
+      <Transition name="flyout">
+        <div
+          v-if="rail && flyout"
+          class="absolute left-full z-50 ml-2"
+          :style="{ top: `${flyout.top + (flyout.item.children?.length ? -6 : 4)}px` }"
+          @mouseenter="keepFlyout"
+          @mouseleave="hideFlyout()"
+        >
+          <div v-if="flyout.item.children?.length" class="min-w-[11rem] rounded-xl border border-line bg-surface p-1.5 shadow-pop">
+            <p class="px-2.5 pb-1 pt-1 text-2xs font-semibold tracking-wide text-fg-subtle">{{ flyout.item.label }}</p>
+            <RouterLink
+              v-for="child in flyout.item.children"
+              :key="child.to"
+              :to="child.to"
+              class="nav-link nav-link-child"
+              :class="{ 'nav-link-active': isActive(child) }"
+              :aria-current="isActive(child) ? 'page' : undefined"
+            >
+              <UiIcon :name="child.icon" :size="15" />
+              <span class="truncate">{{ child.label }}</span>
+            </RouterLink>
+          </div>
+          <span v-else class="flyout-tip relative block whitespace-nowrap rounded-lg bg-fg px-2.5 py-1.5 text-xs font-medium text-surface shadow-pop">
+            {{ flyout.item.label }}
+          </span>
+        </div>
+      </Transition>
+
       <div class="flex shrink-0 gap-1.5 border-t border-line/70 p-3" :class="rail ? 'flex-col items-center' : 'items-center'">
-        <ThemeSwitcher v-if="!rail" class="flex-1" />
+        <ThemeSwitcher v-if="!rail" labels class="flex-1" />
         <ThemeSwitcher v-else compact />
         <button
           type="button"
@@ -476,6 +541,22 @@ async function handleLogout() {
   content: "";
   @apply absolute bottom-2 left-0 top-2 w-[3px] rounded-r-full bg-accent;
   animation: nav-indicator-in 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.flyout-tip::before {
+  content: "";
+  @apply absolute -left-1 top-1/2 h-2 w-2 -translate-y-1/2 rotate-45 rounded-[1px] bg-fg;
+}
+.flyout-enter-active,
+.flyout-leave-active {
+  transition:
+    opacity 140ms ease,
+    transform 160ms cubic-bezier(0.2, 0, 0, 1);
+}
+.flyout-enter-from,
+.flyout-leave-to {
+  opacity: 0;
+  transform: translateX(-4px);
 }
 
 @keyframes nav-indicator-in {

@@ -17,6 +17,7 @@ import {
   type StaticIpProxy,
   type UpstreamAccount,
 } from "@slipgate/contracts";
+import StaticIpCard from "../../components/admin/clash/StaticIpCard.vue";
 import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
@@ -28,6 +29,8 @@ import UiIcon from "../../components/ui/UiIcon.vue";
 import UiModal from "../../components/ui/UiModal.vue";
 import UiSwitch from "../../components/ui/UiSwitch.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
+import { useNow } from "../../composables/useNow";
+import { usePersistentState } from "../../composables/usePersistentState";
 import { formatDateShort, healthLabel, healthTone, type Tone } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 
@@ -74,6 +77,15 @@ type ProtocolFilter = "all" | StaticIpProtocol;
 type StatusFilter = "all" | "healthy" | "unhealthy" | "disabled" | "pending";
 const protocolFilter = ref<ProtocolFilter>("all");
 const statusFilter = ref<StatusFilter>("all");
+
+type ViewMode = "card" | "table";
+/** Cards by default, like the Clash node and subscription lists. */
+const viewMode = usePersistentState<ViewMode>("slipgate.proxyIps.view", "card", (v): v is ViewMode => v === "card" || v === "table");
+const viewOptions = computed(() => [
+  { value: "card" as const, label: t("clash.view.card") },
+  { value: "table" as const, label: t("clash.view.table") },
+]);
+const now = useNow();
 
 /* ---------------- Data ---------------- */
 
@@ -456,6 +468,7 @@ const uncheckedIds = computed(() => rows.value.filter((r) => r.node).map((r) => 
           <select v-model="statusFilter" class="select input-sm w-36" :aria-label="t('clash.ips.columns.status')">
             <option v-for="o in statusOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
           </select>
+          <SegmentedControl v-model="viewMode" :options="viewOptions" />
         </div>
       </div>
 
@@ -469,6 +482,20 @@ const uncheckedIds = computed(() => rows.value.filter((r) => r.node).map((r) => 
         </div>
       </EmptyState>
       <EmptyState v-else-if="!loading && filtered.length === 0" compact icon="search" :title="t('clash.ips.noMatch')" />
+      <div v-else-if="viewMode === 'card'" class="grid gap-4 p-5 sm:grid-cols-2 xl:grid-cols-3">
+        <StaticIpCard
+          v-for="row in filtered"
+          :key="row.id"
+          :row="row"
+          :busy="busy"
+          :now="now"
+          @toggle="toggleEnabled(row)"
+          @probe="row.node && probe([row.node.nodeId])"
+          @accept-exit="confirmDrift(row)"
+          @retry="resync(row)"
+          @delete="remove(row)"
+        />
+      </div>
       <div v-else class="table-wrap">
         <table class="data-table">
           <thead>

@@ -12,6 +12,8 @@ import type {
   UpstreamAccount,
 } from "@slipgate/contracts";
 import { isStaticIpSubscription } from "@slipgate/contracts";
+import ClashNodeCard from "../../components/admin/clash/ClashNodeCard.vue";
+import ClashSubscriptionCard from "../../components/admin/clash/ClashSubscriptionCard.vue";
 import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import FormField from "../../components/ui/FormField.vue";
@@ -25,6 +27,8 @@ import UiIcon from "../../components/ui/UiIcon.vue";
 import UiSwitch from "../../components/ui/UiSwitch.vue";
 import UiTabs from "../../components/ui/UiTabs.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
+import { useNow } from "../../composables/useNow";
+import { usePersistentState } from "../../composables/usePersistentState";
 import { healthLabel, healthTone } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 
@@ -55,6 +59,15 @@ const subDrawerOpen = ref(false);
 const tlsDrawerOpen = ref(false);
 
 useFeedbackToasts(errorMessage, actionNotice);
+
+type ViewMode = "card" | "table";
+/** Nodes and subscriptions share one table/card preference, cards first (as in linksyncx). */
+const viewMode = usePersistentState<ViewMode>("slipgate.clash.view", "card", (v): v is ViewMode => v === "card" || v === "table");
+const viewOptions = computed(() => [
+  { value: "card" as const, label: t("clash.view.card") },
+  { value: "table" as const, label: t("clash.view.table") },
+]);
+const now = useNow();
 
 const runtime = ref<ClashRuntimeStatus | null>(null);
 const subscriptions = ref<ClashSubscription[]>([]);
@@ -103,6 +116,21 @@ const healthyCount = computed(() => clashNodes.value.filter((n) => n.healthStatu
 const driftCount = computed(() => clashNodes.value.filter((n) => n.driftUnconfirmed).length);
 const accountNameById = computed(() => new Map(accounts.value.map((a) => [a.id, a.name])));
 const nodeNameById = computed(() => new Map(nodes.value.map((n) => [n.nodeId, n.name])));
+const subscriptionNameById = computed(() => new Map(subscriptions.value.map((s) => [s.id, s.name])));
+const accountNamesByNode = computed(() => {
+  const map = new Map<string, string[]>();
+  for (const b of bindings.value) {
+    const list = map.get(b.nodeId) ?? [];
+    list.push(accountNameById.value.get(b.accountId) ?? b.accountId);
+    map.set(b.nodeId, list);
+  }
+  return map;
+});
+const nodesBySubscription = computed(() => {
+  const map = new Map<string, ClashExitNode[]>();
+  for (const n of clashNodes.value) map.set(n.subscriptionId, [...(map.get(n.subscriptionId) ?? []), n]);
+  return map;
+});
 
 const tabs = computed(() => [
   { key: "nodes" as const, label: t("clash.tabs.nodes"), count: clashNodes.value.length, icon: "radar" as const },
@@ -573,12 +601,30 @@ onMounted(() => {
 
       <!-- Nodes -->
       <div v-if="activeTab === 'nodes'">
+        <div v-if="clashNodes.length" class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-3">
+          <span class="text-xs text-fg-muted">{{ t("clash.nodes.summary", { total: clashNodes.length, healthy: healthyCount }) }}</span>
+          <SegmentedControl v-model="viewMode" :options="viewOptions" />
+        </div>
         <EmptyState v-if="clashNodes.length === 0" icon="radar" :title="t('clash.nodes.empty')">
           <button type="button" class="btn btn-primary btn-sm" @click="activeTab = 'subscriptions'; subDrawerOpen = true">
             <UiIcon name="plus" :size="14" />
             {{ t("clash.actions.addSubscription") }}
           </button>
         </EmptyState>
+        <div v-else-if="viewMode === 'card'" class="grid gap-4 p-5 sm:grid-cols-2 xl:grid-cols-3">
+          <ClashNodeCard
+            v-for="n in clashNodes"
+            :key="n.nodeId"
+            :node="n"
+            :subscription-name="subscriptionNameById.get(n.subscriptionId) ?? n.subscriptionId"
+            :account-names="accountNamesByNode.get(n.nodeId) ?? []"
+            :busy="busyAction"
+            :now="now"
+            @toggle="toggleNodeEnabled(n)"
+            @probe="probeNodes([n.nodeId])"
+            @accept-exit="confirmDrift(n.nodeId)"
+          />
+        </div>
         <div v-else class="table-wrap">
           <table class="data-table">
             <thead>
@@ -648,7 +694,9 @@ onMounted(() => {
 
       <!-- Subscriptions -->
       <div v-else-if="activeTab === 'subscriptions'">
-        <div class="flex flex-wrap items-center justify-end gap-3 border-b border-line px-5 py-3">
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-3">
+          <SegmentedControl v-if="clashSubscriptions.length" v-model="viewMode" :options="viewOptions" />
+          <span v-else />
           <button type="button" class="btn btn-primary btn-sm" @click="subDrawerOpen = true">
             <UiIcon name="plus" :size="14" />
             {{ t("clash.actions.addSubscription") }}
@@ -659,6 +707,20 @@ onMounted(() => {
           icon="download"
           :title="t('clash.subscriptions.empty')"
         />
+        <div v-else-if="viewMode === 'card'" class="grid gap-4 p-5 sm:grid-cols-2 xl:grid-cols-3">
+          <ClashSubscriptionCard
+            v-for="sub in clashSubscriptions"
+            :key="sub.id"
+            :sub="sub"
+            :nodes="nodesBySubscription.get(sub.id) ?? []"
+            :status-label="syncStatusLabel(sub.lastSyncStatus)"
+            :busy="busyAction"
+            :now="now"
+            @refresh="syncSubscription(sub.id, false)"
+            @force-refresh="syncSubscription(sub.id, true)"
+            @delete="deleteSubscription(sub.id)"
+          />
+        </div>
         <div v-else class="table-wrap">
           <table class="data-table">
             <thead>

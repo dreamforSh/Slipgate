@@ -54,7 +54,7 @@ export default {
     proxy: "代理管理",
     proxyClash: "Clash 管理",
     proxyIps: "IP 管理",
-    vms: "虚拟机槽位",
+    vms: "VM 管理",
     keys: "密钥与用量",
     openMenu: "打开导航",
     closeMenu: "关闭导航",
@@ -77,6 +77,11 @@ export default {
     system: "跟随系统",
     light: "浅色",
     dark: "深色",
+    short: {
+      system: "自动",
+      light: "浅色",
+      dark: "深色",
+    },
   },
   locale: {
     label: "语言",

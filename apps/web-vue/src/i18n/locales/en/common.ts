@@ -55,7 +55,7 @@ const en: typeof zh = {
     proxy: "Proxies",
     proxyClash: "Clash",
     proxyIps: "IP management",
-    vms: "VM Slots",
+    vms: "VM management",
     keys: "Keys & Usage",
     openMenu: "Open navigation",
     closeMenu: "Close navigation",
@@ -78,6 +78,11 @@ const en: typeof zh = {
     system: "System",
     light: "Light",
     dark: "Dark",
+    short: {
+      system: "Auto",
+      light: "Light",
+      dark: "Dark",
+    },
   },
   locale: {
     label: "Language",

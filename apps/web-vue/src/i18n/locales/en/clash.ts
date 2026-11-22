@@ -2,6 +2,10 @@ import type zh from "../zh-CN/clash";
 
 const en: typeof zh = {
   clash: {
+    view: {
+      card: "Cards",
+      table: "Table",
+    },
     runtime: {
       ready: "Core ready",
       notReady: "Core not ready",
@@ -49,6 +53,16 @@ const en: typeof zh = {
       exitChanged: "Exit changed",
       enableNode: "Enable node",
       disableNode: "Disable node",
+      summary: "{total} nodes · {healthy} healthy",
+      card: {
+        listener: "Port {port}",
+        disabled: "Disabled",
+        latency: "Latency",
+        bound: "Bound",
+        server: "Server",
+        neverProbed: "Not checked",
+        idle: "Idle",
+      },
     },
     subscriptions: {
       empty: "No Clash subscriptions yet",
@@ -69,6 +83,15 @@ const en: typeof zh = {
         fetch_error: "Fetch failed",
         parse_error: "Parse failed",
         error: "Sync failed",
+      },
+      card: {
+        inlineLines: "{count} lines of config",
+        nodes: "Nodes",
+        healthy: "Healthy",
+        bound: "Bound",
+        healthRate: "Healthy share",
+        lastSync: "Synced {time}",
+        neverSynced: "Never synced",
       },
     },
     bindings: {
