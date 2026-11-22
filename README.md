@@ -71,6 +71,30 @@ docker compose up --build -d
 # 就绪探针：curl http://127.0.0.1:8080/readyz
 ```
 
+### 私有仓库部署（Private GitHub Repo & GHCR）
+
+当仓库为私有状态时，请创建一个只读 **GitHub Personal Access Token (PAT)**（拉取 GHCR 镜像勾选 `read:packages`；使用 Release 安装或 `dev` 热更新勾选 `repo` / Fine-grained `Contents: Read-only`）：
+
+1. **私有 GHCR 镜像一键部署（推荐）**：
+   ```bash
+   echo "<YOUR_GITHUB_PAT>" | docker login ghcr.io -u <YOUR_GITHUB_USER> --password-stdin
+   # 下载或克隆 deploy/ 目录后：
+   cd deploy && cp .env.example .env
+   # 若需开启私有仓库 dev 自动热更新，在 .env 中填写 SLIPGATE_GITHUB_TOKEN=<YOUR_GITHUB_PAT>
+   SLIPGATE_IMAGE_TAG=dev docker compose -f docker-compose.prod.yml up -d
+   ```
+2. **私有 Release 二进制一键安装（systemd）**：
+   ```bash
+   curl -fsSL -H "Authorization: Bearer <YOUR_GITHUB_PAT>" \
+     https://raw.githubusercontent.com/dreamforSh/Slipgate/main/deploy/install.sh \
+     | sudo SLIPGATE_GITHUB_TOKEN="<YOUR_GITHUB_PAT>" bash -s -- --channel dev
+   ```
+3. **服务器克隆私有源码本地构建（无需 GHCR 登录）**：
+   ```bash
+   git clone git@github.com:dreamforSh/Slipgate.git && cd Slipgate/deploy
+   cp .env.example .env && docker compose up --build -d
+   ```
+
 ---
 
 ## Dev 模式仓库热更新（Hot-Update）

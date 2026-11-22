@@ -1,6 +1,9 @@
 import postgres from "postgres";
 import {
   formatNanoUsd,
+  isSubscriptionTierAllowedForProvider,
+  SubscriptionTierSchema,
+  subscriptionTierMultiplier,
   type ApiKeyItem,
   type CreateAccountRequest,
   type CreateApiKeyRequest,
@@ -72,6 +75,7 @@ export class PostgresControlStore implements ControlStore {
       ALTER TABLE core.accounts
           ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '',
           ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'stealth_http',
+          ADD COLUMN IF NOT EXISTS subscription_tier TEXT NOT NULL DEFAULT 'standard',
           ADD COLUMN IF NOT EXISTS credential_preview TEXT NOT NULL DEFAULT '';
 
       ALTER TABLE core.api_keys
@@ -527,6 +531,7 @@ export class PostgresControlStore implements ControlStore {
         platform: UpstreamAccount["platform"];
         execution_mode: UpstreamAccount["executionMode"];
         auth_kind: UpstreamAccount["authKind"];
+        subscription_tier: string | null;
         credential_preview: string;
         max_concurrency: number;
         priority: number;
@@ -544,6 +549,7 @@ export class PostgresControlStore implements ControlStore {
         a.platform,
         a.execution_mode,
         a.auth_kind,
+        a.subscription_tier,
         a.credential_preview,
         a.max_concurrency,
         a.priority,
@@ -558,22 +564,27 @@ export class PostgresControlStore implements ControlStore {
         AND (${filter?.executionMode ?? null}::text IS NULL OR a.execution_mode = ${filter?.executionMode ?? null})
       ORDER BY a.priority ASC, a.created_at DESC
     `;
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      groupId: r.group_id,
-      groupName: r.group_name,
-      platform: r.platform,
-      executionMode: r.execution_mode,
-      authKind: r.auth_kind,
-      credentialPreview: r.credential_preview || "****",
-      maxConcurrency: r.max_concurrency,
-      priority: r.priority,
-      status: r.status,
-      window5hUsedBps: r.window_5h_used_bps ?? 0,
-      window7dUsedBps: r.window_7d_used_bps ?? 0,
-      createdAtIso: toIso(r.created_at),
-    }));
+    return rows.map((r) => {
+      const subscriptionTier = SubscriptionTierSchema.catch("standard").parse(r.subscription_tier);
+      return {
+        id: r.id,
+        name: r.name,
+        groupId: r.group_id,
+        groupName: r.group_name,
+        platform: r.platform,
+        executionMode: r.execution_mode,
+        authKind: r.auth_kind,
+        subscriptionTier,
+        tierMultiplier: subscriptionTierMultiplier(r.platform, subscriptionTier),
+        credentialPreview: r.credential_preview || "****",
+        maxConcurrency: r.max_concurrency,
+        priority: r.priority,
+        status: r.status,
+        window5hUsedBps: r.window_5h_used_bps ?? 0,
+        window7dUsedBps: r.window_7d_used_bps ?? 0,
+        createdAtIso: toIso(r.created_at),
+      };
+    });
   }
 
   async createAccount(
@@ -581,11 +592,17 @@ export class PostgresControlStore implements ControlStore {
     encryptedSecret: Uint8Array,
     credentialPreview: string,
   ): Promise<UpstreamAccount> {
+    if (!isSubscriptionTierAllowedForProvider(req.platform, req.subscriptionTier)) {
+      throw new StoreError(
+        "bad_request",
+        `Subscription tier ${req.subscriptionTier} is not valid for provider ${req.platform}`,
+      );
+    }
     try {
       const id = `acc_${crypto.randomUUID()}`;
       await this.sql`
         INSERT INTO core.accounts (
-          id, name, group_id, platform, execution_mode, auth_kind,
+          id, name, group_id, platform, execution_mode, auth_kind, subscription_tier,
           credentials_enc, credential_preview, max_concurrency, priority, status
         )
         VALUES (
@@ -595,6 +612,7 @@ export class PostgresControlStore implements ControlStore {
           ${req.platform},
           ${req.executionMode},
           ${req.authKind},
+          ${req.subscriptionTier},
           ${Buffer.from(encryptedSecret)},
           ${credentialPreview},
           ${req.maxConcurrency},
@@ -621,12 +639,27 @@ export class PostgresControlStore implements ControlStore {
     credentialPreview?: string,
   ): Promise<UpstreamAccount> {
     try {
+      if (req.subscriptionTier !== undefined) {
+        const current = await this.sql<{ platform: UpstreamAccount["platform"] }[]>`
+          SELECT platform FROM core.accounts WHERE id = ${accountId} LIMIT 1
+        `;
+        if (current.length === 0) {
+          throw new StoreError("not_found", `Account ${accountId} not found`);
+        }
+        if (!isSubscriptionTierAllowedForProvider(current[0]!.platform, req.subscriptionTier)) {
+          throw new StoreError(
+            "bad_request",
+            `Subscription tier ${req.subscriptionTier} is not valid for provider ${current[0]!.platform}`,
+          );
+        }
+      }
       const secretBuf = encryptedSecret ? Buffer.from(encryptedSecret) : null;
       const rows = await this.sql<{ id: string }[]>`
         UPDATE core.accounts
         SET name = COALESCE(${req.name ?? null}, name),
             group_id = COALESCE(${req.groupId ?? null}, group_id),
             execution_mode = COALESCE(${req.executionMode ?? null}, execution_mode),
+            subscription_tier = COALESCE(${req.subscriptionTier ?? null}, subscription_tier),
             max_concurrency = COALESCE(${req.maxConcurrency ?? null}, max_concurrency),
             priority = COALESCE(${req.priority ?? null}, priority),
             status = COALESCE(${req.status ?? null}, status),
@@ -873,6 +906,7 @@ export class PostgresControlStore implements ControlStore {
           platform: UpstreamAccount["platform"];
           execution_mode: UpstreamAccount["executionMode"];
           auth_kind: string;
+          subscription_tier: string | null;
           credentials_enc_hex: string;
           max_concurrency: number;
           priority: number;
@@ -887,6 +921,7 @@ export class PostgresControlStore implements ControlStore {
           a.platform,
           a.execution_mode,
           a.auth_kind,
+          a.subscription_tier,
           encode(a.credentials_enc, 'hex') AS credentials_enc_hex,
           a.max_concurrency,
           a.priority,
@@ -945,19 +980,26 @@ export class PostgresControlStore implements ControlStore {
         enabled: g.enabled,
       })),
       routes,
-      accounts: accRows.map((a) => ({
-        id: a.id,
-        groupId: a.group_id,
-        platform: a.platform,
-        executionMode: a.execution_mode,
-        authKind: a.auth_kind,
-        credentialsEncHex: a.credentials_enc_hex,
-        maxConcurrency: a.max_concurrency,
-        priority: a.priority,
-        status: a.status,
-        window5hUsedBps: a.window_5h_used_bps ?? 0,
-        window7dUsedBps: a.window_7d_used_bps ?? 0,
-      })),
+      accounts: accRows.map((a) => {
+        const subscriptionTier = SubscriptionTierSchema.catch("standard").parse(
+          a.subscription_tier,
+        );
+        return {
+          id: a.id,
+          groupId: a.group_id,
+          platform: a.platform,
+          executionMode: a.execution_mode,
+          authKind: a.auth_kind,
+          subscriptionTier,
+          tierMultiplier: subscriptionTierMultiplier(a.platform, subscriptionTier),
+          credentialsEncHex: a.credentials_enc_hex,
+          maxConcurrency: a.max_concurrency,
+          priority: a.priority,
+          status: a.status,
+          window5hUsedBps: a.window_5h_used_bps ?? 0,
+          window7dUsedBps: a.window_7d_used_bps ?? 0,
+        };
+      }),
       apiKeys: keyRows.map((k) => ({
         id: k.id,
         userId: k.user_id,

@@ -11,11 +11,13 @@ import {
   DataPlaneSyncSnapshotSchema,
   formatNanoUsd,
   HardwarePersonaSchema,
+  isSubscriptionTierAllowedForProvider,
   NANO_PER_USD,
   parseUsdToNano,
   ProvisionVmSlotRequestSchema,
   RecordRiskBanInputSchema,
   SetupInitializeRequestSchema,
+  subscriptionTierMultiplier,
   SystemUpdateStatusSchema,
   TriggerUpdateSyncRequestSchema,
   TurnSettlementEventSchema,
@@ -90,10 +92,27 @@ describe("IAM, Pool and API Key contracts", () => {
       name: "claude-max-01",
       groupId: "grp-claude",
       platform: "anthropic",
+      subscriptionTier: "max",
       credentialSecret: "sk-ant-oat01-demo-secret",
     });
     expect(account.executionMode).toBe("stealth_http");
+    expect(account.subscriptionTier).toBe("max");
     expect(account.maxConcurrency).toBe(5);
+
+    // Claude: pro (1x), max (5x), ultra (20x)
+    expect(subscriptionTierMultiplier("anthropic", "pro")).toBe(1);
+    expect(subscriptionTierMultiplier("anthropic", "max")).toBe(5);
+    expect(subscriptionTierMultiplier("anthropic", "ultra")).toBe(20);
+    expect(isSubscriptionTierAllowedForProvider("anthropic", "ultra")).toBe(true);
+    expect(isSubscriptionTierAllowedForProvider("anthropic", "pro_25x")).toBe(false);
+
+    // Codex: plus (1x), pro_5x (5x), pro_10x (10x), pro_25x (25x)
+    expect(subscriptionTierMultiplier("codex", "plus")).toBe(1);
+    expect(subscriptionTierMultiplier("codex", "pro_5x")).toBe(5);
+    expect(subscriptionTierMultiplier("codex", "pro_10x")).toBe(10);
+    expect(subscriptionTierMultiplier("codex", "pro_25x")).toBe(25);
+    expect(isSubscriptionTierAllowedForProvider("codex", "pro_25x")).toBe(true);
+    expect(isSubscriptionTierAllowedForProvider("codex", "max")).toBe(false);
 
     const apiKey = CreateApiKeyRequestSchema.parse({
       name: "cli-key",

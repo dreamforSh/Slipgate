@@ -16,6 +16,28 @@ pub const ExecutionMode = enum {
     direct_api,
 };
 
+pub const SubscriptionTier = enum {
+    standard,
+    plus,
+    pro,
+    pro_5x,
+    pro_10x,
+    pro_25x,
+    max,
+    ultra,
+
+    pub fn defaultMultiplier(self: SubscriptionTier, provider: composite.Provider) u16 {
+        return switch (self) {
+            .pro_5x, .max => 5,
+            .pro_10x => 10,
+            .ultra => 20,
+            .pro_25x => 25,
+            .pro => if (provider == .antigravity) 5 else 1,
+            .plus, .standard => 1,
+        };
+    }
+};
+
 pub const SyncGroupJson = struct {
     id: []const u8,
     platform: []const u8 = "composite",
@@ -43,6 +65,8 @@ pub const SyncAccountJson = struct {
     platform: []const u8,
     executionMode: []const u8 = "stealth_http",
     authKind: []const u8 = "api_key",
+    subscriptionTier: []const u8 = "standard",
+    tierMultiplier: u16 = 0,
     maxConcurrency: u32 = 5,
     priority: i32 = 100,
     status: []const u8 = "active",
@@ -110,6 +134,8 @@ pub const DispatchResponse = struct {
     provider: []const u8 = "",
     executionMode: []const u8 = "",
     authKind: []const u8 = "",
+    subscriptionTier: []const u8 = "standard",
+    tierMultiplier: u16 = 1,
     publicModel: []const u8 = "",
     upstreamModel: []const u8 = "",
     cleanseMode: []const u8 = "zero",
@@ -152,11 +178,30 @@ const AccountRecord = struct {
     platform: composite.Provider,
     execution_mode: ExecutionMode,
     auth_kind: []const u8,
+    subscription_tier: SubscriptionTier,
+    tier_multiplier: u16,
     max_concurrency: u32,
     priority: i32,
     active: bool,
     quota_window: slot_window.SlotQuotaWindow,
 };
+
+fn accountBeats(
+    cand: AccountRecord,
+    cand_inflight: u32,
+    inc: AccountRecord,
+    inc_inflight: u32,
+) bool {
+    if (cand.priority != inc.priority) return cand.priority < inc.priority;
+    const cand_mult: u64 = @max(@as(u64, 1), cand.tier_multiplier);
+    const inc_mult: u64 = @max(@as(u64, 1), inc.tier_multiplier);
+    const cand_load: u64 = @as(u64, cand_inflight) * 10_000 + @as(u64, cand.quota_window.maxUsedBps());
+    const inc_load: u64 = @as(u64, inc_inflight) * 10_000 + @as(u64, inc.quota_window.maxUsedBps());
+    const lhs = cand_load * inc_mult;
+    const rhs = inc_load * cand_mult;
+    if (lhs != rhs) return lhs < rhs;
+    return cand_mult > inc_mult;
+}
 
 const ApiKeyRecord = struct {
     id: []const u8,
@@ -393,12 +438,16 @@ pub const GatewayEngine = struct {
         for (in.accounts) |a| {
             const provider = std.meta.stringToEnum(composite.Provider, a.platform) orelse continue;
             const exec_mode = std.meta.stringToEnum(ExecutionMode, a.executionMode) orelse .stealth_http;
+            const sub_tier = std.meta.stringToEnum(SubscriptionTier, a.subscriptionTier) orelse .standard;
+            const tier_mult: u16 = if (a.tierMultiplier > 0) a.tierMultiplier else sub_tier.defaultMultiplier(provider);
             try next_accounts.append(.{
                 .id = try cat.dupe(u8, a.id),
                 .group_id = try cat.dupe(u8, a.groupId),
                 .platform = provider,
                 .execution_mode = exec_mode,
                 .auth_kind = try cat.dupe(u8, if (a.authKind.len > 0) a.authKind else "api_key"),
+                .subscription_tier = sub_tier,
+                .tier_multiplier = tier_mult,
                 .max_concurrency = @max(@as(u32, 1), a.maxConcurrency),
                 .priority = a.priority,
                 .active = std.mem.eql(u8, a.status, "active"),
@@ -700,10 +749,7 @@ pub const GatewayEngine = struct {
             const cur_inflight = self.account_inflight.get(acc.id) orelse 0;
             if (cur_inflight >= acc.max_concurrency) continue;
 
-            if (chosen_account == null or
-                acc.priority < chosen_account.?.priority or
-                (acc.priority == chosen_account.?.priority and cur_inflight < chosen_inflight))
-            {
+            if (chosen_account == null or accountBeats(acc, cur_inflight, chosen_account.?, chosen_inflight)) {
                 chosen_account = acc;
                 chosen_inflight = cur_inflight;
             }
@@ -775,6 +821,8 @@ pub const GatewayEngine = struct {
             .provider = @tagName(target_provider),
             .executionMode = @tagName(selected_acc.execution_mode),
             .authKind = selected_acc.auth_kind,
+            .subscriptionTier = @tagName(selected_acc.subscription_tier),
+            .tierMultiplier = selected_acc.tier_multiplier,
             .publicModel = public_model,
             .upstreamModel = route_match.upstream_model,
             .cleanseMode = "zero",
@@ -1045,4 +1093,59 @@ test "gateway engine enforces sha256 auth, hold/settle nano-USD precision, and p
     const banned_raw = try engine.evaluateTurnJson(arena, probe_req);
     try std.testing.expect(std.mem.indexOf(u8, banned_raw, "\"status\":403") != null);
     try std.testing.expect(std.mem.indexOf(u8, banned_raw, "\"banDuration\":\"10m\"") != null);
+}
+
+test "subscription tier weights schedule Claude ultra(20x)/max(5x) and Codex pro_25x/pro_10x/pro_5x" {
+    try std.testing.expectEqual(@as(u16, 1), SubscriptionTier.pro.defaultMultiplier(.anthropic));
+    try std.testing.expectEqual(@as(u16, 5), SubscriptionTier.max.defaultMultiplier(.anthropic));
+    try std.testing.expectEqual(@as(u16, 20), SubscriptionTier.ultra.defaultMultiplier(.anthropic));
+    try std.testing.expectEqual(@as(u16, 1), SubscriptionTier.plus.defaultMultiplier(.codex));
+    try std.testing.expectEqual(@as(u16, 5), SubscriptionTier.pro_5x.defaultMultiplier(.codex));
+    try std.testing.expectEqual(@as(u16, 10), SubscriptionTier.pro_10x.defaultMultiplier(.codex));
+    try std.testing.expectEqual(@as(u16, 25), SubscriptionTier.pro_25x.defaultMultiplier(.codex));
+
+    var engine = GatewayEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw_key = "sk-sg-tier0123456789abcdef0123456789abcdef0123";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw_key, &digest, .{});
+    const hex_buf = std.fmt.bytesToHex(digest, .lower);
+
+    const sync_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"groups\":[{{\"id\":\"grp_sub\",\"platform\":\"composite\",\"subscriptionType\":\"subscription\",\"enabled\":true}}]," ++
+            "\"accounts\":[" ++
+            "{{\"id\":\"acc_claude_pro\",\"groupId\":\"grp_sub\",\"platform\":\"anthropic\",\"subscriptionTier\":\"pro\",\"maxConcurrency\":10,\"priority\":100,\"status\":\"active\"}}," ++
+            "{{\"id\":\"acc_claude_max\",\"groupId\":\"grp_sub\",\"platform\":\"anthropic\",\"subscriptionTier\":\"max\",\"maxConcurrency\":10,\"priority\":100,\"status\":\"active\"}}," ++
+            "{{\"id\":\"acc_claude_ultra\",\"groupId\":\"grp_sub\",\"platform\":\"anthropic\",\"subscriptionTier\":\"ultra\",\"maxConcurrency\":10,\"priority\":100,\"status\":\"active\"}}," ++
+            "{{\"id\":\"acc_codex_5x\",\"groupId\":\"grp_sub\",\"platform\":\"codex\",\"subscriptionTier\":\"pro_5x\",\"maxConcurrency\":10,\"priority\":100,\"status\":\"active\"}}," ++
+            "{{\"id\":\"acc_codex_10x\",\"groupId\":\"grp_sub\",\"platform\":\"codex\",\"subscriptionTier\":\"pro_10x\",\"maxConcurrency\":10,\"priority\":100,\"status\":\"active\"}}," ++
+            "{{\"id\":\"acc_codex_25x\",\"groupId\":\"grp_sub\",\"platform\":\"codex\",\"subscriptionTier\":\"pro_25x\",\"maxConcurrency\":10,\"priority\":100,\"status\":\"active\"}}" ++
+            "]," ++
+            "\"apiKeys\":[{{\"id\":\"key_t\",\"userId\":\"usr_t\",\"groupId\":\"grp_sub\",\"keyHashHex\":\"{s}\",\"rpmLimit\":60,\"concurrencyLimit\":20,\"enabled\":true}}]}}",
+        .{&hex_buf},
+    );
+    _ = try engine.applySyncJson(arena, sync_json);
+
+    const claude_req = try std.fmt.allocPrint(arena, "{{\"method\":\"POST\",\"path\":\"/v1/messages\",\"apiKey\":\"{s}\",\"model\":\"claude-sonnet-4-5\"}}", .{raw_key});
+    const d1 = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, claude_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("acc_claude_ultra", d1.value.accountId);
+    try std.testing.expectEqualStrings("ultra", d1.value.subscriptionTier);
+    try std.testing.expectEqual(@as(u16, 20), d1.value.tierMultiplier);
+
+    const d2 = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, claude_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("acc_claude_max", d2.value.accountId);
+    try std.testing.expectEqualStrings("max", d2.value.subscriptionTier);
+    try std.testing.expectEqual(@as(u16, 5), d2.value.tierMultiplier);
+
+    const codex_req = try std.fmt.allocPrint(arena, "{{\"method\":\"POST\",\"path\":\"/v1/responses\",\"apiKey\":\"{s}\",\"model\":\"gpt-5-codex\"}}", .{raw_key});
+    const c1 = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, codex_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("acc_codex_25x", c1.value.accountId);
+    try std.testing.expectEqualStrings("pro_25x", c1.value.subscriptionTier);
+    try std.testing.expectEqual(@as(u16, 25), c1.value.tierMultiplier);
 }

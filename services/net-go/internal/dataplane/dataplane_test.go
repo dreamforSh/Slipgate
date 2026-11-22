@@ -51,18 +51,29 @@ func TestVaultAESGCMAndFormats(t *testing.T) {
 		t.Fatalf("unexpected mock secret: %+v err=%v", secMock, err)
 	}
 
-	// Pasted .claude/.credentials.json format
-	claudeRaw := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-live-token","refreshToken":"sk-ant-ort01-refresh"}}`
+	// Pasted .claude/.credentials.json format (normalizes legacy 20x -> ultra, 5x -> max)
+	claudeRaw := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-live-token","refreshToken":"sk-ant-ort01-refresh","rateLimitTier":"default_claude_max_20x"}}`
 	secClaude := ParseAccountSecret(claudeRaw)
-	if secClaude.APIKey != "sk-ant-oat01-live-token" || secClaude.RefreshToken != "sk-ant-ort01-refresh" {
+	if secClaude.APIKey != "sk-ant-oat01-live-token" || secClaude.RefreshToken != "sk-ant-ort01-refresh" || secClaude.SubscriptionTier != "ultra" {
 		t.Fatalf("unexpected .claude/.credentials.json parse: %+v", secClaude)
 	}
+	if NormalizeSubscriptionTier("default_claude_max_5x") != "max" ||
+		SubscriptionTierMultiplier("anthropic", "max") != 5 ||
+		SubscriptionTierMultiplier("anthropic", "ultra") != 20 {
+		t.Fatalf("unexpected Claude max(5x)/ultra(20x) tier mapping")
+	}
 
-	// Pasted .codex/auth.json format
-	codexRaw := `{"tokens":{"access_token":"eyJ-codex-oat","refresh_token":"rt-codex","account_id":"acct_chatgpt_99"}}`
+	// Pasted .codex/auth.json format + Codex Pro 5x / 10x / 25x tiers
+	codexRaw := `{"tokens":{"access_token":"eyJ-codex-oat","refresh_token":"rt-codex","account_id":"acct_chatgpt_99","plan_type":"pro_25x"}}`
 	secCodex := ParseAccountSecret(codexRaw)
-	if secCodex.APIKey != "eyJ-codex-oat" || secCodex.RefreshToken != "rt-codex" || secCodex.ChatGPTAccountID != "acct_chatgpt_99" {
+	if secCodex.APIKey != "eyJ-codex-oat" || secCodex.RefreshToken != "rt-codex" || secCodex.ChatGPTAccountID != "acct_chatgpt_99" || secCodex.SubscriptionTier != "pro_25x" {
 		t.Fatalf("unexpected .codex/auth.json parse: %+v", secCodex)
+	}
+	if SubscriptionTierMultiplier("codex", "plus") != 1 ||
+		SubscriptionTierMultiplier("codex", "pro_5x") != 5 ||
+		SubscriptionTierMultiplier("codex", "pro_10x") != 10 ||
+		SubscriptionTierMultiplier("codex", "pro_25x") != 25 {
+		t.Fatalf("unexpected Codex Pro 5x/10x/25x tier multipliers")
 	}
 
 	// Pasted Antigravity OAuth credentials format

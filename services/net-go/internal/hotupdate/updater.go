@@ -76,6 +76,7 @@ type StatusSnapshot struct {
 
 type githubAsset struct {
 	Name               string `json:"name"`
+	APIURL             string `json:"url"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
@@ -268,13 +269,15 @@ func (m *Manager) syncRelease(ctx context.Context, checkOnly bool, asyncRestart 
 	remoteVersion := strings.TrimSpace(rel.TagName)
 
 	if metaAsset, ok := findAsset(rel.Assets, "BUILD_META.json"); ok {
-		var meta buildMeta
-		if err := m.fetchJSON(ctx, metaAsset.BrowserDownloadURL, &meta); err == nil {
-			if strings.TrimSpace(meta.Commit) != "" {
-				remoteCommit = strings.TrimSpace(meta.Commit)
-			}
-			if strings.TrimSpace(meta.Version) != "" {
-				remoteVersion = strings.TrimSpace(meta.Version)
+		if metaRaw, err := m.downloadBytes(ctx, m.assetDownloadURL(metaAsset), maxManifestBytes); err == nil {
+			var meta buildMeta
+			if json.Unmarshal(metaRaw, &meta) == nil {
+				if strings.TrimSpace(meta.Commit) != "" {
+					remoteCommit = strings.TrimSpace(meta.Commit)
+				}
+				if strings.TrimSpace(meta.Version) != "" {
+					remoteVersion = strings.TrimSpace(meta.Version)
+				}
 			}
 		}
 	}
@@ -299,7 +302,7 @@ func (m *Manager) syncRelease(ctx context.Context, checkOnly bool, asyncRestart 
 	if !hasSums {
 		return fmt.Errorf("%w: missing SHA256SUMS.txt in dev-latest release", ErrChecksumMismatch)
 	}
-	sumsBytes, err := m.downloadBytes(ctx, sumsAsset.BrowserDownloadURL, maxManifestBytes)
+	sumsBytes, err := m.downloadBytes(ctx, m.assetDownloadURL(sumsAsset), maxManifestBytes)
 	if err != nil {
 		return fmt.Errorf("download SHA256SUMS.txt: %w", err)
 	}
@@ -327,7 +330,7 @@ func (m *Manager) syncRelease(ctx context.Context, checkOnly bool, asyncRestart 
 	defer os.RemoveAll(tmpDir)
 
 	archivePath := filepath.Join(tmpDir, chosen.Name)
-	if err := m.downloadVerifiedFile(ctx, chosen.BrowserDownloadURL, archivePath, expectedSHA); err != nil {
+	if err := m.downloadVerifiedFile(ctx, m.assetDownloadURL(*chosen), archivePath, expectedSHA); err != nil {
 		return err
 	}
 
@@ -560,6 +563,16 @@ func (m *Manager) fetchJSON(ctx context.Context, rawURL string, dest any) error 
 	return json.Unmarshal(body, dest)
 }
 
+func (m *Manager) assetDownloadURL(a githubAsset) string {
+	if m.cfg.GitHubToken != "" && strings.TrimSpace(a.APIURL) != "" {
+		return strings.TrimSpace(a.APIURL)
+	}
+	if strings.TrimSpace(a.BrowserDownloadURL) != "" {
+		return strings.TrimSpace(a.BrowserDownloadURL)
+	}
+	return strings.TrimSpace(a.APIURL)
+}
+
 func (m *Manager) downloadBytes(ctx context.Context, rawURL string, limit int64) ([]byte, error) {
 	if err := validateDownloadURL(rawURL, m.allowCustomHost); err != nil {
 		return nil, err
@@ -568,6 +581,7 @@ func (m *Manager) downloadBytes(ctx context.Context, rawURL string, limit int64)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Accept", "application/octet-stream")
 	req.Header.Set("User-Agent", "slipgate-hotupdater")
 	if m.cfg.GitHubToken != "" {
 		req.Header.Set("Authorization", "Bearer "+m.cfg.GitHubToken)
@@ -592,6 +606,7 @@ func (m *Manager) downloadVerifiedFile(ctx context.Context, rawURL, destPath, ex
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Accept", "application/octet-stream")
 	req.Header.Set("User-Agent", "slipgate-hotupdater")
 	if m.cfg.GitHubToken != "" {
 		req.Header.Set("Authorization", "Bearer "+m.cfg.GitHubToken)

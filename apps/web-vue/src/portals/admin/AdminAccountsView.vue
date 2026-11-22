@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import type {
-  AccountAuthKind,
-  ExecutionMode,
-  GroupItem,
-  GroupPlatform,
-  GroupSubscriptionType,
-  Provider,
-  UpstreamAccount,
+import {
+  allowedSubscriptionTiersForProvider,
+  recommendedMaxConcurrencyForTier,
+  type AccountAuthKind,
+  type ExecutionMode,
+  type GroupItem,
+  type GroupPlatform,
+  type GroupSubscriptionType,
+  type Provider,
+  type SubscriptionTier,
+  type UpstreamAccount,
 } from "@slipgate/contracts";
 import { useAuthStore } from "../../stores/auth";
 
@@ -30,35 +33,74 @@ const accGroupId = ref("");
 const accPlatform = ref<Provider>("anthropic");
 const accMode = ref<ExecutionMode>("stealth_http");
 const accAuthKind = ref<AccountAuthKind>("oauth");
+const accSubscriptionTier = ref<SubscriptionTier>("max");
 const accSecret = ref("");
-const accMaxConc = ref(5);
+const accMaxConc = ref(12);
 const accPriority = ref(100);
 
-function applySubscriptionTemplate(preset: "claude" | "codex" | "antigravity") {
-  if (preset === "claude") {
+const tierOptions = computed(() => allowedSubscriptionTiersForProvider(accPlatform.value));
+
+function onPlatformChange() {
+  const valid = tierOptions.value.some((o) => o.tier === accSubscriptionTier.value);
+  if (!valid) {
+    if (accPlatform.value === "anthropic") {
+      accSubscriptionTier.value = "max";
+    } else if (accPlatform.value === "codex" || accPlatform.value === "openai") {
+      accSubscriptionTier.value = "pro_5x";
+    } else if (accPlatform.value === "antigravity") {
+      accSubscriptionTier.value = "pro";
+    } else {
+      accSubscriptionTier.value = "standard";
+    }
+  }
+  accMaxConc.value = recommendedMaxConcurrencyForTier(accPlatform.value, accSubscriptionTier.value);
+}
+
+function onTierChange() {
+  accMaxConc.value = recommendedMaxConcurrencyForTier(accPlatform.value, accSubscriptionTier.value);
+}
+
+function applySubscriptionTemplate(
+  preset:
+    | "claude_max"
+    | "claude_ultra"
+    | "codex_pro_5x"
+    | "codex_pro_10x"
+    | "codex_pro_25x"
+    | "antigravity",
+) {
+  if (preset === "claude_max" || preset === "claude_ultra") {
     accPlatform.value = "anthropic";
     accMode.value = "stealth_http";
     accAuthKind.value = "oauth";
+    accSubscriptionTier.value = preset === "claude_ultra" ? "ultra" : "max";
+    accMaxConc.value = recommendedMaxConcurrencyForTier("anthropic", accSubscriptionTier.value);
     if (!accSecret.value.trim()) {
       accSecret.value = JSON.stringify({
         claudeAiOauth: {
           accessToken: "sk-ant-oat01-replace-me",
           refreshToken: "sk-ant-ort01-replace-me",
+          subscriptionType: accSubscriptionTier.value,
         },
       });
     }
     return;
   }
-  if (preset === "codex") {
+  if (preset === "codex_pro_5x" || preset === "codex_pro_10x" || preset === "codex_pro_25x") {
+    const tier: SubscriptionTier =
+      preset === "codex_pro_25x" ? "pro_25x" : preset === "codex_pro_10x" ? "pro_10x" : "pro_5x";
     accPlatform.value = "codex";
     accMode.value = "stealth_http";
     accAuthKind.value = "oauth";
+    accSubscriptionTier.value = tier;
+    accMaxConc.value = recommendedMaxConcurrencyForTier("codex", tier);
     if (!accSecret.value.trim()) {
       accSecret.value = JSON.stringify({
         tokens: {
           access_token: "eyJhbGciOi-replace-me",
           refresh_token: "rt_replace_me",
           account_id: "acct_chatgpt_replace_me",
+          plan_type: tier,
         },
       });
     }
@@ -67,12 +109,35 @@ function applySubscriptionTemplate(preset: "claude" | "codex" | "antigravity") {
   accPlatform.value = "antigravity";
   accMode.value = "vm_slot";
   accAuthKind.value = "vm_cli_seed";
+  accSubscriptionTier.value = "pro";
+  accMaxConc.value = recommendedMaxConcurrencyForTier("antigravity", "pro");
   if (!accSecret.value.trim()) {
     accSecret.value = JSON.stringify({
       accessToken: "ya29.replace-me",
       refreshToken: "1//replace-me",
       projectId: "rising-fact-p41fc",
     });
+  }
+}
+
+function formatTierBadge(acc: UpstreamAccount): string {
+  switch (acc.subscriptionTier) {
+    case "ultra":
+      return `ULTRA · ${acc.tierMultiplier}x`;
+    case "max":
+      return `MAX · ${acc.tierMultiplier}x`;
+    case "pro_25x":
+      return "PRO 25x";
+    case "pro_10x":
+      return "PRO 10x";
+    case "pro_5x":
+      return "PRO 5x";
+    case "plus":
+      return `PLUS · ${acc.tierMultiplier}x`;
+    case "pro":
+      return `PRO · ${acc.tierMultiplier}x`;
+    default:
+      return `STD · ${acc.tierMultiplier}x`;
   }
 }
 
@@ -158,6 +223,7 @@ async function handleCreateAccount() {
       platform: accPlatform.value,
       executionMode: accMode.value,
       authKind: accAuthKind.value,
+      subscriptionTier: accSubscriptionTier.value,
       credentialSecret: accSecret.value,
       maxConcurrency: accMaxConc.value,
       priority: accPriority.value,
@@ -170,6 +236,24 @@ async function handleCreateAccount() {
   }
   accName.value = "";
   accSecret.value = "";
+  await refreshPool();
+}
+
+async function changeAccountTier(acc: UpstreamAccount, nextTier: SubscriptionTier) {
+  errorMessage.value = null;
+  const res = await auth.apiFetch(`/api/v1/admin/accounts/${acc.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      subscriptionTier: nextTier,
+      maxConcurrency: recommendedMaxConcurrencyForTier(acc.platform, nextTier),
+    }),
+  });
+  if (!res.ok) {
+    const data = (await res.json()) as { message?: string };
+    errorMessage.value = data.message ?? "更新订阅档位失败";
+    return;
+  }
   await refreshPool();
 }
 
@@ -303,27 +387,48 @@ onMounted(() => {
       </div>
 
       <div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
-        <span class="text-slate-400">订阅快速预设：</span>
+        <span class="text-slate-400">订阅档位快速预设：</span>
         <button
           type="button"
           class="rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-amber-200 hover:bg-amber-500/20"
-          @click="applySubscriptionTemplate('claude')"
+          @click="applySubscriptionTemplate('claude_max')"
         >
-          Claude Max/Pro (.credentials.json)
+          Claude Max (5x)
+        </button>
+        <button
+          type="button"
+          class="rounded border border-amber-400/50 bg-amber-400/15 px-2.5 py-1 font-medium text-amber-100 hover:bg-amber-400/25"
+          @click="applySubscriptionTemplate('claude_ultra')"
+        >
+          Claude Ultra (20x)
         </button>
         <button
           type="button"
           class="rounded border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-emerald-200 hover:bg-emerald-500/20"
-          @click="applySubscriptionTemplate('codex')"
+          @click="applySubscriptionTemplate('codex_pro_5x')"
         >
-          Codex Plus/Pro (.codex/auth.json)
+          Codex Pro 5x
+        </button>
+        <button
+          type="button"
+          class="rounded border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-emerald-200 hover:bg-emerald-500/20"
+          @click="applySubscriptionTemplate('codex_pro_10x')"
+        >
+          Codex Pro 10x
+        </button>
+        <button
+          type="button"
+          class="rounded border border-emerald-400/50 bg-emerald-400/15 px-2.5 py-1 font-medium text-emerald-100 hover:bg-emerald-400/25"
+          @click="applySubscriptionTemplate('codex_pro_25x')"
+        >
+          Codex Pro 25x
         </button>
         <button
           type="button"
           class="rounded border border-violet-500/40 bg-violet-500/10 px-2.5 py-1 text-violet-200 hover:bg-violet-500/20"
           @click="applySubscriptionTemplate('antigravity')"
         >
-          Antigravity 反重力 (Cloud Code + VM)
+          Antigravity 反重力 VM
         </button>
       </div>
 
@@ -332,13 +437,17 @@ onMounted(() => {
           v-model="accName"
           type="text"
           required
-          placeholder="账号别名（例如 claude-max-01）"
+          placeholder="账号别名（例如 claude-ultra-01 / codex-25x-01）"
           class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
         />
         <select v-model="accGroupId" required class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white">
           <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
         </select>
-        <select v-model="accPlatform" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white">
+        <select
+          v-model="accPlatform"
+          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+          @change="onPlatformChange"
+        >
           <option value="anthropic">anthropic (Claude Code)</option>
           <option value="codex">codex (Codex CLI Responses)</option>
           <option value="antigravity">antigravity (反重力 v1internal)</option>
@@ -351,6 +460,15 @@ onMounted(() => {
           <option value="minimax">minimax</option>
           <option value="qwen">qwen</option>
         </select>
+        <select
+          v-model="accSubscriptionTier"
+          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+          @change="onTierChange"
+        >
+          <option v-for="opt in tierOptions" :key="opt.tier" :value="opt.tier">
+            档位: {{ opt.label }}
+          </option>
+        </select>
         <select v-model="accMode" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white">
           <option value="stealth_http">stealth_http (uTLS + Clash)</option>
           <option value="vm_slot">vm_slot (KVM/VM 全拟真)</option>
@@ -362,12 +480,28 @@ onMounted(() => {
           <option value="vm_cli_seed">vm_cli_seed (VM 凭据种子)</option>
           <option value="api_key">api_key</option>
         </select>
+        <input
+          v-model.number="accMaxConc"
+          type="number"
+          min="1"
+          max="64"
+          placeholder="并发上限"
+          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-white"
+        />
+        <input
+          v-model.number="accPriority"
+          type="number"
+          min="0"
+          max="10000"
+          placeholder="优先级 (越小越先)"
+          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-white"
+        />
         <textarea
           v-model="accSecret"
           rows="2"
           required
           placeholder="粘贴 .claude/.credentials.json、.codex/auth.json、Antigravity JSON 或 API Key"
-          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white sm:col-span-2"
+          class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-white sm:col-span-3"
         />
         <button
           type="submit"
@@ -387,14 +521,39 @@ onMounted(() => {
             <p class="font-medium text-white">
               {{ acc.name }}
               <span class="ml-2 rounded bg-slate-800 px-2 py-0.5 font-mono text-xs text-sky-300">{{ acc.platform }}</span>
+              <span
+                class="ml-1 rounded px-2 py-0.5 font-mono text-xs font-semibold"
+                :class="
+                  acc.tierMultiplier >= 20
+                    ? 'bg-fuchsia-500/20 text-fuchsia-200'
+                    : acc.tierMultiplier >= 5
+                      ? 'bg-emerald-500/20 text-emerald-200'
+                      : 'bg-slate-800 text-slate-300'
+                "
+              >
+                {{ formatTierBadge(acc) }}
+              </span>
               <span class="ml-1 rounded bg-indigo-500/20 px-2 py-0.5 font-mono text-xs text-indigo-300">{{ acc.executionMode }}</span>
               <span class="ml-1 rounded bg-slate-800 px-2 py-0.5 font-mono text-xs text-amber-300">{{ acc.authKind }}</span>
             </p>
             <p class="mt-1 font-mono text-xs text-slate-400">
-              分组 {{ acc.groupName }} · 凭据 {{ acc.credentialPreview }} · 5h {{ (acc.window5hUsedBps / 100).toFixed(1) }}% · 7d {{ (acc.window7dUsedBps / 100).toFixed(1) }}% · 并发 {{ acc.maxConcurrency }} · 优先级 {{ acc.priority }}
+              分组 {{ acc.groupName }} · 凭据 {{ acc.credentialPreview }} · 权重 {{ acc.tierMultiplier }}x · 5h {{ (acc.window5hUsedBps / 100).toFixed(1) }}% · 7d {{ (acc.window7dUsedBps / 100).toFixed(1) }}% · 并发 {{ acc.maxConcurrency }} · 优先级 {{ acc.priority }}
             </p>
           </div>
           <div class="flex items-center gap-2">
+            <select
+              :value="acc.subscriptionTier"
+              class="rounded border border-slate-700 bg-slate-900 px-2 py-1 font-mono text-xs text-slate-200"
+              @change="changeAccountTier(acc, ($event.target as HTMLSelectElement).value as SubscriptionTier)"
+            >
+              <option
+                v-for="opt in allowedSubscriptionTiersForProvider(acc.platform)"
+                :key="opt.tier"
+                :value="opt.tier"
+              >
+                {{ opt.label }}
+              </option>
+            </select>
             <button
               type="button"
               class="rounded px-2.5 py-1 text-xs"

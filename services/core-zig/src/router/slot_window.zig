@@ -13,6 +13,10 @@ pub const SlotQuotaWindow = struct {
             self.active_subagents < self.max_subagents;
     }
 
+    pub fn maxUsedBps(self: SlotQuotaWindow) u16 {
+        return @max(self.used_5h_bps, self.used_7d_bps);
+    }
+
     pub fn tryReserveSeat(self: *SlotQuotaWindow) error{ QuotaWatermarkReached, SubagentCapacityFull }!void {
         if (self.used_5h_bps >= self.watermark_bps or self.used_7d_bps >= self.watermark_bps) {
             return error.QuotaWatermarkReached;

@@ -1,5 +1,7 @@
 import {
   formatNanoUsd,
+  isSubscriptionTierAllowedForProvider,
+  subscriptionTierMultiplier,
   type ApiKeyItem,
   type CreateAccountRequest,
   type CreateApiKeyRequest,
@@ -308,6 +310,12 @@ export class MemoryControlStore implements ControlStore {
     if (!group) {
       throw new StoreError("not_found", `Group ${req.groupId} not found`);
     }
+    if (!isSubscriptionTierAllowedForProvider(req.platform, req.subscriptionTier)) {
+      throw new StoreError(
+        "bad_request",
+        `Subscription tier ${req.subscriptionTier} is not valid for provider ${req.platform}`,
+      );
+    }
     const id = `acc_${crypto.randomUUID()}`;
     const record: InternalAccount = {
       id,
@@ -316,6 +324,8 @@ export class MemoryControlStore implements ControlStore {
       platform: req.platform,
       executionMode: req.executionMode,
       authKind: req.authKind,
+      subscriptionTier: req.subscriptionTier,
+      tierMultiplier: subscriptionTierMultiplier(req.platform, req.subscriptionTier),
       credentialPreview,
       credentialsEnc: encryptedSecret,
       maxConcurrency: req.maxConcurrency,
@@ -348,6 +358,16 @@ export class MemoryControlStore implements ControlStore {
     }
     if (req.name !== undefined) acc.name = req.name;
     if (req.executionMode !== undefined) acc.executionMode = req.executionMode;
+    if (req.subscriptionTier !== undefined) {
+      if (!isSubscriptionTierAllowedForProvider(acc.platform, req.subscriptionTier)) {
+        throw new StoreError(
+          "bad_request",
+          `Subscription tier ${req.subscriptionTier} is not valid for provider ${acc.platform}`,
+        );
+      }
+      acc.subscriptionTier = req.subscriptionTier;
+      acc.tierMultiplier = subscriptionTierMultiplier(acc.platform, req.subscriptionTier);
+    }
     if (req.maxConcurrency !== undefined) acc.maxConcurrency = req.maxConcurrency;
     if (req.priority !== undefined) acc.priority = req.priority;
     if (req.status !== undefined) acc.status = req.status;
@@ -493,6 +513,8 @@ export class MemoryControlStore implements ControlStore {
         platform: a.platform,
         executionMode: a.executionMode,
         authKind: a.authKind,
+        subscriptionTier: a.subscriptionTier,
+        tierMultiplier: a.tierMultiplier,
         credentialsEncHex: bytesToHex(a.credentialsEnc),
         maxConcurrency: a.maxConcurrency,
         priority: a.priority,

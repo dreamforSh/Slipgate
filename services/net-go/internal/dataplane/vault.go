@@ -23,6 +23,7 @@ var (
 type AccountSecret struct {
 	APIKey           string            `json:"apiKey"`
 	RefreshToken     string            `json:"refreshToken,omitempty"`
+	SubscriptionTier string            `json:"subscriptionTier,omitempty"`
 	ChatGPTAccountID string            `json:"chatgptAccountId,omitempty"`
 	ProjectID        string            `json:"projectId,omitempty"`
 	OrganizationID   string            `json:"organizationId,omitempty"`
@@ -138,30 +139,39 @@ func ParseAccountSecret(raw string) AccountSecret {
 			AltBaseURL       string            `json:"base_url"`
 			UTLSProfileID    string            `json:"utlsProfileId"`
 			AltProfileID     string            `json:"utls_profile_id"`
+			SubscriptionTier string            `json:"subscriptionTier"`
+			AltSubTier       string            `json:"subscription_tier"`
+			PlanType         string            `json:"planType"`
+			AltPlanType      string            `json:"plan_type"`
 			Headers          map[string]string `json:"headers"`
 			// Direct support for pasted .claude/.credentials.json and .codex/auth.json structures.
 			ClaudeAiOauth *struct {
-				AccessToken  string `json:"accessToken"`
-				RefreshToken string `json:"refreshToken"`
+				AccessToken      string `json:"accessToken"`
+				RefreshToken     string `json:"refreshToken"`
+				SubscriptionType string `json:"subscriptionType"`
+				RateLimitTier    string `json:"rateLimitTier"`
 			} `json:"claudeAiOauth"`
 			CodexOPENAIKey string `json:"OPENAI_API_KEY"`
 			CodexTokens    *struct {
 				AccessToken  string `json:"access_token"`
 				RefreshToken string `json:"refresh_token"`
 				AccountID    string `json:"account_id"`
+				PlanType     string `json:"plan_type"`
 			} `json:"tokens"`
 		}
 		if err := json.Unmarshal([]byte(trimmed), &envelope); err == nil {
-			var claudeTok, claudeRef string
+			var claudeTok, claudeRef, claudeTier string
 			if envelope.ClaudeAiOauth != nil {
 				claudeTok = envelope.ClaudeAiOauth.AccessToken
 				claudeRef = envelope.ClaudeAiOauth.RefreshToken
+				claudeTier = firstNonEmpty(envelope.ClaudeAiOauth.RateLimitTier, envelope.ClaudeAiOauth.SubscriptionType)
 			}
-			var codexTok, codexRef, codexAcc string
+			var codexTok, codexRef, codexAcc, codexPlan string
 			if envelope.CodexTokens != nil {
 				codexTok = envelope.CodexTokens.AccessToken
 				codexRef = envelope.CodexTokens.RefreshToken
 				codexAcc = envelope.CodexTokens.AccountID
+				codexPlan = envelope.CodexTokens.PlanType
 			}
 			key := firstNonEmpty(
 				envelope.APIKey, envelope.AltAPIKey,
@@ -171,6 +181,11 @@ func ParseAccountSecret(raw string) AccountSecret {
 				claudeTok, codexTok, envelope.CodexOPENAIKey,
 			)
 			refresh := firstNonEmpty(envelope.RefreshToken, envelope.AltRefreshToken, claudeRef, codexRef)
+			tier := NormalizeSubscriptionTier(firstNonEmpty(
+				envelope.SubscriptionTier, envelope.AltSubTier,
+				envelope.PlanType, envelope.AltPlanType,
+				claudeTier, codexPlan,
+			))
 			chatgptAcc := firstNonEmpty(envelope.ChatGPTAccountID, envelope.AltChatGPTAccID, codexAcc, envelope.AccountID, envelope.AltAccountID)
 			proj := firstNonEmpty(envelope.ProjectID, envelope.AltProjectID, envelope.CompanionProject)
 			org := firstNonEmpty(envelope.OrganizationID, envelope.AltOrgID)
@@ -179,6 +194,7 @@ func ParseAccountSecret(raw string) AccountSecret {
 			return AccountSecret{
 				APIKey:           key,
 				RefreshToken:     refresh,
+				SubscriptionTier: tier,
 				ChatGPTAccountID: chatgptAcc,
 				ProjectID:        proj,
 				OrganizationID:   org,
@@ -267,6 +283,67 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// NormalizeSubscriptionTier canonicalizes upstream plan/rateLimitTier strings into Slipgate's tier taxonomy:
+// Codex: plus (1x), pro_5x (5x), pro_10x (10x), pro_25x (25x); Claude: pro (1x), max (5x), ultra (20x).
+func NormalizeSubscriptionTier(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return ""
+	}
+	switch s {
+	case "standard", "plus", "pro", "pro_5x", "pro_10x", "pro_25x", "max", "ultra":
+		return s
+	case "default_claude_max_20x", "claude_max_20x", "max_20x", "20x", "claude_ultra":
+		return "ultra"
+	case "default_claude_max_5x", "claude_max_5x", "max_5x", "claude_max":
+		return "max"
+	case "5x", "codex_pro_5x", "pro5x", "pro-5x":
+		return "pro_5x"
+	case "10x", "codex_pro_10x", "pro10x", "pro-10x":
+		return "pro_10x"
+	case "25x", "codex_pro_25x", "pro25x", "pro-25x":
+		return "pro_25x"
+	default:
+		if strings.Contains(s, "20x") || strings.Contains(s, "ultra") {
+			return "ultra"
+		}
+		if strings.Contains(s, "25x") {
+			return "pro_25x"
+		}
+		if strings.Contains(s, "10x") {
+			return "pro_10x"
+		}
+		if strings.Contains(s, "claude") && strings.Contains(s, "5x") {
+			return "max"
+		}
+		if strings.Contains(s, "5x") {
+			return "pro_5x"
+		}
+		return ""
+	}
+}
+
+// SubscriptionTierMultiplier returns the integer quota capacity weight for a (provider, tier) pair.
+func SubscriptionTierMultiplier(provider, tier string) uint16 {
+	switch NormalizeSubscriptionTier(tier) {
+	case "pro_5x", "max":
+		return 5
+	case "pro_10x":
+		return 10
+	case "ultra":
+		return 20
+	case "pro_25x":
+		return 25
+	case "pro":
+		if strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
+			return 5
+		}
+		return 1
+	default:
+		return 1
+	}
 }
 
 func cloneHeaders(in map[string]string) map[string]string {

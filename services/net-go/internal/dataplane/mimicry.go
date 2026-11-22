@@ -20,14 +20,16 @@ const (
 
 // OutboundPersonaContext carries account, auth, and VM-slot identity metadata into outbound protocol shaping.
 type OutboundPersonaContext struct {
-	Provider       string
-	AuthKind       string
-	ExecutionMode  string
-	AccountID      string
-	GuestMachineID string
-	RuntimeProfile string
-	CleanseMode    string
-	RequestID      string
+	Provider         string
+	AuthKind         string
+	SubscriptionTier string
+	TierMultiplier   uint16
+	ExecutionMode    string
+	AccountID        string
+	GuestMachineID   string
+	RuntimeProfile   string
+	CleanseMode      string
+	RequestID        string
 }
 
 // IsClaudeSubscription reports whether outbound traffic should emulate official Claude Code Pro/Max OAuth/CLI wire format.

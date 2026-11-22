@@ -283,3 +283,87 @@ func TestSafeJoinRejectsTraversal(t *testing.T) {
 		}
 	}
 }
+
+func TestPrivateRepoReleaseAssetSyncViaAPIURL(t *testing.T) {
+	t.Parallel()
+
+	assetName := PlatformAssetName("dev")
+	archiveBytes := buildMockArchive(t, assetName, map[string][]byte{
+		"slipgate-dev/webui/index.html": []byte("<html>private-repo-ui</html>"),
+	})
+	sum := sha256.Sum256(archiveBytes)
+	sumHex := hex.EncodeToString(sum[:])
+
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate GitHub private repo: browser_download_url returns 404; only APIURL + Bearer + octet-stream works.
+		if strings.HasPrefix(r.URL.Path, "/browser-404/") {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer ghp_private_pat" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/repos/dreamforSh/Slipgate/releases/tags/dev-latest":
+			_ = json.NewEncoder(w).Encode(githubRelease{
+				TagName:         "dev-latest",
+				TargetCommitish: "998877665544",
+				Assets: []githubAsset{
+					{Name: "BUILD_META.json", APIURL: srvURL + "/assets/101", BrowserDownloadURL: srvURL + "/browser-404/meta"},
+					{Name: "SHA256SUMS.txt", APIURL: srvURL + "/assets/102", BrowserDownloadURL: srvURL + "/browser-404/sums"},
+					{Name: assetName, APIURL: srvURL + "/assets/103", BrowserDownloadURL: srvURL + "/browser-404/archive"},
+				},
+			})
+		case "/assets/101":
+			if r.Header.Get("Accept") != "application/octet-stream" {
+				http.Error(w, "missing octet-stream accept", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(buildMeta{Version: "0.1.0-dev.9988776", Commit: "9988776655443322"})
+		case "/assets/102":
+			if r.Header.Get("Accept") != "application/octet-stream" {
+				http.Error(w, "missing octet-stream accept", http.StatusBadRequest)
+				return
+			}
+			_, _ = fmt.Fprintf(w, "%s  %s\n", sumHex, assetName)
+		case "/assets/103":
+			if r.Header.Get("Accept") != "application/octet-stream" {
+				http.Error(w, "missing octet-stream accept", http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write(archiveBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	var webDir string
+	mgr := NewManager(Options{
+		Config: config.Config{
+			Mode:         "dev",
+			DevSyncMode:  "release",
+			UpdateRepo:   "dreamforSh/Slipgate",
+			UpdateBranch: "main",
+			GitHubToken:  "ghp_private_pat",
+			HotUpdateDir: t.TempDir(),
+		},
+		Version:         "0.1.0",
+		InitialCommit:   "000000000000",
+		APIBaseURL:      srv.URL,
+		AllowCustomHost: true,
+		Logger:          log.New(io.Discard, "", 0),
+		OnWebUIDir:      func(dir string) { webDir = dir },
+	})
+
+	st, err := mgr.Sync(context.Background(), false, false)
+	if err != nil {
+		t.Fatalf("private repo Sync failed: %v", err)
+	}
+	if st.ActiveCommit != "9988776655443322" || webDir == "" {
+		t.Fatalf("unexpected private sync status: %+v webDir=%q", st, webDir)
+	}
+}

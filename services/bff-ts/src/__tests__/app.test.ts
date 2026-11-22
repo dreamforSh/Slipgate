@@ -315,21 +315,73 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
     });
     expect(creditRes.status).toBe(200);
 
-    // Create direct_api mock account + user API key
+    // Create direct_api mock account (Claude Ultra 20x) + Codex Pro 25x + verify tier validation
     const accRes = await app.request("/api/v1/admin/accounts", {
       method: "POST",
       headers: adminHeaders,
       body: JSON.stringify({
-        name: "mock-anthropic-01",
+        name: "mock-anthropic-ultra",
         groupId: "grp_default",
         platform: "anthropic",
         executionMode: "direct_api",
-        authKind: "api_key",
+        authKind: "oauth",
+        subscriptionTier: "ultra",
         credentialSecret: "mock://ok",
       }),
     });
     expect(accRes.status).toBe(201);
-    const { account } = (await accRes.json()) as { account: { id: string } };
+    const { account } = (await accRes.json()) as {
+      account: { id: string; subscriptionTier: string; tierMultiplier: number };
+    };
+    expect(account.subscriptionTier).toBe("ultra");
+    expect(account.tierMultiplier).toBe(20);
+
+    const codex25Res = await app.request("/api/v1/admin/accounts", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: "mock-codex-pro-25x",
+        groupId: "grp_default",
+        platform: "codex",
+        executionMode: "direct_api",
+        authKind: "oauth",
+        subscriptionTier: "pro_25x",
+        credentialSecret: "mock://ok",
+      }),
+    });
+    expect(codex25Res.status).toBe(201);
+    const { account: codexAcc } = (await codex25Res.json()) as {
+      account: { subscriptionTier: string; tierMultiplier: number };
+    };
+    expect(codexAcc.subscriptionTier).toBe("pro_25x");
+    expect(codexAcc.tierMultiplier).toBe(25);
+
+    // Reject cross-provider tier mismatch (e.g. pro_25x on anthropic, max on codex)
+    const badClaudeTier = await app.request("/api/v1/admin/accounts", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: "bad-claude-tier",
+        groupId: "grp_default",
+        platform: "anthropic",
+        subscriptionTier: "pro_25x",
+        credentialSecret: "mock://ok",
+      }),
+    });
+    expect(badClaudeTier.status).toBe(400);
+
+    const badCodexTier = await app.request("/api/v1/admin/accounts", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: "bad-codex-tier",
+        groupId: "grp_default",
+        platform: "codex",
+        subscriptionTier: "max",
+        credentialSecret: "mock://ok",
+      }),
+    });
+    expect(badCodexTier.status).toBe(400);
 
     const keyRes = await app.request("/api/v1/user/api-keys", {
       method: "POST",

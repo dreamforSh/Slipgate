@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { ExecutionModeSchema, GroupPlatformSchema, GroupSubscriptionTypeSchema, ProviderSchema } from "./pool.ts";
+import {
+  ExecutionModeSchema,
+  GroupPlatformSchema,
+  GroupSubscriptionTypeSchema,
+  ProviderSchema,
+  SubscriptionTierSchema,
+} from "./pool.ts";
 
 export const CreateCompositeRouteRequestSchema = z.object({
   groupId: z.string().trim().min(1).default("grp_default"),
@@ -46,6 +52,8 @@ export const DataPlaneSyncAccountSchema = z.object({
   platform: ProviderSchema,
   executionMode: ExecutionModeSchema,
   authKind: z.string(),
+  subscriptionTier: SubscriptionTierSchema.default("standard"),
+  tierMultiplier: z.number().int().min(1).max(100).default(1),
   credentialsEncHex: z.string(),
   maxConcurrency: z.number().int().positive(),
   priority: z.number().int(),

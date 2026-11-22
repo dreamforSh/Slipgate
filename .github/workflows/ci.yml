@@ -176,12 +176,12 @@ jobs:
             "http://127.0.0.1:18080/api/v1/admin/users/$USER_ID/credit" | grep -q '"10000000000"'
 
           curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-            -d '{"name":"ci-mock-anthropic","groupId":"grp_default","platform":"anthropic","executionMode":"direct_api","authKind":"oauth","credentialSecret":"mock://ok"}' \
-            http://127.0.0.1:18080/api/v1/admin/accounts | grep -q '"direct_api"'
+            -d '{"name":"ci-mock-anthropic","groupId":"grp_default","platform":"anthropic","executionMode":"direct_api","authKind":"oauth","subscriptionTier":"ultra","credentialSecret":"mock://ok"}' \
+            http://127.0.0.1:18080/api/v1/admin/accounts | grep -q '"tierMultiplier":20'
 
           curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-            -d '{"name":"ci-mock-codex","groupId":"grp_default","platform":"codex","executionMode":"direct_api","authKind":"oauth","credentialSecret":"mock://ok"}' \
-            http://127.0.0.1:18080/api/v1/admin/accounts | grep -q '"codex"'
+            -d '{"name":"ci-mock-codex","groupId":"grp_default","platform":"codex","executionMode":"direct_api","authKind":"oauth","subscriptionTier":"pro_25x","credentialSecret":"mock://ok"}' \
+            http://127.0.0.1:18080/api/v1/admin/accounts | grep -q '"tierMultiplier":25'
 
           curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
             -d '{"name":"ci-mock-antigravity","groupId":"grp_default","platform":"antigravity","executionMode":"direct_api","authKind":"vm_cli_seed","credentialSecret":"mock://ok"}' \
@@ -205,6 +205,7 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"model":"sonnet-ci","stream":false,"messages":[{"role":"user","content":"Hello Slipgate"}]}' >/tmp/dp_unary.json
           grep -qi 'X-Slipgate-Plane: dataplane-direct' /tmp/dp.headers
+          grep -qi 'X-Slipgate-Subscription-Tier: ultra' /tmp/dp.headers
           grep -q 'Slipgate verified response from claude-sonnet-4-5' /tmp/dp_unary.json
 
           curl -fsS -N -X POST http://127.0.0.1:18080/v1/chat/completions \

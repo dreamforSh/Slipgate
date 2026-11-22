@@ -18,6 +18,7 @@ services:
       - ../migrations/net/0003_clash_subscription_metadata.sql:/docker-entrypoint-initdb.d/08_net_clash_meta.sql:ro
       - ../migrations/net/0004_tls_wire_params_and_vm_seeds.sql:/docker-entrypoint-initdb.d/09_net_tls_vm.sql:ro
       - ../migrations/net/0005_vm_runtime_profile.sql:/docker-entrypoint-initdb.d/10_net_vm_runtime.sql:ro
+      - ../migrations/core/0004_account_subscription_tier.sql:/docker-entrypoint-initdb.d/11_core_sub_tier.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slipgate} -d ${POSTGRES_DB:-slipgate}"]
       interval: 5s
@@ -54,7 +55,8 @@ services:
       SLIPGATE_DEV_SYNC_INTERVAL_SEC: "${SLIPGATE_DEV_SYNC_INTERVAL_SEC:-60}"
       SLIPGATE_UPDATE_REPO: "${SLIPGATE_UPDATE_REPO:-dreamforSh/Slipgate}"
       SLIPGATE_UPDATE_BRANCH: "${SLIPGATE_UPDATE_BRANCH:-main}"
-      DATABASE_URL: "postgres://${POSTGRES_USER:-slipgate}:${POSTGRES_PASSWORD:-slipgate}@postgres:5432/${POSTGRES_DB:-slipgate}"
+      SLIPGATE_GITHUB_TOKEN: "${SLIPGATE_GITHUB_TOKEN:-}"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-slipgate}:${POSTGRES_PASSWORD:-slipgate}@postgres:5432/${POSTGRES_DB:-slipgate}?sslmode=disable"
       REDIS_URL: "redis://redis:6379"
     volumes:
       - slipgate_hotupdate:/var/run/slipgate/hotupdate

@@ -58,6 +58,8 @@ type SyncAccountInput struct {
 	Platform          string `json:"platform"`
 	ExecutionMode     string `json:"executionMode"`
 	AuthKind          string `json:"authKind"`
+	SubscriptionTier  string `json:"subscriptionTier"`
+	TierMultiplier    uint16 `json:"tierMultiplier"`
 	CredentialsEncHex string `json:"credentialsEncHex"`
 	MaxConcurrency    uint32 `json:"maxConcurrency"`
 	Priority          int32  `json:"priority"`
@@ -192,6 +194,7 @@ type Coordinator struct {
 	mu                 sync.RWMutex
 	keyIPAllowlists    map[string][]string
 	accountAuthKinds   map[string]string
+	accountTiers       map[string]string
 	lastCoreSyncJSON   []byte
 	lastRevisionUnixMs int64
 }
@@ -233,6 +236,7 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		logger:           logger,
 		keyIPAllowlists:  make(map[string][]string),
 		accountAuthKinds: make(map[string]string),
+		accountTiers:     make(map[string]string),
 	}
 }
 
@@ -266,16 +270,18 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		Enabled              bool     `json:"enabled"`
 	}
 	type coreAccount struct {
-		ID              string `json:"id"`
-		GroupID         string `json:"groupId"`
-		Platform        string `json:"platform"`
-		ExecutionMode   string `json:"executionMode"`
-		AuthKind        string `json:"authKind"`
-		MaxConcurrency  uint32 `json:"maxConcurrency"`
-		Priority        int32  `json:"priority"`
-		Status          string `json:"status"`
-		Window5hUsedBps uint16 `json:"window5hUsedBps"`
-		Window7dUsedBps uint16 `json:"window7dUsedBps"`
+		ID               string `json:"id"`
+		GroupID          string `json:"groupId"`
+		Platform         string `json:"platform"`
+		ExecutionMode    string `json:"executionMode"`
+		AuthKind         string `json:"authKind"`
+		SubscriptionTier string `json:"subscriptionTier"`
+		TierMultiplier   uint16 `json:"tierMultiplier"`
+		MaxConcurrency   uint32 `json:"maxConcurrency"`
+		Priority         int32  `json:"priority"`
+		Status           string `json:"status"`
+		Window5hUsedBps  uint16 `json:"window5hUsedBps"`
+		Window7dUsedBps  uint16 `json:"window7dUsedBps"`
 	}
 	type coreAPIKey struct {
 		ID               string `json:"id"`
@@ -312,21 +318,31 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	}
 
 	nextAuthKinds := make(map[string]string, len(snap.Accounts))
+	nextTiers := make(map[string]string, len(snap.Accounts))
 	coreAccounts := make([]coreAccount, 0, len(snap.Accounts))
 	for _, a := range snap.Accounts {
 		authKind := firstNonEmpty(a.AuthKind, "api_key")
+		secTier := nextSecrets[a.ID].SubscriptionTier
+		subTier := firstNonEmpty(NormalizeSubscriptionTier(a.SubscriptionTier), secTier, "standard")
+		tierMult := a.TierMultiplier
+		if tierMult == 0 {
+			tierMult = SubscriptionTierMultiplier(a.Platform, subTier)
+		}
 		nextAuthKinds[a.ID] = authKind
+		nextTiers[a.ID] = subTier
 		coreAccounts = append(coreAccounts, coreAccount{
-			ID:              a.ID,
-			GroupID:         a.GroupID,
-			Platform:        a.Platform,
-			ExecutionMode:   a.ExecutionMode,
-			AuthKind:        authKind,
-			MaxConcurrency:  max(1, a.MaxConcurrency),
-			Priority:        a.Priority,
-			Status:          a.Status,
-			Window5hUsedBps: a.Window5hUsedBps,
-			Window7dUsedBps: a.Window7dUsedBps,
+			ID:               a.ID,
+			GroupID:          a.GroupID,
+			Platform:         a.Platform,
+			ExecutionMode:    a.ExecutionMode,
+			AuthKind:         authKind,
+			SubscriptionTier: subTier,
+			TierMultiplier:   tierMult,
+			MaxConcurrency:   max(1, a.MaxConcurrency),
+			Priority:         a.Priority,
+			Status:           a.Status,
+			Window5hUsedBps:  a.Window5hUsedBps,
+			Window7dUsedBps:  a.Window7dUsedBps,
 		})
 	}
 
@@ -381,6 +397,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	c.mu.Lock()
 	c.keyIPAllowlists = nextIPAllowlists
 	c.accountAuthKinds = nextAuthKinds
+	c.accountTiers = nextTiers
 	c.lastCoreSyncJSON = corePayload
 	c.lastRevisionUnixMs = snap.RevisionUnixMs
 	c.mu.Unlock()
@@ -507,10 +524,12 @@ type coreDispatchDirective struct {
 	APIKeyID      string   `json:"apiKeyId"`
 	GroupID       string   `json:"groupId"`
 	AccountID     string   `json:"accountId"`
-	Provider      string   `json:"provider"`
-	ExecutionMode string   `json:"executionMode"`
-	AuthKind      string   `json:"authKind"`
-	PublicModel   string   `json:"publicModel"`
+	Provider         string   `json:"provider"`
+	ExecutionMode    string   `json:"executionMode"`
+	AuthKind         string   `json:"authKind"`
+	SubscriptionTier string   `json:"subscriptionTier"`
+	TierMultiplier   uint16   `json:"tierMultiplier"`
+	PublicModel      string   `json:"publicModel"`
 	UpstreamModel string   `json:"upstreamModel"`
 	CleanseMode   string   `json:"cleanseMode"`
 	HoldNanoUSD   string   `json:"holdNanoUsd"`
@@ -732,13 +751,25 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	cleanseMode := firstNonEmpty(directive.CleanseMode, "zero")
 	tracker := &NativeTurnTracker{}
+	subTier := firstNonEmpty(
+		NormalizeSubscriptionTier(directive.SubscriptionTier),
+		c.accountTier(directive.AccountID),
+		secret.SubscriptionTier,
+		"standard",
+	)
+	tierMult := directive.TierMultiplier
+	if tierMult == 0 {
+		tierMult = SubscriptionTierMultiplier(directive.Provider, subTier)
+	}
 	pctx := OutboundPersonaContext{
-		Provider:      directive.Provider,
-		AuthKind:      firstNonEmpty(directive.AuthKind, c.accountAuthKind(directive.AccountID)),
-		ExecutionMode: directive.ExecutionMode,
-		AccountID:     directive.AccountID,
-		CleanseMode:   cleanseMode,
-		RequestID:     requestID,
+		Provider:         directive.Provider,
+		AuthKind:         firstNonEmpty(directive.AuthKind, c.accountAuthKind(directive.AccountID)),
+		SubscriptionTier: subTier,
+		TierMultiplier:   tierMult,
+		ExecutionMode:    directive.ExecutionMode,
+		AccountID:        directive.AccountID,
+		CleanseMode:      cleanseMode,
+		RequestID:        requestID,
 	}
 
 	if directive.ExecutionMode == "vm_slot" {
@@ -790,6 +821,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("X-Slipgate-Execution-Mode", directive.ExecutionMode)
 	w.Header().Set("X-Slipgate-Provider", directive.Provider)
+	w.Header().Set("X-Slipgate-Subscription-Tier", subTier)
 
 	upstreamReq, egressCodec, buildErr := BuildUpstreamHTTPRequestWithPersona(
 		r.Context(),
@@ -903,6 +935,12 @@ func (c *Coordinator) accountAuthKind(accountID string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.accountAuthKinds[accountID]
+}
+
+func (c *Coordinator) accountTier(accountID string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.accountTiers[accountID]
 }
 
 func (c *Coordinator) isClientIPAllowed(apiKeyID, clientIP string) bool {
