@@ -1327,6 +1327,9 @@ export class PostgresControlStore implements ControlStore {
         formattedCostUsd: formatNanoUsd(cost),
         ttftMs: r.ttft_ms ?? 0,
         durationMs: r.duration_ms ?? 0,
+        // Quota watermarks live on the account (core.account_window_quotas), not on each usage row.
+        window5hUsedBps: 0,
+        window7dUsedBps: 0,
         statusCode: r.status_code,
         createdAtIso: toIso(r.created_at),
       };
