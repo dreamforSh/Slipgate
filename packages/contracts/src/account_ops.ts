@@ -103,11 +103,12 @@ export const AccountImportResultSchema = z.object({
 });
 export type AccountImportResult = z.infer<typeof AccountImportResultSchema>;
 
-/** Exporting plaintext credentials requires the admin to re-enter their password. */
+/** Exporting plaintext credentials requires the admin to re-enter their password (and 2FA code when enabled). */
 export const AccountExportRequestSchema = z.object({
   /** Omit to export every account. */
   accountIds: z.array(z.string().min(1)).min(1).max(5000).optional(),
   password: z.string().min(1).max(256),
+  totpCode: z.string().trim().regex(/^\d{6}$/, "Enter the 6-digit code").optional(),
 });
 export type AccountExportRequest = z.infer<typeof AccountExportRequestSchema>;
 

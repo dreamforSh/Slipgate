@@ -21,29 +21,36 @@ function safeUrl(raw: string): string | null {
   return null;
 }
 
+function formatEmphasis(text: string): string {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
+    .replace(/~~([^~]+)~~/g, "<del>$1</del>");
+}
+
 /** Inline formatting on already-escaped text. */
 function inline(escaped: string): string {
-  const codes: string[] = [];
-  let out = escaped.replace(/`([^`]+)`/g, (_m, code: string) => {
-    codes.push(`<code>${code}</code>`);
-    return `\u0000${codes.length - 1}\u0000`;
-  });
+  const tokens: string[] = [];
+  const stash = (rendered: string): string => {
+    tokens.push(rendered);
+    return `\u0000${tokens.length - 1}\u0000`;
+  };
+  let out = escaped.replace(/`([^`]+)`/g, (_m, code: string) => stash(`<code>${code}</code>`));
   out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt: string, url: string) => {
     const safe = safeUrl(url.replace(/&amp;/g, "&"));
-    return safe ? `<img src="${escapeHtml(safe)}" alt="${alt}" loading="lazy" />` : m;
+    return safe ? stash(`<img src="${escapeHtml(safe)}" alt="${alt}" loading="lazy" />`) : m;
   });
   out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text: string, url: string) => {
     const safe = safeUrl(url.replace(/&amp;/g, "&"));
     if (!safe) return m;
     const external = /^https?:/i.test(safe);
-    return `<a href="${escapeHtml(safe)}"${external ? ' target="_blank" rel="noopener noreferrer"' : ""}>${text}</a>`;
+    return stash(
+      `<a href="${escapeHtml(safe)}"${external ? ' target="_blank" rel="noopener noreferrer"' : ""}>${formatEmphasis(text)}</a>`,
+    );
   });
-  out = out
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/__([^_]+)__/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
-    .replace(/~~([^~]+)~~/g, "<del>$1</del>");
-  return out.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => codes[Number(i)] ?? "");
+  out = formatEmphasis(out);
+  return out.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => tokens[Number(i)] ?? "");
 }
 
 function splitRow(line: string): string[] {
@@ -55,7 +62,7 @@ function splitRow(line: string): string[] {
 }
 
 export function renderMarkdown(source: string): string {
-  const lines = escapeHtml(source.replace(/\r\n?/g, "\n")).split("\n");
+  const lines = escapeHtml(source.replace(/\u0000/g, "").replace(/\r\n?/g, "\n")).split("\n");
   const html: string[] = [];
   let i = 0;
   let paragraph: string[] = [];

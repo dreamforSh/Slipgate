@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashcore"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/netguard"
 )
 
 const (
@@ -224,9 +225,10 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 	if ipEchoURL == "" {
 		ipEchoURL = "https://api.ipify.org?format=json"
 	}
+	allowLoopback := opts.AllowLoopbackServers || netguard.AllowPrivateUpstreamsFromEnv()
 	httpCli := opts.HTTPClient
 	if httpCli == nil {
-		httpCli = &http.Client{Timeout: 15 * time.Second}
+		httpCli = netguard.NewSafeHTTPClient(15*time.Second, allowLoopback)
 	}
 	store := opts.Store
 	if store == nil {
@@ -246,7 +248,7 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		probeURL:         probeURL,
 		ipEchoURL:        ipEchoURL,
 		probeIntervalSec: opts.ProbeIntervalSec,
-		allowLoopback:    opts.AllowLoopbackServers,
+		allowLoopback:    allowLoopback,
 		httpClient:       httpCli,
 		lastConnSamples:  make(map[string][2]int64),
 	}
@@ -1006,6 +1008,9 @@ func (c *Coordinator) selectNodesForProbe(nodeIDs []string) []Node {
 }
 
 func (c *Coordinator) fetchSubscriptionURL(ctx context.Context, rawURL, userAgent string) ([]byte, error) {
+	if err := netguard.ValidateOutboundURL(rawURL, c.allowLoopback); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err

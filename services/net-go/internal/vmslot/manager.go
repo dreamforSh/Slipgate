@@ -272,6 +272,15 @@ func (m *Manager) UpsertRestoredSlot(s Slot) {
 	if s.RuntimeProfile == "" {
 		s.RuntimeProfile = RuntimeClaudeCode
 	}
+	// Clear stale in-flight counters and previous-boot local PIDs so slots never restore wedged.
+	s.ActiveSubagents = 0
+	if s.GuestPID > 0 && strings.HasPrefix(s.GuestUDSPath, "tcp://") {
+		s.GuestPID = 0
+		s.GuestUDSPath = "sandbox://" + s.ID
+		if s.DaemonVersion != "" {
+			s.DaemonVersion = "sandbox-ready"
+		}
+	}
 	m.slots[s.ID] = cloneSlot(s)
 	if s.ClashNodeID != "" {
 		m.usedNodes[s.ClashNodeID] = s.ID

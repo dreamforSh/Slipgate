@@ -10,7 +10,7 @@ import OrderStatusBadge from "../../components/payments/OrderStatusBadge.vue";
 import PaymentQrPanel from "../../components/payments/PaymentQrPanel.vue";
 import PaymentStatusMark from "../../components/payments/PaymentStatusMark.vue";
 import RefundRequestModal from "../../components/payments/RefundRequestModal.vue";
-import { detectDevice, invokeWechatPay, usePayErrors } from "../../components/payments/paymentFlow";
+import { detectDevice, invokeWechatPay, safeHttpUrl, usePayErrors } from "../../components/payments/paymentFlow";
 import { countdownText, formatFiat, refreshWallet, REFUND_STATUSES } from "../../components/payments/paymentUtil";
 import { usePaymentLabels } from "../../components/payments/usePaymentLabels";
 import ConfirmButton from "../../components/ui/ConfirmButton.vue";
@@ -262,7 +262,7 @@ const qrInline = computed(() => checkout.value?.flow === "qrcode" && Boolean(che
 const reopenUrl = computed(() => {
   const c = checkout.value;
   if (c && c.flow !== "redirect") return null;
-  return c?.payUrl ?? order.value?.payUrl ?? null;
+  return safeHttpUrl(c?.payUrl ?? order.value?.payUrl);
 });
 const wechatPayable = computed(() => checkout.value?.flow === "jsapi" && Boolean(checkout.value.jsapi) && device === "wechat");
 const airwallexPayable = computed(() => checkout.value?.flow === "airwallex" && Boolean(checkout.value.airwallex));

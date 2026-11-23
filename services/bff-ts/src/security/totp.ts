@@ -77,8 +77,19 @@ export async function verifyTotp(secretBase32: string, code: string, replayKey?:
     if (replayKey) {
       const last = lastAcceptedStep.get(replayKey);
       if (last !== undefined && step <= last) return false;
+      // Delete-then-set moves the entry to the tail of Map insertion order for bounded LRU/FIFO eviction.
+      lastAcceptedStep.delete(replayKey);
       lastAcceptedStep.set(replayKey, step);
-      if (lastAcceptedStep.size > 50_000) lastAcceptedStep.clear();
+      if (lastAcceptedStep.size > 50_000) {
+        const minLiveStep = current - 2;
+        for (const [k, s] of lastAcceptedStep) {
+          if (s < minLiveStep || lastAcceptedStep.size > 50_000) {
+            lastAcceptedStep.delete(k);
+          } else {
+            break;
+          }
+        }
+      }
     }
     return true;
   }

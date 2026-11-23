@@ -230,6 +230,9 @@ func (m *Manager) Status() StatusSnapshot {
 // Sync checks the configured repository for updates and applies them if checkOnly is false.
 // When asyncRestart is true, child plane restarts run shortly after Sync returns so proxied HTTP responses flush cleanly.
 func (m *Manager) Sync(ctx context.Context, checkOnly bool, asyncRestart bool) (StatusSnapshot, error) {
+	if !checkOnly && !strings.EqualFold(strings.TrimSpace(m.cfg.Mode), "dev") {
+		return m.Status(), errors.New("hotupdate: binary apply is disabled outside dev mode (SLIPGATE_MODE=dev required)")
+	}
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
 

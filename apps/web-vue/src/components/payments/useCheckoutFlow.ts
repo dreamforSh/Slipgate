@@ -3,7 +3,7 @@ import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 import type { CreateOrderRequest, CreateOrderResponse, PaymentCheckout, PaymentOrderItem } from "@slipgate/contracts";
 import { useToastStore } from "../../stores/toast";
-import { invokeWechatPay, PayApiError, payApi, resultLink, savePendingPurchase } from "./paymentFlow";
+import { invokeWechatPay, PayApiError, payApi, resultLink, safeHttpUrl, savePendingPurchase } from "./paymentFlow";
 
 /**
  * Hands a created (or resumed) order to the way it is paid: a redirect to the provider, the
@@ -29,10 +29,12 @@ export function useCheckoutFlow() {
       return await payApi<CreateOrderResponse>("/api/v1/user/orders", { method: "POST", body });
     } catch (err) {
       if (err instanceof PayApiError && err.code === "wechat_oauth_required" && typeof err.body.authorizeUrl === "string") {
+        const safeAuthUrl = safeHttpUrl(err.body.authorizeUrl);
+        if (!safeAuthUrl) throw new Error("Invalid WeChat authorization URL");
         savePendingPurchase({ planId: body.planId, amount: body.amount, provider: body.provider, method: body.method });
         leaving.value = true;
         toast.info(t("payFlow.checkout.wechatAuthorizing"));
-        window.location.assign(err.body.authorizeUrl);
+        window.location.assign(safeAuthUrl);
         return null;
       }
       throw err;
@@ -41,7 +43,7 @@ export function useCheckoutFlow() {
 
   async function proceed(order: PaymentOrderItem, checkout: PaymentCheckout | null = order.checkout): Promise<void> {
     const flow = checkout?.flow ?? (order.provider === "manual" ? "manual" : "redirect");
-    const payUrl = checkout?.payUrl ?? order.payUrl;
+    const payUrl = safeHttpUrl(checkout?.payUrl ?? order.payUrl);
     if (flow === "redirect" && payUrl) {
       leaving.value = true;
       toast.info(t("payFlow.checkout.redirecting"));

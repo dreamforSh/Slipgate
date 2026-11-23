@@ -146,10 +146,254 @@ export class PostgresControlStore implements ControlStore {
   }
 
   async init(): Promise<void> {
-    // Ensure required schemas/tables/columns exist even against a fresh database.
+    // Self-heal all base core.* and commerce.* tables first so standalone deployments, external RDS
+    // instances, and fresh databases without /docker-entrypoint-initdb.d mounts boot cleanly.
     await this.sql.unsafe(`
       CREATE SCHEMA IF NOT EXISTS commerce;
       CREATE SCHEMA IF NOT EXISTS core;
+
+      CREATE TABLE IF NOT EXISTS core.groups (
+          id                TEXT PRIMARY KEY,
+          name              TEXT NOT NULL UNIQUE,
+          platform          TEXT NOT NULL,
+          subscription_type TEXT NOT NULL DEFAULT 'balance',
+          rate_multiplier   NUMERIC(12, 6) NOT NULL DEFAULT 1.000000,
+          model_allowlist   JSONB NOT NULL DEFAULT '[]'::jsonb,
+          enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS core.accounts (
+          id                  TEXT PRIMARY KEY,
+          group_id            TEXT NOT NULL REFERENCES core.groups(id) ON DELETE CASCADE,
+          platform            TEXT NOT NULL,
+          auth_kind           TEXT NOT NULL,
+          credentials_enc     BYTEA NOT NULL,
+          max_concurrency     INTEGER NOT NULL DEFAULT 5,
+          priority            INTEGER NOT NULL DEFAULT 100,
+          is_shadow_follower  BOOLEAN NOT NULL DEFAULT FALSE,
+          parent_account_id   TEXT REFERENCES core.accounts(id) ON DELETE SET NULL,
+          status              TEXT NOT NULL DEFAULT 'active',
+          temp_unsched_until  TIMESTAMPTZ,
+          temp_unsched_reason TEXT,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_core_accounts_group_status
+          ON core.accounts (group_id, status, priority);
+
+      CREATE TABLE IF NOT EXISTS core.composite_routes (
+          id              TEXT PRIMARY KEY,
+          group_id        TEXT NOT NULL REFERENCES core.groups(id) ON DELETE CASCADE,
+          public_model    TEXT NOT NULL,
+          match_type      TEXT NOT NULL CHECK (match_type IN ('exact', 'prefix')),
+          target_platform TEXT NOT NULL,
+          upstream_model  TEXT NOT NULL,
+          endpoint        TEXT NOT NULL DEFAULT 'any',
+          priority        INTEGER NOT NULL DEFAULT 100,
+          enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_core_composite_routes_lookup
+          ON core.composite_routes (group_id, enabled, priority, id);
+
+      CREATE TABLE IF NOT EXISTS core.api_keys (
+          id                  TEXT PRIMARY KEY,
+          user_id             TEXT NOT NULL,
+          group_id            TEXT NOT NULL REFERENCES core.groups(id) ON DELETE RESTRICT,
+          key_prefix          TEXT NOT NULL,
+          key_hash_blake3     BYTEA NOT NULL UNIQUE,
+          rpm_limit           INTEGER NOT NULL DEFAULT 60,
+          concurrency_limit   INTEGER NOT NULL DEFAULT 5,
+          ip_allowlist        JSONB NOT NULL DEFAULT '[]'::jsonb,
+          enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+          expires_at          TIMESTAMPTZ,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_core_api_keys_user
+          ON core.api_keys (user_id, enabled);
+
+      CREATE TABLE IF NOT EXISTS core.quota_wallets (
+          user_id             TEXT PRIMARY KEY,
+          balance_nano_usd    NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          held_nano_usd       NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          CONSTRAINT chk_core_wallet_non_negative_held CHECK (held_nano_usd >= 0)
+      );
+
+      CREATE TABLE IF NOT EXISTS core.ledger_entries (
+          id                  TEXT PRIMARY KEY,
+          idempotency_key     TEXT NOT NULL UNIQUE,
+          user_id             TEXT NOT NULL REFERENCES core.quota_wallets(user_id) ON DELETE RESTRICT,
+          entry_kind          TEXT NOT NULL CHECK (entry_kind IN ('credit', 'hold', 'settle', 'release', 'adjust')),
+          delta_nano_usd      NUMERIC(39, 0) NOT NULL,
+          balance_after_nano  NUMERIC(39, 0) NOT NULL,
+          reference_id        TEXT,
+          metadata            JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_core_ledger_user_created
+          ON core.ledger_entries (user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS core.usage_logs (
+          id                  TEXT NOT NULL,
+          request_id          TEXT NOT NULL,
+          user_id             TEXT NOT NULL,
+          api_key_id          TEXT NOT NULL,
+          account_id          TEXT NOT NULL,
+          group_id            TEXT NOT NULL,
+          platform            TEXT NOT NULL,
+          public_model        TEXT NOT NULL,
+          upstream_model      TEXT NOT NULL,
+          ingress_codec       TEXT NOT NULL,
+          egress_codec        TEXT NOT NULL,
+          input_tokens        BIGINT NOT NULL DEFAULT 0,
+          output_tokens       BIGINT NOT NULL DEFAULT 0,
+          cache_read_tokens   BIGINT NOT NULL DEFAULT 0,
+          cache_write_tokens  BIGINT NOT NULL DEFAULT 0,
+          cost_nano_usd       NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          ttft_ms             INTEGER,
+          duration_ms         INTEGER,
+          status_code         INTEGER NOT NULL,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (id, created_at)
+      ) PARTITION BY RANGE (created_at);
+
+      CREATE TABLE IF NOT EXISTS core.usage_logs_default
+          PARTITION OF core.usage_logs DEFAULT;
+
+      CREATE TABLE IF NOT EXISTS core.account_window_quotas (
+          account_id              TEXT PRIMARY KEY REFERENCES core.accounts(id) ON DELETE CASCADE,
+          window_5h_used_bps      INTEGER NOT NULL DEFAULT 0 CHECK (window_5h_used_bps >= 0 AND window_5h_used_bps <= 10000),
+          window_5h_reset_at      TIMESTAMPTZ,
+          window_7d_used_bps      INTEGER NOT NULL DEFAULT 0 CHECK (window_7d_used_bps >= 0 AND window_7d_used_bps <= 10000),
+          window_7d_reset_at      TIMESTAMPTZ,
+          lifetime_tokens         BIGINT NOT NULL DEFAULT 0,
+          lifetime_cost_nano_usd  NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS core.risk_ban_records (
+          id                  TEXT PRIMARY KEY,
+          subject_kind        TEXT NOT NULL CHECK (subject_kind IN ('device', 'session', 'api_key', 'ip')),
+          subject_hash        TEXT NOT NULL,
+          strike_level        SMALLINT NOT NULL CHECK (strike_level BETWEEN 1 AND 3),
+          ban_reason          TEXT NOT NULL,
+          source_request_id   TEXT,
+          expires_at          TIMESTAMPTZ,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_core_risk_ban_lookup
+          ON core.risk_ban_records (subject_kind, subject_hash, expires_at DESC);
+
+      CREATE TABLE IF NOT EXISTS core.refusal_cache (
+          request_fingerprint TEXT PRIMARY KEY,
+          reason              TEXT NOT NULL,
+          http_status         INTEGER NOT NULL DEFAULT 400,
+          response_payload    JSONB NOT NULL,
+          expires_at          TIMESTAMPTZ NOT NULL,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_core_refusal_cache_expiry
+          ON core.refusal_cache (expires_at);
+
+      CREATE TABLE IF NOT EXISTS commerce.users (
+          id              TEXT PRIMARY KEY,
+          email           TEXT NOT NULL UNIQUE,
+          password_hash   TEXT,
+          role            TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+          status          TEXT NOT NULL DEFAULT 'active',
+          totp_secret_enc BYTEA,
+          totp_enabled    BOOLEAN NOT NULL DEFAULT FALSE,
+          referrer_id     TEXT REFERENCES commerce.users(id) ON DELETE SET NULL,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS commerce.auth_identities (
+          id              TEXT PRIMARY KEY,
+          user_id         TEXT NOT NULL REFERENCES commerce.users(id) ON DELETE CASCADE,
+          provider        TEXT NOT NULL,
+          subject         TEXT NOT NULL,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (provider, subject)
+      );
+
+      CREATE TABLE IF NOT EXISTS commerce.passkeys (
+          id              TEXT PRIMARY KEY,
+          user_id         TEXT NOT NULL REFERENCES commerce.users(id) ON DELETE CASCADE,
+          credential_id   BYTEA NOT NULL UNIQUE,
+          public_key      BYTEA NOT NULL,
+          sign_count      BIGINT NOT NULL DEFAULT 0,
+          transports      JSONB NOT NULL DEFAULT '[]'::jsonb,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS commerce.payment_orders (
+          id                  TEXT PRIMARY KEY,
+          user_id             TEXT NOT NULL REFERENCES commerce.users(id) ON DELETE RESTRICT,
+          provider            TEXT NOT NULL,
+          provider_trade_no   TEXT,
+          amount_nano_usd     NUMERIC(39, 0) NOT NULL,
+          currency            TEXT NOT NULL DEFAULT 'USD',
+          status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'failed', 'refunded')),
+          idempotency_key     TEXT NOT NULL UNIQUE,
+          paid_at             TIMESTAMPTZ,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS commerce.outbox_events (
+          id              TEXT PRIMARY KEY,
+          event_type      TEXT NOT NULL,
+          aggregate_id    TEXT NOT NULL,
+          payload         JSONB NOT NULL,
+          status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'dispatched', 'dead_letter')),
+          attempts        INTEGER NOT NULL DEFAULT 0,
+          next_retry_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          dispatched_at   TIMESTAMPTZ,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_commerce_outbox_pending
+          ON commerce.outbox_events (status, next_retry_at);
+
+      CREATE TABLE IF NOT EXISTS commerce.subscriptions (
+          id              TEXT PRIMARY KEY,
+          user_id         TEXT NOT NULL REFERENCES commerce.users(id) ON DELETE CASCADE,
+          group_id        TEXT NOT NULL,
+          plan_code       TEXT NOT NULL,
+          status          TEXT NOT NULL DEFAULT 'active',
+          starts_at       TIMESTAMPTZ NOT NULL,
+          expires_at      TIMESTAMPTZ NOT NULL,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS commerce.redeem_codes (
+          code            TEXT PRIMARY KEY,
+          amount_nano_usd NUMERIC(39, 0) NOT NULL,
+          redeemed_by     TEXT REFERENCES commerce.users(id) ON DELETE SET NULL,
+          redeemed_at     TIMESTAMPTZ,
+          expires_at      TIMESTAMPTZ,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS commerce.affiliate_commissions (
+          id              TEXT PRIMARY KEY,
+          beneficiary_id  TEXT NOT NULL REFERENCES commerce.users(id) ON DELETE RESTRICT,
+          source_order_id TEXT NOT NULL REFERENCES commerce.payment_orders(id) ON DELETE RESTRICT,
+          amount_nano_usd NUMERIC(39, 0) NOT NULL,
+          status          TEXT NOT NULL DEFAULT 'pending',
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
 
       CREATE TABLE IF NOT EXISTS commerce.portal_settings (
           key         TEXT PRIMARY KEY,
@@ -1504,7 +1748,7 @@ export class PostgresControlStore implements ControlStore {
   }
 
   async exportDataPlaneSnapshot(): Promise<DataPlaneSyncSnapshot> {
-    const [groups, routes, accRows, keyRows, walletRows] = await Promise.all([
+    const [groups, routes, accRows, keyRows, walletRows, banRows] = await Promise.all([
       this.listGroups(false),
       this.listCompositeRoutes(),
       this.sql<
@@ -1583,6 +1827,20 @@ export class PostgresControlStore implements ControlStore {
         SELECT user_id, balance_nano_usd::text, held_nano_usd::text
         FROM core.quota_wallets
       `,
+      this.sql<
+        {
+          subject_kind: "device" | "session" | "api_key" | "ip";
+          subject_hash: string;
+          strike_level: number;
+          expires_at: Date | null;
+        }[]
+      >`
+        SELECT DISTINCT ON (subject_kind, subject_hash)
+          subject_kind, subject_hash, strike_level, expires_at
+        FROM core.risk_ban_records
+        WHERE expires_at IS NULL OR expires_at > NOW()
+        ORDER BY subject_kind, subject_hash, strike_level DESC, created_at DESC
+      `,
     ]);
 
     const nowMs = Date.now();
@@ -1643,6 +1901,12 @@ export class PostgresControlStore implements ControlStore {
         userId: w.user_id,
         balanceNanoUsd: w.balance_nano_usd,
         heldNanoUsd: w.held_nano_usd,
+      })),
+      riskBans: banRows.map((b) => ({
+        subjectKind: b.subject_kind,
+        subjectHash: b.subject_hash,
+        strikeLevel: Math.max(1, Math.min(3, b.strike_level)),
+        bannedUntilUnixMs: b.expires_at ? b.expires_at.getTime() : -1,
       })),
     };
   }

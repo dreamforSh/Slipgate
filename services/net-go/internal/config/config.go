@@ -48,6 +48,8 @@ type Config struct {
 	WebUIDir              string
 	GitHubToken           string
 	InternalToken         string
+	TrustedProxies        string
+	AllowPrivateUpstreams bool
 }
 
 // LoadFromEnv loads configuration from SLIPGATE_* environment variables with safe defaults.
@@ -128,6 +130,8 @@ func LoadFromEnv() Config {
 		WebUIDir:              strings.TrimSpace(os.Getenv("SLIPGATE_WEBUI_DIR")),
 		GitHubToken:           ghToken,
 		InternalToken:         internalToken,
+		TrustedProxies:        strings.TrimSpace(os.Getenv("SLIPGATE_TRUSTED_PROXIES")),
+		AllowPrivateUpstreams: envBool("SLIPGATE_ALLOW_PRIVATE_UPSTREAMS", false),
 	}
 }
 

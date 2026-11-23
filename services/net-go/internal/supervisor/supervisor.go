@@ -42,12 +42,14 @@ type ChildSnapshot struct {
 }
 
 type managedChild struct {
-	spec      ChildSpec
-	cmd       *exec.Cmd
-	status    ChildStatus
-	pid       int
-	lastError string
-	done      chan struct{}
+	spec          ChildSpec
+	cmd           *exec.Cmd
+	status        ChildStatus
+	pid           int
+	lastError     string
+	done          chan struct{}
+	crashRestarts int
+	lastStartAt   time.Time
 }
 
 // Supervisor launches, hot-restarts, and cleanly terminates slipgate-core (Zig) and slipgate-bff (Bun).
@@ -56,10 +58,20 @@ type Supervisor struct {
 	lifecycleMu sync.Mutex
 	mu          sync.RWMutex
 	rootCtx     context.Context
+	stopping    bool
 	children    []*managedChild
 	order       []int
 	// lineHook also receives every child output line (system-log forwarding); nil when unset.
 	lineHook func(child, line string)
+	// restartHook runs asynchronously whenever a child restarts after an unexpected crash; nil when unset.
+	restartHook func(child string)
+}
+
+// SetRestartHook registers a callback invoked asynchronously after a supervised child recovers from a crash.
+func (s *Supervisor) SetRestartHook(hook func(child string)) {
+	s.mu.Lock()
+	s.restartHook = hook
+	s.mu.Unlock()
 }
 
 // SetLineHook registers a function that receives each output line of every child started from
@@ -93,6 +105,7 @@ func (s *Supervisor) StartAll(ctx context.Context, specs []ChildSpec) error {
 
 	s.mu.Lock()
 	s.rootCtx = ctx
+	s.stopping = false
 	s.children = make([]*managedChild, len(specs))
 	s.order = make([]int, 0, len(specs))
 	for i, spec := range specs {
@@ -250,12 +263,14 @@ func (s *Supervisor) startChildLocked(ctx context.Context, idx int) error {
 	}
 
 	done := make(chan struct{})
+	startedAt := time.Now()
 	s.mu.Lock()
 	child.cmd = cmd
 	child.pid = cmd.Process.Pid
 	child.status = StatusRunning
 	child.lastError = ""
 	child.done = done
+	child.lastStartAt = startedAt
 	if !slices.Contains(s.order, idx) {
 		s.order = append(s.order, idx)
 	}
@@ -267,32 +282,63 @@ func (s *Supervisor) startChildLocked(ctx context.Context, idx int) error {
 	go s.streamLogs(spec.Name, stdout, &ioWG, hook)
 	go s.streamLogs(spec.Name, stderr, &ioWG, hook)
 
-	go func(c *managedChild, procCmd *exec.Cmd, doneCh chan struct{}) {
+	go func(childIdx int, c *managedChild, procCmd *exec.Cmd, doneCh chan struct{}) {
 		ioWG.Wait()
 		waitErr := procCmd.Wait()
 
 		s.mu.Lock()
-		// An exit nobody asked for (no Stop/Restart, children's context still live) is logged, so
-		// a crashed or failed child leaves a system-log entry (forwarded once the BFF is up).
-		unexpected := c.done == doneCh && c.status != StatusStopped && !errors.Is(ctx.Err(), context.Canceled)
+		// An exit nobody asked for (no Stop/Restart, children's context still live) triggers logged auto-recovery.
+		unexpected := c.done == doneCh && c.status != StatusStopped && !s.stopping && !errors.Is(ctx.Err(), context.Canceled)
+		var backoff time.Duration
 		if c.done == doneCh {
-			if waitErr != nil && !errors.Is(ctx.Err(), context.Canceled) && c.status != StatusStopped {
+			if unexpected {
 				c.status = StatusDegraded
-				c.lastError = waitErr.Error()
+				if waitErr != nil {
+					c.lastError = waitErr.Error()
+				} else {
+					c.lastError = "unexpected exit 0"
+				}
+				if time.Since(c.lastStartAt) > 30*time.Second {
+					c.crashRestarts = 0
+				}
+				c.crashRestarts++
+				shift := min(c.crashRestarts-1, 5)
+				backoff = min(10*time.Second, time.Duration(250*(1<<shift))*time.Millisecond)
 			} else {
 				c.status = StatusStopped
 			}
 		}
 		s.mu.Unlock()
+		close(doneCh)
+
 		if unexpected {
 			if waitErr != nil {
-				s.logger.Printf("[supervisor] error: child %s (pid=%d) exited unexpectedly: %v", spec.Name, procCmd.Process.Pid, waitErr)
+				s.logger.Printf("[supervisor] error: child %s (pid=%d) exited unexpectedly: %v (restarting in %s)", spec.Name, procCmd.Process.Pid, waitErr, backoff)
 			} else {
-				s.logger.Printf("[supervisor] warning: child %s (pid=%d) exited unexpectedly with status 0", spec.Name, procCmd.Process.Pid)
+				s.logger.Printf("[supervisor] warning: child %s (pid=%d) exited unexpectedly with status 0 (restarting in %s)", spec.Name, procCmd.Process.Pid, backoff)
 			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			s.lifecycleMu.Lock()
+			s.mu.RLock()
+			stillNeedsRestart := !s.stopping && ctx.Err() == nil && childIdx < len(s.children) && s.children[childIdx] == c && c.done == doneCh
+			onRestart := s.restartHook
+			s.mu.RUnlock()
+			if stillNeedsRestart {
+				if restartErr := s.startChildLocked(ctx, childIdx); restartErr != nil {
+					s.logger.Printf("[supervisor] error: auto-restart of %s failed: %v", spec.Name, restartErr)
+				} else if onRestart != nil {
+					go onRestart(spec.Name)
+				}
+			}
+			s.lifecycleMu.Unlock()
 		}
-		close(doneCh)
-	}(child, cmd, done)
+	}(idx, child, cmd, done)
 
 	s.logger.Printf("[supervisor] started %s (pid=%d)", spec.Name, cmd.Process.Pid)
 	return nil
@@ -316,6 +362,9 @@ func (s *Supervisor) streamLogs(name string, r io.Reader, wg *sync.WaitGroup, ho
 func (s *Supervisor) Stop(graceTimeout time.Duration) error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
 	return s.stopAllLocked(graceTimeout)
 }
 

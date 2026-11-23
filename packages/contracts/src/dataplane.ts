@@ -99,6 +99,14 @@ export const DataPlaneSyncPriceRuleSchema = z.object({
 });
 export type DataPlaneSyncPriceRule = z.infer<typeof DataPlaneSyncPriceRuleSchema>;
 
+export const DataPlaneSyncRiskBanSchema = z.object({
+  subjectKind: z.enum(["device", "session", "api_key", "ip"]),
+  subjectHash: z.string().min(1),
+  strikeLevel: z.number().int().min(1).max(3),
+  bannedUntilUnixMs: z.number().int(),
+});
+export type DataPlaneSyncRiskBan = z.infer<typeof DataPlaneSyncRiskBanSchema>;
+
 export const DataPlaneSyncSnapshotSchema = z.object({
   revisionUnixMs: z.number().int().nonnegative(),
   groups: z.array(DataPlaneSyncGroupSchema),
@@ -108,6 +116,8 @@ export const DataPlaneSyncSnapshotSchema = z.object({
   wallets: z.array(DataPlaneSyncWalletSchema),
   /** Lets slipgate-core hold and settle at the same prices the BFF bills (empty = built-in rates). */
   priceRules: z.array(DataPlaneSyncPriceRuleSchema).optional(),
+  /** Active risk bans restored into slipgate-core across restarts. */
+  riskBans: z.array(DataPlaneSyncRiskBanSchema).optional(),
   /** Per-user / per-group RPM and concurrency caps slipgate-net enforces at the edge (user_limits.ts). */
   userLimits: DataPlaneSyncUserLimitsSchema.optional(),
 });

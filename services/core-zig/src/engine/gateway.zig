@@ -100,6 +100,13 @@ pub const SyncPriceRuleJson = struct {
     cacheWriteNanoPerMTok: []const u8 = "0",
 };
 
+pub const SyncRiskBanJson = struct {
+    subjectKind: []const u8 = "api_key",
+    subjectHash: []const u8,
+    strikeLevel: u8 = 1,
+    bannedUntilUnixMs: i64 = 0,
+};
+
 pub const SyncStatePayload = struct {
     groups: []const SyncGroupJson = &.{},
     routes: []const SyncRouteJson = &.{},
@@ -107,6 +114,7 @@ pub const SyncStatePayload = struct {
     apiKeys: []const SyncApiKeyJson = &.{},
     wallets: []const SyncWalletJson = &.{},
     priceRules: []const SyncPriceRuleJson = &.{},
+    riskBans: []const SyncRiskBanJson = &.{},
 };
 
 pub const TurnEvalRequest = struct {
@@ -211,10 +219,10 @@ fn accountBeats(
     if (cand.priority != inc.priority) return cand.priority < inc.priority;
     const cand_mult: u64 = @max(@as(u64, 1), cand.tier_multiplier);
     const inc_mult: u64 = @max(@as(u64, 1), inc.tier_multiplier);
-    const cand_load: u64 = @as(u64, cand_inflight) * 10_000 + @as(u64, cand.quota_window.maxUsedBps());
-    const inc_load: u64 = @as(u64, inc_inflight) * 10_000 + @as(u64, inc.quota_window.maxUsedBps());
-    const lhs = cand_load * inc_mult;
-    const rhs = inc_load * cand_mult;
+    const cand_load: u64 = (@as(u64, cand_inflight) *| 10_000) +| @as(u64, cand.quota_window.maxUsedBps());
+    const inc_load: u64 = (@as(u64, inc_inflight) *| 10_000) +| @as(u64, inc.quota_window.maxUsedBps());
+    const lhs = cand_load *| inc_mult;
+    const rhs = inc_load *| cand_mult;
     if (lhs != rhs) return lhs < rhs;
     return cand_mult > inc_mult;
 }
@@ -280,6 +288,9 @@ fn lookupModelRate(model: []const u8) ModelRate {
     if (std.mem.startsWith(u8, model, "deepseek-")) {
         return .{ .in_nano_per_token = 270, .out_nano_per_token = 1_100 };
     }
+    if (std.mem.startsWith(u8, model, "qwen-") or std.mem.startsWith(u8, model, "qwq-")) {
+        return .{ .in_nano_per_token = 800, .out_nano_per_token = 2_400 };
+    }
     return .{ .in_nano_per_token = 1_000, .out_nano_per_token = 4_000 };
 }
 
@@ -322,12 +333,13 @@ fn priceTurnCostNano(
 ) i128 {
     const rule = matchPriceRule(rules, public_model) orelse matchPriceRule(rules, upstream_model) orelse
         return computeTurnCostNano(upstream_model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, rate_multiplier_micros);
-    const base = @as(i128, @intCast(input_tokens)) * rule.input_per_mtok +
-        @as(i128, @intCast(output_tokens)) * rule.output_per_mtok +
-        @as(i128, @intCast(cache_read_tokens)) * rule.cache_read_per_mtok +
-        @as(i128, @intCast(cache_write_tokens)) * rule.cache_write_per_mtok;
+    const in_part = @as(i128, @intCast(input_tokens)) *| rule.input_per_mtok;
+    const out_part = @as(i128, @intCast(output_tokens)) *| rule.output_per_mtok;
+    const cr_part = @as(i128, @intCast(cache_read_tokens)) *| rule.cache_read_per_mtok;
+    const cw_part = @as(i128, @intCast(cache_write_tokens)) *| rule.cache_write_per_mtok;
+    const base = in_part +| out_part +| cr_part +| cw_part;
     const mult = @as(i128, @intCast(@max(@as(u64, 1), rate_multiplier_micros)));
-    return @divTrunc(@divTrunc(base * mult, 1_000_000), 1_000_000);
+    return @divTrunc(@divTrunc(base *| mult, 1_000_000), 1_000_000);
 }
 
 fn computeTurnCostNano(
@@ -339,13 +351,13 @@ fn computeTurnCostNano(
     rate_multiplier_micros: u64,
 ) i128 {
     const rate = lookupModelRate(model);
-    const in_cost = @as(i128, @intCast(input_tokens)) * rate.in_nano_per_token;
-    const out_cost = @as(i128, @intCast(output_tokens)) * rate.out_nano_per_token;
-    const cache_r_cost = @divTrunc(@as(i128, @intCast(cache_read_tokens)) * rate.in_nano_per_token, 10);
-    const cache_w_cost = @divTrunc(@as(i128, @intCast(cache_write_tokens)) * rate.in_nano_per_token * 5, 4);
-    const base_total = in_cost + out_cost + cache_r_cost + cache_w_cost;
+    const in_cost = @as(i128, @intCast(input_tokens)) *| rate.in_nano_per_token;
+    const out_cost = @as(i128, @intCast(output_tokens)) *| rate.out_nano_per_token;
+    const cache_r_cost = @divTrunc(@as(i128, @intCast(cache_read_tokens)) *| rate.in_nano_per_token, 10);
+    const cache_w_cost = @divTrunc((@as(i128, @intCast(cache_write_tokens)) *| rate.in_nano_per_token) *| 5, 4);
+    const base_total = in_cost +| out_cost +| cache_r_cost +| cache_w_cost;
     const mult = @as(i128, @intCast(@max(@as(u64, 1), rate_multiplier_micros)));
-    return @divTrunc(base_total * mult, 1_000_000);
+    return @divTrunc(base_total *| mult, 1_000_000);
 }
 
 fn constantTimeEq32(a: [32]u8, b: [32]u8) bool {
@@ -410,6 +422,7 @@ const builtin_model_candidates = [_][]const u8{
     "deepseek-chat",
     "deepseek-reasoner",
     "glm-4.6",
+    "qwen-max",
 };
 
 fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
@@ -657,6 +670,26 @@ pub const GatewayEngine = struct {
             }
         }
 
+        for (in.riskBans) |rb| {
+            if (!std.mem.eql(u8, rb.subjectKind, "api_key") or rb.subjectHash.len == 0) continue;
+            const capped_strikes: u8 = @max(@as(u8, 1), @min(@as(u8, 3), rb.strikeLevel));
+            if (self.bans.getPtr(rb.subjectHash)) |existing| {
+                if (capped_strikes > existing.strikes) existing.strikes = capped_strikes;
+                if (rb.bannedUntilUnixMs == -1) {
+                    existing.banned_until_ms = -1;
+                } else if (existing.banned_until_ms != -1 and rb.bannedUntilUnixMs > existing.banned_until_ms) {
+                    existing.banned_until_ms = rb.bannedUntilUnixMs;
+                }
+            } else {
+                const owned_hash = try self.backing.dupe(u8, rb.subjectHash);
+                errdefer self.backing.free(owned_hash);
+                try self.bans.put(owned_hash, .{
+                    .strikes = capped_strikes,
+                    .banned_until_ms = rb.bannedUntilUnixMs,
+                });
+            }
+        }
+
         return std.fmt.allocPrint(
             turn_alloc,
             "{{\"ok\":true,\"groups\":{d},\"routes\":{d},\"accounts\":{d},\"apiKeys\":{d},\"wallets\":{d}}}",
@@ -681,13 +714,13 @@ pub const GatewayEngine = struct {
         const now_ms = if (req.nowUnixMs > 0) req.nowUnixMs else std.time.milliTimestamp();
 
         const trimmed_key = std.mem.trim(u8, req.apiKey, " \t\r\n");
-        if (trimmed_key.len == 0 or !std.mem.startsWith(u8, trimmed_key, "sk-sg-")) {
+        if (trimmed_key.len == 0 or trimmed_key.len > 512) {
             return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
                 .action = "reject",
                 .status = 401,
                 .errorType = "authentication_error",
                 .errorCode = "invalid_api_key",
-                .message = "Missing or malformed sk-sg-* API key",
+                .message = "Missing or malformed API key",
             }, .{});
         }
 
@@ -832,7 +865,7 @@ pub const GatewayEngine = struct {
                 .errorType = "rate_limit_error",
                 .errorCode = "rpm_limit_exceeded",
                 .message = "API key requests-per-minute limit exceeded",
-                .retryAfterMs = msUntil(now_ms, (current_min + 1) * 60_000),
+                .retryAfterMs = msUntil(now_ms, (current_min +| 1) *| 60_000),
             }, .{});
         }
         if (rate_ptr.active_inflight >= api_key.concurrency_limit) {
@@ -963,31 +996,16 @@ pub const GatewayEngine = struct {
                 }, .{});
             };
         }
-
-        const hold_id = self.next_hold_id;
-        self.next_hold_id += 1;
-
-        const hold_rec = ActiveHold{
-            .hold_id = hold_id,
-            .user_id = try self.backing.dupe(u8, api_key.user_id),
-            .api_key_id = try self.backing.dupe(u8, api_key.id),
-            .account_id = try self.backing.dupe(u8, selected_acc.id),
-            .model = try self.backing.dupe(u8, route_match.upstream_model),
-            .public_model = try self.backing.dupe(u8, public_model),
-            .held_nano = hold_nano,
-            .rate_multiplier_micros = group.rate_multiplier_micros,
-            .is_balance_group = is_balance,
-            .is_free = is_free,
+        errdefer if (is_balance) {
+            if (self.wallets.getPtr(api_key.user_id)) |wp| {
+                wp.release(hold_nano) catch {};
+            }
         };
-        errdefer self.freeHoldStrings(hold_rec);
-        try self.holds.put(hold_id, hold_rec);
 
-        rate_ptr.minute_count += 1;
-        rate_ptr.active_inflight += 1;
-        try self.incrementAccountInflightLocked(selected_acc.id);
-
+        const inflight_ptr = try self.getOrCreateAccountInflightLocked(selected_acc.id);
+        const hold_id = self.next_hold_id;
         const hold_str = try std.fmt.allocPrint(turn_alloc, "{d}", .{hold_nano});
-        return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
+        const resp_json = try std.json.stringifyAlloc(turn_alloc, DispatchResponse{
             .action = "dispatch",
             .status = 200,
             .holdId = hold_id,
@@ -1005,6 +1023,38 @@ pub const GatewayEngine = struct {
             .cleanseMode = "zero",
             .holdNanoUsd = hold_str,
         }, .{});
+
+        try self.holds.ensureUnusedCapacity(1);
+        const u_copy = try self.backing.dupe(u8, api_key.user_id);
+        errdefer self.backing.free(u_copy);
+        const k_copy = try self.backing.dupe(u8, api_key.id);
+        errdefer self.backing.free(k_copy);
+        const a_copy = try self.backing.dupe(u8, selected_acc.id);
+        errdefer self.backing.free(a_copy);
+        const m_copy = try self.backing.dupe(u8, route_match.upstream_model);
+        errdefer self.backing.free(m_copy);
+        const pm_copy = try self.backing.dupe(u8, public_model);
+        errdefer self.backing.free(pm_copy);
+
+        self.next_hold_id +|= 1;
+        self.holds.putAssumeCapacity(hold_id, .{
+            .hold_id = hold_id,
+            .user_id = u_copy,
+            .api_key_id = k_copy,
+            .account_id = a_copy,
+            .model = m_copy,
+            .public_model = pm_copy,
+            .held_nano = hold_nano,
+            .rate_multiplier_micros = group.rate_multiplier_micros,
+            .is_balance_group = is_balance,
+            .is_free = is_free,
+        });
+
+        rate_ptr.minute_count +|= 1;
+        rate_ptr.active_inflight +|= 1;
+        inflight_ptr.* +|= 1;
+
+        return resp_json;
     }
 
     pub fn settleTurnJson(self: *GatewayEngine, turn_alloc: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
@@ -1170,8 +1220,8 @@ pub const GatewayEngine = struct {
         if (ptr.strikes < 3) ptr.strikes += 1;
         ptr.banned_until_ms = switch (duration) {
             .none => 0,
-            .ten_minutes => now_ms + 10 * 60 * 1000,
-            .twenty_four_hours => now_ms + 24 * 60 * 60 * 1000,
+            .ten_minutes => now_ms +| (10 * 60 * 1000),
+            .twenty_four_hours => now_ms +| (24 * 60 * 60 * 1000),
             .permanent => -1,
         };
         return .{ .strikes = ptr.strikes, .duration = duration };
@@ -1193,14 +1243,12 @@ pub const GatewayEngine = struct {
         return self.key_rates.getPtr(key_id).?;
     }
 
-    fn incrementAccountInflightLocked(self: *GatewayEngine, acc_id: []const u8) !void {
-        if (self.account_inflight.getPtr(acc_id)) |ptr| {
-            ptr.* += 1;
-            return;
-        }
+    fn getOrCreateAccountInflightLocked(self: *GatewayEngine, acc_id: []const u8) !*u32 {
+        if (self.account_inflight.getPtr(acc_id)) |ptr| return ptr;
         const owned = try self.backing.dupe(u8, acc_id);
         errdefer self.backing.free(owned);
-        try self.account_inflight.put(owned, 1);
+        try self.account_inflight.put(owned, 0);
+        return self.account_inflight.getPtr(acc_id).?;
     }
 };
 
@@ -1209,6 +1257,19 @@ pub fn serveEngineConnection(
     conn: std.net.Server.Connection,
     engine: *GatewayEngine,
 ) void {
+    serveEngineConnectionAuth(allocator, conn, engine, "", null);
+}
+
+pub fn serveEngineConnectionAuth(
+    allocator: std.mem.Allocator,
+    conn: std.net.Server.Connection,
+    engine: *GatewayEngine,
+    required_token: []const u8,
+    active_conns: ?*std.atomic.Value(u32),
+) void {
+    defer if (active_conns) |ac| {
+        _ = ac.fetchSub(1, .release);
+    };
     defer conn.stream.close();
 
     const reader = conn.stream.reader();
@@ -1216,9 +1277,14 @@ pub fn serveEngineConnection(
 
     var frame_arena = std.heap.ArenaAllocator.init(allocator);
     defer frame_arena.deinit();
+    var last_payload_len: usize = 0;
 
     while (true) {
-        _ = frame_arena.reset(.retain_capacity);
+        if (last_payload_len > frame.MAX_RETAINED_ARENA_BYTES) {
+            _ = frame_arena.reset(.free_all);
+        } else {
+            _ = frame_arena.reset(.retain_capacity);
+        }
         const arena = frame_arena.allocator();
 
         var hdr_buf: [frame.HEADER_LEN]u8 = undefined;
@@ -1226,6 +1292,7 @@ pub fn serveEngineConnection(
         if (read_n == 0 or read_n < frame.HEADER_LEN) return;
 
         const hdr = frame.Header.decode(&hdr_buf) catch return;
+        last_payload_len = hdr.payload_len;
         const payload = arena.alloc(u8, hdr.payload_len) catch return;
 
         if (hdr.payload_len > 0) {
@@ -1233,16 +1300,25 @@ pub fn serveEngineConnection(
             if (payload_n != hdr.payload_len) return;
         }
 
+        const inner_payload = frame.unwrapAuthenticatedPayload(hdr.flags, payload, required_token) catch {
+            frame.writeFrame(writer, hdr.stream_id, .{
+                .frame_type = .stream_end,
+                .flags = frame.FLAG_END_STREAM | frame.FLAG_ERROR,
+                .payload = "{\"error\":\"unauthorized_ipc\"}",
+            }) catch {};
+            return;
+        };
+
         switch (hdr.frame_type) {
             .ping => {
                 frame.writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .pong,
                     .flags = frame.FLAG_END_STREAM,
-                    .payload = payload,
+                    .payload = inner_payload,
                 }) catch return;
             },
             .sync_state => {
-                const ack = engine.applySyncJson(arena, payload) catch "{\"ok\":false}";
+                const ack = engine.applySyncJson(arena, inner_payload) catch "{\"ok\":false}";
                 frame.writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .sync_ack,
                     .flags = frame.FLAG_END_STREAM,
@@ -1250,7 +1326,7 @@ pub fn serveEngineConnection(
                 }) catch return;
             },
             .req_headers => {
-                const directive = engine.evaluateTurnJson(arena, payload) catch "{\"engine\":\"slipgate-core\",\"action\":\"reject\",\"status\":500}";
+                const directive = engine.evaluateTurnJson(arena, inner_payload) catch "{\"engine\":\"slipgate-core\",\"action\":\"reject\",\"status\":500}";
                 frame.writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .dispatch_directive,
                     .flags = frame.FLAG_END_STREAM,
@@ -1258,7 +1334,7 @@ pub fn serveEngineConnection(
                 }) catch return;
             },
             .settle_report => {
-                const ack = engine.settleTurnJson(arena, payload) catch "{\"ok\":false}";
+                const ack = engine.settleTurnJson(arena, inner_payload) catch "{\"ok\":false}";
                 frame.writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .settle_ack,
                     .flags = frame.FLAG_END_STREAM,

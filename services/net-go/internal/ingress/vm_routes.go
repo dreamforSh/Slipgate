@@ -189,7 +189,7 @@ func (s *Server) handleGetVmSeed(w http.ResponseWriter, r *http.Request) {
 		writeVmError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, seed)
+	writeJSON(w, http.StatusOK, vmslot.RedactSeedForAPI(seed))
 }
 
 func (s *Server) handleUpdateVmSeed(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +208,7 @@ func (s *Server) handleUpdateVmSeed(w http.ResponseWriter, r *http.Request) {
 		writeVmError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, seed)
+	writeJSON(w, http.StatusOK, vmslot.RedactSeedForAPI(seed))
 }
 
 func (s *Server) handleUpdateVmTelemetry(w http.ResponseWriter, r *http.Request) {

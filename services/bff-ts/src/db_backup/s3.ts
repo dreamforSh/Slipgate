@@ -1,5 +1,6 @@
 import { S3Client } from "bun";
 import { DB_BACKUP_DEFAULT_PREFIX, type BackupS3Config } from "@slipgate/contracts";
+import { allowPrivateUpstreamsFromEnv, isBlockedHostname, ssrfSafeFetch } from "../security/ssrf.ts";
 
 /** The S3 target with its decrypted secret (never persisted or returned in this form). */
 export interface ResolvedS3Target extends BackupS3Config {
@@ -57,6 +58,15 @@ function isIpOrLocalHost(hostname: string): boolean {
 export function s3ClientOptions(t: ResolvedS3Target) {
   const region = t.region || "us-east-1";
   let endpoint = t.endpoint.trim().replace(/\/+$/, "");
+  if (endpoint) {
+    const epUrl = new URL(endpoint);
+    if (epUrl.protocol !== "https:" && epUrl.protocol !== "http:") {
+      throw new S3RequestError("InvalidEndpoint: S3 endpoint must use http or https", 400, "InvalidEndpoint");
+    }
+    if (isBlockedHostname(epUrl.hostname, allowPrivateUpstreamsFromEnv())) {
+      throw new S3RequestError("InvalidEndpoint: S3 endpoint points to a restricted internal or loopback address", 400, "InvalidEndpoint");
+    }
+  }
   let virtualHostedStyle = false;
   if (!t.forcePathStyle) {
     const url = new URL(endpoint || `https://s3.${region}.amazonaws.com`);
@@ -76,10 +86,12 @@ export function s3ClientOptions(t: ResolvedS3Target) {
   };
 }
 
-/** `<Code>` / `<Message>` of an S3 XML error body (secrets never appear there). */
+/** `<Code>` / `<Message>` of an S3 XML error body (non-XML response bodies are never reflected verbatim). */
 function parseS3Error(status: number, body: string): S3RequestError {
-  const code = /<Code>([^<]{1,100})<\/Code>/.exec(body)?.[1] ?? `HTTP${status}`;
-  const message = /<Message>([^<]{1,300})<\/Message>/.exec(body)?.[1] ?? (body.trim().slice(0, 200) || `HTTP ${status}`);
+  const codeMatch = /<Code>([^<]{1,100})<\/Code>/.exec(body);
+  const msgMatch = /<Message>([^<]{1,300})<\/Message>/.exec(body);
+  const code = codeMatch?.[1]?.trim() || `HTTP${status}`;
+  const message = msgMatch?.[1]?.trim() || `S3 endpoint returned HTTP ${status}`;
   return new S3RequestError(`${code}: ${message}`, status, code);
 }
 
@@ -104,13 +116,16 @@ const UPLOAD_ATTEMPTS = 3;
  * below the 5 GiB single-PUT limit, the same layout Linksyncx uses.
  */
 export function createBunObjectStore(target: ResolvedS3Target, fetchImpl: typeof fetch = fetch): BackupObjectStore {
-  const client = new S3Client(s3ClientOptions(target));
+  const opts = s3ClientOptions(target);
+  const client = new S3Client(opts);
+  const s3Fetch = (url: string, init?: RequestInit) =>
+    fetchImpl === fetch ? ssrfSafeFetch(url, init, fetchImpl) : fetchImpl(url, init);
 
   async function put(key: string, body: BodyInit, contentType: string): Promise<void> {
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
       try {
-        const res = await fetchImpl(client.presign(key, { method: "PUT", expiresIn: PRESIGN_OP_SECONDS }), {
+        const res = await s3Fetch(client.presign(key, { method: "PUT", expiresIn: PRESIGN_OP_SECONDS }), {
           method: "PUT",
           body,
           headers: { "Content-Type": contentType },
@@ -130,7 +145,7 @@ export function createBunObjectStore(target: ResolvedS3Target, fetchImpl: typeof
   }
 
   async function del(key: string): Promise<void> {
-    const res = await fetchImpl(client.presign(key, { method: "DELETE", expiresIn: PRESIGN_OP_SECONDS }), { method: "DELETE" });
+    const res = await s3Fetch(client.presign(key, { method: "DELETE", expiresIn: PRESIGN_OP_SECONDS }), { method: "DELETE" });
     if (res.ok || res.status === 404) {
       await res.body?.cancel().catch(() => undefined);
       return;
@@ -144,7 +159,7 @@ export function createBunObjectStore(target: ResolvedS3Target, fetchImpl: typeof
     },
 
     async download(key) {
-      const res = await fetchImpl(client.presign(key, { method: "GET", expiresIn: PRESIGN_OP_SECONDS }));
+      const res = await s3Fetch(client.presign(key, { method: "GET", expiresIn: PRESIGN_OP_SECONDS }));
       if (!res.ok || !res.body) throw await failure(res);
       return res.body as ReadableStream<Uint8Array>;
     },

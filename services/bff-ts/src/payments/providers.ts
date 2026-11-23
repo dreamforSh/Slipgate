@@ -104,6 +104,18 @@ export function resolveEasypayRef(apiUrl: string, ref: string): string {
   }
 }
 
+function sanitizeGatewayPayUrl(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") return parsed.toString();
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export interface EasypayApiPayment {
   tradeNo: string | null;
   payUrl: string | null;
@@ -144,10 +156,15 @@ export async function easypayCreateApiPayment(
   const payUrl = (mobile && str(data.payurl2)) || str(data.payurl);
   const qrCode = str(data.qrcode);
   if (!payUrl && !qrCode) throw new GatewayError("EasyPay returned neither a pay URL nor a QR code", true);
+  const resolvedPayUrl = payUrl ? sanitizeGatewayPayUrl(resolveEasypayRef(creds.apiUrl, payUrl)) : null;
+  const resolvedQrCode = qrCode ? resolveEasypayRef(creds.apiUrl, qrCode) : null;
+  if (!resolvedPayUrl && !resolvedQrCode) {
+    throw new GatewayError("EasyPay returned an invalid or unsafe payment URL", true);
+  }
   return {
     tradeNo: str(data.trade_no) || null,
-    payUrl: payUrl ? resolveEasypayRef(creds.apiUrl, payUrl) : null,
-    qrCode: qrCode ? resolveEasypayRef(creds.apiUrl, qrCode) : null,
+    payUrl: resolvedPayUrl,
+    qrCode: resolvedQrCode,
   };
 }
 

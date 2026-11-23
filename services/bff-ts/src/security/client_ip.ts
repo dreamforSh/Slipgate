@@ -217,3 +217,40 @@ export function clientAddress(c: Context): string {
 export function clientIp(c: Context): string {
   return rateLimitBucket(clientAddress(c));
 }
+
+function sanitizeHostAuthority(raw: string | undefined): string | null {
+  const host = (raw ?? "").trim();
+  if (!host || host.length > 255) return null;
+  if (/[/\\?#@\s\r\n]/.test(host)) return null;
+  try {
+    const parsed = new URL(`http://${host}`);
+    if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) return null;
+    return parsed.host;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether X-Forwarded-Host / X-Forwarded-Proto on this request came from a trusted reverse proxy
+ * (or an in-process Hono test call with no socket peer). Untrusted direct TCP peers cannot spoof
+ * forwarded host/scheme headers to poison OAuth redirect_uri or payment callback URLs.
+ */
+export function trustsForwardedHeaders(c: Context): boolean {
+  const peer = peerAddress(c);
+  if (!peer) return true;
+  const parsed = parseIp(peer);
+  return parsed ? trusted(parsed, trustedProxies()) : false;
+}
+
+/** Safe external origin (`http(s)://host[:port]`) derived from forwarded headers (when trusted) or `c.req.url`. */
+export function safeRequestOrigin(c: Context): string {
+  const reqUrl = new URL(c.req.url);
+  const trustForwarded = trustsForwardedHeaders(c);
+  const rawProto = trustForwarded ? c.req.header("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase() : undefined;
+  const proto = rawProto === "https" || rawProto === "http" ? rawProto : reqUrl.protocol.replace(":", "") === "https" ? "https" : "http";
+  const forwardedHost = trustForwarded ? sanitizeHostAuthority(c.req.header("x-forwarded-host")?.split(",")[0]) : null;
+  const directHost = sanitizeHostAuthority(c.req.header("host"));
+  const host = forwardedHost ?? directHost ?? reqUrl.host;
+  return `${proto}://${host}`;
+}

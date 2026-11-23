@@ -178,6 +178,7 @@ export const SlotSeedSnapshotSchema = z.object({
   settingsJsonRaw: z.string(),
   customSettingRaw: z.string(),
   authJsonRaw: z.string().optional(),
+  hasAuthJson: z.boolean().optional(),
   proxyEnvRaw: z.string().optional(),
   bootstrapScriptRaw: z.string().optional(),
   rejectClientSettings: z.boolean(),

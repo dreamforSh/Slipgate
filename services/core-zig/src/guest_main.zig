@@ -111,6 +111,8 @@ pub fn main() !void {
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.deinit();
 
+    var active_conns = std.atomic.Value(u32).init(0);
+
     std.log.info(
         "slipgate-guestd {s} bound to slot={s} machine_id={s} listening on {s}:{d}",
         .{ VERSION, slot_id, machine_id, parsed.host, parsed.port },
@@ -121,7 +123,13 @@ pub fn main() !void {
             std.log.err("accept error: {s}", .{@errorName(err)});
             continue;
         };
-        const thread = std.Thread.spawn(.{}, frame.serveConnection, .{ allocator, conn, @as([]const u8, directive_json) }) catch |err| {
+        if (active_conns.fetchAdd(1, .acq_rel) >= frame.MAX_CONCURRENT_CONNS) {
+            _ = active_conns.fetchSub(1, .release);
+            conn.stream.close();
+            continue;
+        }
+        const thread = std.Thread.spawn(.{}, frame.serveConnectionBounded, .{ allocator, conn, @as([]const u8, directive_json), &active_conns }) catch |err| {
+            _ = active_conns.fetchSub(1, .release);
             std.log.err("thread spawn error: {s}", .{@errorName(err)});
             conn.stream.close();
             continue;

@@ -52,7 +52,7 @@ func TestProbeAccountStreamsThroughOutboundPath(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	coord := NewCoordinator(CoordinatorOptions{VaultSecret: "probe-vault-secret"})
+	coord := NewCoordinator(CoordinatorOptions{VaultSecret: "probe-vault-secret", AllowPrivateUpstreams: true})
 	encReal, _ := coord.Vault().EncryptHex(fmt.Sprintf(`{"apiKey":"sk-probe-real","baseUrl":%q}`, upstream.URL+"/v1"))
 	encOK, _ := coord.Vault().EncryptHex("mock://ok")
 	enc400, _ := coord.Vault().EncryptHex("mock://400")

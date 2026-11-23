@@ -19,6 +19,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dataplane"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/netguard"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/webui"
@@ -87,12 +88,19 @@ func NewServer(cfg config.Config, version string, pool *clashpool.Manager, sup *
 		return nil, fmt.Errorf("ingress: invalid BFF address %q: %w", cfg.BFFAddr, err)
 	}
 
-	bffProxy := httputil.NewSingleHostReverseProxy(bffURL)
-	bffProxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error":   "bff_unavailable",
-			"message": proxyErr.Error(),
-		})
+	trustedProxies := netguard.ParseTrustedProxies(cfg.TrustedProxies)
+	bffProxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(bffURL)
+			pr.Out.Host = pr.In.Host
+			trustedProxies.SanitizeForwardedHeaders(pr.In, pr.Out)
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error":   "bff_unavailable",
+				"message": proxyErr.Error(),
+			})
+		},
 	}
 
 	uiDynamic := webui.Handler()
@@ -171,7 +179,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
 	defer cancel()
 
-	coreUp := dpbridge.Ping(ctx, s.cfg.CoreIPC) == nil
+	coreUp := dpbridge.PingAuth(ctx, s.cfg.CoreIPC, s.cfg.InternalToken) == nil
 	bffUp := s.probeBFF(ctx)
 	ready := coreUp && bffUp
 
@@ -323,50 +331,24 @@ func (s *Server) handleDataPlane(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	conn, err := dpbridge.DialIPC(ctx, s.cfg.CoreIPC)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]any{
-				"type":    "core_unavailable",
-				"message": "slipgate-core dataplane unreachable",
-				"detail":  err.Error(),
-			},
-		})
-		return
-	}
-	defer conn.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-
 	meta, _ := json.Marshal(map[string]string{
 		"method": r.Method,
 		"path":   r.URL.Path,
 	})
 
 	streamID := s.streamSeq.Add(1)
-	if err := dpbridge.WriteFrame(conn, dpbridge.Frame{
+	reply, err := dpbridge.ExchangeAuth(ctx, s.cfg.CoreIPC, s.cfg.InternalToken, dpbridge.Frame{
 		StreamID: streamID,
 		Type:     dpbridge.FrameReqHeaders,
 		Flags:    dpbridge.FlagEndStream,
 		Payload:  meta,
-	}); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"error": map[string]any{
-				"type":    "ipc_write_failed",
-				"message": err.Error(),
-			},
-		})
-		return
-	}
-
-	reply, err := dpbridge.ReadFrame(conn)
+	})
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": map[string]any{
-				"type":    "ipc_read_failed",
-				"message": err.Error(),
+				"type":    "core_unavailable",
+				"message": "slipgate-core dataplane unreachable",
+				"detail":  err.Error(),
 			},
 		})
 		return

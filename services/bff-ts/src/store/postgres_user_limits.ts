@@ -390,7 +390,7 @@ export class PostgresUserLimitsStore implements UserLimitsStore {
           rpmOverride: o.rpm_override,
           rateMultiplier: o.rate === null ? null : normalizeRate(Number(o.rate)),
         }))
-        .sort(byKey((o) => `${o.userId} ${o.groupId}`)),
+        .sort(byKey((o) => `${o.userId}\u0000${o.groupId}`)),
     };
   }
 

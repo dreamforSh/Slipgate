@@ -148,6 +148,24 @@ func TestCheckOnlyAndChecksumMismatch(t *testing.T) {
 	if err := validateDownloadURL("https://evil.example.com/payload.tar.gz", false); !errors.Is(err, ErrUntrustedDownloadHost) {
 		t.Fatalf("expected ErrUntrustedDownloadHost, got %v", err)
 	}
+
+	releaseMgr := NewManager(Options{
+		Config: config.Config{
+			Mode:         "release",
+			DevSyncMode:  "release",
+			UpdateRepo:   "dreamforSh/Slipgate",
+			UpdateBranch: "main",
+			HotUpdateDir: t.TempDir(),
+		},
+		Version:         "0.1.0",
+		InitialCommit:   "oldcommit12345",
+		APIBaseURL:      srv.URL,
+		AllowCustomHost: true,
+		Logger:          log.New(io.Discard, "", 0),
+	})
+	if _, relErr := releaseMgr.Sync(context.Background(), false, false); relErr == nil {
+		t.Fatalf("expected Sync(checkOnly=false) to be blocked in release mode")
+	}
 }
 
 func TestSyncEndToEndHotRestartsSupervisorAndOverridesWebUI(t *testing.T) {

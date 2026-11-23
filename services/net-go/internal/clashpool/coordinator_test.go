@@ -93,12 +93,31 @@ proxies:
 	bridge := &mockStealthBridge{}
 	bridge.exitIPToReturn.Store("203.0.113.77")
 
-	coord := NewCoordinator(CoordinatorOptions{
-		Manager: mgr,
-		Runtime: rt,
-		Store:   store,
-		Stealth: bridge,
+	// Default coordinator (AllowLoopbackServers=false) must block SSRF against loopback subscription URLs.
+	guardedCoord := NewCoordinator(CoordinatorOptions{
+		Manager: NewManager(22000, 22010, 1),
+		Runtime: &mockRuntime{},
+		Store:   NewMemoryNetStore(),
 		Logger:  log.New(io.Discard, "", 0),
+	})
+	_ = guardedCoord.Bootstrap(context.Background())
+	if _, _, ssrfErr := guardedCoord.CreateSubscription(context.Background(), CreateSubscriptionInput{
+		ID:         "sub-ssrf-blocked",
+		Name:       "Blocked Loopback",
+		SourceKind: "url",
+		SourceURL:  subSrv.URL + "/sub",
+		AutoSync:   true,
+	}); ssrfErr == nil {
+		t.Fatalf("expected default Coordinator to block loopback subscription SSRF")
+	}
+
+	coord := NewCoordinator(CoordinatorOptions{
+		Manager:              mgr,
+		Runtime:              rt,
+		Store:                store,
+		Stealth:              bridge,
+		AllowLoopbackServers: true,
+		Logger:               log.New(io.Discard, "", 0),
 	})
 
 	ctx := context.Background()

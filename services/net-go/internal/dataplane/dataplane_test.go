@@ -297,6 +297,17 @@ func TestCoordinatorEndToEndModesRiskAndSettlement(t *testing.T) {
 				if rErr != nil {
 					return
 				}
+				innerPayload, authErr := dpbridge.UnwrapAuthPayload(req.Flags, req.Payload, internalToken)
+				if authErr != nil {
+					_ = dpbridge.WriteFrame(c, dpbridge.Frame{
+						StreamID: req.StreamID,
+						Type:     dpbridge.FrameStreamEnd,
+						Flags:    dpbridge.FlagEndStream | dpbridge.FlagError,
+						Payload:  []byte(`{"error":"unauthorized_ipc"}`),
+					})
+					return
+				}
+				req.Payload = innerPayload
 				switch req.Type {
 				case dpbridge.FrameSyncState:
 					coreMu.Lock()

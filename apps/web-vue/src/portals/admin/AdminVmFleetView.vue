@@ -407,7 +407,7 @@ async function saveSlotSeed() {
         body: JSON.stringify({
           settingsJsonRaw: seedSettingsJson.value,
           customSettingRaw: seedCustomEnv.value,
-          authJsonRaw: seedAuthJson.value,
+          authJsonRaw: seedAuthJson.value.trim() ? seedAuthJson.value : undefined,
           rejectClientSettings: seedRejectSettings.value,
           rejectClientIdentity: seedRejectIdentity.value,
         }),

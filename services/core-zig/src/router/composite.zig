@@ -11,6 +11,7 @@ pub const Provider = enum {
     glm,
     kimi,
     minimax,
+    qwen,
 };
 
 pub const EndpointKind = enum {
@@ -128,6 +129,7 @@ fn detectBuiltinProvider(model: []const u8) ?Provider {
     if (std.mem.startsWith(u8, model, "glm-")) return .glm;
     if (std.mem.startsWith(u8, model, "kimi-") or std.mem.startsWith(u8, model, "moonshot-")) return .kimi;
     if (std.mem.startsWith(u8, model, "minimax-") or std.mem.startsWith(u8, model, "abab")) return .minimax;
+    if (std.mem.startsWith(u8, model, "qwen-") or std.mem.startsWith(u8, model, "qwq-") or std.mem.startsWith(u8, model, "qwen/")) return .qwen;
     return null;
 }
 
@@ -169,4 +171,7 @@ test "builtin detector distinguishes codex and antigravity models" {
 
     const ag_match = try resolveRoute(&.{}, .messages, "antigravity/claude-sonnet-4-5");
     try std.testing.expectEqual(Provider.antigravity, ag_match.provider);
+
+    const qwen_match = try resolveRoute(&.{}, .chat_completions, "qwen-max");
+    try std.testing.expectEqual(Provider.qwen, qwen_match.provider);
 }

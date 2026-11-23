@@ -1,4 +1,5 @@
 import { defineSlipgatePlugin } from "@slipgate/plugin-sdk";
+import { ssrfSafeFetch } from "../security/ssrf.ts";
 
 /**
  * Built-in plugin: POSTs every settled payment to an operator URL as JSON, signed with
@@ -24,7 +25,7 @@ export const paymentWebhookPlugin = defineSlipgatePlugin({
       const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)));
       headers["X-Slipgate-Signature"] = `sha256=${Array.from(mac, (b) => b.toString(16).padStart(2, "0")).join("")}`;
     }
-    const res = await fetch(url, { method: "POST", headers, body, signal: AbortSignal.timeout(10_000) });
+    const res = await ssrfSafeFetch(url, { method: "POST", headers, body, signal: AbortSignal.timeout(10_000) });
     if (!res.ok) throw new Error(`Webhook answered HTTP ${res.status}`);
     ctx.logger("payment webhook delivered", { orderId: event.orderId });
   },

@@ -170,11 +170,19 @@ func ConfigHash(cfg map[string]any) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// IsLoopbackOrUnspecified returns true for localhost, 127.0.0.0/8, ::1, and 0.0.0.0 / ::.
+// IsLoopbackOrUnspecified returns true for loopback, unspecified, RFC1918/ULA private, link-local/IMDS, CGNAT, and internal hostnames.
 func IsLoopbackOrUnspecified(server string) bool {
-	host := strings.Trim(strings.TrimSpace(server), "[]")
+	host := strings.TrimSuffix(strings.Trim(strings.TrimSpace(server), "[]"), ".")
 	lower := strings.ToLower(host)
-	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") {
+	if lower == "localhost" ||
+		strings.HasSuffix(lower, ".localhost") ||
+		lower == "metadata.google.internal" ||
+		strings.HasSuffix(lower, ".metadata.google.internal") ||
+		lower == "metadata" ||
+		lower == "instance-data" ||
+		strings.HasSuffix(lower, ".internal") ||
+		strings.HasSuffix(lower, ".local") ||
+		lower == "host.docker.internal" {
 		return true
 	}
 	addr, err := netip.ParseAddr(host)
@@ -182,7 +190,13 @@ func IsLoopbackOrUnspecified(server string) bool {
 		return false
 	}
 	addr = addr.Unmap()
-	return addr.IsLoopback() || addr.IsUnspecified() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || cgnatRange.Contains(addr)
+	return addr.IsLoopback() ||
+		addr.IsUnspecified() ||
+		addr.IsPrivate() ||
+		addr.IsMulticast() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		cgnatRange.Contains(addr)
 }
 
 func sanitizeNode(raw map[string]any, excludeRe *regexp.Regexp, allowLoopback bool) (ParsedNode, string) {

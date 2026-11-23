@@ -309,11 +309,18 @@ func ParseIngressRequest(path, rawQuery string, body []byte) (*CanonicalTurn, er
 	rawBytes := max(0, len(trimmed)-mediaBytes)
 	turn.EstimatedInputTokens = uint64(max(16, (len(combinedText)+rawBytes/4+3)/4+mediaParts*1600))
 
-	excerptSource := combinedText + "\n" + string(trimmed)
-	if len(excerptSource) > 4096 {
-		excerptSource = excerptSource[:4096]
+	const maxTextExcerpt = 48 * 1024
+	const maxRawTail = 16 * 1024
+	textSample := combinedText
+	if len(textSample) > maxTextExcerpt {
+		half := maxTextExcerpt / 2
+		textSample = textSample[:half] + "\n...\n" + textSample[len(textSample)-half:]
 	}
-	turn.BodyExcerpt = excerptSource
+	rawSample := string(trimmed)
+	if len(rawSample) > maxRawTail {
+		rawSample = rawSample[len(rawSample)-maxRawTail:]
+	}
+	turn.BodyExcerpt = textSample + "\n" + rawSample
 	return turn, nil
 }
 
@@ -1260,7 +1267,11 @@ func BuildUpstreamHTTPRequestWithPersona(
 		ApplyAntigravityHeaders(req, pctx, secret)
 	case CodecGeminiGenerate:
 		if secret.APIKey != "" {
-			req.Header.Set("x-goog-api-key", secret.APIKey)
+			if strings.EqualFold(strings.TrimSpace(pctx.AuthKind), "oauth") {
+				req.Header.Set("Authorization", "Bearer "+secret.APIKey)
+			} else {
+				req.Header.Set("x-goog-api-key", secret.APIKey)
+			}
 		}
 	default:
 		if secret.APIKey != "" {

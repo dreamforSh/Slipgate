@@ -1,6 +1,7 @@
 package dpbridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -39,11 +40,13 @@ const (
 	FlagEndStream   uint8 = 1 << 0
 	FlagPassthrough uint8 = 1 << 1
 	FlagError       uint8 = 1 << 2
+	FlagAuth        uint8 = 1 << 3
 )
 
 var (
 	ErrPayloadTooLarge = errors.New("dpbridge: payload exceeds maximum frame size")
 	ErrShortHeader     = errors.New("dpbridge: frame header shorter than 10 bytes")
+	ErrUnauthorizedIPC = errors.New("dpbridge: unauthorized ipc frame")
 )
 
 // Frame represents one DataPlane multiplexed IPC frame shared between Go and Zig.
@@ -137,8 +140,72 @@ func DialIPC(ctx context.Context, endpoint string) (net.Conn, error) {
 	return dialer.DialContext(ctx, "tcp", target)
 }
 
+// WrapAuthFrame prepends [u16 BE len(token)][token] and sets FlagAuth when token is non-empty.
+func WrapAuthFrame(req Frame, token string) (Frame, error) {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return req, nil
+	}
+	if len(trimmed) > 65535 {
+		return Frame{}, fmt.Errorf("%w: ipc token too long", ErrPayloadTooLarge)
+	}
+	wrapped := make([]byte, 2+len(trimmed)+len(req.Payload))
+	binary.BigEndian.PutUint16(wrapped[0:2], uint16(len(trimmed)))
+	copy(wrapped[2:2+len(trimmed)], trimmed)
+	copy(wrapped[2+len(trimmed):], req.Payload)
+	if len(wrapped) > MaxPayloadSize {
+		return Frame{}, fmt.Errorf("%w: %d", ErrPayloadTooLarge, len(wrapped))
+	}
+	req.Flags |= FlagAuth
+	req.Payload = wrapped
+	return req, nil
+}
+
+// UnwrapAuthPayload validates and strips a FlagAuth prefix against expectedToken (mirrors Zig unwrapAuthenticatedPayload).
+func UnwrapAuthPayload(flags uint8, rawPayload []byte, expectedToken string) ([]byte, error) {
+	expected := strings.TrimSpace(expectedToken)
+	if (flags & FlagAuth) == 0 {
+		if expected != "" {
+			return nil, ErrUnauthorizedIPC
+		}
+		return rawPayload, nil
+	}
+	if len(rawPayload) < 2 {
+		return nil, ErrUnauthorizedIPC
+	}
+	tokLen := int(binary.BigEndian.Uint16(rawPayload[0:2]))
+	if len(rawPayload) < 2+tokLen {
+		return nil, ErrUnauthorizedIPC
+	}
+	provided := rawPayload[2 : 2+tokLen]
+	inner := rawPayload[2+tokLen:]
+	if expected == "" {
+		return inner, nil
+	}
+	if len(provided) != len(expected) {
+		return nil, ErrUnauthorizedIPC
+	}
+	var diff byte
+	for i := 0; i < len(expected); i++ {
+		diff |= provided[i] ^ expected[i]
+	}
+	if diff != 0 {
+		return nil, ErrUnauthorizedIPC
+	}
+	return inner, nil
+}
+
 // Exchange sends req over endpoint and returns the single reply Frame.
 func Exchange(ctx context.Context, endpoint string, req Frame) (Frame, error) {
+	return ExchangeAuth(ctx, endpoint, "", req)
+}
+
+// ExchangeAuth sends req authenticated with token (when non-empty) over endpoint and returns the single reply Frame.
+func ExchangeAuth(ctx context.Context, endpoint, token string, req Frame) (Frame, error) {
+	wireReq, err := WrapAuthFrame(req, token)
+	if err != nil {
+		return Frame{}, err
+	}
 	conn, err := DialIPC(ctx, endpoint)
 	if err != nil {
 		return Frame{}, err
@@ -149,15 +216,27 @@ func Exchange(ctx context.Context, endpoint string, req Frame) (Frame, error) {
 		_ = conn.SetDeadline(deadline)
 	}
 
-	if err := WriteFrame(conn, req); err != nil {
+	if err := WriteFrame(conn, wireReq); err != nil {
 		return Frame{}, err
 	}
-	return ReadFrame(conn)
+	resp, err := ReadFrame(conn)
+	if err != nil {
+		return Frame{}, err
+	}
+	if resp.Flags&FlagError != 0 && bytes.Contains(resp.Payload, []byte("unauthorized_ipc")) {
+		return Frame{}, ErrUnauthorizedIPC
+	}
+	return resp, nil
 }
 
 // Ping verifies live connectivity to slipgate-core over the binary frame protocol.
 func Ping(ctx context.Context, endpoint string) error {
-	resp, err := Exchange(ctx, endpoint, Frame{
+	return PingAuth(ctx, endpoint, "")
+}
+
+// PingAuth verifies authenticated live connectivity to slipgate-core over the binary frame protocol.
+func PingAuth(ctx context.Context, endpoint, token string) error {
+	resp, err := ExchangeAuth(ctx, endpoint, token, Frame{
 		StreamID: 0,
 		Type:     FramePing,
 		Flags:    FlagEndStream,

@@ -5,7 +5,7 @@ import type { PaymentOrderItem } from "@slipgate/contracts";
 import QrCode from "../me/QrCode.vue";
 import UiIcon from "../ui/UiIcon.vue";
 import ChannelGlyph from "./ChannelGlyph.vue";
-import { detectDevice } from "./paymentFlow";
+import { detectDevice, safeHttpUrl, safePaymentAppLink } from "./paymentFlow";
 import { channelKey, countdownText, formatFiat } from "./paymentUtil";
 
 /**
@@ -26,8 +26,8 @@ const { t } = useI18n();
 const device = detectDevice();
 
 const qrText = computed(() => props.order.checkout?.qrCode ?? props.order.qrCode ?? "");
-const appLink = computed(() => (device !== "pc" ? (props.order.checkout?.appLink ?? null) : null));
-const payUrl = computed(() => props.order.checkout?.payUrl ?? props.order.payUrl ?? null);
+const appLink = computed(() => (device !== "pc" ? safePaymentAppLink(props.order.checkout?.appLink) : null));
+const payUrl = computed(() => safeHttpUrl(props.order.checkout?.payUrl ?? props.order.payUrl));
 const expired = computed(() => {
   const at = Date.parse(props.order.expiresAtIso);
   return Number.isFinite(at) && props.nowMs >= at;

@@ -22,6 +22,10 @@ pub const FrameType = enum(u8) {
 pub const FLAG_END_STREAM: u8 = 1 << 0;
 pub const FLAG_PASSTHROUGH: u8 = 1 << 1;
 pub const FLAG_ERROR: u8 = 1 << 2;
+pub const FLAG_AUTH: u8 = 1 << 3;
+
+pub const MAX_CONCURRENT_CONNS: u32 = 256;
+pub const MAX_RETAINED_ARENA_BYTES: usize = 256 * 1024;
 
 pub const Header = struct {
     stream_id: u32,
@@ -93,12 +97,48 @@ pub fn writeFrame(writer: anytype, stream_id: u32, reply: FrameReply) !void {
     }
 }
 
+pub fn unwrapAuthenticatedPayload(
+    flags: u8,
+    raw_payload: []const u8,
+    required_token: []const u8,
+) error{UnauthorizedIpc}![]const u8 {
+    if ((flags & FLAG_AUTH) == 0) {
+        if (required_token.len > 0) return error.UnauthorizedIpc;
+        return raw_payload;
+    }
+    if (raw_payload.len < 2) return error.UnauthorizedIpc;
+    const tok_len: usize = std.mem.readInt(u16, raw_payload[0..2], .big);
+    if (raw_payload.len < 2 + tok_len) return error.UnauthorizedIpc;
+    const provided = raw_payload[2 .. 2 + tok_len];
+    const inner = raw_payload[2 + tok_len ..];
+    if (required_token.len == 0) return inner;
+    if (provided.len != required_token.len) return error.UnauthorizedIpc;
+    var diff: u8 = 0;
+    for (provided, required_token) |a, b| {
+        diff |= a ^ b;
+    }
+    if (diff != 0) return error.UnauthorizedIpc;
+    return inner;
+}
+
 /// Static directive server used by slipgate-guestd and baseline frame tests.
 pub fn serveConnection(
     allocator: std.mem.Allocator,
     conn: std.net.Server.Connection,
     directive_json: []const u8,
 ) void {
+    serveConnectionBounded(allocator, conn, directive_json, null);
+}
+
+pub fn serveConnectionBounded(
+    allocator: std.mem.Allocator,
+    conn: std.net.Server.Connection,
+    directive_json: []const u8,
+    active_conns: ?*std.atomic.Value(u32),
+) void {
+    defer if (active_conns) |ac| {
+        _ = ac.fetchSub(1, .release);
+    };
     defer conn.stream.close();
 
     const reader = conn.stream.reader();
@@ -106,9 +146,14 @@ pub fn serveConnection(
 
     var frame_arena = std.heap.ArenaAllocator.init(allocator);
     defer frame_arena.deinit();
+    var last_payload_len: usize = 0;
 
     while (true) {
-        _ = frame_arena.reset(.retain_capacity);
+        if (last_payload_len > MAX_RETAINED_ARENA_BYTES) {
+            _ = frame_arena.reset(.free_all);
+        } else {
+            _ = frame_arena.reset(.retain_capacity);
+        }
         const arena = frame_arena.allocator();
 
         var hdr_buf: [HEADER_LEN]u8 = undefined;
@@ -116,6 +161,7 @@ pub fn serveConnection(
         if (read_n == 0 or read_n < HEADER_LEN) return;
 
         const hdr = Header.decode(&hdr_buf) catch return;
+        last_payload_len = hdr.payload_len;
         const payload = arena.alloc(u8, hdr.payload_len) catch return;
 
         if (hdr.payload_len > 0) {
@@ -123,12 +169,21 @@ pub fn serveConnection(
             if (payload_n != hdr.payload_len) return;
         }
 
+        const inner = unwrapAuthenticatedPayload(hdr.flags, payload, "") catch {
+            writeFrame(writer, hdr.stream_id, .{
+                .frame_type = .stream_end,
+                .flags = FLAG_END_STREAM | FLAG_ERROR,
+                .payload = "{\"error\":\"unauthorized_ipc\"}",
+            }) catch {};
+            return;
+        };
+
         switch (hdr.frame_type) {
             .ping => {
                 writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .pong,
                     .flags = FLAG_END_STREAM,
-                    .payload = payload,
+                    .payload = inner,
                 }) catch return;
             },
             .req_headers => {

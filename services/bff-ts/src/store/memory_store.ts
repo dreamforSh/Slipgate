@@ -113,6 +113,10 @@ export class MemoryControlStore implements ControlStore {
   private readonly settlements = new Map<string, { usageId: string; createdAtIso: string }>();
   private readonly usageLogs: UsageLogItem[] = [];
   private readonly riskEvents: RiskBanEvent[] = [];
+  private readonly activeRiskBans = new Map<
+    string,
+    { subjectKind: RiskBanEvent["subjectKind"]; subjectHash: string; strikeLevel: number; bannedUntilUnixMs: number }
+  >();
   private readonly ledger: MemoryLedgerEntry[] = [];
 
   private readonly walletState = { wallets: this.wallets, idempotencyKeys: this.idempotencyKeys, ledger: this.ledger };
@@ -871,6 +875,9 @@ export class MemoryControlStore implements ControlStore {
         balanceNanoUsd: w.balanceNano.toString(),
         heldNanoUsd: w.heldNano.toString(),
       })),
+      riskBans: Array.from(this.activeRiskBans.values())
+        .filter((b) => b.bannedUntilUnixMs === -1 || b.bannedUntilUnixMs > nowMs)
+        .map((b) => ({ ...b })),
     };
   }
 
@@ -962,6 +969,20 @@ export class MemoryControlStore implements ControlStore {
   }
 
   async recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent> {
+    const nowMs = Date.now();
+    const bannedUntilUnixMs =
+      ev.banDuration === "permanent" ? -1 : ev.banDuration === "24h" ? nowMs + 24 * 3_600_000 : nowMs + 10 * 60_000;
+    const banKey = `${ev.subjectKind}:${ev.subjectHash}`;
+    const prevBan = this.activeRiskBans.get(banKey);
+    this.activeRiskBans.set(banKey, {
+      subjectKind: ev.subjectKind,
+      subjectHash: ev.subjectHash,
+      strikeLevel: Math.max(prevBan?.strikeLevel ?? 1, Math.min(3, ev.strikeLevel)),
+      bannedUntilUnixMs:
+        prevBan?.bannedUntilUnixMs === -1 || bannedUntilUnixMs === -1
+          ? -1
+          : Math.max(prevBan?.bannedUntilUnixMs ?? 0, bannedUntilUnixMs),
+    });
     const record: RiskBanEvent = {
       eventId: `rsk_${crypto.randomUUID()}`,
       subjectKind: ev.subjectKind,
@@ -970,7 +991,7 @@ export class MemoryControlStore implements ControlStore {
       reason: ev.reason,
       ordinaryUpstream400Count: ev.ordinaryUpstream400Count,
       downgradedCount: ev.downgradedCount,
-      createdAtIso: new Date().toISOString(),
+      createdAtIso: new Date(nowMs).toISOString(),
     };
     this.riskEvents.unshift(record);
     if (this.riskEvents.length > 200) {

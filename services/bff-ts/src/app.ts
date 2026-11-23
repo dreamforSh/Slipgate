@@ -69,6 +69,7 @@ import { PluginRegistry } from "@slipgate/plugin-sdk";
 import { buildAccountUsageStats, buildDashboardStats, dashboardWindow, DASHBOARD_MAX_ROWS } from "./dashboard.ts";
 import { applyEntitlements, cached, detectBuiltinProvider, WindowLimiter } from "./insights.ts";
 import { verifyTotp } from "./security/totp.ts";
+import { totpStepUp } from "./security/step_up.ts";
 import { SessionManager, type AuthEnv } from "./middleware/auth.ts";
 import { clientIp } from "./security/client_ip.ts";
 import { auditMiddleware, registerOpsRoutes } from "./routes/ops.ts";
@@ -489,7 +490,8 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   // First middleware: request ids, the logging context and 5xx / access entries wrap every route.
   const systemLogs = mountSystemLogging(app, store, options.startSchedulers === true);
   const startedAt = Date.now();
-  const loginTotpLimiter = new WindowLimiter(8, 5 * 60_000);
+  const stepUpGuard = totpStepUp(store, vaultSecret);
+  const loginTotpLimiter = stepUpGuard.limiter;
   /** Issues, re-validates (per request) and revokes console sessions; owns the password-attempt limits. */
   const sessions = new SessionManager(store, jwtSecret);
   /** Captcha, sign-up email policy, backend (admin-only) mode and legal documents (auth_guards.ts). */
@@ -1469,6 +1471,11 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
         return c.json({ error: "too_many_attempts", message: "Too many wrong passwords, try again later" }, 429);
       }
       return c.json({ error: "invalid_password", message: "Password confirmation failed" }, 403);
+    }
+    const totpState = await store.ops.getTotp(claims.sub);
+    if (totpState?.enabled) {
+      const totpRefusal = await stepUpGuard.require(c, claims.sub, parsed.data.totpCode);
+      if (totpRefusal) return totpRefusal;
     }
     const wanted = parsed.data.accountIds ? new Set(parsed.data.accountIds) : null;
     const accounts = (await store.listAccounts()).filter((a) => !wanted || wanted.has(a.id));

@@ -220,7 +220,7 @@ const OptionalUrlSchema = z
   .string()
   .trim()
   .max(2048)
-  .refine((v) => v === "" || /^(https?:\/\/|\/)/i.test(v), "Must be an http(s) URL or a site path");
+  .refine((v) => v === "" || /^(https?:\/\/|\/(?!\/))/i.test(v), "Must be an http(s) URL or a site path");
 
 export const CustomNavLinkSchema = z.object({
   label: z.string().trim().min(1).max(40),
@@ -229,7 +229,7 @@ export const CustomNavLinkSchema = z.object({
     .trim()
     .min(1)
     .max(2048)
-    .refine((v) => /^(https?:\/\/|\/)/i.test(v), "Must be an http(s) URL or a site path"),
+    .refine((v) => /^(https?:\/\/|\/(?!\/))/i.test(v), "Must be an http(s) URL or a site path"),
 });
 export type CustomNavLink = z.infer<typeof CustomNavLinkSchema>;
 

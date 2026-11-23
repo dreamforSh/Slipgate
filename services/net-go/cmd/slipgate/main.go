@@ -20,6 +20,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dataplane"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/ingress"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/netguard"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/syslogfwd"
@@ -114,14 +115,15 @@ func main() {
 
 	stealthDialer := stealth.NewAccountDialer(pool)
 	clashCoord := clashpool.NewCoordinator(clashpool.CoordinatorOptions{
-		Manager:          pool,
-		Runtime:          clashRT,
-		Store:            netStore,
-		Stealth:          stealth.NewCoordinatorAdapter(stealthDialer),
-		Logger:           logger,
-		ProbeURL:         cfg.ClashProbeURL,
-		IPEchoURL:        cfg.ClashIPEchoURL,
-		ProbeIntervalSec: cfg.ClashProbeIntervalSec,
+		Manager:              pool,
+		Runtime:              clashRT,
+		Store:                netStore,
+		Stealth:              stealth.NewCoordinatorAdapter(stealthDialer),
+		Logger:               logger,
+		ProbeURL:             cfg.ClashProbeURL,
+		IPEchoURL:            cfg.ClashIPEchoURL,
+		ProbeIntervalSec:     cfg.ClashProbeIntervalSec,
+		AllowLoopbackServers: cfg.AllowPrivateUpstreams,
 	})
 	if err := clashCoord.Bootstrap(rootCtx); err != nil {
 		if !cfg.AllowDegraded {
@@ -169,9 +171,12 @@ func main() {
 	if cfg.Supervise {
 		specs := []supervisor.ChildSpec{
 			{
-				Name:          "core",
-				Binary:        cfg.CoreBin,
-				Env:           []string{"SLIPGATE_CORE_ADDR=" + cfg.CoreIPC},
+				Name:   "core",
+				Binary: cfg.CoreBin,
+				Env: []string{
+					"SLIPGATE_CORE_ADDR=" + cfg.CoreIPC,
+					"SLIPGATE_INTERNAL_TOKEN=" + cfg.InternalToken,
+				},
 				AllowDegraded: cfg.AllowDegraded,
 			},
 			{
@@ -210,18 +215,28 @@ func main() {
 	}
 
 	dpCoord := dataplane.NewCoordinator(dataplane.CoordinatorOptions{
-		CoreIPC:       cfg.CoreIPC,
-		BFFOrigin:     cfg.BFFAddr,
-		InternalToken: cfg.InternalToken,
-		VaultSecret:   cfg.VaultSecret,
-		ClashPool:     pool,
-		StealthDialer: stealthDialer,
-		VMSlots:       vmSlots,
-		Logger:        logger,
+		CoreIPC:               cfg.CoreIPC,
+		BFFOrigin:             cfg.BFFAddr,
+		InternalToken:         cfg.InternalToken,
+		VaultSecret:           cfg.VaultSecret,
+		ClashPool:             pool,
+		StealthDialer:         stealthDialer,
+		VMSlots:               vmSlots,
+		Logger:                logger,
+		AllowPrivateUpstreams: cfg.AllowPrivateUpstreams,
+		TrustedProxies:        netguard.ParseTrustedProxies(cfg.TrustedProxies),
 		// "[http.access]" per /v1 turn while the BFF persists access logs (runtime config, ~30 s).
 		AccessLogEnabled: logFwd.AccessLogsEnabled,
 		// On the persistent volume by default, so undelivered settlements survive a restart or redeploy.
 		SettlementSpoolDir: dataplane.ResolveSettlementSpoolDir(filepath.Join(cfg.HotUpdateDir, "settlement-spool")),
+	})
+	sup.SetRestartHook(func(child string) {
+		if child != "core" {
+			return
+		}
+		if err := dpCoord.ResyncCore(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Printf("[dataplane] warning: core restart snapshot resync failed: %v", err)
+		}
 	})
 	dpCoord.StartBackgroundSync(rootCtx)
 

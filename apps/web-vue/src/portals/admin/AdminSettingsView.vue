@@ -147,7 +147,7 @@ const NUMERIC: FieldKey[] = [
   "defaultUserConcurrency",
   "rebatePercent",
 ];
-const URL_RE = /^(https?:\/\/|\/)/i;
+const URL_RE = /^(https?:\/\/|\/(?!\/))/i;
 const NANO_PER_USD = 1_000_000_000n;
 const MAX_NAV_LINKS = 10;
 const HOME_MAX = 20_000;

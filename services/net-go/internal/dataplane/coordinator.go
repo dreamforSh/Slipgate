@@ -3,7 +3,6 @@ package dataplane
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/netguard"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 )
@@ -101,6 +101,14 @@ type SyncPriceRuleInput struct {
 	CacheWriteNanoPerMTok string `json:"cacheWriteNanoPerMTok"`
 }
 
+// SyncRiskBanInput matches DataPlaneSyncRiskBanSchema: an active risk ban restored into slipgate-core.
+type SyncRiskBanInput struct {
+	SubjectKind       string `json:"subjectKind"`
+	SubjectHash       string `json:"subjectHash"`
+	StrikeLevel       uint8  `json:"strikeLevel"`
+	BannedUntilUnixMs int64  `json:"bannedUntilUnixMs"`
+}
+
 // SyncSnapshot matches DataPlaneSyncSnapshotSchema exported by slipgate-bff.
 type SyncSnapshot struct {
 	RevisionUnixMs int64                `json:"revisionUnixMs"`
@@ -110,6 +118,7 @@ type SyncSnapshot struct {
 	APIKeys        []SyncApiKeyInput    `json:"apiKeys"`
 	Wallets        []SyncWalletInput    `json:"wallets"`
 	PriceRules     []SyncPriceRuleInput `json:"priceRules"`
+	RiskBans       []SyncRiskBanInput   `json:"riskBans"`
 	UserLimits     *SyncUserLimitsInput `json:"userLimits"` // enforced in user_limits.go
 }
 
@@ -196,6 +205,10 @@ type CoordinatorOptions struct {
 	VMSlots       *vmslot.Manager
 	DirectClient  *http.Client
 	Logger        *log.Logger
+	// AllowPrivateUpstreams permits loopback/RFC1918 targets on direct_api upstreams (local tests/dev only).
+	AllowPrivateUpstreams bool
+	// TrustedProxies controls which peers may supply X-Forwarded-For / X-Real-IP (nil = SLIPGATE_TRUSTED_PROXIES env).
+	TrustedProxies *netguard.TrustedProxies
 	// AccessLogEnabled reports whether each turn should write an "[http.access]" line (the BFF
 	// persists access logs; cmd/slipgate passes the system-log forwarder's flag). Nil = never.
 	AccessLogEnabled func() bool
@@ -207,18 +220,20 @@ type CoordinatorOptions struct {
 
 // Coordinator bridges HTTP AI ingress, L2 Zig hot-path policy/ledger IPC, three-mode outbound execution, and BFF settlement.
 type Coordinator struct {
-	coreIPC       string
-	bffOrigin     string
-	internalToken string
-	vault         *Vault
-	pool          *clashpool.Manager
-	stealth       *stealth.AccountDialer
-	vmSlots       *vmslot.Manager
-	directClient  *http.Client
-	bffClient     *http.Client
-	logger        *log.Logger
-	streamSeq     atomic.Uint32
-	settlements   *settlementOutbox
+	coreIPC               string
+	bffOrigin             string
+	internalToken         string
+	vault                 *Vault
+	pool                  *clashpool.Manager
+	stealth               *stealth.AccountDialer
+	vmSlots               *vmslot.Manager
+	directClient          *http.Client
+	bffClient             *http.Client
+	allowPrivateUpstreams bool
+	trustedProxies        *netguard.TrustedProxies
+	logger                *log.Logger
+	streamSeq             atomic.Uint32
+	settlements           *settlementOutbox
 
 	// accessLogEnabled gates the per-turn http.access line (turn_log.go).
 	accessLogEnabled func() bool
@@ -240,18 +255,14 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
+	allowPrivate := opts.AllowPrivateUpstreams || netguard.AllowPrivateUpstreamsFromEnv()
 	directClient := opts.DirectClient
 	if directClient == nil {
-		directClient = &http.Client{
-			Timeout: 120 * time.Second,
-			Transport: &http.Transport{
-				Proxy:               http.ProxyFromEnvironment,
-				MaxIdleConns:        64,
-				MaxIdleConnsPerHost: 16,
-				IdleConnTimeout:     90 * time.Second,
-				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-			},
-		}
+		directClient = netguard.NewSafeHTTPClient(120*time.Second, allowPrivate)
+	}
+	trustedProxies := opts.TrustedProxies
+	if trustedProxies == nil {
+		trustedProxies = netguard.ParseTrustedProxiesFromEnv()
 	}
 	bffOrigin := strings.TrimRight(strings.TrimSpace(opts.BFFOrigin), "/")
 	if bffOrigin != "" && !strings.HasPrefix(bffOrigin, "http://") && !strings.HasPrefix(bffOrigin, "https://") {
@@ -259,16 +270,18 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 	}
 
 	c := &Coordinator{
-		coreIPC:          opts.CoreIPC,
-		bffOrigin:        bffOrigin,
-		internalToken:    opts.InternalToken,
-		vault:            NewVault(opts.VaultSecret),
-		pool:             opts.ClashPool,
-		stealth:          opts.StealthDialer,
-		vmSlots:          opts.VMSlots,
-		directClient:     directClient,
-		bffClient:        &http.Client{Timeout: 5 * time.Second},
-		logger:           logger,
+		coreIPC:               opts.CoreIPC,
+		bffOrigin:             bffOrigin,
+		internalToken:         opts.InternalToken,
+		vault:                 NewVault(opts.VaultSecret),
+		pool:                  opts.ClashPool,
+		stealth:               opts.StealthDialer,
+		vmSlots:               opts.VMSlots,
+		directClient:          directClient,
+		bffClient:             &http.Client{Timeout: 5 * time.Second},
+		allowPrivateUpstreams: allowPrivate,
+		trustedProxies:        trustedProxies,
+		logger:                logger,
 		accessLogEnabled: opts.AccessLogEnabled,
 		keyIPAllowlists:  make(map[string][]string),
 		keyIPDenylists:   make(map[string][]string),
@@ -481,6 +494,10 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	if priceRules == nil {
 		priceRules = []SyncPriceRuleInput{}
 	}
+	riskBans := snap.RiskBans
+	if riskBans == nil {
+		riskBans = []SyncRiskBanInput{}
+	}
 
 	corePayload, err := json.Marshal(map[string]any{
 		"groups":     coreGroups,
@@ -489,6 +506,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		"apiKeys":    coreKeys,
 		"wallets":    coreWallets,
 		"priceRules": priceRules,
+		"riskBans":   riskBans,
 	})
 	if err != nil {
 		return SyncAckResult{}, err
@@ -518,7 +536,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	ipcCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	reply, err := dpbridge.Exchange(ipcCtx, c.coreIPC, dpbridge.Frame{
+	reply, err := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
 		StreamID: c.streamSeq.Add(1),
 		Type:     dpbridge.FrameSyncState,
 		Flags:    dpbridge.FlagEndStream,
@@ -531,6 +549,41 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		res.CoreAck = json.RawMessage(reply.Payload)
 	}
 	return res, nil
+}
+
+// ResyncCore immediately pushes the latest cached snapshot (or pulls a fresh one from BFF) into slipgate-core
+// after a supervised core restart, eliminating any unauthenticated/cold window.
+func (c *Coordinator) ResyncCore(ctx context.Context) error {
+	for attempt := range 10 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := c.PullSnapshotFromBFF(ctx); err == nil {
+			return nil
+		}
+		c.mu.RLock()
+		cachedPayload := c.lastCoreSyncJSON
+		c.mu.RUnlock()
+		if len(cachedPayload) > 0 && strings.TrimSpace(c.coreIPC) != "" {
+			ipcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			_, ipcErr := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
+				StreamID: c.streamSeq.Add(1),
+				Type:     dpbridge.FrameSyncState,
+				Flags:    dpbridge.FlagEndStream,
+				Payload:  cachedPayload,
+			})
+			cancel()
+			if ipcErr == nil {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(100*(attempt+1)) * time.Millisecond):
+		}
+	}
+	return errors.New("dataplane: failed to resync slipgate-core after restart")
 }
 
 // PullSnapshotFromBFF fetches the latest DataPlaneSyncSnapshot from slipgate-bff and applies it to Vault + slipgate-core.
@@ -725,7 +778,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	access.setTurn(turn)
 
-	clientIP := extractClientIP(r)
+	clientIP := c.clientIPFromRequest(r)
 	evalPayload, _ := json.Marshal(coreTurnEvalRequest{
 		RequestID:            requestID,
 		Method:               r.Method,
@@ -741,7 +794,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 
 	ipcCtx, ipcCancel := context.WithTimeout(r.Context(), 5*time.Second)
-	replyFrame, ipcErr := dpbridge.Exchange(ipcCtx, c.coreIPC, dpbridge.Frame{
+	replyFrame, ipcErr := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
 		StreamID: streamID,
 		Type:     dpbridge.FrameReqHeaders,
 		Flags:    dpbridge.FlagEndStream,
@@ -848,7 +901,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(100 * time.Millisecond)
 			}
 			settleCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			ackFrame, err = dpbridge.Exchange(settleCtx, c.coreIPC, dpbridge.Frame{
+			ackFrame, err = dpbridge.ExchangeAuth(settleCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
 				StreamID: c.streamSeq.Add(1),
 				Type:     dpbridge.FrameSettleReport,
 				Flags:    dpbridge.FlagEndStream,
@@ -967,9 +1020,10 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer func() { _ = c.vmSlots.ReleaseSubagentSeat(slot.ID) }()
 
-		if strings.TrimSpace(slot.GuestUDSPath) != "" {
+		guestEndpoint := strings.TrimSpace(slot.GuestUDSPath)
+		if guestEndpoint != "" && !strings.HasPrefix(guestEndpoint, "sandbox://") && !strings.HasPrefix(guestEndpoint, "ssh://") {
 			pingCtx, pingCancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
-			pingErr := dpbridge.Ping(pingCtx, slot.GuestUDSPath)
+			pingErr := dpbridge.Ping(pingCtx, guestEndpoint)
 			pingCancel()
 			if pingErr != nil {
 				settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
@@ -1102,6 +1156,9 @@ func (c *Coordinator) executeOutbound(
 	default:
 		if secret.IsMock() {
 			return ExecuteMockTurn(secret.EffectiveMockTarget(), upstreamModel, egressCodec, turn), nil
+		}
+		if err := netguard.ValidateOutboundURL(req.URL.String(), c.allowPrivateUpstreams); err != nil {
+			return nil, err
 		}
 		return c.directClient.Do(req)
 	}
@@ -1276,18 +1333,15 @@ func extractAPIKey(r *http.Request) string {
 	return ""
 }
 
+func (c *Coordinator) clientIPFromRequest(r *http.Request) string {
+	if c != nil && c.trustedProxies != nil {
+		return c.trustedProxies.ClientIP(r)
+	}
+	return extractClientIP(r)
+}
+
 func extractClientIP(r *http.Request) string {
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		if idx := strings.IndexByte(xff, ','); idx > 0 {
-			return strings.TrimSpace(xff[:idx])
-		}
-		return xff
-	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil && host != "" {
-		return host
-	}
-	return strings.TrimSpace(r.RemoteAddr)
+	return netguard.ParseTrustedProxiesFromEnv().ClientIP(r)
 }
 
 func sanitizeRequestID(raw string, seq uint32) string {

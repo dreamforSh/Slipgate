@@ -32,8 +32,9 @@ type ClusterNode struct {
 	DriverKind string `json:"driverKind"` // "local" | "ssh"
 	SSHAddr    string `json:"sshAddr"`
 	SSHUser    string `json:"sshUser"`
-	SSHKeyPEM  string `json:"sshKeyPem,omitempty"`
-	HasSSHKey  bool   `json:"hasSSHKey"`
+	// SSHKeyPEM holds the decrypted private key only in memory for GetClusterNode SSH dialing; never serialized to JSON.
+	SSHKeyPEM string `json:"-"`
+	HasSSHKey bool   `json:"hasSSHKey"`
 	// SSHHostKey is the pinned server host key ("<type> <base64>"): admin-supplied or recorded
 	// on first connect. Empty means the next connection pins whatever the server presents.
 	SSHHostKey            string            `json:"sshHostKey,omitempty"`
@@ -55,6 +56,7 @@ type SlotSeed struct {
 	SettingsJSONRaw        string         `json:"settingsJsonRaw"`
 	CustomSettingRaw       string         `json:"customSettingRaw"`
 	AuthJSONRaw            string         `json:"authJsonRaw,omitempty"`
+	HasAuthJSON            bool           `json:"hasAuthJson,omitempty"`
 	RejectClientSettings   bool           `json:"rejectClientSettings"`
 	RejectClientIdentity   bool           `json:"rejectClientIdentity"`
 	TelemetryMode          TelemetryMode  `json:"telemetryMode"`
@@ -62,6 +64,16 @@ type SlotSeed struct {
 	ProxyEnvRaw            string         `json:"proxyEnvRaw,omitempty"`
 	BootstrapScriptRaw     string         `json:"bootstrapScriptRaw,omitempty"`
 	SyncedAtUnixMs         int64          `json:"syncedAtUnixMs"`
+}
+
+// RedactSeedForAPI strips raw OAuth/API credentials and proxy passwords before returning a SlotSeed over HTTP.
+func RedactSeedForAPI(seed SlotSeed) SlotSeed {
+	seed.HasAuthJSON = strings.TrimSpace(seed.AuthJSONRaw) != ""
+	seed.AuthJSONRaw = ""
+	if seed.ProxyEnvRaw != "" {
+		seed.ProxyEnvRaw = strings.TrimRight(redactProxyEnv(seed.ProxyEnvRaw), "\n")
+	}
+	return seed
 }
 
 // MigrationJob records one KVM slot cluster migration or memory resize event.
@@ -136,7 +148,9 @@ func (m *MemoryVmStore) ListClusterNodes(context.Context) ([]ClusterNode, error)
 	defer m.mu.RUnlock()
 	out := make([]ClusterNode, 0, len(m.nodes))
 	for _, n := range m.nodes {
-		out = append(out, cloneClusterNode(n))
+		cp := cloneClusterNode(n)
+		cp.SSHKeyPEM = ""
+		out = append(out, cp)
 	}
 	slices.SortFunc(out, func(a, b ClusterNode) int { return strings.Compare(a.ID, b.ID) })
 	return out, nil
@@ -448,8 +462,9 @@ CREATE TABLE IF NOT EXISTS net.vm_terminal_audit (
 
 func (p *PostgresVmStore) ListClusterNodes(ctx context.Context) ([]ClusterNode, error) {
 	rows, err := p.db.QueryContext(ctx, `
-		SELECT id, name, driver_kind, ssh_addr, ssh_user, ssh_key_enc, ssh_host_key,
-		       arch, kvm_capable, docker_capable, status, max_slots, labels,
+		SELECT id, name, driver_kind, ssh_addr, ssh_user,
+		       (ssh_key_enc IS NOT NULL AND octet_length(ssh_key_enc) > 0) AS has_ssh_key,
+		       ssh_host_key, arch, kvm_capable, docker_capable, status, max_slots, labels,
 		       created_at, updated_at
 		FROM net.cluster_nodes
 		ORDER BY id ASC
@@ -463,23 +478,16 @@ func (p *PostgresVmStore) ListClusterNodes(ctx context.Context) ([]ClusterNode, 
 	for rows.Next() {
 		var (
 			n         ClusterNode
-			keyEnc    []byte
 			labelsRaw []byte
 		)
 		if err := rows.Scan(
-			&n.ID, &n.Name, &n.DriverKind, &n.SSHAddr, &n.SSHUser, &keyEnc, &n.SSHHostKey,
+			&n.ID, &n.Name, &n.DriverKind, &n.SSHAddr, &n.SSHUser, &n.HasSSHKey, &n.SSHHostKey,
 			&n.Arch, &n.KVMCapable, &n.DockerCapable, &n.Status, &n.MaxSlots, &labelsRaw,
 			&n.CreatedAt, &n.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
 		n.SSHHostKeyFingerprint = SSHHostKeyFingerprint(n.SSHHostKey)
-		if len(keyEnc) > 0 {
-			n.HasSSHKey = true
-			if plain, decErr := p.vault.decrypt(keyEnc); decErr == nil {
-				n.SSHKeyPEM = string(plain)
-			}
-		}
 		if len(labelsRaw) > 0 {
 			_ = json.Unmarshal(labelsRaw, &n.Labels)
 		}
@@ -489,16 +497,39 @@ func (p *PostgresVmStore) ListClusterNodes(ctx context.Context) ([]ClusterNode, 
 }
 
 func (p *PostgresVmStore) GetClusterNode(ctx context.Context, nodeID string) (ClusterNode, error) {
-	nodes, err := p.ListClusterNodes(ctx)
+	var (
+		n         ClusterNode
+		keyEnc    []byte
+		labelsRaw []byte
+	)
+	err := p.db.QueryRowContext(ctx, `
+		SELECT id, name, driver_kind, ssh_addr, ssh_user, ssh_key_enc, ssh_host_key,
+		       arch, kvm_capable, docker_capable, status, max_slots, labels,
+		       created_at, updated_at
+		FROM net.cluster_nodes
+		WHERE id = $1
+	`, nodeID).Scan(
+		&n.ID, &n.Name, &n.DriverKind, &n.SSHAddr, &n.SSHUser, &keyEnc, &n.SSHHostKey,
+		&n.Arch, &n.KVMCapable, &n.DockerCapable, &n.Status, &n.MaxSlots, &labelsRaw,
+		&n.CreatedAt, &n.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ClusterNode{}, ErrClusterNodeNotFound
+	}
 	if err != nil {
 		return ClusterNode{}, err
 	}
-	for _, n := range nodes {
-		if n.ID == nodeID {
-			return n, nil
+	n.SSHHostKeyFingerprint = SSHHostKeyFingerprint(n.SSHHostKey)
+	if len(keyEnc) > 0 {
+		n.HasSSHKey = true
+		if plain, decErr := p.vault.decrypt(keyEnc); decErr == nil {
+			n.SSHKeyPEM = string(plain)
 		}
 	}
-	return ClusterNode{}, ErrClusterNodeNotFound
+	if len(labelsRaw) > 0 {
+		_ = json.Unmarshal(labelsRaw, &n.Labels)
+	}
+	return n, nil
 }
 
 func (p *PostgresVmStore) UpsertClusterNode(ctx context.Context, node ClusterNode) error {

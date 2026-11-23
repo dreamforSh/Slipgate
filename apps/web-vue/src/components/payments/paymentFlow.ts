@@ -260,12 +260,49 @@ export async function openAirwallexHosted(c: AirwallexCheckout, successUrl: stri
   const { payments } = await airwallexInit(c.env, locale);
   if (!payments) throw new Error("Airwallex payments are unavailable");
   const out = payments.redirectToCheckout({ ...intentOptions(c), successUrl });
-  if (typeof out === "string" && out) window.location.assign(out);
+  const safeOut = typeof out === "string" ? safeHttpUrl(out) : null;
+  if (safeOut) window.location.assign(safeOut);
 }
 
 /* ------------------------------------------------------------------------------------------ */
 /* Links                                                                                      */
 /* ------------------------------------------------------------------------------------------ */
+
+/** Accepts only absolute http(s) URLs for browser redirects / cashier links (blocks javascript:/data:). */
+export function safeHttpUrl(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") return parsed.toString();
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Accepts http(s) or mobile wallet deep links (Alipay / WeChat) for explicit app-launch buttons. */
+export function safePaymentAppLink(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (
+      parsed.protocol === "https:" ||
+      parsed.protocol === "http:" ||
+      parsed.protocol === "alipays:" ||
+      parsed.protocol === "alipay:" ||
+      parsed.protocol === "weixin:"
+    ) {
+      return trimmed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 export function resultLink(orderId: string, extra: Record<string, string> = {}) {
   return { path: "/payment/result", query: { order: orderId, ...extra } };
@@ -275,10 +312,10 @@ export function resultLink(orderId: string, extra: Record<string, string> = {}) 
 export function canResume(order: Pick<PaymentOrderItem, "status" | "provider" | "payUrl" | "checkout">): boolean {
   if (order.status !== "pending") return false;
   const c = order.checkout;
-  if (!c) return Boolean(order.payUrl);
+  if (!c) return Boolean(safeHttpUrl(order.payUrl));
   switch (c.flow) {
     case "redirect":
-      return Boolean(c.payUrl ?? order.payUrl);
+      return Boolean(safeHttpUrl(c.payUrl ?? order.payUrl));
     case "qrcode":
       return Boolean(c.qrCode);
     case "jsapi":

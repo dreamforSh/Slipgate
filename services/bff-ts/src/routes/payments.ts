@@ -40,7 +40,7 @@ import {
   wechatResumeToken,
 } from "../payments/tokens.ts";
 import { wechatOAuthAuthorizeUrl, wechatOAuthOpenid, wxpayDecryptResource, wxpayJsapiAppId, wxpaySignatureHeaders, wxpayVerifySignature } from "../payments/wxpay.ts";
-import { clientAddress, clientIp } from "../security/client_ip.ts";
+import { clientAddress, clientIp, safeRequestOrigin } from "../security/client_ip.ts";
 import type { OrderInput, PlanInput } from "../store/payments_types.ts";
 import { StoreError, type ControlStore } from "../store/types.ts";
 import { registerPaymentProviderRoutes } from "./payment_providers.ts";
@@ -82,10 +82,7 @@ async function body<T extends z.ZodTypeAny>(c: Context, schema: T): Promise<z.in
 }
 
 function requestOrigin(c: Context): string {
-  const url = new URL(c.req.url);
-  const proto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim() || url.protocol.replace(":", "");
-  const host = c.req.header("x-forwarded-host")?.split(",")[0]?.trim() || c.req.header("host") || url.host;
-  return `${proto}://${host}`;
+  return safeRequestOrigin(c);
 }
 
 /** The payer's address for gateways that want it (H5 / API payments); empty when unknown. */

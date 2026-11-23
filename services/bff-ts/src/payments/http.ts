@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { ssrfSafeFetch } from "../security/ssrf.ts";
 
 /**
  * Shared plumbing of the payment gateway clients: bounded response bodies, timeouts and an error
@@ -40,7 +41,8 @@ export async function readText(res: Response): Promise<string> {
 export async function gatewayFetch(fetchImpl: typeof fetch, url: string, init: RequestInit): Promise<{ status: number; text: string; headers: Headers }> {
   let res: Response;
   try {
-    res = await fetchImpl(url, { ...init, signal: init.signal ?? AbortSignal.timeout(GATEWAY_TIMEOUT_MS) });
+    const reqInit = { ...init, signal: init.signal ?? AbortSignal.timeout(GATEWAY_TIMEOUT_MS) };
+    res = fetchImpl === fetch ? await ssrfSafeFetch(url, reqInit, fetchImpl) : await fetchImpl(url, reqInit);
   } catch (err) {
     throw new GatewayError(`Network error: ${err instanceof Error ? err.message : String(err)}`, false);
   }

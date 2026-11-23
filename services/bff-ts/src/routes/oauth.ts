@@ -11,8 +11,9 @@ import {
 } from "@slipgate/contracts";
 import { WindowLimiter } from "../insights.ts";
 import { issueAccessToken, type AuthEnv } from "../middleware/auth.ts";
-import { clientIp } from "../security/client_ip.ts";
+import { clientIp, safeRequestOrigin, trustsForwardedHeaders } from "../security/client_ip.ts";
 import { decryptSecret, encryptSecret, hashPassword } from "../security/crypto.ts";
+import { ssrfSafeFetch } from "../security/ssrf.ts";
 import { StoreError, type ControlStore } from "../store/types.ts";
 import type { AuthGuards } from "../auth_guards.ts";
 
@@ -266,12 +267,13 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
    * X-Forwarded-Proto the scheme is unknown and only the host counts).
    */
   function offCanonicalOrigin(c: Context, base: string): boolean {
-    const host = c.req.header("x-forwarded-host")?.split(",")[0]?.trim() || c.req.header("host") || new URL(c.req.url).host;
-    const proto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
     try {
       const canonical = new URL(base);
-      if (proto && `${proto}:` !== canonical.protocol) return true;
-      return new URL(`${canonical.protocol}//${host}`).host !== canonical.host;
+      const current = new URL(safeRequestOrigin(c));
+      if (trustsForwardedHeaders(c) && c.req.header("x-forwarded-proto")) {
+        if (current.protocol !== canonical.protocol) return true;
+      }
+      return current.host !== canonical.host;
     } catch {
       return false;
     }
@@ -305,10 +307,12 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
   async function githubVerifiedEmail(userinfoUrl: string, accessToken: string, claimed: string): Promise<string> {
     if (!/\/user\/?$/.test(userinfoUrl)) return "";
     try {
-      const res = await doFetch(userinfoUrl.replace(/\/user\/?$/, "/user/emails"), {
+      const emailsUrl = userinfoUrl.replace(/\/user\/?$/, "/user/emails");
+      const reqInit: RequestInit = {
         headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json", "User-Agent": "Slipgate" },
         signal: AbortSignal.timeout(10_000),
-      });
+      };
+      const res = doFetch === fetch ? await ssrfSafeFetch(emailsUrl, reqInit, doFetch) : await doFetch(emailsUrl, reqInit);
       if (!res.ok) return "";
       const list: unknown = await res.json().catch(() => null);
       if (!Array.isArray(list)) return "";
@@ -356,10 +360,7 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
   async function baseUrl(c: Context) {
     const settings = await store.ops.getSettings();
     if (/^https?:\/\//i.test(settings.apiBaseUrl)) return settings.apiBaseUrl.replace(/\/+$/, "");
-    const url = new URL(c.req.url);
-    const proto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim() || url.protocol.replace(":", "");
-    const host = c.req.header("x-forwarded-host")?.split(",")[0]?.trim() || c.req.header("host") || url.host;
-    return `${proto}://${host}`;
+    return safeRequestOrigin(c);
   }
 
   function parseProvider(raw: string): OAuthProviderId {
@@ -472,7 +473,7 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
     // Exchange the code (form-encoded, JSON answer; GitHub needs the Accept header).
     let accessToken = "";
     try {
-      const tokenRes = await doFetch(cfg.tokenUrl, {
+      const tokenInit: RequestInit = {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
         body: new URLSearchParams({
@@ -484,7 +485,8 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
           code_verifier: entry.verifier,
         }).toString(),
         signal: AbortSignal.timeout(15_000),
-      });
+      };
+      const tokenRes = doFetch === fetch ? await ssrfSafeFetch(cfg.tokenUrl, tokenInit, doFetch) : await doFetch(cfg.tokenUrl, tokenInit);
       const tokenJson = (await tokenRes.json().catch(() => ({}))) as { access_token?: string };
       accessToken = tokenJson.access_token ?? "";
     } catch {
@@ -494,10 +496,11 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
 
     let profile: unknown;
     try {
-      const infoRes = await doFetch(cfg.userinfoUrl, {
+      const infoInit: RequestInit = {
         headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json", "User-Agent": "Slipgate" },
         signal: AbortSignal.timeout(15_000),
-      });
+      };
+      const infoRes = doFetch === fetch ? await ssrfSafeFetch(cfg.userinfoUrl, infoInit, doFetch) : await doFetch(cfg.userinfoUrl, infoInit);
       if (!infoRes.ok) return fail("userinfo_failed");
       profile = await infoRes.json();
     } catch {
