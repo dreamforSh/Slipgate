@@ -11,6 +11,17 @@ export * from "./vm.ts";
 export * from "./dataplane.ts";
 export * from "./dashboard.ts";
 export * from "./account_ops.ts";
+export * from "./commerce.ts";
+export * from "./auth_guards.ts";
+export * from "./announcements.ts";
+export * from "./audit.ts";
+export * from "./usage.ts";
+export * from "./payments.ts";
+export * from "./payment_providers.ts";
+export * from "./backup.ts";
+export * from "./db_backups.ts";
+export * from "./user_limits.ts";
+export * from "./system_logs.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 

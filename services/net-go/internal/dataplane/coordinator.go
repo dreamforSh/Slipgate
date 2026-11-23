@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -77,8 +78,10 @@ type SyncApiKeyInput struct {
 	RPMLimit         uint32   `json:"rpmLimit"`
 	ConcurrencyLimit uint32   `json:"concurrencyLimit"`
 	IPAllowlist      []string `json:"ipAllowlist"`
-	Enabled          bool     `json:"enabled"`
-	ExpiresAtISO     *string  `json:"expiresAtIso"`
+	// IPDenylist blocks matching client IPs/CIDRs; it wins over IPAllowlist.
+	IPDenylist   []string `json:"ipDenylist"`
+	Enabled      bool     `json:"enabled"`
+	ExpiresAtISO *string  `json:"expiresAtIso"`
 }
 
 // SyncWalletInput matches DataPlaneSyncWalletSchema from @slipgate/contracts.
@@ -88,14 +91,26 @@ type SyncWalletInput struct {
 	HeldNanoUSD    string `json:"heldNanoUsd"`
 }
 
+// SyncPriceRuleInput matches DataPlaneSyncPriceRuleSchema: an enabled admin price rule in nano-USD
+// per 1M tokens, forwarded to slipgate-core so its holds and settlements use the billed prices.
+type SyncPriceRuleInput struct {
+	Pattern               string `json:"pattern"`
+	InputNanoPerMTok      string `json:"inputNanoPerMTok"`
+	OutputNanoPerMTok     string `json:"outputNanoPerMTok"`
+	CacheReadNanoPerMTok  string `json:"cacheReadNanoPerMTok"`
+	CacheWriteNanoPerMTok string `json:"cacheWriteNanoPerMTok"`
+}
+
 // SyncSnapshot matches DataPlaneSyncSnapshotSchema exported by slipgate-bff.
 type SyncSnapshot struct {
-	RevisionUnixMs int64              `json:"revisionUnixMs"`
-	Groups         []SyncGroupInput   `json:"groups"`
-	Routes         []SyncRouteInput   `json:"routes"`
-	Accounts       []SyncAccountInput `json:"accounts"`
-	APIKeys        []SyncApiKeyInput  `json:"apiKeys"`
-	Wallets        []SyncWalletInput  `json:"wallets"`
+	RevisionUnixMs int64                `json:"revisionUnixMs"`
+	Groups         []SyncGroupInput     `json:"groups"`
+	Routes         []SyncRouteInput     `json:"routes"`
+	Accounts       []SyncAccountInput   `json:"accounts"`
+	APIKeys        []SyncApiKeyInput    `json:"apiKeys"`
+	Wallets        []SyncWalletInput    `json:"wallets"`
+	PriceRules     []SyncPriceRuleInput `json:"priceRules"`
+	UserLimits     *SyncUserLimitsInput `json:"userLimits"` // enforced in user_limits.go
 }
 
 // SyncAckResult summarizes the result of applying a DataPlaneSyncSnapshot across Go and Zig.
@@ -108,6 +123,12 @@ type SyncAckResult struct {
 
 // TurnSettlementEvent matches TurnSettlementEventSchema posted back to slipgate-bff.
 type TurnSettlementEvent struct {
+	// SettlementID is minted here once per settled turn and reused on every redelivery: it is the
+	// BFF's billing idempotency key. RequestID is the caller's X-Request-Id (correlation only).
+	SettlementID string `json:"settlementId"`
+	// CoreSettled is false when slipgate-core did not settle the hold (IPC failure, or the hold
+	// was lost in a core restart); CostNanoUSD is then "0" and the BFF prices the tokens itself.
+	CoreSettled      bool   `json:"coreSettled"`
 	RequestID        string `json:"requestId"`
 	UserID           string `json:"userId"`
 	APIKeyID         string `json:"apiKeyId"`
@@ -175,6 +196,13 @@ type CoordinatorOptions struct {
 	VMSlots       *vmslot.Manager
 	DirectClient  *http.Client
 	Logger        *log.Logger
+	// AccessLogEnabled reports whether each turn should write an "[http.access]" line (the BFF
+	// persists access logs; cmd/slipgate passes the system-log forwarder's flag). Nil = never.
+	AccessLogEnabled func() bool
+	// SettlementSpoolDir keeps undelivered settlements across restarts (defaults to the
+	// SLIPGATE_SETTLEMENT_SPOOL_DIR environment variable; empty or "off" = in-memory retry queue
+	// only). cmd/slipgate always passes one (see ResolveSettlementSpoolDir).
+	SettlementSpoolDir string
 }
 
 // Coordinator bridges HTTP AI ingress, L2 Zig hot-path policy/ledger IPC, three-mode outbound execution, and BFF settlement.
@@ -190,14 +218,20 @@ type Coordinator struct {
 	bffClient     *http.Client
 	logger        *log.Logger
 	streamSeq     atomic.Uint32
+	settlements   *settlementOutbox
+
+	// accessLogEnabled gates the per-turn http.access line (turn_log.go).
+	accessLogEnabled func() bool
 
 	mu                 sync.RWMutex
 	keyIPAllowlists    map[string][]string
+	keyIPDenylists     map[string][]string
 	accountAuthKinds   map[string]string
 	accountTiers       map[string]string
 	accountMetas       map[string]accountMeta
 	lastCoreSyncJSON   []byte
 	lastRevisionUnixMs int64
+	userLimits         userLimitGate // per-user / per-group caps (user_limits.go)
 }
 
 // NewCoordinator constructs a DataPlane Coordinator.
@@ -224,7 +258,7 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		bffOrigin = "http://" + bffOrigin
 	}
 
-	return &Coordinator{
+	c := &Coordinator{
 		coreIPC:          opts.CoreIPC,
 		bffOrigin:        bffOrigin,
 		internalToken:    opts.InternalToken,
@@ -235,11 +269,58 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		directClient:     directClient,
 		bffClient:        &http.Client{Timeout: 5 * time.Second},
 		logger:           logger,
+		accessLogEnabled: opts.AccessLogEnabled,
 		keyIPAllowlists:  make(map[string][]string),
+		keyIPDenylists:   make(map[string][]string),
 		accountAuthKinds: make(map[string]string),
 		accountTiers:     make(map[string]string),
 		accountMetas:     make(map[string]accountMeta),
 	}
+	spoolDir := strings.TrimSpace(opts.SettlementSpoolDir)
+	if spoolDir == "" {
+		spoolDir = strings.TrimSpace(os.Getenv(SettlementSpoolDirEnv))
+	}
+	c.settlements = newSettlementOutbox(c.postSettlementOnce, logger, spoolDir)
+	if c.settlements.spoolDir != "" {
+		logger.Printf("[dataplane] settlement spool: %s", c.settlements.spoolDir)
+	}
+	if bffOrigin != "" && opts.InternalToken != "" {
+		c.settlements.loadSpool()
+	}
+	return c
+}
+
+// FlushSettlements runs on shutdown once the edge has stopped serving turns, while slipgate-bff is
+// still up: it waits for settlement deliveries in flight and retries queued ones until ctx ends or
+// the BFF turns out to be down. Whatever is left stays in the spool for the next start.
+func (c *Coordinator) FlushSettlements(ctx context.Context) {
+	left := c.settlements.flush(ctx)
+	if left == 0 {
+		return
+	}
+	if c.settlements.spoolDir != "" {
+		c.logger.Printf("[dataplane] %d undelivered settlement(s) kept in %s for the next start", left, c.settlements.spoolDir)
+		return
+	}
+	c.logger.Printf("[dataplane] error: %d undelivered settlement(s) lost at shutdown: the settlement spool is off (%s)", left, SettlementSpoolDirEnv)
+}
+
+// postSettlementOnce makes one settlement POST and reports the BFF's status code.
+func (c *Coordinator) postSettlementOnce(ctx context.Context, body []byte) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.bffOrigin+"/api/v1/internal/dataplane/settlement", bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Slipgate-Internal-Token", c.internalToken)
+	resp, err := c.bffClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	// Drain so the keep-alive connection is reused.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
+	return resp.StatusCode, nil
 }
 
 // Vault exposes the coordinator's in-memory credential vault (used by tests and internal diagnostics).
@@ -256,7 +337,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		}
 		sec, err := c.vault.DecryptHex(acc.CredentialsEncHex)
 		if err != nil {
-			c.logger.Printf("[dataplane] warning: failed to decrypt credentials for account %s: %v", acc.ID, err)
+			c.logEvent("warn", fmt.Sprintf("failed to decrypt credentials: %v", err), "account_id", acc.ID)
 			continue
 		}
 		nextSecrets[acc.ID] = sec
@@ -358,6 +439,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 
 	now := time.Now()
 	nextIPAllowlists := make(map[string][]string)
+	nextIPDenylists := make(map[string][]string)
 	coreKeys := make([]coreAPIKey, 0, len(snap.APIKeys))
 	for _, k := range snap.APIKeys {
 		enabled := k.Enabled
@@ -368,6 +450,9 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		}
 		if len(k.IPAllowlist) > 0 {
 			nextIPAllowlists[k.ID] = append([]string(nil), k.IPAllowlist...)
+		}
+		if len(k.IPDenylist) > 0 {
+			nextIPDenylists[k.ID] = append([]string(nil), k.IPDenylist...)
 		}
 		coreKeys = append(coreKeys, coreAPIKey{
 			ID:               k.ID,
@@ -392,13 +477,18 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	if routes == nil {
 		routes = []SyncRouteInput{}
 	}
+	priceRules := snap.PriceRules
+	if priceRules == nil {
+		priceRules = []SyncPriceRuleInput{}
+	}
 
 	corePayload, err := json.Marshal(map[string]any{
-		"groups":   coreGroups,
-		"routes":   routes,
-		"accounts": coreAccounts,
-		"apiKeys":  coreKeys,
-		"wallets":  coreWallets,
+		"groups":     coreGroups,
+		"routes":     routes,
+		"accounts":   coreAccounts,
+		"apiKeys":    coreKeys,
+		"wallets":    coreWallets,
+		"priceRules": priceRules,
 	})
 	if err != nil {
 		return SyncAckResult{}, err
@@ -406,12 +496,14 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 
 	c.mu.Lock()
 	c.keyIPAllowlists = nextIPAllowlists
+	c.keyIPDenylists = nextIPDenylists
 	c.accountAuthKinds = nextAuthKinds
 	c.accountTiers = nextTiers
 	c.accountMetas = nextMetas
 	c.lastCoreSyncJSON = corePayload
 	c.lastRevisionUnixMs = snap.RevisionUnixMs
 	c.mu.Unlock()
+	c.userLimits.apply(snap.UserLimits)
 
 	res := SyncAckResult{
 		OK:             true,
@@ -557,7 +649,9 @@ type coreDispatchDirective struct {
 }
 
 type coreSettleReport struct {
-	HoldID           uint64 `json:"holdId"`
+	HoldID uint64 `json:"holdId"`
+	// APIKeyID lets the core refuse a report whose hold id now names another turn's hold.
+	APIKeyID         string `json:"apiKeyId,omitempty"`
 	UpstreamStatus   uint16 `json:"upstreamStatus"`
 	InputTokens      uint64 `json:"inputTokens"`
 	OutputTokens     uint64 `json:"outputTokens"`
@@ -572,11 +666,17 @@ type coreSettleAck struct {
 	SettledCostNanoUSD          string `json:"settledCostNanoUsd"`
 	BalanceAfterNanoUSD         string `json:"balanceAfterNanoUsd"`
 	OrdinaryUpstream400Exempted bool   `json:"ordinaryUpstream400Exempted"`
+	// settled is true only when slipgate-core acknowledged settling this hold; otherwise the
+	// reported cost is not the core's valuation and the BFF must price the turn.
+	settled bool
 }
 
 // HandleHTTP serves /v1/*, /v1beta/*, and /mcp/* strictly on the DataPlane (Go <-> Zig IPC, zero BFF hot path).
 func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
+	// One "[http.access]" line per turn while the BFF persists access logs (nil = off).
+	access := c.beginAccess(&w, r, startedAt)
+	defer c.finishAccess(access)
 	w.Header().Set("X-Slipgate-Plane", "dataplane-direct")
 
 	streamID := c.streamSeq.Add(1)
@@ -623,6 +723,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		turn.AnthropicVersion = r.Header.Get("anthropic-version")
 		turn.AnthropicBeta = r.Header.Get("anthropic-beta")
 	}
+	access.setTurn(turn)
 
 	clientIP := extractClientIP(r)
 	evalPayload, _ := json.Marshal(coreTurnEvalRequest{
@@ -648,12 +749,14 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	ipcCancel()
 	if ipcErr != nil {
+		c.logTurn("error", "slipgate-core dataplane unreachable: "+ipcErr.Error(), requestID, nil, turn.PublicModel)
 		WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "core_unavailable", "core_unreachable", "slipgate-core dataplane unreachable: "+ipcErr.Error())
 		return
 	}
 
 	var directive coreDispatchDirective
 	_ = json.Unmarshal(replyFrame.Payload, &directive)
+	access.setDirective(&directive)
 
 	// Preserve compatibility with lightweight IPC listeners that emit raw FrameDispatchDirective payloads without an engine action.
 	if directive.Action == "" {
@@ -725,6 +828,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		reportRaw, _ := json.Marshal(coreSettleReport{
 			HoldID:           directive.HoldID,
+			APIKeyID:         directive.APIKeyID,
 			UpstreamStatus:   statusU16,
 			InputTokens:      metrics.InputTokens,
 			OutputTokens:     metrics.OutputTokens,
@@ -733,22 +837,43 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			Window5hUsedBps:  metrics.Window5hUsedBps,
 			Window7dUsedBps:  metrics.Window7dUsedBps,
 		})
-		settleCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		ackFrame, err := dpbridge.Exchange(settleCtx, c.coreIPC, dpbridge.Frame{
-			StreamID: c.streamSeq.Add(1),
-			Type:     dpbridge.FrameSettleReport,
-			Flags:    dpbridge.FlagEndStream,
-			Payload:  reportRaw,
-		})
+		var (
+			ackFrame dpbridge.Frame
+			err      error
+		)
+		// One retry for a transient IPC failure. A retry that reaches a core which already
+		// settled the hold just gets ok:false, and the BFF bills the turn exactly once either way.
+		for attempt := range 2 {
+			if attempt > 0 {
+				time.Sleep(100 * time.Millisecond)
+			}
+			settleCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ackFrame, err = dpbridge.Exchange(settleCtx, c.coreIPC, dpbridge.Frame{
+				StreamID: c.streamSeq.Add(1),
+				Type:     dpbridge.FrameSettleReport,
+				Flags:    dpbridge.FlagEndStream,
+				Payload:  reportRaw,
+			})
+			cancel()
+			if err == nil {
+				break
+			}
+		}
 		if err != nil {
-			c.logger.Printf("[dataplane] warning: hold %d settle IPC failed: %v", directive.HoldID, err)
+			c.logTurn("warn", fmt.Sprintf("hold %d settle IPC failed: %v", directive.HoldID, err), requestID, &directive, turn.PublicModel,
+				"hold_id", fmtUint(directive.HoldID))
 			return coreSettleAck{SettledCostNanoUSD: "0"}
 		}
 		var ack coreSettleAck
 		_ = json.Unmarshal(ackFrame.Payload, &ack)
 		if ack.SettledCostNanoUSD == "" {
 			ack.SettledCostNanoUSD = "0"
+		}
+		// ok:false means the core no longer knew the hold (e.g. it restarted mid-stream).
+		ack.settled = ack.OK
+		if !ack.OK {
+			c.logTurn("warn", fmt.Sprintf("slipgate-core did not settle hold %d; the BFF will price the turn", directive.HoldID), requestID, &directive, turn.PublicModel,
+				"hold_id", fmtUint(directive.HoldID))
 		}
 		return ack
 	}
@@ -760,6 +885,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	if !c.isClientIPAllowed(directive.APIKeyID, clientIP) {
 		settleHold(RelayMetrics{UpstreamStatus: http.StatusForbidden})
 		WriteProtocolError(w, turn.IngressCodec, http.StatusForbidden, "permission_error", "ip_not_allowed", "client IP is not in API key allowlist")
+		return
+	}
+	releaseUserLimits, admitted := c.admitUserLimits(w, turn.IngressCodec, &directive, settleHold)
+	defer releaseUserLimits()
+	if !admitted {
 		return
 	}
 
@@ -878,6 +1008,8 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	upstreamResp, execErr := c.executeOutbound(r.Context(), pctx, secret, upstreamReq, directive.UpstreamModel, egressCodec, turn)
 	if execErr != nil {
+		c.logTurn("warn", "outbound dispatch failed: "+execErr.Error(), requestID, &directive, turn.PublicModel,
+			"execution_mode", directive.ExecutionMode, "upstream_model", directive.UpstreamModel)
 		settleHold(RelayMetrics{UpstreamStatus: http.StatusBadGateway})
 		WriteProtocolError(w, turn.IngressCodec, http.StatusBadGateway, "upstream_error", "outbound_dispatch_failed", execErr.Error())
 		return
@@ -895,13 +1027,17 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		tracker.OnVisibleToolDelta,
 	)
 	if relayErr != nil {
-		c.logger.Printf("[dataplane] warning: stream relay interrupted on %s: %v", requestID, relayErr)
+		// Structured (logx): the system log keeps the request, user, key, account, platform and model.
+		c.logTurn("warn", fmt.Sprintf("stream relay interrupted: %v", relayErr), requestID, &directive, turn.PublicModel,
+			"upstream_status", fmtInt(int64(metrics.UpstreamStatus)))
 	}
 
 	ack := settleHold(metrics)
 	durationMs := elapsedMs(startedAt)
 
 	c.postSettlementBounded(TurnSettlementEvent{
+		SettlementID:     newSettlementID(),
+		CoreSettled:      ack.settled,
 		RequestID:        requestID,
 		UserID:           directive.UserID,
 		APIKeyID:         directive.APIKeyID,
@@ -986,12 +1122,24 @@ func (c *Coordinator) accountTier(accountID string) string {
 func (c *Coordinator) isClientIPAllowed(apiKeyID, clientIP string) bool {
 	c.mu.RLock()
 	allow := c.keyIPAllowlists[apiKeyID]
+	deny := c.keyIPDenylists[apiKeyID]
 	c.mu.RUnlock()
+	if ipListMatches(deny, clientIP) {
+		return false
+	}
 	if len(allow) == 0 {
 		return true
 	}
+	return ipListMatches(allow, clientIP)
+}
+
+// ipListMatches reports whether clientIP equals an entry or falls inside a CIDR entry.
+func ipListMatches(entries []string, clientIP string) bool {
+	if len(entries) == 0 {
+		return false
+	}
 	parsedIP := net.ParseIP(clientIP)
-	for _, entry := range allow {
+	for _, entry := range entries {
 		trimmed := strings.TrimSpace(entry)
 		if trimmed == "" {
 			continue
@@ -1008,11 +1156,26 @@ func (c *Coordinator) isClientIPAllowed(apiKeyID, clientIP string) bool {
 	return false
 }
 
+// postSettlementBounded hands the event to the at-least-once outbox (retried with backoff until the
+// BFF accepts it) and waits at most syncWaitBound for the first attempt.
 func (c *Coordinator) postSettlementBounded(ev TurnSettlementEvent) {
 	if c.bffOrigin == "" || c.internalToken == "" {
 		return
 	}
-	c.postInternalJSONBounded("/api/v1/internal/dataplane/settlement", ev)
+	if ev.SettlementID == "" {
+		ev.SettlementID = newSettlementID()
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	done := c.settlements.deliver(ev.SettlementID, raw)
+	timer := time.NewTimer(syncWaitBound)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 func (c *Coordinator) postRiskEventBounded(ev RiskBanEventPayload) {

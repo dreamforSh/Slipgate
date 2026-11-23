@@ -11,8 +11,12 @@ import {
   canonicalCredentialText,
   DashboardRangeSchema,
   AuthLoginRequestSchema,
+  BulkUpdateApiKeysRequestSchema,
   AuthRegisterRequestSchema,
   AuthSessionResponseSchema,
+  LogoutResponseSchema,
+  RevokeAllSessionsRequestSchema,
+  RevokeAllSessionsResponseSchema,
   BindAccountExitRequestSchema,
   ClashExitNodeSchema,
   ClashOutboundTestRequestSchema,
@@ -55,6 +59,7 @@ import {
   type ClashExitNode,
   type ClusterNode,
   type CompositeRouteRule,
+  type DataPlaneSyncSnapshot,
   type Provider,
   type SlotSeedSnapshot,
   type TlsProfile,
@@ -62,7 +67,27 @@ import {
 } from "@slipgate/contracts";
 import { PluginRegistry } from "@slipgate/plugin-sdk";
 import { buildAccountUsageStats, buildDashboardStats, dashboardWindow, DASHBOARD_MAX_ROWS } from "./dashboard.ts";
-import { requireAdmin, requireAuth, type AuthEnv } from "./middleware/auth.ts";
+import { applyEntitlements, cached, detectBuiltinProvider, WindowLimiter } from "./insights.ts";
+import { verifyTotp } from "./security/totp.ts";
+import { SessionManager, type AuthEnv } from "./middleware/auth.ts";
+import { clientIp } from "./security/client_ip.ts";
+import { auditMiddleware, registerOpsRoutes } from "./routes/ops.ts";
+import { digestEmailCode, registerMailRoutes, type MailService } from "./routes/mail.ts";
+import { registerPaymentRoutes } from "./routes/payments.ts";
+import { registerPricingRoutes, repriceSettlement, snapshotPriceRules, type PricingService } from "./routes/pricing.ts";
+import { CoalescingRunner, KeyedThrottle } from "./settlement_guards.ts";
+import { AccountAutoTester, registerAutoTestRoutes } from "./autotest.ts";
+import { mountAuditRetention } from "./audit_retention.ts";
+import { logRouteError, mountSystemLogging, registerSystemLogRoutes } from "./routes/system_logs.ts";
+import { registerAnnouncementRoutes } from "./routes/announcements.ts";
+import { paymentWebhookPlugin } from "./plugins/payment_webhook.ts";
+import { registerPluginRoutes } from "./routes/plugins.ts";
+import { registerBackupRoutes } from "./routes/backup.ts";
+import { mountDbBackups, type DbBackupAppOptions } from "./routes/db_backups.ts";
+import { registerOAuthRoutes } from "./routes/oauth.ts";
+import { AuthGuards, BACKEND_MODE_REFUSAL, conflictRefusal, refusalResponse, registerAuthGuardRoutes } from "./auth_guards.ts";
+import { RegistrationGuardError } from "./store/auth_guards_store.ts";
+import { registerUserLimitRoutes, repriceForUser, UserRateCache, withApiKeyDefaults, withUserLimits } from "./routes/user_limits.ts";
 import {
   credentialFingerprint,
   decryptSecret,
@@ -70,11 +95,10 @@ import {
   generateApiKey,
   hashPassword,
   maskSecret,
-  signJwt,
-  verifyPassword,
+  verifyPasswordOrDummy,
 } from "./security/crypto.ts";
 import { MemoryControlStore } from "./store/memory_store.ts";
-import { StoreError, type ControlStore, type StoredCredential } from "./store/types.ts";
+import { StoreError, type ControlStore, type StoredCredential, type UserCredentialRecord } from "./store/types.ts";
 
 export interface BffAppOptions {
   store?: ControlStore;
@@ -82,20 +106,19 @@ export interface BffAppOptions {
   vaultSecret?: string;
   internalToken?: string;
   registry?: PluginRegistry;
+  /** Test hook: replaces fetch for OAuth token/userinfo calls. */
+  oauthFetch?: typeof fetch;
+  /** Test hook: replaces fetch for payment gateway calls (EasyPay, Stripe, Alipay, WeChat Pay, Airwallex). */
+  paymentFetch?: typeof fetch;
+  /** Test hook: replaces fetch for captcha verification (Turnstile / Tencent / Aliyun). */
+  captchaFetch?: typeof fetch;
+  /** Run background schedulers (account auto-tests). Only the server entrypoint sets this. */
+  startSchedulers?: boolean;
+  /** Test hook: replaces SMTP delivery for verification/reset mail. */
+  mailDelivery?: (cfg: import("./mail/smtp.ts").SmtpConfig, msg: import("./mail/smtp.ts").MailMessage) => Promise<unknown>;
+  /** Test hooks for full database backups (dump runner, object storage, part size, clock). */
+  dbBackup?: DbBackupAppOptions;
 }
-
-const CreateOrderSchema = z.object({
-  userId: z.string().min(1),
-  provider: z.enum(["stripe", "airwallex", "alipay", "wechat", "easypay"]),
-  amountUsd: z.string().min(1),
-});
-
-const PaymentWebhookSchema = z.object({
-  orderId: z.string().min(1),
-  userId: z.string().min(1),
-  providerTradeNo: z.string().min(1),
-  amountNanoUsd: z.string().regex(/^\d+$/),
-});
 
 const AdminCreditUserSchema = z.object({
   amountUsd: z.string().min(1),
@@ -160,37 +183,6 @@ const SAMPLE_VM_SLOTS: VmSlotSummary[] = [
     },
   }),
 ];
-
-function detectBuiltinProvider(model: string): Provider | null {
-  if (model.startsWith("antigravity/") || model.startsWith("ag-")) return "antigravity";
-  if (
-    model.startsWith("codex-") ||
-    model.startsWith("codex/") ||
-    model.startsWith("gpt-5-codex") ||
-    model.startsWith("o3-codex") ||
-    model.startsWith("o4-mini-codex")
-  ) {
-    return "codex";
-  }
-  if (model.startsWith("claude-") || model.startsWith("anthropic/")) return "anthropic";
-  if (model.startsWith("gemini-") || model.startsWith("google/")) return "gemini";
-  if (
-    model.startsWith("gpt-") ||
-    model.startsWith("o1") ||
-    model.startsWith("o3") ||
-    model.startsWith("o4") ||
-    model.startsWith("openai/")
-  ) {
-    return "openai";
-  }
-  if (model.startsWith("grok-") || model.startsWith("xai/")) return "grok";
-  if (model.startsWith("deepseek-")) return "deepseek";
-  if (model.startsWith("glm-")) return "glm";
-  if (model.startsWith("kimi-") || model.startsWith("moonshot-")) return "kimi";
-  if (model.startsWith("minimax-") || model.startsWith("abab")) return "minimax";
-  if (model.startsWith("qwen-")) return "qwen";
-  return null;
-}
 
 function ruleBeats(candidate: CompositeRouteRule, incumbent: CompositeRouteRule): boolean {
   const cExact = candidate.matchType === "exact";
@@ -482,6 +474,9 @@ async function forwardNetInternal(
   };
 }
 
+/** Push the real balance once an under-valued wallet can pay for fewer than this many such turns. */
+const LOW_BALANCE_TURNS = 32n;
+
 export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   const store = options.store ?? new MemoryControlStore();
   const jwtSecret = options.jwtSecret ?? process.env.SLIPGATE_JWT_SECRET ?? "slipgate-dev-jwt-secret-change-in-prod";
@@ -491,7 +486,17 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   const registry = options.registry ?? new PluginRegistry();
 
   const app = new Hono<AuthEnv>();
+  // First middleware: request ids, the logging context and 5xx / access entries wrap every route.
+  const systemLogs = mountSystemLogging(app, store, options.startSchedulers === true);
   const startedAt = Date.now();
+  const loginTotpLimiter = new WindowLimiter(8, 5 * 60_000);
+  /** Issues, re-validates (per request) and revokes console sessions; owns the password-attempt limits. */
+  const sessions = new SessionManager(store, jwtSecret);
+  /** Captcha, sign-up email policy, backend (admin-only) mode and legal documents (auth_guards.ts). */
+  const guards = new AuthGuards({ store, vaultSecret, sessions, fetchImpl: options.captchaFetch });
+  // Assigned when the mail routes register (after the admin guard); read lazily by handlers.
+  let mail: MailService = { ready: async () => false };
+  let pricing: PricingService = { rules: async () => [], invalidate: () => undefined };
 
   function verifyInternalHeader(c: Context): boolean {
     if (!internalToken) return false;
@@ -504,23 +509,108 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return diff === 0;
   }
 
-  async function syncDataPlaneBestEffort(): Promise<void> {
+  /**
+   * The store snapshot with keys of suspended users, ungranted exclusive groups and unusable
+   * subscriptions turned off, plus the enabled price rules so slipgate-core holds and settles at
+   * the prices the BFF bills.
+   */
+  async function exportEffectiveSnapshot(): Promise<DataPlaneSyncSnapshot> {
+    const [snapshot, access, entitlements, groups, overLimit, rules] = await Promise.all([
+      store.exportDataPlaneSnapshot(),
+      store.ops.listUserAccess(),
+      store.ops.subscriptionEntitlements(),
+      store.listGroups(false),
+      store.listOverLimitKeyIds(),
+      pricing.rules(),
+    ]);
+    const effective = { ...applyEntitlements(snapshot, access, entitlements, groups, new Set(overLimit)), priceRules: snapshotPriceRules(rules) };
+    // Per-user / per-group RPM and concurrency caps (slipgate-net enforces them; key limits clamped).
+    return withUserLimits(store, effective);
+  }
+
+  /**
+   * Shares one in-flight export between concurrent callers (pulls and pushes), so slow exports
+   * never pile up. `snapshotGen` moves on every data-plane sync request (i.e. after a write), and an
+   * export is only shared within its generation: a caller never gets one that began before its write.
+   */
+  let snapshotGen = 0;
+  let snapshotInflight: { gen: number; promise: Promise<DataPlaneSyncSnapshot> } | null = null;
+  function sharedSnapshot(): Promise<DataPlaneSyncSnapshot> {
+    const gen = snapshotGen;
+    if (snapshotInflight?.gen === gen) return snapshotInflight.promise;
+    const promise = exportEffectiveSnapshot().finally(() => {
+      if (snapshotInflight?.promise === promise) snapshotInflight = null;
+    });
+    snapshotInflight = { gen, promise };
+    return promise;
+  }
+
+  /**
+   * Settlement-path caches (one listGroups feeds the multipliers and the capped subscription
+   * groups). cached() shares an in-flight load, so a miss costs one query however many settlements
+   * hit it; a sync swaps in fresh caches instead of letting every caller reload on its own.
+   */
+  const loadGroupMeta = async () => {
+    const groups = await store.listGroups(false);
+    return {
+      multipliers: new Map(groups.map((g) => [g.id, g.rateMultiplier])),
+      // Every subscription group gets the per-settlement entitlement check: it also catches an
+      // expired subscription. Only capped groups sum usage in it (an uncapped group's check never
+      // touches usage_logs), so the check stays cheap for them.
+      subscriptionGroupIds: new Set(groups.filter((g) => g.subscriptionType === "subscription").map((g) => g.id)),
+    };
+  };
+  const loadLimitedKeyIds = async () => new Set(await store.listLimitedKeyIds());
+  let groupMeta = cached(30_000, loadGroupMeta);
+  let limitedKeyIds = cached(30_000, loadLimitedKeyIds);
+  /** Per-user custom group rates the settlement path bills at (lane U1). */
+  const userRates = new UserRateCache(store);
+  function refreshSettlementCaches() {
+    groupMeta = cached(30_000, loadGroupMeta);
+    limitedKeyIds = cached(30_000, loadLimitedKeyIds);
+    userRates.invalidate();
+  }
+  /** Per-key / per-subscription cap checks after a charged settlement: at most one per second each, with a trailing run. */
+  const keyCapChecks = new KeyedThrottle(1000);
+  const subscriptionCapChecks = new KeyedThrottle(1000);
+
+  /** Debounces sync requests from the settlement path (e.g. settlements crossing a cap) into one push. */
+  let syncTimer: ReturnType<typeof setTimeout> | null = null;
+  let syncDueAt = 0;
+  function scheduleDataPlaneSync(delayMs = 1000) {
+    const dueAt = Date.now() + delayMs;
+    if (syncTimer && syncDueAt <= dueAt) return;
+    if (syncTimer) clearTimeout(syncTimer);
+    syncDueAt = dueAt;
+    syncTimer = setTimeout(() => {
+      syncTimer = null;
+      void syncDataPlaneBestEffort();
+    }, delayMs);
+  }
+
+  /** At most one export+push runs at a time; requests made meanwhile share exactly one more. */
+  const dataPlanePush = new CoalescingRunner(async () => {
     const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
     if (!internalUrl || !internalToken) return;
-    try {
-      const snapshot = await store.exportDataPlaneSnapshot();
-      await fetch(`${internalUrl}/internal/net/dataplane/sync`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Slipgate-Internal-Token": internalToken,
-        },
-        body: JSON.stringify(snapshot),
-        signal: AbortSignal.timeout(2500),
-      });
-    } catch {
-      // DataPlane coordinator also reconciles periodically via background pull.
-    }
+    const snapshot = await sharedSnapshot();
+    await fetch(`${internalUrl}/internal/net/dataplane/sync`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Slipgate-Internal-Token": internalToken,
+      },
+      body: JSON.stringify(snapshot),
+      signal: AbortSignal.timeout(2500),
+    });
+    // Failures are swallowed by the runner: the DataPlane coordinator also pulls every 15 s.
+  });
+
+  async function syncDataPlaneBestEffort(): Promise<void> {
+    refreshSettlementCaches();
+    snapshotGen++;
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    if (!internalUrl || !internalToken) return;
+    await dataPlanePush.request();
   }
 
   async function fingerprintOf(secret: string): Promise<string> {
@@ -557,6 +647,9 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   }
 
   app.onError((err, c) => {
+    logRouteError(c, err);
+    // A sign-up that lost the race for its inbox / quota domain inside registerUser.
+    if (err instanceof RegistrationGuardError) return refusalResponse(c, conflictRefusal(err.reason));
     if (err instanceof StoreError) {
       return c.json({ error: err.code, message: err.message }, err.status);
     }
@@ -637,18 +730,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     const passwordHash = await hashPassword(parsed.data.adminPassword);
     const admin = await store.initializeSetup(parsed.data, passwordHash);
     await syncDataPlaneBestEffort();
-    const { token, expiresAtIso } = await signJwt(
-      { sub: admin.id, email: admin.email, role: admin.role },
-      jwtSecret,
-    );
-    return c.json(
-      AuthSessionResponseSchema.parse({
-        accessToken: token,
-        expiresAtIso,
-        user: admin,
-      }),
-      201,
-    );
+    return c.json(AuthSessionResponseSchema.parse(await sessions.issue(admin)), 201);
   });
 
   app.post("/api/v1/auth/register", async (c) => {
@@ -657,21 +739,52 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
-    const passwordHash = await hashPassword(parsed.data.password);
-    const user = await store.registerUser(parsed.data.email, passwordHash);
-    await syncDataPlaneBestEffort();
-    const { token, expiresAtIso } = await signJwt(
-      { sub: user.id, email: user.email, role: user.role },
-      jwtSecret,
-    );
-    return c.json(
-      AuthSessionResponseSchema.parse({
-        accessToken: token,
-        expiresAtIso,
-        user,
-      }),
-      201,
-    );
+    const settings = await store.ops.getSettings();
+    const req = parsed.data;
+    // Backend mode, attempt limit, captcha, reserved domain, allowlist / quota, same inbox (auth_guards.ts).
+    const preflight = await guards.registerPreflight(c, req, settings, () => mail.ready());
+    if ("response" in preflight) return preflight.response;
+    if (settings.inviteRequired) {
+      if (!req.inviteCode || !(await store.ops.isInvitationCodeUsable(req.inviteCode))) {
+        return c.json({ error: "invite_required", message: "A valid invitation code is required to register" }, 400);
+      }
+    }
+    if (settings.emailVerificationRequired && (await mail.ready())) {
+      const code = req.emailCode?.trim() ?? "";
+      if (!/^\d{6}$/.test(code) || !(await store.ops.consumeEmailCode(req.email, "register", await digestEmailCode(req.email, code)))) {
+        return c.json({ error: "email_code_invalid", message: "The email verification code is invalid or expired" }, 400);
+      }
+    }
+    const promoCode = settings.promoCodeEnabled && req.promoCode ? req.promoCode : undefined;
+    if (promoCode) {
+      const check = await store.ops.checkPromoCode(promoCode);
+      if (!check.valid) {
+        return c.json({ error: "invalid_promo_code", message: `Promo code is ${check.reason.replace("_", " ")}` }, 400);
+      }
+    }
+    const passwordHash = await hashPassword(req.password);
+    // The invitation is claimed atomically before the user exists (one winner per code, handed
+    // back if the registration fails), so concurrent sign-ups can't all pass the pre-check above.
+    const created = settings.inviteRequired
+      ? await store.ops.registerWithInvitation(req.inviteCode ?? "", () => store.registerUser(req.email, passwordHash, preflight.guard))
+      : await store.registerUser(req.email, passwordHash, preflight.guard);
+    if (!created) {
+      return c.json({ error: "invite_required", message: "A valid invitation code is required to register" }, 400);
+    }
+    await store.ops.applyRegistrationExtras(created.id, {
+      username: req.username,
+      promoCode,
+      affCode: settings.affiliateEnabled ? req.affCode : undefined,
+    });
+    const defaultBalance = BigInt(settings.defaultBalanceNanoUsd);
+    if (defaultBalance > 0n) {
+      await store.creditWallet(created.id, defaultBalance, `signup:${created.id}`, "signup_default_balance");
+    }
+    await store.ops.touchLastLogin(created.id);
+    const user = (await store.getUserById(created.id)) ?? created;
+    // No data-plane push: a new user has no API keys yet, and creating one pushes the snapshot
+    // (wallet included). An unauthenticated signup must not be able to drive snapshot exports.
+    return c.json(AuthSessionResponseSchema.parse(await sessions.issue(user)), 201);
   });
 
   app.post("/api/v1/auth/login", async (c) => {
@@ -680,49 +793,147 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
-    const userRecord = await store.findUserByEmail(parsed.data.email);
-    if (!userRecord || !userRecord.passwordHash) {
+    // Captcha first (the two-factor step presents the one-time pass the first step handed out).
+    const captchaGate = await guards.captcha(c, "login", parsed.data.captcha, parsed.data.email);
+    if (!captchaGate.ok) return captchaGate.response;
+    // Failed passwords are limited per account and client address (trusted-proxy aware, see
+    // security/attempts.ts). The attempt is reserved before the store is read or the password
+    // hashed, so a burst of concurrent guesses can't outrun the count.
+    const start = sessions.attempts.beginSignIn(parsed.data.email, clientIp(c));
+    if (!start.ok) {
+      c.header("Retry-After", String(start.retryAfterSeconds));
+      return c.json({ error: "too_many_attempts", message: "Too many failed sign-in attempts, try again later" }, 429);
+    }
+    let userRecord: UserCredentialRecord | null;
+    let ok: boolean;
+    try {
+      userRecord = await store.findUserByEmail(parsed.data.email);
+      // Unknown accounts pay for one hash as well, so timing doesn't reveal which emails exist.
+      ok = await verifyPasswordOrDummy(parsed.data.password, userRecord?.passwordHash);
+    } catch (err) {
+      start.attempt.release();
+      throw err;
+    }
+    if (!userRecord || !ok) {
+      start.attempt.failed();
       return c.json({ error: "invalid_credentials", message: "Invalid email or password" }, 401);
     }
-    const ok = await verifyPassword(parsed.data.password, userRecord.passwordHash);
-    if (!ok) {
-      return c.json({ error: "invalid_credentials", message: "Invalid email or password" }, 401);
-    }
+    start.attempt.succeeded();
     if (userRecord.status !== "active") {
       return c.json({ error: "account_suspended", message: "Account is suspended" }, 403);
     }
-    const { passwordHash: _, ...profile } = userRecord;
-    const { token, expiresAtIso } = await signJwt(
-      { sub: profile.id, email: profile.email, role: profile.role },
-      jwtSecret,
-    );
-    return c.json(
-      AuthSessionResponseSchema.parse({
-        accessToken: token,
-        expiresAtIso,
-        user: profile,
-      }),
-    );
+    // Backend (admin-only) mode, told only after the password checked out (no account probing).
+    if (userRecord.role !== "admin" && (await guards.backendMode())) return refusalResponse(c, BACKEND_MODE_REFUSAL);
+    if (userRecord.totpEnabled) {
+      const code = parsed.data.totpCode?.trim();
+      if (!code) {
+        return c.json(
+          { error: "totp_required", message: "Enter the code from your authenticator app", ...guards.passFor(captchaGate, "login", parsed.data.email) },
+          401,
+        );
+      }
+      if (!loginTotpLimiter.allow(userRecord.id)) {
+        return c.json({ error: "too_many_attempts", message: "Too many attempts, try again later" }, 429);
+      }
+      const state = await store.ops.getTotp(userRecord.id);
+      let valid = false;
+      if (state?.secretEnc) {
+        try {
+          valid = await verifyTotp(await decryptSecret(state.secretEnc, vaultSecret), code, userRecord.id);
+        } catch {
+          valid = false;
+        }
+      }
+      if (!valid) {
+        return c.json(
+          { error: "invalid_totp", message: "The two-factor code is not valid", ...guards.passFor(captchaGate, "login", parsed.data.email) },
+          401,
+        );
+      }
+    }
+    const { passwordHash: _, tokenVersion, ...profile } = userRecord;
+    await store.ops.touchLastLogin(profile.id);
+    // Signed at the version read with the hash just checked: if the password was changed or reset
+    // meanwhile, this session belongs to the old password and is refused like the others.
+    return c.json(AuthSessionResponseSchema.parse(await sessions.issue(profile, tokenVersion)));
+  });
+
+  /**
+   * Server-side logout of the presented token only: its id is denylisted until it expires, so a
+   * copy of it (another tab, a leaked header) stops working too. Other devices stay signed in; use
+   * POST /api/v1/user/sessions/revoke-all for those. Idempotent for expired or invalid tokens.
+   */
+  app.post("/api/v1/auth/logout", async (c) => {
+    if (!(await sessions.logout(c.req.header("Authorization")))) {
+      return c.json({ error: "unauthorized", message: "Missing bearer token" }, 401);
+    }
+    return c.json(LogoutResponseSchema.parse({ loggedOut: true }));
   });
 
   // ---------------------------------------------------------------------------
   // Authenticated User Self-Service Endpoints
   // ---------------------------------------------------------------------------
-  app.get("/api/v1/auth/me", requireAuth(jwtSecret), async (c) => {
+  app.get("/api/v1/auth/me", sessions.requireAuth(), guards.backendModeUserGuard(), async (c) => {
     const claims = c.get("authUser");
     const user = await store.getUserById(claims.sub);
     if (!user) {
       return c.json({ error: "unauthorized", message: "User no longer exists" }, 401);
     }
+    if (user.status !== "active") {
+      // 401 makes the console drop the session, the same as an expired token.
+      return c.json({ error: "account_suspended", message: "Account is suspended" }, 401);
+    }
     const wallet = await store.getWallet(user.id);
     return c.json({ user, wallet });
   });
 
-  app.use("/api/v1/user/*", requireAuth(jwtSecret));
+  app.use("/api/v1/user/*", sessions.requireAuth());
+  // Backend (admin-only) mode: other users' sessions stop working at once.
+  app.use("/api/v1/user/*", guards.backendModeUserGuard());
+
+  /** Sign out of all devices: bumps the caller's token version, ending every session at once. */
+  app.post("/api/v1/user/sessions/revoke-all", async (c) => {
+    const text = await c.req.text();
+    let raw: unknown = {};
+    if (text.trim()) {
+      try {
+        raw = JSON.parse(text);
+      } catch {
+        throw new StoreError("bad_request", "Malformed JSON request body");
+      }
+    }
+    const parsed = RevokeAllSessionsRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    const userId = c.get("authUser").sub;
+    const version = await sessions.revokeAll(userId);
+    let session = null;
+    if (parsed.data.keepCurrent) {
+      // This device keeps going on a fresh token at the new version.
+      const user = await store.getUserById(userId);
+      if (user) session = await sessions.issue(user, version);
+    }
+    return c.json(RevokeAllSessionsResponseSchema.parse({ revoked: true, session }));
+  });
+
+  async function allowedGroupIdsOf(userId: string): Promise<Set<string>> {
+    return new Set((await store.ops.getAdminUser(userId))?.allowedGroupIds ?? []);
+  }
+
+  /** Moving a key into an exclusive group needs the same grant as creating one there. */
+  async function assertGroupUsable(userId: string, role: string, groupId: string | undefined) {
+    if (!groupId || role === "admin") return;
+    const group = (await store.listGroups()).find((g) => g.id === groupId);
+    if (group?.isExclusive && !(await allowedGroupIdsOf(userId)).has(group.id)) {
+      throw new StoreError("forbidden", "This group is reserved for administrators");
+    }
+  }
 
   app.get("/api/v1/user/groups", async (c) => {
     const claims = c.get("authUser");
-    const groups = (await store.listGroups(true)).filter((g) => claims.role === "admin" || !g.isExclusive);
+    const granted = claims.role === "admin" ? null : await allowedGroupIdsOf(claims.sub);
+    const groups = (await store.listGroups(true)).filter((g) => !g.isExclusive || !granted || granted.has(g.id));
     return c.json({ groups });
   });
 
@@ -746,10 +957,14 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return c.json({ items });
   });
 
+  /** Custom (bring-your-own) key creations per user and hour. */
+  const customKeyLimiter = new WindowLimiter(10, 60 * 60_000);
+
   app.post("/api/v1/user/api-keys", async (c) => {
     const claims = c.get("authUser");
     const raw = await readJsonBody(c.req.raw);
-    const parsed = CreateApiKeyRequestSchema.safeParse(raw);
+    // Omitted RPM / concurrency take the portal's new-key defaults (Settings), not the schema's.
+    const parsed = CreateApiKeyRequestSchema.safeParse(withApiKeyDefaults(raw, await store.ops.getSettings()));
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
@@ -757,14 +972,38 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       // Look across disabled groups too: an enabled-only lookup misses a disabled exclusive
       // group and would skip this guard, leaving only the store's enabled check in the way.
       const group = (await store.listGroups()).find((g) => g.id === parsed.data.groupId);
-      if (group?.isExclusive) {
+      if (group?.isExclusive && !(await allowedGroupIdsOf(claims.sub)).has(group.id)) {
         return c.json({ error: "forbidden", message: "This group is reserved for administrators" }, 403);
       }
     }
-    const { plaintextKey, keyPrefix, keyHash } = await generateApiKey();
-    const item = await store.createApiKey(claims.sub, parsed.data, keyPrefix, keyHash);
+    let material: { plaintextKey: string; keyPrefix: string; keyHash: Uint8Array };
+    if (parsed.data.customKey) {
+      // Every custom-key attempt is a probe of "does this key exist?" (the hash is unique), so
+      // attempts are budgeted per user whatever their outcome.
+      if (!customKeyLimiter.allow(claims.sub)) {
+        return c.json({ error: "too_many_attempts", message: "Too many custom keys, try again later" }, 429);
+      }
+      const plaintextKey = parsed.data.customKey;
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(plaintextKey));
+      material = {
+        plaintextKey,
+        // A chosen key can be short (16 characters): store and show only its first four.
+        keyPrefix: `${plaintextKey.slice(0, 4)}...`,
+        keyHash: new Uint8Array(digest),
+      };
+    } else {
+      material = await generateApiKey();
+    }
+    const item = await store.createApiKey(claims.sub, parsed.data, material.keyPrefix, material.keyHash).catch((err: unknown) => {
+      if (err instanceof StoreError && err.code === "conflict" && parsed.data.customKey) return null;
+      throw err;
+    });
+    if (!item) {
+      // Never say whose key collided, or that it is "in use": one generic refusal.
+      return c.json({ error: "conflict", message: "This key can't be used. Choose a different one." }, 409);
+    }
     await syncDataPlaneBestEffort();
-    return c.json(CreatedApiKeyResponseSchema.parse({ item, plaintextKey }), 201);
+    return c.json(CreatedApiKeyResponseSchema.parse({ item, plaintextKey: material.plaintextKey }), 201);
   });
 
   app.patch("/api/v1/user/api-keys/:keyId", async (c) => {
@@ -775,9 +1014,25 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
+    await assertGroupUsable(claims.sub, claims.role, parsed.data.groupId);
     const item = await store.updateUserApiKey(claims.sub, keyId, parsed.data);
     await syncDataPlaneBestEffort();
     return c.json({ item });
+  });
+
+  app.post("/api/v1/user/api-keys/bulk", async (c) => {
+    const claims = c.get("authUser");
+    const raw = await readJsonBody(c.req.raw);
+    const parsed = BulkUpdateApiKeysRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+    await assertGroupUsable(claims.sub, claims.role, parsed.data.patch.groupId);
+    // One UPDATE for every key and one listing of just those keys (not a per-key round trip).
+    const result = await store.updateUserApiKeys(claims.sub, parsed.data.keyIds, parsed.data.patch);
+    const failed = result.failed.map((f) => ({ keyId: f.keyId, message: f.error.message }));
+    await syncDataPlaneBestEffort();
+    return c.json({ items: result.items, failed });
   });
 
   app.delete("/api/v1/user/api-keys/:keyId", async (c) => {
@@ -788,56 +1043,6 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return c.json({ deleted: true, keyId });
   });
 
-  app.post("/api/v1/commerce/orders", requireAuth(jwtSecret), async (c) => {
-    const raw = await readJsonBody(c.req.raw);
-    const parsed = CreateOrderSchema.safeParse(raw);
-    if (!parsed.success) {
-      return c.json({ error: "invalid_order", issues: parsed.error.issues }, 400);
-    }
-    const amountNano = parseUsdToNano(parsed.data.amountUsd);
-    const orderId = `ord_${crypto.randomUUID()}`;
-    return c.json(
-      {
-        orderId,
-        userId: parsed.data.userId,
-        provider: parsed.data.provider,
-        amountNanoUsd: amountNano.toString(),
-        formattedAmountUsd: formatNanoUsd(amountNano),
-        status: "pending",
-        idempotencyKey: `credit:${orderId}`,
-      },
-      201,
-    );
-  });
-
-  app.post("/webhooks/payment/:provider", async (c) => {
-    const provider = c.req.param("provider");
-    const raw = await readJsonBody(c.req.raw);
-    const parsed = PaymentWebhookSchema.safeParse(raw);
-    if (!parsed.success) {
-      return c.json({ error: "invalid_webhook", issues: parsed.error.issues }, 400);
-    }
-
-    await registry.emitPaymentSettled(
-      {
-        serviceVersion: "0.1.0",
-        logger: (msg, meta) => console.log(`[plugin] ${msg}`, meta ?? {}),
-      },
-      {
-        orderId: parsed.data.orderId,
-        userId: parsed.data.userId,
-        provider,
-        amountNanoUsd: parsed.data.amountNanoUsd,
-      },
-    );
-
-    return c.json({
-      accepted: true,
-      outboxEvent: "core.v1.CreditWallet",
-      idempotencyKey: `credit:${provider}:${parsed.data.orderId}`,
-    });
-  });
-
   // ---------------------------------------------------------------------------
   // Internal DataPlane Synchronization & Post-Turn Settlement Bridge
   // ---------------------------------------------------------------------------
@@ -845,7 +1050,8 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (!verifyInternalHeader(c)) {
       return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
     }
-    const snapshot = await store.exportDataPlaneSnapshot();
+    // Overlapping pulls (and pushes) share one export instead of piling up behind a slow one.
+    const snapshot = await sharedSnapshot();
     return c.json(snapshot);
   });
 
@@ -858,8 +1064,46 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
-    const item = await store.recordTurnSettlement(parsed.data);
-    return c.json({ ok: true, item });
+    // Admin price rules override the core's built-in rates for charged turns, and a turn the core
+    // could not settle (coreSettled: false) is priced here rather than recorded as free.
+    const reported = parsed.data;
+    let event = reported;
+    const rules = await pricing.rules();
+    // A user's custom group rate replaces the group's: billed here whatever slipgate-core held.
+    const userRate = await userRates.rateFor(reported.userId, reported.groupId);
+    if (rules.length > 0 || reported.coreSettled === false || userRate !== null) {
+      event = repriceForUser(event, rules, (await groupMeta()).multipliers.get(event.groupId) ?? 1, userRate);
+    }
+    // Idempotent per settlement id: net-go redelivers until it gets a 2xx.
+    const { settlementId, duplicate, walletBalanceAfterNanoUsd, ...item } = await store.recordTurnSettlement(event);
+    if (!duplicate && BigInt(item.costNanoUsd) > 0n) {
+      try {
+        // The core held and debited its local wallet at its own valuation. When the bill came out
+        // higher (a price rule it has not received yet, or a turn it never settled) its view of the
+        // wallet is too generous: push the real balance before it admits turns nobody can pay for.
+        if (walletBalanceAfterNanoUsd !== undefined) {
+          const balance = BigInt(walletBalanceAfterNanoUsd);
+          const underValued = BigInt(event.costNanoUsd) > BigInt(reported.costNanoUsd);
+          if (balance <= 0n || (underValued && balance < BigInt(event.costNanoUsd) * LOW_BALANCE_TURNS)) {
+            scheduleDataPlaneSync(250);
+          }
+        }
+        if ((await limitedKeyIds()).has(item.apiKeyId)) {
+          await keyCapChecks.request(item.apiKeyId, async () => {
+            const state = await store.getApiKeyLimitState(item.apiKeyId);
+            if (state && state !== "ok") scheduleDataPlaneSync();
+          });
+        }
+        if ((await groupMeta()).subscriptionGroupIds.has(item.groupId)) {
+          await subscriptionCapChecks.request(`${item.userId}\u0000${item.groupId}`, async () => {
+            if (await store.ops.isSubscriptionOverLimit(item.userId, item.groupId)) scheduleDataPlaneSync();
+          });
+        }
+      } catch {
+        // The settlement is recorded; the periodic snapshot pull still converges.
+      }
+    }
+    return c.json({ ok: true, settlementId, duplicate, item });
   });
 
   app.post("/api/v1/internal/dataplane/risk-events", async (c) => {
@@ -878,7 +1122,8 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   // ---------------------------------------------------------------------------
   // Admin Console Endpoints (RBAC: admin required)
   // ---------------------------------------------------------------------------
-  app.use("/api/v1/admin/*", requireAdmin(jwtSecret));
+  app.use("/api/v1/admin/*", sessions.requireAdmin());
+  app.use("/api/v1/admin/*", auditMiddleware(store));
 
   app.get("/api/v1/admin/system/update", async (c) => {
     const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
@@ -1214,15 +1459,15 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
     const claims = c.get("authUser");
-    const admin = await store.findUserByEmail(claims.email);
-    // Re-check role and status from the store: the JWT may predate a demotion or suspension.
-    const passwordOk =
-      !!admin?.passwordHash &&
-      admin.id === claims.sub &&
-      admin.role === "admin" &&
-      admin.status === "active" &&
-      (await verifyPassword(parsed.data.password, admin.passwordHash));
-    if (!passwordOk) {
+    // requireAdmin re-read the caller's role and status from the store for this request. The
+    // password goes through the same per-user attempt limit as every other password check made
+    // with a session, so a stolen admin token is not an unlimited password oracle here either.
+    const check = await sessions.confirmPassword(claims.sub, clientIp(c), parsed.data.password);
+    if (!check.ok) {
+      if (check.retryAfterSeconds !== null) {
+        c.header("Retry-After", String(check.retryAfterSeconds));
+        return c.json({ error: "too_many_attempts", message: "Too many wrong passwords, try again later" }, 429);
+      }
       return c.json({ error: "invalid_password", message: "Password confirmation failed" }, 403);
     }
     const wanted = parsed.data.accountIds ? new Set(parsed.data.accountIds) : null;
@@ -1424,11 +1669,6 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
         apiKeys: snapshot.apiKeys,
       }),
     );
-  });
-
-  app.get("/api/v1/admin/users", async (c) => {
-    const users = await store.listUsers();
-    return c.json({ users });
   });
 
   app.post("/api/v1/admin/users/:userId/credit", async (c) => {
@@ -2095,7 +2335,8 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   });
 
   app.get("/api/v1/admin/risk/events", async (c) => {
-    const events = await store.listRiskBanEvents(50);
+    const limitRaw = Number.parseInt(c.req.query("limit") ?? "50", 10);
+    const events = await store.listRiskBanEvents(Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 50);
     return c.json({
       events,
       banLadder: ["10m", "24h", "permanent"],
@@ -2179,6 +2420,69 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       }),
       400,
     );
+  });
+
+  // Before the ops routes: its public-page guards and settings-write hook wrap their handlers.
+  registerAuthGuardRoutes(app, guards);
+  registerOpsRoutes(app, {
+    store,
+    vaultSecret,
+    syncDataPlane: syncDataPlaneBestEffort,
+    mailReady: () => mail.ready(),
+    pricingRules: () => pricing.rules(),
+    sessions,
+    publicCaptcha: () => guards.publicCaptcha(),
+  });
+  registerUserLimitRoutes(app, { store, sessions, syncDataPlane: syncDataPlaneBestEffort, internalToken });
+  mail = registerMailRoutes(app, { store, vaultSecret, sessions, deliver: options.mailDelivery, guards });
+  // Price rules travel in the data-plane snapshot, so an edit is pushed like any other change.
+  pricing = registerPricingRoutes(app, store, () => void syncDataPlaneBestEffort());
+  const autoTester = new AccountAutoTester(store, () => {
+    const url = process.env.SLIPGATE_NET_INTERNAL_URL;
+    return url && internalToken ? { url, token: internalToken } : null;
+  });
+  registerAutoTestRoutes(app, autoTester);
+  mountAuditRetention(app, store, options.startSchedulers === true, vaultSecret);
+  registerSystemLogRoutes(app, store, systemLogs, { verifyInternal: verifyInternalHeader });
+  registerAnnouncementRoutes(app, store);
+  if (!registry.list().some((p) => p.name === paymentWebhookPlugin.name)) registry.register(paymentWebhookPlugin);
+  const plugins = registerPluginRoutes(app, store, registry, vaultSecret);
+  registerOAuthRoutes(app, { store, vaultSecret, jwtSecret, fetchImpl: options.oauthFetch, guards });
+  registerBackupRoutes(app, store, async () => {
+    pricing.invalidate();
+    await plugins.reload();
+    await syncDataPlaneBestEffort();
+  });
+  mountDbBackups(app, {
+    store,
+    sessions,
+    vaultSecret,
+    jwtSecret,
+    options: options.dbBackup,
+    startScheduler: options.startSchedulers === true,
+    // A restored dump may predate today's schema: re-apply it, then reload what is cached in memory.
+    afterRestore: async () => {
+      await store.init();
+      pricing.invalidate();
+      await plugins.reload();
+      await syncDataPlaneBestEffort();
+    },
+  });
+  if (options.startSchedulers) autoTester.start();
+  registerPaymentRoutes(app, {
+    store,
+    vaultSecret,
+    fetchImpl: options.paymentFetch,
+    startSchedulers: options.startSchedulers === true,
+    syncDataPlane: syncDataPlaneBestEffort,
+    onOrderPaid: (order) =>
+      registry.emitPaymentSettled(
+        {
+          serviceVersion: "0.1.0",
+          logger: (msg, meta) => console.log(`[plugin] ${msg}`, meta ?? {}),
+        },
+        { orderId: order.id, userId: order.userId, provider: order.provider, amountNanoUsd: order.creditNanoUsd },
+      ),
   });
 
   return app;

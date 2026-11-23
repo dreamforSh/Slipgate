@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import { useAuthStore } from "../stores/auth";
+import { usePortalStore } from "../stores/portal";
+import AnnouncementBell from "./AnnouncementBell.vue";
 import BrandMark from "./BrandMark.vue";
 import LocaleSwitcher from "./LocaleSwitcher.vue";
 import ThemeSwitcher from "./ThemeSwitcher.vue";
@@ -10,6 +12,7 @@ import UiIcon, { type IconName } from "./ui/UiIcon.vue";
 
 const { t } = useI18n();
 const auth = useAuthStore();
+const portal = usePortalStore();
 const route = useRoute();
 const router = useRouter();
 
@@ -18,6 +21,8 @@ interface NavItem {
   label: string;
   icon: IconName;
   exact?: boolean;
+  /** External link (admin-defined nav links) rendered as a plain anchor in a new tab. */
+  href?: string;
   /** A collapsible group: the parent only toggles; `to` is where the icon rail sends a click. */
   children?: NavItem[];
 }
@@ -28,34 +33,106 @@ interface NavSection {
 
 const sections = computed<NavSection[]>(() => {
   const out: NavSection[] = [];
+  const settings = portal.settings;
   if (auth.isAdmin) {
-    out.push({
-      title: t("nav.sections.admin"),
-      items: [
-        { to: "/admin", label: t("nav.dashboard"), icon: "dashboard", exact: true },
-        { to: "/admin/groups", label: t("nav.groups"), icon: "layers" },
-        { to: "/admin/accounts", label: t("nav.accounts"), icon: "users" },
-        {
-          to: "/admin/proxy",
-          label: t("nav.proxy"),
-          icon: "globe",
-          children: [
-            { to: "/admin/proxy/clash", label: t("nav.proxyClash"), icon: "network" },
-            { to: "/admin/proxy/ips", label: t("nav.proxyIps"), icon: "route" },
-          ],
-        },
-        { to: "/admin/vms", label: t("nav.vms"), icon: "server" },
-      ],
-    });
+    out.push(
+      {
+        title: t("nav.sections.overview"),
+        items: [
+          { to: "/admin", label: t("nav.dashboard"), icon: "dashboard", exact: true },
+          { to: "/admin/ops", label: t("nav.ops"), icon: "activity" },
+          { to: "/admin/usage", label: t("nav.adminUsage"), icon: "chart" },
+        ],
+      },
+      {
+        title: t("nav.sections.people"),
+        items: [
+          { to: "/admin/users", label: t("nav.users"), icon: "user" },
+          { to: "/admin/groups", label: t("nav.groups"), icon: "layers" },
+          { to: "/admin/subscriptions", label: t("nav.subscriptions"), icon: "crown" },
+        ],
+      },
+      {
+        title: t("nav.sections.resources"),
+        items: [
+          { to: "/admin/accounts", label: t("nav.accounts"), icon: "users" },
+          {
+            to: "/admin/proxy",
+            label: t("nav.proxy"),
+            icon: "globe",
+            children: [
+              { to: "/admin/proxy/clash", label: t("nav.proxyClash"), icon: "network" },
+              { to: "/admin/proxy/ips", label: t("nav.proxyIps"), icon: "route" },
+            ],
+          },
+          { to: "/admin/pricing", label: t("nav.pricing"), icon: "percent" },
+          { to: "/admin/monitor", label: t("nav.channelMonitor"), icon: "radar" },
+          { to: "/admin/vms", label: t("nav.vms"), icon: "server" },
+        ],
+      },
+      {
+        title: t("nav.sections.operations"),
+        items: [
+          { to: "/admin/announcements", label: t("nav.announcements"), icon: "megaphone" },
+          { to: "/admin/redeem", label: t("nav.redeem"), icon: "ticket" },
+          { to: "/admin/promo-codes", label: t("nav.promoCodes"), icon: "gift" },
+          {
+            to: "/admin/billing",
+            label: t("nav.billing"),
+            icon: "credit-card",
+            children: [
+              { to: "/admin/payments", label: t("nav.paymentDashboard"), icon: "trending-up" },
+              { to: "/admin/orders", label: t("nav.paymentOrders"), icon: "list" },
+              { to: "/admin/payment-plans", label: t("nav.paymentPlans"), icon: "box" },
+              { to: "/admin/payment-settings", label: t("nav.paymentSettings"), icon: "sliders" },
+            ],
+          },
+          { to: "/admin/affiliates", label: t("nav.affiliateRebates"), icon: "share" },
+        ],
+      },
+      {
+        title: t("nav.sections.system"),
+        items: [
+          { to: "/admin/risk", label: t("nav.risk"), icon: "shield-alert" },
+          { to: "/admin/audit-logs", label: t("nav.auditLogs"), icon: "scroll" },
+          { to: "/admin/system-logs", label: t("systemLogs.title"), icon: "terminal" },
+          { to: "/admin/plugins", label: t("nav.plugins"), icon: "plug" },
+          { to: "/admin/backup", label: t("nav.backup"), icon: "database" },
+          { to: "/admin/settings", label: t("nav.settings"), icon: "settings" },
+        ],
+      },
+    );
   }
-  out.push({
-    title: t("nav.sections.account"),
-    items: [{ to: "/user", label: t("nav.keys"), icon: "key" }],
-  });
+  const mine: NavItem[] = [
+    { to: "/dashboard", label: t("nav.myDashboard"), icon: "gauge" },
+    { to: "/keys", label: t("nav.keys"), icon: "key" },
+    { to: "/usage", label: t("nav.myUsage"), icon: "activity" },
+    { to: "/subscriptions", label: t("nav.mySubscriptions"), icon: "crown" },
+    { to: "/redeem", label: t("nav.myRedeem"), icon: "ticket" },
+  ];
+  if (settings?.paymentEnabled) {
+    mine.splice(4, 0, { to: "/purchase", label: t("nav.purchase"), icon: "credit-card" }, { to: "/orders", label: t("nav.orders"), icon: "list" });
+  }
+  if (settings?.affiliateEnabled) mine.push({ to: "/affiliate", label: t("nav.affiliate"), icon: "share" });
+  if (settings?.modelPlazaEnabled !== false) mine.push({ to: "/models", label: t("nav.models"), icon: "store" });
+  if (settings?.statusPageEnabled !== false) mine.push({ to: "/status", label: t("nav.status"), icon: "radar" });
+  mine.push({ to: "/profile", label: t("nav.profile"), icon: "user" });
+  out.push({ title: t("nav.sections.account"), items: mine });
+
+  const links: NavItem[] = (settings?.customNavLinks ?? []).map((l, i) => ({
+    to: `#link-${i}`,
+    href: l.url,
+    label: l.label,
+    icon: "external-link",
+  }));
+  if (settings?.docUrl) links.unshift({ to: "#docs", href: settings.docUrl, label: t("publicNav.docs"), icon: "book-open" });
+  if (links.length) out.push({ title: t("nav.sections.links"), items: links });
   return out;
 });
 
-function isActive(item: NavItem) {
+function isActive(item: NavItem): boolean {
+  if (item.href) return false;
+  if (item.children?.length) return item.children.some(isActive);
   return item.exact ? route.path === item.to : route.path === item.to || route.path.startsWith(`${item.to}/`);
 }
 
@@ -111,10 +188,12 @@ const pageTitle = computed(() =>
   route.meta.titleKey ? t(route.meta.titleKey) : (activeSection.value?.items.find(isActive)?.label ?? ""),
 );
 
-const siteName = computed(() => auth.setupStatus?.siteName || "Slipgate");
-const homePath = computed(() => (auth.isAdmin ? "/admin" : "/user"));
+const siteName = computed(() => portal.settings?.siteName || auth.setupStatus?.siteName || "Slipgate");
+const logoUrl = computed(() => portal.logoUrl);
+const homePath = computed(() => (auth.isAdmin ? "/admin" : "/dashboard"));
 const email = computed(() => auth.user?.email ?? "");
-const initials = computed(() => (email.value || "?").slice(0, 1).toUpperCase());
+const displayName = computed(() => auth.user?.username || email.value);
+const initials = computed(() => (displayName.value || "?").slice(0, 1).toUpperCase());
 const roleLabel = computed(() => (auth.isAdmin ? t("shell.roles.admin") : t("shell.roles.user")));
 const balance = computed(() => auth.wallet?.formattedAvailableUsd ?? null);
 
@@ -188,10 +267,18 @@ watch(
 watch(rail, () => (flyout.value = null));
 onBeforeUnmount(() => window.clearTimeout(flyoutTimer));
 
+let signingOut = false;
 async function handleLogout() {
+  if (signingOut) return;
+  signingOut = true;
   menuOpen.value = false;
-  auth.logout();
-  await router.push("/login");
+  try {
+    // Revokes this device's token on the server, then clears it locally (even when offline).
+    await auth.signOut();
+    await router.push("/login");
+  } finally {
+    signingOut = false;
+  }
 }
 </script>
 
@@ -222,7 +309,8 @@ async function handleLogout() {
     >
       <div class="flex h-16 shrink-0 items-center gap-3 border-b border-line/70 px-[18px]">
         <RouterLink :to="homePath" class="shrink-0 rounded-[10px] transition-opacity hover:opacity-85" :title="siteName">
-          <BrandMark :size="36" glow />
+          <img v-if="logoUrl" :src="logoUrl" alt="" class="h-9 w-9 rounded-[10px] object-contain" />
+          <BrandMark v-else :size="36" glow />
         </RouterLink>
         <div class="fade-x min-w-0 flex-1 leading-tight" :class="{ 'fade-x-hidden': rail }" :aria-hidden="rail">
           <RouterLink :to="homePath" class="block truncate text-base font-bold tracking-tight text-fg hover:text-accent">
@@ -282,6 +370,18 @@ async function handleLogout() {
                   </li>
                 </ul>
               </template>
+              <a
+                v-else-if="item.href"
+                :href="item.href"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="nav-link"
+                :class="{ 'nav-link-rail': rail }"
+                :aria-label="rail ? item.label : undefined"
+              >
+                <UiIcon :name="item.icon" :size="18" />
+                <span class="fade-x truncate" :class="{ 'fade-x-hidden': rail }">{{ item.label }}</span>
+              </a>
               <RouterLink
                 v-else
                 :to="item.to"
@@ -357,7 +457,8 @@ async function handleLogout() {
               <UiIcon name="menu" :size="18" />
             </button>
             <RouterLink :to="homePath" class="shrink-0 lg:hidden" :title="siteName">
-              <BrandMark :size="28" />
+              <img v-if="logoUrl" :src="logoUrl" alt="" class="h-7 w-7 rounded-lg object-contain" />
+              <BrandMark v-else :size="28" />
             </RouterLink>
             <span class="truncate text-sm font-semibold tracking-tight text-fg sm:hidden">{{ siteName }}</span>
             <nav :aria-label="t('nav.breadcrumb')" class="hidden min-w-0 items-center gap-1.5 text-sm sm:flex">
@@ -375,9 +476,10 @@ async function handleLogout() {
 
           <div class="flex shrink-0 items-center gap-1.5 sm:gap-2.5">
             <LocaleSwitcher />
+            <AnnouncementBell />
             <RouterLink
               v-if="balance"
-              to="/user"
+              to="/dashboard"
               class="hidden items-center gap-2 rounded-lg bg-accent/10 px-2.5 py-1.5 text-accent ring-1 ring-inset ring-accent/20 transition-colors hover:bg-accent/15 sm:inline-flex"
               :title="t('shell.balance')"
             >
@@ -402,7 +504,7 @@ async function handleLogout() {
                   {{ initials }}
                 </span>
                 <span class="hidden min-w-0 max-w-[12rem] text-left leading-tight md:block">
-                  <span class="block truncate text-sm font-medium text-fg">{{ email }}</span>
+                  <span class="block truncate text-sm font-medium text-fg">{{ displayName }}</span>
                   <span class="block text-2xs text-fg-subtle">{{ roleLabel }}</span>
                 </span>
                 <UiIcon
@@ -425,7 +527,8 @@ async function handleLogout() {
                     {{ initials }}
                   </span>
                   <div class="min-w-0 leading-tight">
-                    <p class="truncate text-sm font-medium text-fg" :title="email">{{ email }}</p>
+                    <p class="truncate text-sm font-medium text-fg" :title="email">{{ displayName }}</p>
+                    <p v-if="displayName !== email" class="truncate text-2xs text-fg-subtle">{{ email }}</p>
                     <p class="mt-0.5 text-2xs text-fg-subtle">{{ roleLabel }}</p>
                   </div>
                 </div>
@@ -434,13 +537,21 @@ async function handleLogout() {
                   <span class="font-mono text-sm font-semibold tabular-nums text-accent">{{ balance }}</span>
                 </div>
                 <div class="border-t border-line/70 py-1">
-                  <RouterLink to="/user" class="menu-item" role="menuitem">
+                  <RouterLink to="/profile" class="menu-item" role="menuitem">
+                    <UiIcon name="user" :size="15" />
+                    {{ t("shell.profile") }}
+                  </RouterLink>
+                  <RouterLink to="/keys" class="menu-item" role="menuitem">
                     <UiIcon name="key" :size="15" />
                     {{ t("nav.keys") }}
                   </RouterLink>
+                  <RouterLink to="/dashboard" class="menu-item" role="menuitem">
+                    <UiIcon name="gauge" :size="15" />
+                    {{ t("nav.myDashboard") }}
+                  </RouterLink>
                   <RouterLink v-if="auth.isAdmin" to="/admin" class="menu-item" role="menuitem">
                     <UiIcon name="dashboard" :size="15" />
-                    {{ t("nav.dashboard") }}
+                    {{ t("nav.sections.admin") }}
                   </RouterLink>
                 </div>
                 <div class="border-t border-line/70 pt-1">

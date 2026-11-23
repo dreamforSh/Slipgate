@@ -63,6 +63,23 @@ export default {
       submitCreate: "创建",
       submitSave: "保存",
     },
+    caps: {
+      title: "订阅额度",
+      hint: "每位订阅用户在滚动窗口内的消费上限，填 0 表示不限",
+      daily: "每日上限（USD）",
+      weekly: "每周上限（USD）",
+      monthly: "每月上限（USD）",
+      validity: "默认有效期（天）",
+      validityHint: "分配订阅时默认的时长",
+      invalid: "请输入有效金额，例如 10 或 2.5",
+      unlimited: "不限额",
+      days: "{n} 天",
+      short: {
+        daily: "日",
+        weekly: "周",
+        monthly: "月",
+      },
+    },
     notice: {
       created: "已创建分组 {name}",
       saved: "已保存分组 {name}",

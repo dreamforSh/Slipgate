@@ -137,6 +137,7 @@ func (s *Server) Handler() http.Handler {
 	s.registerClashInternalRoutes(mux)
 	s.registerVmInternalRoutes(mux)
 	s.registerAccountInternalRoutes(mux)
+	s.registerUserLimitInternalRoutes(mux)
 
 	// DataPlane AI hot paths strictly bypass the TypeScript BFF.
 	mux.HandleFunc("/v1/", s.handleDataPlane)

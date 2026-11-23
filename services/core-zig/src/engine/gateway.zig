@@ -89,12 +89,24 @@ pub const SyncWalletJson = struct {
     balanceNanoUsd: []const u8 = "0",
 };
 
+/// Enabled admin price rule from the BFF (nano-USD per 1M tokens, before the group multiplier).
+/// NOTE: written without a Zig toolchain in the loop (not compiled); mirrors
+/// DataPlaneSyncPriceRuleSchema and the BFF's priceTurn/matchPricingRule.
+pub const SyncPriceRuleJson = struct {
+    pattern: []const u8,
+    inputNanoPerMTok: []const u8 = "0",
+    outputNanoPerMTok: []const u8 = "0",
+    cacheReadNanoPerMTok: []const u8 = "0",
+    cacheWriteNanoPerMTok: []const u8 = "0",
+};
+
 pub const SyncStatePayload = struct {
     groups: []const SyncGroupJson = &.{},
     routes: []const SyncRouteJson = &.{},
     accounts: []const SyncAccountJson = &.{},
     apiKeys: []const SyncApiKeyJson = &.{},
     wallets: []const SyncWalletJson = &.{},
+    priceRules: []const SyncPriceRuleJson = &.{},
 };
 
 pub const TurnEvalRequest = struct {
@@ -113,6 +125,8 @@ pub const TurnEvalRequest = struct {
 
 pub const TurnSettleRequest = struct {
     holdId: u64,
+    /// Key the hold was issued to (empty from older edges): a mismatch means the hold id is stale.
+    apiKeyId: []const u8 = "",
     upstreamStatus: u16 = 200,
     inputTokens: u64 = 0,
     outputTokens: u64 = 0,
@@ -233,6 +247,8 @@ const ActiveHold = struct {
     api_key_id: []u8,
     account_id: []u8,
     model: []u8,
+    /// Public model the caller asked for: price rules match it before the upstream model.
+    public_model: []u8,
     held_nano: i128,
     rate_multiplier_micros: u64,
     is_balance_group: bool,
@@ -265,6 +281,53 @@ fn lookupModelRate(model: []const u8) ModelRate {
         return .{ .in_nano_per_token = 270, .out_nano_per_token = 1_100 };
     }
     return .{ .in_nano_per_token = 1_000, .out_nano_per_token = 4_000 };
+}
+
+/// Admin price rule (nano-USD per 1M tokens). NOTE: not compiled here (no Zig toolchain).
+const PriceRule = struct {
+    pattern: []const u8,
+    input_per_mtok: i128,
+    output_per_mtok: i128,
+    cache_read_per_mtok: i128,
+    cache_write_per_mtok: i128,
+};
+
+/// Same as the BFF's matchPricingRule: an exact pattern wins, else the longest "prefix*".
+fn matchPriceRule(rules: []const PriceRule, model: []const u8) ?PriceRule {
+    var best: ?PriceRule = null;
+    for (rules) |rule| {
+        if (std.mem.eql(u8, rule.pattern, model)) return rule;
+        if (rule.pattern.len > 0 and rule.pattern[rule.pattern.len - 1] == '*') {
+            const prefix = rule.pattern[0 .. rule.pattern.len - 1];
+            if (std.mem.startsWith(u8, model, prefix)) {
+                if (best == null or rule.pattern.len > best.?.pattern.len) best = rule;
+            }
+        }
+    }
+    return best;
+}
+
+/// Turn cost under the billed prices: a matching admin rule (public model first, then upstream,
+/// exactly as the BFF reprices), otherwise the built-in table. Rule math equals the BFF's
+/// priceTurn: sum(tokens x nano/MTok) x multiplier_micros / 1e6 / 1e6.
+fn priceTurnCostNano(
+    rules: []const PriceRule,
+    public_model: []const u8,
+    upstream_model: []const u8,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    rate_multiplier_micros: u64,
+) i128 {
+    const rule = matchPriceRule(rules, public_model) orelse matchPriceRule(rules, upstream_model) orelse
+        return computeTurnCostNano(upstream_model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, rate_multiplier_micros);
+    const base = @as(i128, @intCast(input_tokens)) * rule.input_per_mtok +
+        @as(i128, @intCast(output_tokens)) * rule.output_per_mtok +
+        @as(i128, @intCast(cache_read_tokens)) * rule.cache_read_per_mtok +
+        @as(i128, @intCast(cache_write_tokens)) * rule.cache_write_per_mtok;
+    const mult = @as(i128, @intCast(@max(@as(u64, 1), rate_multiplier_micros)));
+    return @divTrunc(@divTrunc(base * mult, 1_000_000), 1_000_000);
 }
 
 fn computeTurnCostNano(
@@ -403,6 +466,7 @@ pub const GatewayEngine = struct {
     routes: []GroupRouteRecord = &.{},
     accounts: []AccountRecord = &.{},
     api_keys: []ApiKeyRecord = &.{},
+    price_rules: []PriceRule = &.{},
 
     wallets: std.StringHashMap(fixed_point.Wallet),
     key_rates: std.StringHashMap(KeyRateState),
@@ -420,7 +484,17 @@ pub const GatewayEngine = struct {
             .account_inflight = std.StringHashMap(u32).init(backing),
             .bans = std.StringHashMap(BanRecord).init(backing),
             .holds = std.AutoHashMap(u64, ActiveHold).init(backing),
+            .next_hold_id = bootHoldIdBase(),
         };
+    }
+
+    /// Hold ids live only in this process. Each boot starts in its own range (wall-clock ms in the
+    /// high bits), so a settle report for a hold issued before a restart cannot match a live hold of
+    /// this boot (it misses, and the edge reports the turn as unsettled for the BFF to price).
+    fn bootHoldIdBase() u64 {
+        const now_ms = std.time.milliTimestamp();
+        const ms: u64 = if (now_ms > 0) @intCast(now_ms) else 0;
+        return (ms << 20) | 1;
     }
 
     pub fn deinit(self: *GatewayEngine) void {
@@ -453,6 +527,7 @@ pub const GatewayEngine = struct {
         self.backing.free(h.api_key_id);
         self.backing.free(h.account_id);
         self.backing.free(h.model);
+        self.backing.free(h.public_model);
     }
 
     pub fn applySyncJson(self: *GatewayEngine, turn_alloc: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
@@ -543,6 +618,19 @@ pub const GatewayEngine = struct {
             });
         }
 
+        var next_rules = std.ArrayList(PriceRule).init(cat);
+        for (in.priceRules) |r| {
+            if (r.pattern.len == 0) continue;
+            // A malformed rate skips the rule (built-in rates apply), never a zero price.
+            try next_rules.append(.{
+                .pattern = try cat.dupe(u8, r.pattern),
+                .input_per_mtok = std.fmt.parseInt(i128, r.inputNanoPerMTok, 10) catch continue,
+                .output_per_mtok = std.fmt.parseInt(i128, r.outputNanoPerMTok, 10) catch continue,
+                .cache_read_per_mtok = std.fmt.parseInt(i128, r.cacheReadNanoPerMTok, 10) catch continue,
+                .cache_write_per_mtok = std.fmt.parseInt(i128, r.cacheWriteNanoPerMTok, 10) catch continue,
+            });
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -552,6 +640,7 @@ pub const GatewayEngine = struct {
         self.routes = next_routes.items;
         self.accounts = next_accounts.items;
         self.api_keys = next_keys.items;
+        self.price_rules = next_rules.items;
         old_arena.deinit();
 
         for (in.wallets) |w| {
@@ -859,7 +948,7 @@ pub const GatewayEngine = struct {
         if (is_balance) {
             hold_nano = @max(
                 @as(i128, 1_000),
-                computeTurnCostNano(route_match.upstream_model, est_in, est_out, 0, 0, group.rate_multiplier_micros),
+                priceTurnCostNano(self.price_rules, public_model, route_match.upstream_model, est_in, est_out, 0, 0, group.rate_multiplier_micros),
             );
             const wallet_ptr = try self.getOrCreateWalletLocked(api_key.user_id);
             wallet_ptr.hold(hold_nano) catch {
@@ -884,6 +973,7 @@ pub const GatewayEngine = struct {
             .api_key_id = try self.backing.dupe(u8, api_key.id),
             .account_id = try self.backing.dupe(u8, selected_acc.id),
             .model = try self.backing.dupe(u8, route_match.upstream_model),
+            .public_model = try self.backing.dupe(u8, public_model),
             .held_nano = hold_nano,
             .rate_multiplier_micros = group.rate_multiplier_micros,
             .is_balance_group = is_balance,
@@ -927,13 +1017,23 @@ pub const GatewayEngine = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        const not_settled = SettleAckResponse{
+            .ok = false,
+            .settledCostNanoUsd = "0",
+            .balanceAfterNanoUsd = "0",
+            .ordinaryUpstream400Exempted = false,
+        };
+        // A report naming another key's hold is stale (issued before a restart): leave that live
+        // hold alone and answer ok:false, so the BFF prices this turn itself.
+        if (req.apiKeyId.len > 0) {
+            if (self.holds.get(req.holdId)) |live| {
+                if (!std.mem.eql(u8, live.api_key_id, req.apiKeyId)) {
+                    return std.json.stringifyAlloc(turn_alloc, not_settled, .{});
+                }
+            }
+        }
         const kv = self.holds.fetchRemove(req.holdId) orelse {
-            return std.json.stringifyAlloc(turn_alloc, SettleAckResponse{
-                .ok = false,
-                .settledCostNanoUsd = "0",
-                .balanceAfterNanoUsd = "0",
-                .ordinaryUpstream400Exempted = false,
-            }, .{});
+            return std.json.stringifyAlloc(turn_alloc, not_settled, .{});
         };
         const hold = kv.value;
         defer self.freeHoldStrings(hold);
@@ -969,7 +1069,9 @@ pub const GatewayEngine = struct {
         const billable_tokens = !hold.is_free and
             (req.inputTokens > 0 or req.outputTokens > 0 or req.cacheReadTokens > 0 or req.cacheWriteTokens > 0);
         if (billable_tokens) {
-            settled_cost = computeTurnCostNano(
+            settled_cost = priceTurnCostNano(
+                self.price_rules,
+                hold.public_model,
                 hold.model,
                 req.inputTokens,
                 req.outputTokens,
@@ -1238,6 +1340,68 @@ test "gateway engine enforces sha256 auth, hold/settle nano-USD precision, and p
     const banned_raw = try engine.evaluateTurnJson(arena, probe_req);
     try std.testing.expect(std.mem.indexOf(u8, banned_raw, "\"status\":403") != null);
     try std.testing.expect(std.mem.indexOf(u8, banned_raw, "\"banDuration\":\"10m\"") != null);
+}
+
+// NOTE: added without a Zig toolchain available (not compiled or run here).
+test "snapshot price rules drive the hold and the settled cost exactly like the BFF's priceTurn" {
+    var engine = GatewayEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw_key = "sk-sg-0123456789abcdef0123456789abcdef01234567";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw_key, &digest, .{});
+    const hex_buf = std.fmt.bytesToHex(digest, .lower);
+
+    const sync_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"groups\":[{{\"id\":\"grp_default\",\"platform\":\"composite\",\"subscriptionType\":\"balance\",\"rateMultiplierMicros\":2000000,\"enabled\":true}}]," ++
+            "\"routes\":[{{\"id\":\"rt_1\",\"groupId\":\"grp_default\",\"publicModel\":\"o3-mini\",\"matchType\":\"exact\",\"targetPlatform\":\"openai\",\"upstreamModel\":\"o3-mini\",\"priority\":10}}]," ++
+            "\"accounts\":[{{\"id\":\"acc_1\",\"groupId\":\"grp_default\",\"platform\":\"openai\",\"executionMode\":\"direct_api\",\"maxConcurrency\":2,\"priority\":10,\"status\":\"active\"}}]," ++
+            "\"apiKeys\":[{{\"id\":\"key_1\",\"userId\":\"usr_1\",\"groupId\":\"grp_default\",\"keyHashHex\":\"{s}\",\"rpmLimit\":10,\"concurrencyLimit\":2,\"enabled\":true}}]," ++
+            "\"wallets\":[{{\"userId\":\"usr_1\",\"balanceNanoUsd\":\"1000000000\"}}]," ++
+            "\"priceRules\":[{{\"pattern\":\"o3*\",\"inputNanoPerMTok\":\"10000000000\",\"outputNanoPerMTok\":\"40000000000\",\"cacheReadNanoPerMTok\":\"1000000000\",\"cacheWriteNanoPerMTok\":\"12500000000\"}}]}}",
+        .{&hex_buf},
+    );
+    _ = try engine.applySyncJson(arena, sync_json);
+
+    const eval_req = try std.fmt.allocPrint(
+        arena,
+        "{{\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"apiKey\":\"{s}\",\"model\":\"o3-mini\",\"maxTokens\":200,\"estimatedInputTokens\":100,\"nowUnixMs\":1700000000000}}",
+        .{raw_key},
+    );
+    const disp_raw = try engine.evaluateTurnJson(arena, eval_req);
+    const disp = try std.json.parseFromSlice(DispatchResponse, arena, disp_raw, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("dispatch", disp.value.action);
+    // (100 x $10 + 200 x $40) / 1M x 2 = $0.018 held, not the $1/$4 default.
+    try std.testing.expectEqualStrings("18000000", disp.value.holdNanoUsd);
+    // Hold ids start in a per-boot range, never at 1.
+    try std.testing.expect(disp.value.holdId > (1 << 20));
+
+    // A report whose hold id names another key's live hold (a stale pre-restart id) is refused and
+    // leaves the hold in place.
+    const foreign = try std.fmt.allocPrint(arena, "{{\"holdId\":{d},\"apiKeyId\":\"key_other\",\"upstreamStatus\":200,\"inputTokens\":100}}", .{disp.value.holdId});
+    const refused = try engine.settleTurnJson(arena, foreign);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "\"ok\":false") != null);
+
+    const settle = try std.fmt.allocPrint(arena, "{{\"holdId\":{d},\"apiKeyId\":\"key_1\",\"upstreamStatus\":200,\"inputTokens\":100,\"outputTokens\":50}}", .{disp.value.holdId});
+    const ack = try engine.settleTurnJson(arena, settle);
+    // (100 x $10 + 50 x $40) / 1M x 2 = $0.006
+    try std.testing.expect(std.mem.indexOf(u8, ack, "\"settledCostNanoUsd\":\"6000000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ack, "\"balanceAfterNanoUsd\":\"994000000\"") != null);
+
+    const rules = [_]PriceRule{
+        .{ .pattern = "claude-*", .input_per_mtok = 1, .output_per_mtok = 1, .cache_read_per_mtok = 1, .cache_write_per_mtok = 1 },
+        .{ .pattern = "claude-opus-*", .input_per_mtok = 2, .output_per_mtok = 2, .cache_read_per_mtok = 2, .cache_write_per_mtok = 2 },
+        .{ .pattern = "claude-opus-5-5", .input_per_mtok = 3, .output_per_mtok = 3, .cache_read_per_mtok = 3, .cache_write_per_mtok = 3 },
+    };
+    try std.testing.expectEqualStrings("claude-opus-5-5", matchPriceRule(&rules, "claude-opus-5-5").?.pattern);
+    try std.testing.expectEqualStrings("claude-opus-*", matchPriceRule(&rules, "claude-opus-4").?.pattern);
+    try std.testing.expectEqualStrings("claude-*", matchPriceRule(&rules, "claude-sonnet-5-5").?.pattern);
+    try std.testing.expect(matchPriceRule(&rules, "gpt-4o") == null);
 }
 
 test "subscription tier weights schedule Claude ultra(20x)/max(5x) and Codex pro_25x/pro_10x/pro_5x" {

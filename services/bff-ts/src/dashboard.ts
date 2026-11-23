@@ -62,7 +62,7 @@ export function dashboardWindow(range: DashboardRange, nowMs: number, tzOffsetMi
   };
 }
 
-class TotalsAccumulator {
+export class TotalsAccumulator {
   requests = 0;
   errors = 0;
   inputTokens = 0;
@@ -105,13 +105,13 @@ class TotalsAccumulator {
   }
 }
 
-interface Breakdown {
+export interface Breakdown {
   requests: number;
   tokens: number;
   cost: bigint;
 }
 
-function bump(map: Map<string, Breakdown>, key: string, log: UsageLogItem) {
+export function bump(map: Map<string, Breakdown>, key: string, log: UsageLogItem) {
   const entry = map.get(key) ?? { requests: 0, tokens: 0, cost: 0n };
   entry.requests += 1;
   entry.tokens += log.inputTokens + log.outputTokens;
@@ -119,7 +119,7 @@ function bump(map: Map<string, Breakdown>, key: string, log: UsageLogItem) {
   map.set(key, entry);
 }
 
-function ranked(map: Map<string, Breakdown>, limit = BREAKDOWN_LIMIT) {
+export function ranked(map: Map<string, Breakdown>, limit = BREAKDOWN_LIMIT) {
   return Array.from(map.entries())
     .sort(([, a], [, b]) => b.tokens - a.tokens || b.requests - a.requests)
     .slice(0, limit)

@@ -58,6 +58,16 @@ type Supervisor struct {
 	rootCtx     context.Context
 	children    []*managedChild
 	order       []int
+	// lineHook also receives every child output line (system-log forwarding); nil when unset.
+	lineHook func(child, line string)
+}
+
+// SetLineHook registers a function that receives each output line of every child started from
+// now on (after it is echoed to the logger). The hook must not block.
+func (s *Supervisor) SetLineHook(hook func(child, line string)) {
+	s.mu.Lock()
+	s.lineHook = hook
+	s.mu.Unlock()
 }
 
 // New initializes a supervisor with a target logger.
@@ -249,18 +259,22 @@ func (s *Supervisor) startChildLocked(ctx context.Context, idx int) error {
 	if !slices.Contains(s.order, idx) {
 		s.order = append(s.order, idx)
 	}
+	hook := s.lineHook
 	s.mu.Unlock()
 
 	var ioWG sync.WaitGroup
 	ioWG.Add(2)
-	go s.streamLogs(spec.Name, stdout, &ioWG)
-	go s.streamLogs(spec.Name, stderr, &ioWG)
+	go s.streamLogs(spec.Name, stdout, &ioWG, hook)
+	go s.streamLogs(spec.Name, stderr, &ioWG, hook)
 
 	go func(c *managedChild, procCmd *exec.Cmd, doneCh chan struct{}) {
 		ioWG.Wait()
 		waitErr := procCmd.Wait()
 
 		s.mu.Lock()
+		// An exit nobody asked for (no Stop/Restart, children's context still live) is logged, so
+		// a crashed or failed child leaves a system-log entry (forwarded once the BFF is up).
+		unexpected := c.done == doneCh && c.status != StatusStopped && !errors.Is(ctx.Err(), context.Canceled)
 		if c.done == doneCh {
 			if waitErr != nil && !errors.Is(ctx.Err(), context.Canceled) && c.status != StatusStopped {
 				c.status = StatusDegraded
@@ -270,6 +284,13 @@ func (s *Supervisor) startChildLocked(ctx context.Context, idx int) error {
 			}
 		}
 		s.mu.Unlock()
+		if unexpected {
+			if waitErr != nil {
+				s.logger.Printf("[supervisor] error: child %s (pid=%d) exited unexpectedly: %v", spec.Name, procCmd.Process.Pid, waitErr)
+			} else {
+				s.logger.Printf("[supervisor] warning: child %s (pid=%d) exited unexpectedly with status 0", spec.Name, procCmd.Process.Pid)
+			}
+		}
 		close(doneCh)
 	}(child, cmd, done)
 
@@ -277,13 +298,17 @@ func (s *Supervisor) startChildLocked(ctx context.Context, idx int) error {
 	return nil
 }
 
-func (s *Supervisor) streamLogs(name string, r io.Reader, wg *sync.WaitGroup) {
+func (s *Supervisor) streamLogs(name string, r io.Reader, wg *sync.WaitGroup, hook func(child, line string)) {
 	defer wg.Done()
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 	for scanner.Scan() {
-		s.logger.Printf("[%s] %s", name, scanner.Text())
+		line := scanner.Text()
+		s.logger.Printf("[%s] %s", name, line)
+		if hook != nil {
+			hook(name, line)
+		}
 	}
 }
 

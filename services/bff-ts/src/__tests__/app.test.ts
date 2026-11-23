@@ -477,8 +477,10 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
     expect(snap.apiKeys.some((k) => k.id === apiKey.id && k.keyHashHex.length === 64)).toBe(true);
     expect(snap.routes.some((r) => r.id === route.id)).toBe(true);
 
-    // Post turn settlement (210,000 nano-USD = $0.00021) twice to verify idempotency
+    // Post turn settlement (210,000 nano-USD = $0.00021) twice to verify idempotency: the edge
+    // redelivers with the same server-minted settlementId.
     const settlePayload = {
+      settlementId: "stl_test_settle_001",
       requestId: "req_test_settle_001",
       userId: user.id,
       apiKeyId: apiKey.id,

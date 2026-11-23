@@ -1,5 +1,9 @@
 import { PluginRegistry } from "@slipgate/plugin-sdk";
 import { createBffApp } from "./app.ts";
+import { stopAuditRetentionSweepers } from "./audit_retention.ts";
+import { installCrashLogging } from "./logging/crash.ts";
+import { installConsoleCapture } from "./logging/logger.ts";
+import { stopSystemLogServices } from "./logging/service.ts";
 import { MemoryControlStore } from "./store/memory_store.ts";
 import { PostgresControlStore } from "./store/postgres_store.ts";
 import { allowInsecureSecrets, secretProblems } from "./security/secrets.ts";
@@ -11,6 +15,12 @@ if (process.argv.includes("--version")) {
   console.log(`slipgate-bff ${VERSION}`);
   process.exit(0);
 }
+
+// console.warn / console.error everywhere also become persisted system-log entries (once the app's
+// system-log service is registered as the default destination by createBffApp below).
+installConsoleCapture();
+// A crash is stored as an error entry (queued entries written first), then the process exits 1.
+installCrashLogging(() => stopSystemLogServices());
 
 const weakSecrets = secretProblems(process.env);
 if (weakSecrets.length > 0) {
@@ -57,7 +67,7 @@ await registry.initAll({
 });
 
 const { hostname, port } = resolveBindAddress();
-const app = createBffApp({ store, registry });
+const app = createBffApp({ store, registry, startSchedulers: true });
 
 const server = Bun.serve({
   hostname,
@@ -69,6 +79,9 @@ console.log(`slipgate-bff ${VERSION} listening on http://${server.hostname}:${se
 
 const shutdown = async () => {
   server.stop(true);
+  stopAuditRetentionSweepers();
+  // Writes the entries still queued before the pool closes.
+  await stopSystemLogServices().catch(() => undefined);
   await store.close();
   process.exit(0);
 };

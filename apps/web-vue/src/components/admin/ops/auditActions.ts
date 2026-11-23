@@ -1,0 +1,96 @@
+/**
+ * "METHOD /route/pattern" → key under `audit.actions.*`. Routes not listed here fall back to
+ * the raw pattern in the UI, so new admin endpoints still show up (just without a name).
+ */
+const A = "/api/v1/admin";
+
+export const AUDIT_ACTION_KEYS: Record<string, string> = {
+  [`POST ${A}/users`]: "userCreate",
+  [`PATCH ${A}/users/:userId`]: "userUpdate",
+  [`DELETE ${A}/users/:userId`]: "userDelete",
+  [`POST ${A}/users/:userId/balance`]: "userBalance",
+  [`POST ${A}/users/:userId/credit`]: "userCredit",
+  [`POST ${A}/users/batch-status`]: "userBatchStatus",
+  [`POST ${A}/users/batch-limits`]: "userBatchLimits",
+  [`POST ${A}/users/batch-concurrency`]: "userBatchConcurrency",
+  [`POST ${A}/users/batch-delete`]: "userBatchDelete",
+  [`PUT ${A}/users/:userId/group-rates`]: "userGroupRates",
+  [`POST ${A}/users/:userId/replace-group`]: "userReplaceGroup",
+  [`PATCH ${A}/api-keys/:keyId`]: "apiKeyAdminUpdate",
+  [`PUT ${A}/groups/:groupId/rate-multipliers`]: "groupRateMultipliers",
+  [`DELETE ${A}/groups/:groupId/rate-multipliers`]: "groupRateMultipliersClear",
+  [`PUT ${A}/groups/:groupId/rpm-overrides`]: "groupRpmOverrides",
+  [`DELETE ${A}/groups/:groupId/rpm-overrides`]: "groupRpmOverridesClear",
+
+  [`POST ${A}/groups`]: "groupCreate",
+  [`PATCH ${A}/groups/:groupId`]: "groupUpdate",
+  [`DELETE ${A}/groups/:groupId`]: "groupDelete",
+  [`POST ${A}/groups/:groupId/duplicate`]: "groupDuplicate",
+
+  [`POST ${A}/accounts`]: "accountCreate",
+  [`PATCH ${A}/accounts/:accountId`]: "accountUpdate",
+  [`DELETE ${A}/accounts/:accountId`]: "accountDelete",
+  [`POST ${A}/accounts/:accountId/test`]: "accountTest",
+  [`POST ${A}/accounts/batch-delete`]: "accountBatchDelete",
+  [`POST ${A}/accounts/bulk-update`]: "accountBulkUpdate",
+  [`POST ${A}/accounts/export`]: "accountExport",
+  [`POST ${A}/accounts/import`]: "accountImport",
+
+  [`POST ${A}/routes`]: "routeCreate",
+  [`DELETE ${A}/routes/:routeId`]: "routeDelete",
+  [`POST ${A}/routes/preview`]: "routePreview",
+
+  [`POST ${A}/redeem-codes/generate`]: "redeemGenerate",
+  [`POST ${A}/redeem-codes/batch`]: "redeemBatch",
+
+  [`POST ${A}/promo-codes`]: "promoCreate",
+  [`PATCH ${A}/promo-codes/:id`]: "promoUpdate",
+  [`DELETE ${A}/promo-codes/:id`]: "promoDelete",
+
+  [`POST ${A}/announcements`]: "announcementCreate",
+  [`PUT ${A}/announcements/:id`]: "announcementUpdate",
+  [`DELETE ${A}/announcements/:id`]: "announcementDelete",
+
+  [`POST ${A}/audit-logs/clear`]: "auditClear",
+  [`PUT ${A}/audit-logs/retention`]: "auditRetentionUpdate",
+  [`POST ${A}/audit-logs/retention/run`]: "auditRetentionRun",
+
+  [`POST ${A}/subscriptions/assign`]: "subscriptionAssign",
+  [`POST ${A}/subscriptions/bulk`]: "subscriptionBulk",
+  [`PATCH ${A}/subscriptions/:id`]: "subscriptionUpdate",
+  [`DELETE ${A}/subscriptions/:id`]: "subscriptionDelete",
+
+  [`PATCH ${A}/settings`]: "settingsUpdate",
+
+  [`POST ${A}/clash/bindings`]: "clashBindingCreate",
+  [`DELETE ${A}/clash/bindings/:accountId`]: "clashBindingDelete",
+  [`POST ${A}/clash/subscriptions`]: "clashSubscriptionCreate",
+  [`DELETE ${A}/clash/subscriptions/:id`]: "clashSubscriptionDelete",
+  [`POST ${A}/clash/subscriptions/:id/sync`]: "clashSubscriptionSync",
+  [`PATCH ${A}/clash/nodes/:id`]: "clashNodeUpdate",
+  [`POST ${A}/clash/nodes/probe`]: "clashNodeProbe",
+  [`POST ${A}/clash/nodes/:id/confirm-drift`]: "clashNodeConfirmDrift",
+  [`POST ${A}/clash/test-outbound`]: "clashTestOutbound",
+
+  [`POST ${A}/vms/nodes`]: "vmNodeCreate",
+  [`DELETE ${A}/vms/nodes/:id`]: "vmNodeDelete",
+  [`POST ${A}/vms/slots`]: "vmSlotCreate",
+  [`DELETE ${A}/vms/slots/:id`]: "vmSlotDelete",
+  [`POST ${A}/vms/slots/:id/start`]: "vmSlotStart",
+  [`POST ${A}/vms/slots/:id/stop`]: "vmSlotStop",
+  [`POST ${A}/vms/slots/:id/migrate`]: "vmSlotMigrate",
+  [`POST ${A}/vms/slots/:id/terminal-ticket`]: "vmSlotTerminal",
+  [`PATCH ${A}/vms/slots/:id/telemetry`]: "vmSlotTelemetry",
+  [`PUT ${A}/vms/:slotId/seed`]: "vmSeed",
+  [`PUT ${A}/vms/slots/:slotId/seed`]: "vmSeed",
+
+  [`POST ${A}/tls-profiles`]: "tlsCreate",
+  [`PUT ${A}/tls-profiles/:id`]: "tlsUpdate",
+  [`DELETE ${A}/tls-profiles/:id`]: "tlsDelete",
+
+  [`POST ${A}/system/update/sync`]: "systemUpdateSync",
+};
+
+export function auditActionKey(method: string, route: string): string | null {
+  return AUDIT_ACTION_KEYS[`${method.toUpperCase()} ${route}`] ?? null;
+}

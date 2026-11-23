@@ -40,9 +40,9 @@ function log(atIso: string, over: Partial<UsageLogItem> = {}): UsageLogItem {
 }
 
 const users: UserProfile[] = [
-  { id: "u1", email: "a@x.test", role: "admin", status: "active", totpEnabled: false, createdAtIso: "2026-01-01T00:00:00Z" },
+  { id: "u1", email: "a@x.test", username: "", role: "admin", status: "active", totpEnabled: false, createdAtIso: "2026-01-01T00:00:00Z" },
   // Created 2026-11-22 08:00 local -> counts as new today.
-  { id: "u2", email: "b@x.test", role: "user", status: "active", totpEnabled: false, createdAtIso: "2026-11-22T00:00:00Z" },
+  { id: "u2", email: "b@x.test", username: "", role: "user", status: "active", totpEnabled: false, createdAtIso: "2026-11-22T00:00:00Z" },
 ];
 
 const groups = [{ id: "g1", name: "main" }, { id: "g2", name: "vip" }] as GroupItem[];

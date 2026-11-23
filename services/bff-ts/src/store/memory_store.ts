@@ -1,6 +1,7 @@
 import {
   effectiveAccountStatus,
   formatNanoUsd,
+  parseUsdToNano,
   isSubscriptionTierAllowedForProvider,
   effectiveSubscriptionTier,
   subscriptionTierMultiplier,
@@ -29,11 +30,29 @@ import {
 } from "@slipgate/contracts";
 import { normalizeIso, resolveCooldownChange } from "./account_patch.ts";
 import {
+  memoryRegistrationConflict,
+  RegistrationGuardError,
+  type RegistrationConflict,
+  type RegistrationGuard,
+} from "./auth_guards_store.ts";
+import { applyMemoryWalletDelta, MemoryOpsStore, type MemoryLedgerEntry, type MemoryWallet } from "./memory_ops.ts";
+import { MemoryPaymentsStore } from "./memory_payments.ts";
+import { MemorySystemLogStore } from "./memory_system_logs.ts";
+import { MemoryDbBackupStore } from "./db_backups_memory.ts";
+import { MemoryUserLimitsStore } from "./memory_user_limits.ts";
+import type { OpsStore } from "./ops_types.ts";
+import type { PaymentsStore } from "./payments_types.ts";
+import {
+  SETTLEMENT_ID_RETENTION_DAYS,
+  settlementIdOf,
   StoreError,
   type AccountSecretRecord,
+  type ApiKeyBulkResult,
   type ControlStore,
   type StoredCredential,
   type StoredUserRecord,
+  type UserCredentialRecord,
+  type TurnSettlementResult,
   type UsageLogFilter,
 } from "./types.ts";
 
@@ -52,13 +71,28 @@ interface InternalAccount extends Omit<UpstreamAccount, "groupName" | "effective
   credentialFingerprint: string | null;
 }
 
-interface InternalApiKey extends Omit<ApiKeyItem, "groupName"> {
+type ComputedKeyFields =
+  | "groupName"
+  | "usage5hNanoUsd"
+  | "usage1dNanoUsd"
+  | "usage7dNanoUsd"
+  | "limitState";
+
+interface InternalApiKey extends Omit<ApiKeyItem, ComputedKeyFields> {
   keyHash: Uint8Array;
+  /** Rolling-window spend before this instant is ignored (key "reset windows"). */
+  usageResetAtIso: string | null;
 }
 
-interface InternalWallet {
-  balanceNano: bigint;
-  heldNano: bigint;
+const HOUR_MS = 3_600_000;
+
+type InternalWallet = MemoryWallet;
+
+/** USD cap typed by an admin ("0" = unlimited) → nano-USD digits. */
+function limitNano(usd: string | undefined, fallback = "0"): string {
+  if (usd === undefined) return fallback;
+  const nano = parseUsdToNano(usd);
+  return (nano > 0n ? nano : 0n).toString();
 }
 
 export class MemoryControlStore implements ControlStore {
@@ -75,9 +109,50 @@ export class MemoryControlStore implements ControlStore {
   private readonly accounts = new Map<string, InternalAccount>();
   private readonly apiKeys = new Map<string, InternalApiKey>();
   private readonly routes = new Map<string, StoredCompositeRoute>();
-  private readonly usageByRequestId = new Map<string, UsageLogItem>();
+  /** Settlement id -> the usage row it recorded (billing idempotency, see recordTurnSettlement). */
+  private readonly settlements = new Map<string, { usageId: string; createdAtIso: string }>();
   private readonly usageLogs: UsageLogItem[] = [];
   private readonly riskEvents: RiskBanEvent[] = [];
+  private readonly ledger: MemoryLedgerEntry[] = [];
+
+  private readonly walletState = { wallets: this.wallets, idempotencyKeys: this.idempotencyKeys, ledger: this.ledger };
+
+  readonly ops: OpsStore & Pick<MemoryOpsStore, "tokenVersionOf"> = new MemoryOpsStore({
+    getSetup: () => ({ ...this.setup }),
+    patchSetup: (patch) => {
+      this.setup = { ...this.setup, ...patch };
+    },
+    users: this.users,
+    wallets: this.wallets,
+    idempotencyKeys: this.idempotencyKeys,
+    ledger: this.ledger,
+    groups: this.groups,
+    apiKeys: this.apiKeys,
+    accounts: this.accounts,
+    usageLogs: this.usageLogs,
+  });
+
+  readonly systemLogs = new MemorySystemLogStore();
+  readonly dbBackups = new MemoryDbBackupStore();
+
+  readonly userLimits = new MemoryUserLimitsStore({
+    users: this.users,
+    groups: this.groups,
+    apiKeys: this.apiKeys,
+    usageLogs: this.usageLogs,
+    ops: () => this.ops,
+  });
+
+  readonly payments: PaymentsStore = new MemoryPaymentsStore(
+    {
+      users: this.users,
+      wallets: this.wallets,
+      idempotencyKeys: this.idempotencyKeys,
+      ledger: this.ledger,
+      groups: this.groups,
+    },
+    this.ops,
+  );
 
   async init(): Promise<void> {}
   async close(): Promise<void> {}
@@ -105,6 +180,7 @@ export class MemoryControlStore implements ControlStore {
     const admin: StoredUserRecord = {
       id: adminId,
       email: normalizedEmail,
+      username: "",
       passwordHash: adminPasswordHash,
       role: "admin",
       status: "active",
@@ -112,7 +188,7 @@ export class MemoryControlStore implements ControlStore {
       createdAtIso: now,
     };
     this.users.set(adminId, admin);
-    this.wallets.set(adminId, { balanceNano: 0n, heldNano: 0n });
+    this.wallets.set(adminId, { balanceNano: 0n, heldNano: 0n, spentNano: 0n });
 
     // Seed a default composite routing group so newly initialized users can immediately issue keys.
     const defaultGroupId = "grp_default";
@@ -128,6 +204,12 @@ export class MemoryControlStore implements ControlStore {
         isExclusive: false,
         sortOrder: 0,
         enabled: true,
+        dailyLimitNanoUsd: "0",
+        weeklyLimitNanoUsd: "0",
+        monthlyLimitNanoUsd: "0",
+        defaultValidityDays: 30,
+        rpmLimit: 0,
+        concurrencyLimit: 0,
         createdAtIso: now,
       });
     }
@@ -142,13 +224,16 @@ export class MemoryControlStore implements ControlStore {
     return profile;
   }
 
-  async registerUser(email: string, passwordHash: string): Promise<UserProfile> {
+  async registerUser(email: string, passwordHash: string, guard?: RegistrationGuard): Promise<UserProfile> {
     if (!this.setup.initialized) {
       throw new StoreError("conflict", "System setup has not completed yet");
     }
     if (!this.setup.allowRegistration) {
       throw new StoreError("forbidden", "Public user registration is disabled");
     }
+    // Checked and inserted with no await in between (one winner among concurrent variants).
+    const conflict = guard ? memoryRegistrationConflict(this.users.values(), email, guard) : null;
+    if (conflict) throw new RegistrationGuardError(conflict);
     const normalizedEmail = email.toLowerCase();
     for (const u of this.users.values()) {
       if (u.email.toLowerCase() === normalizedEmail) {
@@ -160,6 +245,7 @@ export class MemoryControlStore implements ControlStore {
     const user: StoredUserRecord = {
       id: userId,
       email: normalizedEmail,
+      username: "",
       passwordHash,
       role: "user",
       status: "active",
@@ -167,19 +253,24 @@ export class MemoryControlStore implements ControlStore {
       createdAtIso: new Date().toISOString(),
     };
     this.users.set(userId, user);
-    this.wallets.set(userId, { balanceNano: 0n, heldNano: 0n });
+    this.wallets.set(userId, { balanceNano: 0n, heldNano: 0n, spentNano: 0n });
     const { passwordHash: _, ...profile } = user;
     return profile;
   }
 
-  async findUserByEmail(email: string): Promise<StoredUserRecord | null> {
+  async findUserByEmail(email: string): Promise<UserCredentialRecord | null> {
     const normalized = email.toLowerCase();
     for (const u of this.users.values()) {
       if (u.email.toLowerCase() === normalized) {
-        return { ...u };
+        // Hash and token version in the same synchronous step (one consistent read).
+        return { ...u, tokenVersion: this.ops.tokenVersionOf(u.id) };
       }
     }
     return null;
+  }
+
+  async registrationEmailConflict(email: string, guard: RegistrationGuard): Promise<RegistrationConflict | null> {
+    return memoryRegistrationConflict(this.users.values(), email, guard);
   }
 
   async getUserById(userId: string): Promise<UserProfile | null> {
@@ -197,7 +288,7 @@ export class MemoryControlStore implements ControlStore {
     if (!this.users.has(userId)) {
       throw new StoreError("not_found", `User ${userId} not found`);
     }
-    const w = this.wallets.get(userId) ?? { balanceNano: 0n, heldNano: 0n };
+    const w = this.wallets.get(userId) ?? { balanceNano: 0n, heldNano: 0n, spentNano: 0n };
     const available = w.balanceNano - w.heldNano;
     return {
       userId,
@@ -220,12 +311,7 @@ export class MemoryControlStore implements ControlStore {
     if (!this.users.has(userId)) {
       throw new StoreError("not_found", `User ${userId} not found`);
     }
-    if (!this.idempotencyKeys.has(idempotencyKey)) {
-      this.idempotencyKeys.add(idempotencyKey);
-      const w = this.wallets.get(userId) ?? { balanceNano: 0n, heldNano: 0n };
-      w.balanceNano += amountNanoUsd;
-      this.wallets.set(userId, w);
-    }
+    applyMemoryWalletDelta(this.walletState, userId, amountNanoUsd, idempotencyKey, "credit", _reason);
     return this.getWallet(userId);
   }
 
@@ -273,6 +359,12 @@ export class MemoryControlStore implements ControlStore {
       isExclusive: req.isExclusive,
       sortOrder: req.sortOrder,
       enabled: req.enabled,
+      dailyLimitNanoUsd: limitNano(req.dailyLimitUsd),
+      weeklyLimitNanoUsd: limitNano(req.weeklyLimitUsd),
+      monthlyLimitNanoUsd: limitNano(req.monthlyLimitUsd),
+      defaultValidityDays: req.defaultValidityDays,
+      rpmLimit: req.rpmLimit,
+      concurrencyLimit: req.concurrencyLimit,
       createdAtIso: new Date().toISOString(),
     };
     this.groups.set(id, item);
@@ -295,6 +387,12 @@ export class MemoryControlStore implements ControlStore {
     if (req.isExclusive !== undefined) existing.isExclusive = req.isExclusive;
     if (req.sortOrder !== undefined) existing.sortOrder = req.sortOrder;
     if (req.enabled !== undefined) existing.enabled = req.enabled;
+    existing.dailyLimitNanoUsd = limitNano(req.dailyLimitUsd, existing.dailyLimitNanoUsd);
+    existing.weeklyLimitNanoUsd = limitNano(req.weeklyLimitUsd, existing.weeklyLimitNanoUsd);
+    existing.monthlyLimitNanoUsd = limitNano(req.monthlyLimitUsd, existing.monthlyLimitNanoUsd);
+    if (req.defaultValidityDays !== undefined) existing.defaultValidityDays = req.defaultValidityDays;
+    if (req.rpmLimit !== undefined) existing.rpmLimit = req.rpmLimit;
+    if (req.concurrencyLimit !== undefined) existing.concurrencyLimit = req.concurrencyLimit;
     return this.withGroupCounts(existing);
   }
 
@@ -339,6 +437,12 @@ export class MemoryControlStore implements ControlStore {
       isExclusive: source.isExclusive,
       sortOrder: source.sortOrder,
       enabled: false,
+      dailyLimitUsd: formatNanoUsd(BigInt(source.dailyLimitNanoUsd)),
+      weeklyLimitUsd: formatNanoUsd(BigInt(source.weeklyLimitNanoUsd)),
+      monthlyLimitUsd: formatNanoUsd(BigInt(source.monthlyLimitNanoUsd)),
+      defaultValidityDays: source.defaultValidityDays,
+      rpmLimit: source.rpmLimit,
+      concurrencyLimit: source.concurrencyLimit,
     });
   }
 
@@ -516,17 +620,59 @@ export class MemoryControlStore implements ControlStore {
     }));
   }
 
-  async listUserApiKeys(userId: string): Promise<ApiKeyItem[]> {
-    const out: ApiKeyItem[] = [];
-    for (const k of this.apiKeys.values()) {
-      if (k.userId !== userId) continue;
-      const { keyHash: _, ...rest } = k;
-      out.push({
-        ...rest,
-        groupName: this.groups.get(k.groupId)?.name ?? k.groupId,
-      });
+  /** Spend per rolling window for a key, honouring its window reset. */
+  private keyWindowSpend(k: InternalApiKey, nowMs = Date.now()) {
+    const floor = k.usageResetAtIso ? Date.parse(k.usageResetAtIso) : Number.NEGATIVE_INFINITY;
+    const since5h = Math.max(floor, nowMs - 5 * HOUR_MS);
+    const since1d = Math.max(floor, nowMs - 24 * HOUR_MS);
+    const since7d = Math.max(floor, nowMs - 168 * HOUR_MS);
+    let h5 = 0n;
+    let d1 = 0n;
+    let d7 = 0n;
+    for (const log of this.usageLogs) {
+      if (log.apiKeyId !== k.id) continue;
+      const t = Date.parse(log.createdAtIso);
+      // Spend at the reset instant itself belongs to the old window.
+      if (t < since7d || t <= floor) continue;
+      const cost = BigInt(log.costNanoUsd);
+      d7 += cost;
+      if (t >= since1d) d1 += cost;
+      if (t >= since5h) h5 += cost;
     }
-    return out;
+    return { h5, d1, d7 };
+  }
+
+  private keyLimitState(k: InternalApiKey, spend: { h5: bigint; d1: bigint; d7: bigint }): ApiKeyItem["limitState"] {
+    const quota = BigInt(k.quotaNanoUsd);
+    if (quota > 0n && BigInt(k.spentNanoUsd) >= quota) return "quota_exhausted";
+    const over = (limit: string, used: bigint) => BigInt(limit) > 0n && used >= BigInt(limit);
+    if (over(k.limit5hNanoUsd, spend.h5) || over(k.limit1dNanoUsd, spend.d1) || over(k.limit7dNanoUsd, spend.d7)) {
+      return "window_exhausted";
+    }
+    return "ok";
+  }
+
+  private toKeyItem(k: InternalApiKey, nowMs = Date.now()): ApiKeyItem {
+    const { keyHash: _h, usageResetAtIso: _r, ...rest } = k;
+    const spend = this.keyWindowSpend(k, nowMs);
+    return {
+      ...rest,
+      ipAllowlist: [...k.ipAllowlist],
+      ipDenylist: [...k.ipDenylist],
+      groupName: this.groups.get(k.groupId)?.name ?? k.groupId,
+      usage5hNanoUsd: spend.h5.toString(),
+      usage1dNanoUsd: spend.d1.toString(),
+      usage7dNanoUsd: spend.d7.toString(),
+      limitState: this.keyLimitState(k, spend),
+    };
+  }
+
+  async listUserApiKeys(userId: string): Promise<ApiKeyItem[]> {
+    const nowMs = Date.now();
+    return Array.from(this.apiKeys.values())
+      .filter((k) => k.userId === userId)
+      .sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso))
+      .map((k) => this.toKeyItem(k, nowMs));
   }
 
   async createApiKey(
@@ -539,6 +685,10 @@ export class MemoryControlStore implements ControlStore {
     if (!group || !group.enabled) {
       throw new StoreError("bad_request", `Group ${req.groupId} is unavailable`);
     }
+    const hex = bytesToHex(keyHash);
+    for (const k of this.apiKeys.values()) {
+      if (bytesToHex(k.keyHash) === hex) throw new StoreError("conflict", "That key is already in use");
+    }
     const id = `key_${crypto.randomUUID()}`;
     const record: InternalApiKey = {
       id,
@@ -550,13 +700,20 @@ export class MemoryControlStore implements ControlStore {
       rpmLimit: req.rpmLimit,
       concurrencyLimit: req.concurrencyLimit,
       ipAllowlist: [...req.ipAllowlist],
+      ipDenylist: [...req.ipDenylist],
       enabled: true,
       expiresAtIso: req.expiresAtIso,
       createdAtIso: new Date().toISOString(),
+      quotaNanoUsd: limitNano(req.quotaUsd),
+      spentNanoUsd: "0",
+      limit5hNanoUsd: limitNano(req.limit5hUsd),
+      limit1dNanoUsd: limitNano(req.limit1dUsd),
+      limit7dNanoUsd: limitNano(req.limit7dUsd),
+      lastUsedAtIso: null,
+      usageResetAtIso: null,
     };
     this.apiKeys.set(id, record);
-    const { keyHash: _, ...rest } = record;
-    return { ...rest, groupName: group.name };
+    return this.toKeyItem(record);
   }
 
   async updateUserApiKey(
@@ -568,15 +725,60 @@ export class MemoryControlStore implements ControlStore {
     if (!existing || existing.userId !== userId) {
       throw new StoreError("not_found", `API key ${keyId} not found`);
     }
+    if (req.groupId !== undefined && req.groupId !== existing.groupId) {
+      const group = this.groups.get(req.groupId);
+      if (!group || !group.enabled) throw new StoreError("bad_request", `Group ${req.groupId} is unavailable`);
+      existing.groupId = req.groupId;
+    }
     if (req.name !== undefined) existing.name = req.name;
     if (req.rpmLimit !== undefined) existing.rpmLimit = req.rpmLimit;
     if (req.concurrencyLimit !== undefined) existing.concurrencyLimit = req.concurrencyLimit;
     if (req.enabled !== undefined) existing.enabled = req.enabled;
-    const { keyHash: _, ...rest } = existing;
-    return {
-      ...rest,
-      groupName: this.groups.get(existing.groupId)?.name ?? existing.groupId,
-    };
+    if (req.ipAllowlist !== undefined) existing.ipAllowlist = [...req.ipAllowlist];
+    if (req.ipDenylist !== undefined) existing.ipDenylist = [...req.ipDenylist];
+    if (req.expiresAtIso !== undefined) existing.expiresAtIso = req.expiresAtIso;
+    existing.quotaNanoUsd = limitNano(req.quotaUsd, existing.quotaNanoUsd);
+    existing.limit5hNanoUsd = limitNano(req.limit5hUsd, existing.limit5hNanoUsd);
+    existing.limit1dNanoUsd = limitNano(req.limit1dUsd, existing.limit1dNanoUsd);
+    existing.limit7dNanoUsd = limitNano(req.limit7dUsd, existing.limit7dNanoUsd);
+    if (req.resetQuota) existing.spentNanoUsd = "0";
+    if (req.resetWindows) existing.usageResetAtIso = new Date().toISOString();
+    return this.toKeyItem(existing);
+  }
+
+  async updateUserApiKeys(userId: string, keyIds: string[], req: UpdateApiKeyRequest): Promise<ApiKeyBulkResult> {
+    const result: ApiKeyBulkResult = { items: [], failed: [] };
+    for (const keyId of new Set(keyIds)) {
+      try {
+        result.items.push(await this.updateUserApiKey(userId, keyId, req));
+      } catch (err) {
+        if (!(err instanceof StoreError)) throw err;
+        result.failed.push({ keyId, error: err });
+      }
+    }
+    return result;
+  }
+
+  async listOverLimitKeyIds(): Promise<string[]> {
+    const nowMs = Date.now();
+    const out: string[] = [];
+    for (const k of this.apiKeys.values()) {
+      const limited =
+        k.quotaNanoUsd !== "0" || k.limit5hNanoUsd !== "0" || k.limit1dNanoUsd !== "0" || k.limit7dNanoUsd !== "0";
+      if (limited && this.keyLimitState(k, this.keyWindowSpend(k, nowMs)) !== "ok") out.push(k.id);
+    }
+    return out;
+  }
+
+  async getApiKeyLimitState(keyId: string): Promise<ApiKeyItem["limitState"] | null> {
+    const k = this.apiKeys.get(keyId);
+    return k ? this.keyLimitState(k, this.keyWindowSpend(k)) : null;
+  }
+
+  async listLimitedKeyIds(): Promise<string[]> {
+    return Array.from(this.apiKeys.values())
+      .filter((k) => k.quotaNanoUsd !== "0" || k.limit5hNanoUsd !== "0" || k.limit1dNanoUsd !== "0" || k.limit7dNanoUsd !== "0")
+      .map((k) => k.id);
   }
 
   async deleteUserApiKey(userId: string, keyId: string): Promise<void> {
@@ -660,6 +862,7 @@ export class MemoryControlStore implements ControlStore {
         rpmLimit: k.rpmLimit,
         concurrencyLimit: k.concurrencyLimit,
         ipAllowlist: [...k.ipAllowlist],
+        ipDenylist: [...k.ipDenylist],
         enabled: k.enabled,
         expiresAtIso: k.expiresAtIso,
       })),
@@ -671,24 +874,38 @@ export class MemoryControlStore implements ControlStore {
     };
   }
 
-  async recordTurnSettlement(ev: TurnSettlementEvent): Promise<UsageLogItem> {
-    const existing = this.usageByRequestId.get(ev.requestId);
-    if (existing) {
-      return { ...existing };
+  async recordTurnSettlement(ev: TurnSettlementEvent): Promise<TurnSettlementResult> {
+    // The server-minted settlement id, never the caller's X-Request-Id, decides "already charged".
+    const settlementId = settlementIdOf(ev);
+    const costNano = BigInt(ev.costNanoUsd);
+    const prior = this.settlements.get(settlementId);
+    if (prior) {
+      return {
+        ...ev,
+        settlementId,
+        duplicate: true,
+        id: prior.usageId,
+        formattedCostUsd: formatNanoUsd(costNano),
+        createdAtIso: prior.createdAtIso,
+      };
     }
 
-    const costNano = BigInt(ev.costNanoUsd);
-    const idemKey = `settle:${ev.requestId}`;
-    if (!this.idempotencyKeys.has(idemKey)) {
-      this.idempotencyKeys.add(idemKey);
-      if (costNano > 0n) {
-        const w = this.wallets.get(ev.userId) ?? { balanceNano: 0n, heldNano: 0n };
-        w.balanceNano -= costNano;
-        this.wallets.set(ev.userId, w);
+    // Subscription-billed groups are paid for by the subscription: record the cost for its
+    // caps but leave the wallet alone (the data plane takes no hold for them either).
+    const billedToWallet = this.groups.get(ev.groupId)?.subscriptionType !== "subscription";
+    let walletBalanceAfterNanoUsd: string | undefined;
+    if (costNano > 0n && billedToWallet) {
+      if (applyMemoryWalletDelta(this.walletState, ev.userId, -costNano, `settle:${settlementId}`, "settle", ev.publicModel)) {
+        walletBalanceAfterNanoUsd = this.wallets.get(ev.userId)!.balanceNano.toString();
       }
     }
 
     const createdAtIso = new Date().toISOString();
+    const key = this.apiKeys.get(ev.apiKeyId);
+    if (key) {
+      if (costNano > 0n) key.spentNanoUsd = (BigInt(key.spentNanoUsd) + costNano).toString();
+      key.lastUsedAtIso = createdAtIso;
+    }
     const acc = this.accounts.get(ev.accountId);
     if (acc) {
       if (ev.window5hUsedBps > 0) acc.window5hUsedBps = ev.window5hUsedBps;
@@ -696,18 +913,37 @@ export class MemoryControlStore implements ControlStore {
       acc.lastUsedAtIso = createdAtIso;
     }
 
+    const { settlementId: _sid, coreSettled: _cs, ...usage } = ev;
     const item: UsageLogItem = {
-      ...ev,
+      ...usage,
       id: `usg_${crypto.randomUUID()}`,
       formattedCostUsd: formatNanoUsd(costNano),
       createdAtIso,
     };
-    this.usageByRequestId.set(ev.requestId, item);
+    this.rememberSettlement(settlementId, item.id, createdAtIso);
     this.usageLogs.unshift(item);
     if (this.usageLogs.length > 500) {
       this.usageLogs.length = 500;
     }
-    return { ...item };
+    return {
+      ...ev,
+      ...item,
+      settlementId,
+      duplicate: false,
+      ...(walletBalanceAfterNanoUsd !== undefined ? { walletBalanceAfterNanoUsd } : {}),
+    };
+  }
+
+  /** Same retention as core.settlement_ids: ids outlive the edge's retry horizon, then go. */
+  private rememberSettlement(settlementId: string, usageId: string, createdAtIso: string): void {
+    this.settlements.set(settlementId, { usageId, createdAtIso });
+    if (this.settlements.size % 1024 !== 0) return;
+    const cutoff = Date.now() - SETTLEMENT_ID_RETENTION_DAYS * 24 * HOUR_MS;
+    for (const [id, s] of this.settlements) {
+      // Map iteration follows insertion order, so the oldest come first.
+      if (Date.parse(s.createdAtIso) >= cutoff) break;
+      this.settlements.delete(id);
+    }
   }
 
   async listUsageLogs(filter?: UsageLogFilter): Promise<UsageLogItem[]> {

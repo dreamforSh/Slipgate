@@ -3,6 +3,7 @@ import {
   AccountAuthKindSchema,
   effectiveAccountStatus,
   formatNanoUsd,
+  parseUsdToNano,
   isSubscriptionTierAllowedForProvider,
   SubscriptionTierSchema,
   effectiveSubscriptionTier,
@@ -32,11 +33,36 @@ import {
 } from "@slipgate/contracts";
 import { normalizeIso, resolveCooldownChange } from "./account_patch.ts";
 import {
+  PG_AUTH_GUARDS_SCHEMA_SQL,
+  pgRegistrationConflict,
+  RegistrationGuardError,
+  type RegistrationConflict,
+  type RegistrationGuard,
+} from "./auth_guards_store.ts";
+import type { OpsStore } from "./ops_types.ts";
+import { ensureUsageIndexesInBackground, PG_OPS_SCHEMA_SQL, PG_SESSION_SCHEMA_SQL, PostgresOpsStore } from "./postgres_ops.ts";
+import { PG_ANNOUNCEMENT_TARGETING_SCHEMA_SQL } from "./postgres_announcements.ts";
+import { PG_PAYMENTS_SCHEMA_SQL, pendingAuditSecretScrub, PostgresPaymentsStore } from "./postgres_payments.ts";
+import { PG_PAYMENT_PROVIDERS_SCHEMA_SQL } from "./postgres_payment_providers.ts";
+import { PG_SYSTEM_LOGS_SCHEMA_SQL, PostgresSystemLogStore } from "./postgres_system_logs.ts";
+import { PG_DB_BACKUPS_SCHEMA_SQL, PostgresDbBackupStore } from "./db_backups_postgres.ts";
+import { PG_USER_LIMITS_SCHEMA_SQL, PostgresUserLimitsStore } from "./postgres_user_limits.ts";
+import {
+  PG_SETTLEMENT_SCHEMA_SQL,
+  pruneSettlementIds,
+  SETTLEMENT_PRUNE_BACKLOG_RETRY_MS,
+  SETTLEMENT_PRUNE_INTERVAL_MS,
+} from "./postgres_settlement.ts";
+import type { PaymentsStore } from "./payments_types.ts";
+import {
+  settlementIdOf,
   StoreError,
   type AccountSecretRecord,
+  type ApiKeyBulkResult,
   type ControlStore,
   type StoredCredential,
-  type StoredUserRecord,
+  type TurnSettlementResult,
+  type UserCredentialRecord,
   type UsageLogFilter,
 } from "./types.ts";
 
@@ -79,6 +105,16 @@ function mapPgError(err: unknown): never {
   throw err;
 }
 
+/** USD cap typed by an admin ("0" = unlimited) → nano-USD digits. */
+function limitNano(usd: string): string {
+  const nano = parseUsdToNano(usd);
+  return (nano > 0n ? nano : 0n).toString();
+}
+
+function optionalLimitNano(usd: string | undefined): string | null {
+  return usd === undefined ? null : limitNano(usd);
+}
+
 function toIso(val: Date | string | null | undefined): string {
   if (!val) return new Date().toISOString();
   return val instanceof Date ? val.toISOString() : new Date(val).toISOString();
@@ -86,6 +122,15 @@ function toIso(val: Date | string | null | undefined): string {
 
 export class PostgresControlStore implements ControlStore {
   private readonly sql: SqlExecutor;
+  readonly ops: OpsStore;
+  readonly payments: PaymentsStore;
+  readonly systemLogs: PostgresSystemLogStore;
+  readonly dbBackups: PostgresDbBackupStore;
+  readonly userLimits: PostgresUserLimitsStore;
+  private backgroundMaintenance: Promise<void> = Promise.resolve();
+  /** Earliest time of the next opportunistic core.settlement_ids prune (off the settlement tx). */
+  private settlementPruneAt = 0;
+  private settlementPruneRunning = false;
 
   constructor(databaseUrl: string) {
     this.sql = postgres(databaseUrl, {
@@ -93,6 +138,11 @@ export class PostgresControlStore implements ControlStore {
       idle_timeout: 20,
       onnotice: () => {},
     });
+    this.ops = new PostgresOpsStore(this.sql);
+    this.payments = new PostgresPaymentsStore(this.sql);
+    this.systemLogs = new PostgresSystemLogStore(this.sql);
+    this.dbBackups = new PostgresDbBackupStore(this.sql, databaseUrl);
+    this.userLimits = new PostgresUserLimitsStore(this.sql);
   }
 
   async init(): Promise<void> {
@@ -156,6 +206,26 @@ export class PostgresControlStore implements ControlStore {
       ALTER TABLE core.api_keys
           ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT 'default';
     `);
+    // Before PG_OPS_SCHEMA_SQL: its spent_nano_usd guard must see whether this start adds the column.
+    await this.sql.unsafe(PG_SETTLEMENT_SCHEMA_SQL);
+    await this.sql.unsafe(PG_OPS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_ANNOUNCEMENT_TARGETING_SCHEMA_SQL);
+    await this.sql.unsafe(PG_SESSION_SCHEMA_SQL);
+    await this.sql.unsafe(PG_PAYMENTS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_PAYMENT_PROVIDERS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_SYSTEM_LOGS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_AUTH_GUARDS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_DB_BACKUPS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_USER_LIMITS_SCHEMA_SQL);
+    // Index builds and the one-time spend backfill must not delay startup or block settlements.
+    // So is the one-off pass of the current audit-log redaction over rows older builds stored.
+    const auditScrub = await pendingAuditSecretScrub(this.sql);
+    this.backgroundMaintenance = ensureUsageIndexesInBackground(this.sql).finally(() => auditScrub?.());
+  }
+
+  /** Resolves once the startup index maintenance and spend backfill have finished (tests, tooling). */
+  whenMaintenanceIdle(): Promise<void> {
+    return this.backgroundMaintenance;
   }
 
   async close(): Promise<void> {
@@ -206,6 +276,7 @@ export class PostgresControlStore implements ControlStore {
           {
             id: string;
             email: string;
+            username: string;
             role: "admin" | "user";
             status: "active" | "suspended";
             totp_enabled: boolean;
@@ -214,7 +285,7 @@ export class PostgresControlStore implements ControlStore {
         >`
           INSERT INTO commerce.users (id, email, password_hash, role, status)
           VALUES (${adminId}, ${email}, ${adminPasswordHash}, 'admin', 'active')
-          RETURNING id, email, role, status, totp_enabled, created_at
+          RETURNING id, email, username, role, status, totp_enabled, created_at
         `;
 
         await tx`
@@ -244,6 +315,7 @@ export class PostgresControlStore implements ControlStore {
         return {
           id: row.id,
           email: row.email,
+          username: row.username ?? "",
           role: row.role,
           status: row.status,
           totpEnabled: row.totp_enabled,
@@ -256,7 +328,7 @@ export class PostgresControlStore implements ControlStore {
     }
   }
 
-  async registerUser(email: string, passwordHash: string): Promise<UserProfile> {
+  async registerUser(email: string, passwordHash: string, guard?: RegistrationGuard): Promise<UserProfile> {
     const status = await this.getSetupStatus();
     if (!status.initialized) {
       throw new StoreError("conflict", "System setup has not completed yet");
@@ -268,11 +340,17 @@ export class PostgresControlStore implements ControlStore {
     try {
       return await this.sql.begin(async (txRaw) => {
         const tx = txRaw as unknown as SqlExecutor;
+        if (guard) {
+          // Under the inbox (and domain) advisory locks until commit: see auth_guards_store.ts.
+          const conflict = await pgRegistrationConflict(tx, email, guard, true);
+          if (conflict) throw new RegistrationGuardError(conflict);
+        }
         const userId = `usr_${crypto.randomUUID()}`;
         const rows = await tx<
           {
             id: string;
             email: string;
+            username: string;
             role: "admin" | "user";
             status: "active" | "suspended";
             totp_enabled: boolean;
@@ -281,7 +359,7 @@ export class PostgresControlStore implements ControlStore {
         >`
           INSERT INTO commerce.users (id, email, password_hash, role, status)
           VALUES (${userId}, ${email.toLowerCase()}, ${passwordHash}, 'user', 'active')
-          RETURNING id, email, role, status, totp_enabled, created_at
+          RETURNING id, email, username, role, status, totp_enabled, created_at
         `;
         await tx`
           INSERT INTO core.quota_wallets (user_id, balance_nano_usd, held_nano_usd)
@@ -292,6 +370,7 @@ export class PostgresControlStore implements ControlStore {
         return {
           id: row.id,
           email: row.email,
+          username: row.username ?? "",
           role: row.role,
           status: row.status,
           totpEnabled: row.totp_enabled,
@@ -304,19 +383,26 @@ export class PostgresControlStore implements ControlStore {
     }
   }
 
-  async findUserByEmail(email: string): Promise<StoredUserRecord | null> {
+  async registrationEmailConflict(email: string, guard: RegistrationGuard): Promise<RegistrationConflict | null> {
+    return pgRegistrationConflict(this.sql, email, guard, false);
+  }
+
+  async findUserByEmail(email: string): Promise<UserCredentialRecord | null> {
+    // password_hash and token_version come from one row read (one snapshot): see UserCredentialRecord.
     const rows = await this.sql<
       {
         id: string;
         email: string;
+        username: string;
         password_hash: string | null;
         role: "admin" | "user";
         status: "active" | "suspended";
         totp_enabled: boolean;
         created_at: Date;
+        token_version: number;
       }[]
     >`
-      SELECT id, email, password_hash, role, status, totp_enabled, created_at
+      SELECT id, email, username, password_hash, role, status, totp_enabled, created_at, token_version
       FROM commerce.users
       WHERE LOWER(email) = LOWER(${email})
       LIMIT 1
@@ -326,11 +412,13 @@ export class PostgresControlStore implements ControlStore {
     return {
       id: row.id,
       email: row.email,
+      username: row.username ?? "",
       passwordHash: row.password_hash,
       role: row.role,
       status: row.status,
       totpEnabled: row.totp_enabled,
       createdAtIso: toIso(row.created_at),
+      tokenVersion: Number(row.token_version),
     };
   }
 
@@ -339,13 +427,14 @@ export class PostgresControlStore implements ControlStore {
       {
         id: string;
         email: string;
+        username: string;
         role: "admin" | "user";
         status: "active" | "suspended";
         totp_enabled: boolean;
         created_at: Date;
       }[]
     >`
-      SELECT id, email, role, status, totp_enabled, created_at
+      SELECT id, email, username, role, status, totp_enabled, created_at
       FROM commerce.users
       WHERE id = ${userId}
       LIMIT 1
@@ -355,6 +444,7 @@ export class PostgresControlStore implements ControlStore {
     return {
       id: row.id,
       email: row.email,
+      username: row.username ?? "",
       role: row.role,
       status: row.status,
       totpEnabled: row.totp_enabled,
@@ -367,19 +457,21 @@ export class PostgresControlStore implements ControlStore {
       {
         id: string;
         email: string;
+        username: string;
         role: "admin" | "user";
         status: "active" | "suspended";
         totp_enabled: boolean;
         created_at: Date;
       }[]
     >`
-      SELECT id, email, role, status, totp_enabled, created_at
+      SELECT id, email, username, role, status, totp_enabled, created_at
       FROM commerce.users
       ORDER BY created_at DESC
     `;
     return rows.map((row) => ({
       id: row.id,
       email: row.email,
+      username: row.username ?? "",
       role: row.role,
       status: row.status,
       totpEnabled: row.totp_enabled,
@@ -504,6 +596,12 @@ export class PostgresControlStore implements ControlStore {
         account_count: string;
         active_account_count: string;
         api_key_count: string;
+        daily_limit_nano_usd: string;
+        weekly_limit_nano_usd: string;
+        monthly_limit_nano_usd: string;
+        default_validity_days: number;
+        rpm_limit: number | null;
+        concurrency_limit: number | null;
         created_at: Date;
       }[]
     >`
@@ -525,6 +623,12 @@ export class PostgresControlStore implements ControlStore {
             AND CASE WHEN a.temp_unsched_until IS NOT NULL THEN a.temp_unsched_until <= NOW() ELSE a.status = 'active' END
         )::text AS active_account_count,
         (SELECT COUNT(*) FROM core.api_keys k WHERE k.group_id = g.id)::text AS api_key_count,
+        g.daily_limit_nano_usd::text,
+        g.weekly_limit_nano_usd::text,
+        g.monthly_limit_nano_usd::text,
+        g.default_validity_days,
+        g.rpm_limit,
+        g.concurrency_limit,
         g.created_at
       FROM core.groups g
       LEFT JOIN core.accounts a ON a.group_id = g.id
@@ -547,6 +651,12 @@ export class PostgresControlStore implements ControlStore {
       accountCount: Number.parseInt(r.account_count, 10),
       activeAccountCount: Number.parseInt(r.active_account_count, 10),
       apiKeyCount: Number.parseInt(r.api_key_count, 10),
+      dailyLimitNanoUsd: r.daily_limit_nano_usd ?? "0",
+      weeklyLimitNanoUsd: r.weekly_limit_nano_usd ?? "0",
+      monthlyLimitNanoUsd: r.monthly_limit_nano_usd ?? "0",
+      defaultValidityDays: r.default_validity_days ?? 30,
+      rpmLimit: r.rpm_limit ?? 0,
+      concurrencyLimit: r.concurrency_limit ?? 0,
       createdAtIso: toIso(r.created_at),
     }));
   }
@@ -557,7 +667,9 @@ export class PostgresControlStore implements ControlStore {
       await this.sql`
         INSERT INTO core.groups (
           id, name, description, platform, subscription_type, rate_multiplier,
-          model_allowlist, is_exclusive, sort_order, enabled
+          model_allowlist, is_exclusive, sort_order, enabled,
+          daily_limit_nano_usd, weekly_limit_nano_usd, monthly_limit_nano_usd, default_validity_days,
+          rpm_limit, concurrency_limit
         )
         VALUES (
           ${id},
@@ -569,7 +681,13 @@ export class PostgresControlStore implements ControlStore {
           ${this.sql.json(req.modelAllowlist)},
           ${req.isExclusive},
           ${req.sortOrder},
-          ${req.enabled}
+          ${req.enabled},
+          ${limitNano(req.dailyLimitUsd)}::numeric,
+          ${limitNano(req.weeklyLimitUsd)}::numeric,
+          ${limitNano(req.monthlyLimitUsd)}::numeric,
+          ${req.defaultValidityDays},
+          ${req.rpmLimit},
+          ${req.concurrencyLimit}
         )
       `;
       const [created] = await this.queryGroups({ groupId: id });
@@ -596,6 +714,12 @@ export class PostgresControlStore implements ControlStore {
             is_exclusive = COALESCE(${req.isExclusive ?? null}, is_exclusive),
             sort_order = COALESCE(${req.sortOrder ?? null}, sort_order),
             enabled = COALESCE(${req.enabled ?? null}, enabled),
+            daily_limit_nano_usd = COALESCE(${optionalLimitNano(req.dailyLimitUsd)}::numeric, daily_limit_nano_usd),
+            weekly_limit_nano_usd = COALESCE(${optionalLimitNano(req.weeklyLimitUsd)}::numeric, weekly_limit_nano_usd),
+            monthly_limit_nano_usd = COALESCE(${optionalLimitNano(req.monthlyLimitUsd)}::numeric, monthly_limit_nano_usd),
+            default_validity_days = COALESCE(${req.defaultValidityDays ?? null}, default_validity_days),
+            rpm_limit = COALESCE(${req.rpmLimit ?? null}::int, rpm_limit),
+            concurrency_limit = COALESCE(${req.concurrencyLimit ?? null}::int, concurrency_limit),
             updated_at = NOW()
         WHERE id = ${groupId}
         RETURNING id
@@ -652,6 +776,12 @@ export class PostgresControlStore implements ControlStore {
       isExclusive: source.isExclusive,
       sortOrder: source.sortOrder,
       enabled: false,
+      dailyLimitUsd: formatNanoUsd(BigInt(source.dailyLimitNanoUsd)),
+      weeklyLimitUsd: formatNanoUsd(BigInt(source.weeklyLimitNanoUsd)),
+      monthlyLimitUsd: formatNanoUsd(BigInt(source.monthlyLimitNanoUsd)),
+      defaultValidityDays: source.defaultValidityDays,
+      rpmLimit: source.rpmLimit,
+      concurrencyLimit: source.concurrencyLimit,
     });
   }
 
@@ -989,6 +1119,11 @@ export class PostgresControlStore implements ControlStore {
   }
 
   async listUserApiKeys(userId: string): Promise<ApiKeyItem[]> {
+    return this.queryApiKeys(this.sql`k.user_id = ${userId}`);
+  }
+
+  /** Keys with their rolling-window spend (honouring each key's window reset). */
+  private async queryApiKeys(where: postgres.Fragment): Promise<ApiKeyItem[]> {
     const rows = await this.sql<
       {
         id: string;
@@ -1000,43 +1135,76 @@ export class PostgresControlStore implements ControlStore {
         rpm_limit: number;
         concurrency_limit: number;
         ip_allowlist: string[];
+        ip_denylist: string[];
         enabled: boolean;
         expires_at: Date | null;
         created_at: Date;
+        quota: string;
+        spent: string;
+        l5h: string;
+        l1d: string;
+        l7d: string;
+        u5h: string;
+        u1d: string;
+        u7d: string;
+        last_used_at: Date | null;
       }[]
     >`
       SELECT
-        k.id,
-        k.name,
-        k.user_id,
-        k.group_id,
-        g.name AS group_name,
-        k.key_prefix,
-        k.rpm_limit,
-        k.concurrency_limit,
-        k.ip_allowlist,
-        k.enabled,
-        k.expires_at,
-        k.created_at
+        k.id, k.name, k.user_id, k.group_id, g.name AS group_name, k.key_prefix, k.rpm_limit,
+        k.concurrency_limit, k.ip_allowlist, k.ip_denylist, k.enabled, k.expires_at, k.created_at,
+        k.quota_nano_usd::text AS quota, k.spent_nano_usd::text AS spent,
+        k.limit_5h_nano_usd::text AS l5h, k.limit_1d_nano_usd::text AS l1d, k.limit_7d_nano_usd::text AS l7d,
+        COALESCE(w.h5, 0)::text AS u5h, COALESCE(w.d1, 0)::text AS u1d, COALESCE(w.d7, 0)::text AS u7d,
+        k.last_used_at
       FROM core.api_keys k
       JOIN core.groups g ON g.id = k.group_id
-      WHERE k.user_id = ${userId}
+      LEFT JOIN LATERAL (
+        SELECT SUM(l.cost_nano_usd) FILTER (WHERE l.created_at >= GREATEST(NOW() - INTERVAL '5 hours', COALESCE(k.usage_reset_at, '-infinity'::timestamptz))) AS h5,
+               SUM(l.cost_nano_usd) FILTER (WHERE l.created_at >= GREATEST(NOW() - INTERVAL '1 day', COALESCE(k.usage_reset_at, '-infinity'::timestamptz))) AS d1,
+               SUM(l.cost_nano_usd) AS d7
+          FROM core.usage_logs l
+         WHERE l.api_key_id = k.id
+           AND l.created_at >= GREATEST(NOW() - INTERVAL '7 days', COALESCE(k.usage_reset_at, '-infinity'::timestamptz))
+           AND (k.usage_reset_at IS NULL OR l.created_at > k.usage_reset_at)
+      ) w ON TRUE
+      WHERE ${where}
       ORDER BY k.created_at DESC
     `;
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      userId: r.user_id,
-      groupId: r.group_id,
-      groupName: r.group_name,
-      keyPrefix: r.key_prefix,
-      rpmLimit: r.rpm_limit,
-      concurrencyLimit: r.concurrency_limit,
-      ipAllowlist: jsonArray(r.ip_allowlist),
-      enabled: r.enabled,
-      expiresAtIso: r.expires_at ? toIso(r.expires_at) : null,
-      createdAtIso: toIso(r.created_at),
-    }));
+    return rows.map((r) => {
+      const over = (limit: string, used: string) => BigInt(limit) > 0n && BigInt(used) >= BigInt(limit);
+      const limitState: ApiKeyItem["limitState"] =
+        BigInt(r.quota) > 0n && BigInt(r.spent) >= BigInt(r.quota)
+          ? "quota_exhausted"
+          : over(r.l5h, r.u5h) || over(r.l1d, r.u1d) || over(r.l7d, r.u7d)
+            ? "window_exhausted"
+            : "ok";
+      return {
+        id: r.id,
+        name: r.name,
+        userId: r.user_id,
+        groupId: r.group_id,
+        groupName: r.group_name,
+        keyPrefix: r.key_prefix,
+        rpmLimit: r.rpm_limit,
+        concurrencyLimit: r.concurrency_limit,
+        ipAllowlist: jsonArray(r.ip_allowlist),
+        ipDenylist: jsonArray(r.ip_denylist),
+        enabled: r.enabled,
+        expiresAtIso: r.expires_at ? toIso(r.expires_at) : null,
+        createdAtIso: toIso(r.created_at),
+        quotaNanoUsd: r.quota,
+        spentNanoUsd: r.spent,
+        limit5hNanoUsd: r.l5h,
+        limit1dNanoUsd: r.l1d,
+        limit7dNanoUsd: r.l7d,
+        usage5hNanoUsd: r.u5h,
+        usage1dNanoUsd: r.u1d,
+        usage7dNanoUsd: r.u7d,
+        lastUsedAtIso: r.last_used_at ? toIso(r.last_used_at) : null,
+        limitState,
+      };
+    });
   }
 
   async createApiKey(
@@ -1060,7 +1228,8 @@ export class PostgresControlStore implements ControlStore {
         await tx`
           INSERT INTO core.api_keys (
             id, name, user_id, group_id, key_prefix, key_hash_blake3,
-            rpm_limit, concurrency_limit, ip_allowlist, enabled, expires_at
+            rpm_limit, concurrency_limit, ip_allowlist, ip_denylist, enabled, expires_at,
+            quota_nano_usd, limit_5h_nano_usd, limit_1d_nano_usd, limit_7d_nano_usd
           )
           VALUES (
             ${id},
@@ -1072,17 +1241,23 @@ export class PostgresControlStore implements ControlStore {
             ${req.rpmLimit},
             ${req.concurrencyLimit},
             ${this.sql.json(req.ipAllowlist)},
+            ${this.sql.json(req.ipDenylist)},
             TRUE,
-            ${req.expiresAtIso ? new Date(req.expiresAtIso) : null}
+            ${req.expiresAtIso ? new Date(req.expiresAtIso) : null},
+            ${limitNano(req.quotaUsd ?? "0")}::numeric,
+            ${limitNano(req.limit5hUsd ?? "0")}::numeric,
+            ${limitNano(req.limit1dUsd ?? "0")}::numeric,
+            ${limitNano(req.limit7dUsd ?? "0")}::numeric
           )
         `;
       });
     } catch (err) {
       if (err instanceof StoreError) throw err;
+      if ((err as { code?: string })?.code === "23505") throw new StoreError("conflict", "That key is already in use");
       mapPgError(err);
     }
-    const keys = await this.listUserApiKeys(userId);
-    return keys.find((k) => k.id === id)!;
+    // Just the new key (its spend windows are empty anyway), not a listing of all the user's keys.
+    return (await this.queryApiKeys(this.sql`k.id = ${id}`))[0]!;
   }
 
   async updateUserApiKey(
@@ -1090,20 +1265,142 @@ export class PostgresControlStore implements ControlStore {
     keyId: string,
     req: UpdateApiKeyRequest,
   ): Promise<ApiKeyItem> {
-    const rows = await this.sql<{ id: string }[]>`
-      UPDATE core.api_keys
-      SET name = COALESCE(${req.name ?? null}, name),
-          rpm_limit = COALESCE(${req.rpmLimit ?? null}, rpm_limit),
-          concurrency_limit = COALESCE(${req.concurrencyLimit ?? null}, concurrency_limit),
-          enabled = COALESCE(${req.enabled ?? null}, enabled)
-      WHERE id = ${keyId} AND user_id = ${userId}
-      RETURNING id
-    `;
-    if (rows.length === 0) {
-      throw new StoreError("not_found", `API key ${keyId} not found`);
+    const { items, failed } = await this.updateUserApiKeys(userId, [keyId], req);
+    if (failed[0]) throw failed[0].error;
+    return items[0]!;
+  }
+
+  async updateUserApiKeys(userId: string, keyIds: string[], req: UpdateApiKeyRequest): Promise<ApiKeyBulkResult> {
+    const ids = [...new Set(keyIds)];
+    const result: ApiKeyBulkResult = { items: [], failed: [] };
+    if (ids.length === 0) return result;
+    const okIds: string[] = [];
+    await this.sql.begin(async (txRaw) => {
+      const tx = txRaw as unknown as SqlExecutor;
+      const owned = await tx<{ id: string; group_id: string }[]>`
+        SELECT id, group_id FROM core.api_keys WHERE user_id = ${userId} AND id = ANY(${ids}) FOR UPDATE
+      `;
+      // Same contract as MemoryControlStore: an unknown key is not_found first, and the target
+      // group must be enabled only when the key actually moves (repeating its current group,
+      // e.g. a bulk patch that carries it, stays valid after that group is disabled). FOR SHARE
+      // holds off a concurrent disable/delete of the target until commit, as createApiKey does.
+      let targetUsable = true;
+      if (req.groupId !== undefined) {
+        const target = await tx`SELECT 1 FROM core.groups WHERE id = ${req.groupId} AND enabled FOR SHARE`;
+        targetUsable = target.length > 0;
+      }
+      const groupOf = new Map(owned.map((r) => [r.id, r.group_id]));
+      for (const id of ids) {
+        const current = groupOf.get(id);
+        if (current === undefined) {
+          result.failed.push({ keyId: id, error: new StoreError("not_found", `API key ${id} not found`) });
+        } else if (req.groupId !== undefined && current !== req.groupId && !targetUsable) {
+          result.failed.push({ keyId: id, error: new StoreError("bad_request", `Group ${req.groupId} is unavailable`) });
+        } else {
+          okIds.push(id);
+        }
+      }
+      if (okIds.length === 0) return;
+      const allow = req.ipAllowlist ? this.sql.json(req.ipAllowlist) : null;
+      const deny = req.ipDenylist ? this.sql.json(req.ipDenylist) : null;
+      const expiresSent = req.expiresAtIso !== undefined;
+      await tx`
+        UPDATE core.api_keys
+        SET name = COALESCE(${req.name ?? null}, name),
+            group_id = COALESCE(${req.groupId ?? null}, group_id),
+            rpm_limit = COALESCE(${req.rpmLimit ?? null}, rpm_limit),
+            concurrency_limit = COALESCE(${req.concurrencyLimit ?? null}, concurrency_limit),
+            enabled = COALESCE(${req.enabled ?? null}, enabled),
+            ip_allowlist = COALESCE(${allow}::jsonb, ip_allowlist),
+            ip_denylist = COALESCE(${deny}::jsonb, ip_denylist),
+            expires_at = CASE WHEN ${expiresSent} THEN ${req.expiresAtIso ? new Date(req.expiresAtIso) : null}::timestamptz ELSE expires_at END,
+            quota_nano_usd = COALESCE(${optionalLimitNano(req.quotaUsd)}::numeric, quota_nano_usd),
+            limit_5h_nano_usd = COALESCE(${optionalLimitNano(req.limit5hUsd)}::numeric, limit_5h_nano_usd),
+            limit_1d_nano_usd = COALESCE(${optionalLimitNano(req.limit1dUsd)}::numeric, limit_1d_nano_usd),
+            limit_7d_nano_usd = COALESCE(${optionalLimitNano(req.limit7dUsd)}::numeric, limit_7d_nano_usd),
+            spent_nano_usd = CASE WHEN ${req.resetQuota === true} THEN 0 ELSE spent_nano_usd END,
+            usage_reset_at = CASE WHEN ${req.resetWindows === true} THEN NOW() ELSE usage_reset_at END
+        WHERE user_id = ${userId} AND id = ANY(${okIds})
+      `;
+    });
+    if (okIds.length > 0) {
+      // Spend windows for just the updated keys, once (not a listing of every key per key).
+      const byId = new Map((await this.queryApiKeys(this.sql`k.id = ANY(${okIds})`)).map((k) => [k.id, k]));
+      for (const id of okIds) {
+        const item = byId.get(id);
+        if (item) result.items.push(item);
+      }
     }
-    const keys = await this.listUserApiKeys(userId);
-    return keys.find((k) => k.id === keyId)!;
+    return result;
+  }
+
+  async listLimitedKeyIds(): Promise<string[]> {
+    const rows = await this.sql<{ id: string }[]>`
+      SELECT id FROM core.api_keys
+       WHERE quota_nano_usd > 0 OR limit_5h_nano_usd > 0 OR limit_1d_nano_usd > 0 OR limit_7d_nano_usd > 0
+    `;
+    return rows.map((r) => r.id);
+  }
+
+  async listOverLimitKeyIds(): Promise<string[]> {
+    const keys = await this.queryLimitStates(
+      this.sql`(k.quota_nano_usd > 0 OR k.limit_5h_nano_usd > 0 OR k.limit_1d_nano_usd > 0 OR k.limit_7d_nano_usd > 0)`,
+    );
+    return keys.filter((k) => k.limitState !== "ok").map((k) => k.id);
+  }
+
+  async getApiKeyLimitState(keyId: string): Promise<ApiKeyItem["limitState"] | null> {
+    const rows = await this.queryLimitStates(this.sql`k.id = ${keyId}`);
+    return rows[0]?.limitState ?? null;
+  }
+
+  /**
+   * Same verdict as queryApiKeys' limitState, at the cost of only the windows that matter: the
+   * usage scan is bounded by the widest window that has a cap (none for quota-only or exhausted
+   * keys: the bound is +infinity, an empty index range), and each sum is index-only on
+   * idx_core_usage_logs_key_time_cost.
+   */
+  private async queryLimitStates(where: postgres.Fragment): Promise<{ id: string; limitState: ApiKeyItem["limitState"] }[]> {
+    const rows = await this.sql<
+      { id: string; quota: string; spent: string; l5h: string; l1d: string; l7d: string; u5h: string; u1d: string; u7d: string }[]
+    >`
+      SELECT
+        k.id, k.quota_nano_usd::text AS quota, k.spent_nano_usd::text AS spent,
+        k.limit_5h_nano_usd::text AS l5h, k.limit_1d_nano_usd::text AS l1d, k.limit_7d_nano_usd::text AS l7d,
+        COALESCE(w.h5, 0)::text AS u5h, COALESCE(w.d1, 0)::text AS u1d, COALESCE(w.d7, 0)::text AS u7d
+      FROM core.api_keys k
+      LEFT JOIN LATERAL (
+        SELECT SUM(l.cost_nano_usd) FILTER (WHERE k.limit_5h_nano_usd > 0 AND l.created_at >= GREATEST(NOW() - INTERVAL '5 hours', COALESCE(k.usage_reset_at, '-infinity'::timestamptz))) AS h5,
+               SUM(l.cost_nano_usd) FILTER (WHERE k.limit_1d_nano_usd > 0 AND l.created_at >= GREATEST(NOW() - INTERVAL '1 day', COALESCE(k.usage_reset_at, '-infinity'::timestamptz))) AS d1,
+               SUM(l.cost_nano_usd) FILTER (WHERE k.limit_7d_nano_usd > 0) AS d7
+          FROM core.usage_logs l
+         WHERE l.api_key_id = k.id
+           AND l.created_at >= GREATEST(
+                 COALESCE(
+                   NOW() - CASE
+                     WHEN k.quota_nano_usd > 0 AND k.spent_nano_usd >= k.quota_nano_usd THEN NULL
+                     WHEN k.limit_7d_nano_usd > 0 THEN INTERVAL '7 days'
+                     WHEN k.limit_1d_nano_usd > 0 THEN INTERVAL '1 day'
+                     WHEN k.limit_5h_nano_usd > 0 THEN INTERVAL '5 hours'
+                   END,
+                   'infinity'::timestamptz
+                 ),
+                 COALESCE(k.usage_reset_at, '-infinity'::timestamptz)
+               )
+           AND (k.usage_reset_at IS NULL OR l.created_at > k.usage_reset_at)
+      ) w ON TRUE
+      WHERE ${where}
+    `;
+    return rows.map((r) => {
+      const over = (limit: string, used: string) => BigInt(limit) > 0n && BigInt(used) >= BigInt(limit);
+      const limitState: ApiKeyItem["limitState"] =
+        BigInt(r.quota) > 0n && BigInt(r.spent) >= BigInt(r.quota)
+          ? "quota_exhausted"
+          : over(r.l5h, r.u5h) || over(r.l1d, r.u1d) || over(r.l7d, r.u7d)
+            ? "window_exhausted"
+            : "ok";
+      return { id: r.id, limitState };
+    });
   }
 
   async deleteUserApiKey(userId: string, keyId: string): Promise<void> {
@@ -1258,6 +1555,7 @@ export class PostgresControlStore implements ControlStore {
           rpm_limit: number;
           concurrency_limit: number;
           ip_allowlist: string[];
+          ip_denylist: string[];
           enabled: boolean;
           expires_at: Date | null;
         }[]
@@ -1270,6 +1568,7 @@ export class PostgresControlStore implements ControlStore {
           rpm_limit,
           concurrency_limit,
           ip_allowlist,
+          ip_denylist,
           enabled,
           expires_at
         FROM core.api_keys
@@ -1336,6 +1635,7 @@ export class PostgresControlStore implements ControlStore {
         rpmLimit: k.rpm_limit,
         concurrencyLimit: k.concurrency_limit,
         ipAllowlist: jsonArray(k.ip_allowlist),
+        ipDenylist: jsonArray(k.ip_denylist),
         enabled: k.enabled,
         expiresAtIso: k.expires_at ? toIso(k.expires_at) : null,
       })),
@@ -1347,28 +1647,52 @@ export class PostgresControlStore implements ControlStore {
     };
   }
 
-  async recordTurnSettlement(ev: TurnSettlementEvent): Promise<UsageLogItem> {
+  async recordTurnSettlement(ev: TurnSettlementEvent): Promise<TurnSettlementResult> {
     const costNano = BigInt(ev.costNanoUsd);
-    const idemKey = `settle:${ev.requestId}`;
+    // The server-minted settlement id, never the caller's X-Request-Id, decides "already charged".
+    const settlementId = settlementIdOf(ev);
+    const idemKey = `settle:${settlementId}`;
+    const usageId = `usg_${crypto.randomUUID()}`;
+    let walletBalanceAfterNanoUsd: string | undefined;
 
-    return await this.sql.begin(async (txRaw) => {
+    const result = await this.sql.begin(async (txRaw): Promise<TurnSettlementResult> => {
       const tx = txRaw as unknown as SqlExecutor;
-      const existingRows = await tx<{ id: string; created_at: Date }[]>`
-        SELECT id, created_at
-        FROM core.usage_logs
-        WHERE request_id = ${ev.requestId}
-        LIMIT 1
+      // The primary key is the guarantee: a concurrent duplicate blocks on it until the first
+      // delivery commits (then conflicts) or rolls back (then proceeds). One index probe, no scan.
+      const claimed = await tx<{ settlement_id: string }[]>`
+        INSERT INTO core.settlement_ids (settlement_id, usage_id, usage_created_at)
+        VALUES (${settlementId}, ${usageId}, NOW())
+        ON CONFLICT (settlement_id) DO NOTHING
+        RETURNING settlement_id
       `;
-      if (existingRows.length > 0) {
+      if (claimed.length === 0) {
+        const prior = await tx<{ usage_id: string; usage_created_at: Date }[]>`
+          SELECT usage_id, usage_created_at FROM core.settlement_ids WHERE settlement_id = ${settlementId}
+        `;
         return {
           ...ev,
-          id: existingRows[0]!.id,
+          settlementId,
+          duplicate: true,
+          id: prior[0]?.usage_id ?? usageId,
           formattedCostUsd: formatNanoUsd(costNano),
-          createdAtIso: toIso(existingRows[0]!.created_at),
+          createdAtIso: toIso(prior[0]?.usage_created_at),
         };
       }
 
-      if (costNano > 0n) {
+      // Subscription-billed groups are paid for by the subscription: the cost still lands in
+      // usage_logs (it drives the caps) but the wallet is left alone, as the data plane does.
+      const groupRows = await tx<{ subscription_type: string }[]>`
+        SELECT subscription_type FROM core.groups WHERE id = ${ev.groupId} LIMIT 1
+      `;
+      const billedToWallet = groupRows[0]?.subscription_type !== "subscription";
+
+      await tx`
+        UPDATE core.api_keys
+           SET spent_nano_usd = spent_nano_usd + ${costNano.toString()}::numeric, last_used_at = NOW()
+         WHERE id = ${ev.apiKeyId}
+      `;
+
+      if (costNano > 0n && billedToWallet) {
         const existingLedger = await tx<{ id: string }[]>`
           SELECT id FROM core.ledger_entries WHERE idempotency_key = ${idemKey} LIMIT 1
         `;
@@ -1381,10 +1705,12 @@ export class PostgresControlStore implements ControlStore {
           const updatedWallet = await tx<{ balance_nano_usd: string }[]>`
             UPDATE core.quota_wallets
             SET balance_nano_usd = balance_nano_usd - ${costNano.toString()}::numeric,
+                spent_nano_usd = spent_nano_usd + ${costNano.toString()}::numeric,
                 updated_at = NOW()
             WHERE user_id = ${ev.userId}
             RETURNING balance_nano_usd::text
           `;
+          walletBalanceAfterNanoUsd = updatedWallet[0]!.balance_nano_usd;
           await tx`
             INSERT INTO core.ledger_entries (
               id, idempotency_key, user_id, entry_kind, delta_nano_usd,
@@ -1397,8 +1723,9 @@ export class PostgresControlStore implements ControlStore {
               'settle',
               ${(-costNano).toString()}::numeric,
               ${updatedWallet[0]!.balance_nano_usd}::numeric,
-              ${ev.requestId},
+              ${settlementId},
               ${this.sql.json({
+                requestId: ev.requestId,
                 accountId: ev.accountId,
                 publicModel: ev.publicModel,
                 upstreamModel: ev.upstreamModel,
@@ -1410,7 +1737,6 @@ export class PostgresControlStore implements ControlStore {
         }
       }
 
-      const usageId = `usg_${crypto.randomUUID()}`;
       const inserted = await tx<{ created_at: Date }[]>`
         INSERT INTO core.usage_logs (
           id, request_id, user_id, api_key_id, account_id, group_id,
@@ -1443,20 +1769,22 @@ export class PostgresControlStore implements ControlStore {
       `;
 
       const totalTokens = ev.inputTokens + ev.outputTokens;
+      // An account deleted while the turn was in flight must not fail the whole settlement (the
+      // foreign key would roll back the charge, and every redelivery would fail the same way).
       await tx`
         INSERT INTO core.account_window_quotas (
           account_id, window_5h_used_bps, window_7d_used_bps, lifetime_tokens, lifetime_cost_nano_usd,
           last_used_at, updated_at
         )
-        VALUES (
+        SELECT
           ${ev.accountId},
-          ${ev.window5hUsedBps},
-          ${ev.window7dUsedBps},
-          ${totalTokens},
+          ${ev.window5hUsedBps}::int,
+          ${ev.window7dUsedBps}::int,
+          ${totalTokens}::bigint,
           ${costNano.toString()}::numeric,
           NOW(),
           NOW()
-        )
+        WHERE EXISTS (SELECT 1 FROM core.accounts WHERE id = ${ev.accountId})
         ON CONFLICT (account_id) DO UPDATE SET
           window_5h_used_bps = CASE
             WHEN EXCLUDED.window_5h_used_bps > 0 THEN EXCLUDED.window_5h_used_bps
@@ -1474,11 +1802,38 @@ export class PostgresControlStore implements ControlStore {
 
       return {
         ...ev,
+        settlementId,
+        duplicate: false,
         id: usageId,
         formattedCostUsd: formatNanoUsd(costNano),
         createdAtIso: toIso(inserted[0]?.created_at),
+        ...(walletBalanceAfterNanoUsd !== undefined ? { walletBalanceAfterNanoUsd } : {}),
       };
     });
+    this.maybePruneSettlementIds();
+    return result;
+  }
+
+  /**
+   * Keeps core.settlement_ids bounded, outside any settlement tx: one prune at a time, every five
+   * minutes, each running until no expired id is left (or its time budget is spent, in which case
+   * the next one starts after 30 s). So deletes keep pace with inserts at any settlement rate.
+   */
+  private maybePruneSettlementIds(): void {
+    const now = Date.now();
+    if (this.settlementPruneRunning || now < this.settlementPruneAt) return;
+    this.settlementPruneRunning = true;
+    this.settlementPruneAt = now + SETTLEMENT_PRUNE_INTERVAL_MS;
+    void pruneSettlementIds(this.sql)
+      .then(({ backlog }) => {
+        if (backlog) this.settlementPruneAt = Date.now() + SETTLEMENT_PRUNE_BACKLOG_RETRY_MS;
+      })
+      .catch((err) => {
+        console.warn(`[slipgate-bff] settlement id prune skipped: ${err instanceof Error ? err.message : err}`);
+      })
+      .finally(() => {
+        this.settlementPruneRunning = false;
+      });
   }
 
   async listUsageLogs(filter?: UsageLogFilter): Promise<UsageLogItem[]> {

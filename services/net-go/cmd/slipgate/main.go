@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/ingress"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/syslogfwd"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
 )
 
@@ -41,7 +43,13 @@ func main() {
 		return
 	}
 
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmsgprefix)
+	// Every line still goes to stdout; warnings/errors (and core's, via the supervisor hook) are also
+	// forwarded to the BFF's persisted system logs. SLIPGATE_SYSTEM_LOG_FORWARD=false turns that off.
+	logFwd := syslogfwd.New(syslogfwd.Options{
+		Out:      os.Stdout,
+		Disabled: strings.EqualFold(strings.TrimSpace(os.Getenv("SLIPGATE_SYSTEM_LOG_FORWARD")), "false"),
+	})
+	logger := log.New(logFwd, "", log.LstdFlags|log.Lmsgprefix)
 	cfg := config.LoadFromEnv()
 	if *standalone {
 		cfg.Supervise = false
@@ -153,6 +161,9 @@ func main() {
 	defer vmCoord.Shutdown()
 
 	sup := supervisor.New(logger)
+	sup.SetLineHook(logFwd.ChildLineHook("core", "bff"))
+	logFwd.SetTarget(cfg.BFFAddr, cfg.InternalToken)
+	go logFwd.Run(rootCtx)
 	internalURL := config.LoopbackOrigin(cfg.ListenAddr)
 
 	if cfg.Supervise {
@@ -182,7 +193,13 @@ func main() {
 				AllowDegraded: cfg.AllowDegraded,
 			},
 		}
-		if err := sup.StartAll(rootCtx, specs); err != nil {
+		// The children must outlive the shutdown signal: the edge first drains in-flight turns (which
+		// still settle against core) and flushes pending settlements to a live BFF; the deferred
+		// sup.Stop below then interrupts them gracefully. Spawning them on rootCtx would SIGKILL both
+		// the moment the signal arrives.
+		childCtx, cancelChildren := context.WithCancel(context.Background())
+		defer cancelChildren()
+		if err := sup.StartAll(childCtx, specs); err != nil {
 			logger.Fatalf("failed to start supervised planes: %v", err)
 		}
 		defer func() {
@@ -201,6 +218,10 @@ func main() {
 		StealthDialer: stealthDialer,
 		VMSlots:       vmSlots,
 		Logger:        logger,
+		// "[http.access]" per /v1 turn while the BFF persists access logs (runtime config, ~30 s).
+		AccessLogEnabled: logFwd.AccessLogsEnabled,
+		// On the persistent volume by default, so undelivered settlements survive a restart or redeploy.
+		SettlementSpoolDir: dataplane.ResolveSettlementSpoolDir(filepath.Join(cfg.HotUpdateDir, "settlement-spool")),
 	})
 	dpCoord.StartBackgroundSync(rootCtx)
 
@@ -257,4 +278,10 @@ func main() {
 			logger.Fatalf("[net] http server stopped unexpectedly: %v", serveErr)
 		}
 	}
+
+	// No more turns: hand the last settlements to the BFF before the deferred sup.Stop stops it.
+	// Anything still undelivered is in the settlement spool for the next start.
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
+	dpCoord.FlushSettlements(flushCtx)
+	cancelFlush()
 }

@@ -41,7 +41,7 @@ watch(
 const count = computed(() => (scope.value === "selected" ? props.selectedIds.length : props.totalCount));
 
 function download(file: AccountExportFile) {
-  const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+  const stamp = new Date().toISOString().slice(0, 16).replace(/\D/g, "");
   const blob = new Blob([JSON.stringify(file, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");

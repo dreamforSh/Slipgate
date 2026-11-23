@@ -122,6 +122,12 @@ export type GroupPlatform = z.infer<typeof GroupPlatformSchema>;
 export const GroupSubscriptionTypeSchema = z.enum(["balance", "subscription"]);
 export type GroupSubscriptionType = z.infer<typeof GroupSubscriptionTypeSchema>;
 
+/** USD decimal typed by an admin for a subscription cap; "0" means unlimited. */
+const GroupLimitUsdSchema = z
+  .string()
+  .trim()
+  .regex(/^\$?\d{1,12}(?:\.\d{1,9})?$/, "Expected a USD amount such as 10 or 2.50");
+
 export const GroupItemSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -137,6 +143,15 @@ export const GroupItemSchema = z.object({
   accountCount: z.number().int().nonnegative(),
   activeAccountCount: z.number().int().nonnegative(),
   apiKeyCount: z.number().int().nonnegative(),
+  /** Subscription-billed groups: rolling spend caps per subscriber, nano-USD ("0" = unlimited). */
+  dailyLimitNanoUsd: z.string().regex(/^\d+$/).default("0"),
+  weeklyLimitNanoUsd: z.string().regex(/^\d+$/).default("0"),
+  monthlyLimitNanoUsd: z.string().regex(/^\d+$/).default("0"),
+  /** Validity offered when a subscription is assigned without an explicit length. */
+  defaultValidityDays: z.number().int().min(1).max(3650).default(30),
+  /** Per-user caps inside this group, across the user's keys (0 = none; see user_limits.ts). */
+  rpmLimit: z.number().int().min(0).default(0),
+  concurrencyLimit: z.number().int().min(0).default(0),
   createdAtIso: z.string(),
 });
 export type GroupItem = z.infer<typeof GroupItemSchema>;
@@ -151,6 +166,12 @@ export const CreateGroupRequestSchema = z.object({
   isExclusive: z.boolean().default(false),
   sortOrder: z.number().int().min(-100000).max(100000).default(0),
   enabled: z.boolean().default(true),
+  dailyLimitUsd: GroupLimitUsdSchema.default("0"),
+  weeklyLimitUsd: GroupLimitUsdSchema.default("0"),
+  monthlyLimitUsd: GroupLimitUsdSchema.default("0"),
+  defaultValidityDays: z.number().int().min(1).max(3650).default(30),
+  rpmLimit: z.number().int().min(0).max(1_000_000).default(0),
+  concurrencyLimit: z.number().int().min(0).max(1_000_000).default(0),
 });
 export type CreateGroupRequest = z.infer<typeof CreateGroupRequestSchema>;
 
@@ -164,6 +185,12 @@ export const UpdateGroupRequestSchema = z.object({
   isExclusive: z.boolean().optional(),
   sortOrder: z.number().int().min(-100000).max(100000).optional(),
   enabled: z.boolean().optional(),
+  dailyLimitUsd: GroupLimitUsdSchema.optional(),
+  weeklyLimitUsd: GroupLimitUsdSchema.optional(),
+  monthlyLimitUsd: GroupLimitUsdSchema.optional(),
+  defaultValidityDays: z.number().int().min(1).max(3650).optional(),
+  rpmLimit: z.number().int().min(0).max(1_000_000).optional(),
+  concurrencyLimit: z.number().int().min(0).max(1_000_000).optional(),
 });
 export type UpdateGroupRequest = z.infer<typeof UpdateGroupRequestSchema>;
 

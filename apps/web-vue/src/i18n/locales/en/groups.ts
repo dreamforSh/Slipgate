@@ -64,6 +64,23 @@ const en: typeof zh = {
       submitCreate: "Create",
       submitSave: "Save",
     },
+    caps: {
+      title: "Subscription caps",
+      hint: "Spend limit per subscriber over each rolling window; 0 means unlimited",
+      daily: "Daily cap (USD)",
+      weekly: "Weekly cap (USD)",
+      monthly: "Monthly cap (USD)",
+      validity: "Default validity (days)",
+      validityHint: "Length used when a subscription is assigned",
+      invalid: "Enter a valid amount such as 10 or 2.5",
+      unlimited: "Unlimited",
+      days: "{n} days",
+      short: {
+        daily: "D",
+        weekly: "W",
+        monthly: "M",
+      },
+    },
     notice: {
       created: "Created group {name}",
       saved: "Saved group {name}",

@@ -1,0 +1,2 @@
+-- Lane S1. Idempotent DDL (IF NOT EXISTS / guarded DO blocks); the BFF applies the same statements at startup.
+-- May touch any schema; files run in compose mount order.

@@ -95,7 +95,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" go build \
 # -----------------------------------------------------------------------------
 FROM ${ALPINE_IMAGE} AS runtime
 
-RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc && \
+# postgresql17-client: pg_dump / psql for full database backups and restores (BFF); keep its major
+# version >= the Postgres server's (deploy uses postgres:17-alpine).
+RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc postgresql17-client && \
     addgroup -S slipgate && adduser -S slipgate -G slipgate && \
     mkdir -p /etc/slipgate /var/run/slipgate /var/run/slipgate/clash /var/run/slipgate/vms /var/run/slipgate/hotupdate /usr/local/share/slipgate/guest && \
     chown -R slipgate:slipgate /etc/slipgate /var/run/slipgate

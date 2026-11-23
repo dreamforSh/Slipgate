@@ -6,6 +6,7 @@ import {
   ProviderSchema,
   SubscriptionTierSchema,
 } from "./pool.ts";
+import { DataPlaneSyncUserLimitsSchema } from "./user_limits.ts";
 
 export const CreateCompositeRouteRequestSchema = z.object({
   groupId: z.string().trim().min(1).default("grp_default"),
@@ -71,6 +72,7 @@ export const DataPlaneSyncApiKeySchema = z.object({
   rpmLimit: z.number().int().positive(),
   concurrencyLimit: z.number().int().positive(),
   ipAllowlist: z.array(z.string()).default([]),
+  ipDenylist: z.array(z.string()).default([]),
   enabled: z.boolean(),
   expiresAtIso: z.string().nullable().default(null),
 });
@@ -83,6 +85,20 @@ export const DataPlaneSyncWalletSchema = z.object({
 });
 export type DataPlaneSyncWallet = z.infer<typeof DataPlaneSyncWalletSchema>;
 
+/**
+ * An enabled admin price rule as the data plane applies it (nano-USD per 1M tokens, before the
+ * group multiplier). Same matching as matchPricingRule: exact model id first, then the longest
+ * "prefix*" pattern; the public model is tried before the upstream model.
+ */
+export const DataPlaneSyncPriceRuleSchema = z.object({
+  pattern: z.string().min(1),
+  inputNanoPerMTok: z.string().regex(/^\d+$/),
+  outputNanoPerMTok: z.string().regex(/^\d+$/),
+  cacheReadNanoPerMTok: z.string().regex(/^\d+$/),
+  cacheWriteNanoPerMTok: z.string().regex(/^\d+$/),
+});
+export type DataPlaneSyncPriceRule = z.infer<typeof DataPlaneSyncPriceRuleSchema>;
+
 export const DataPlaneSyncSnapshotSchema = z.object({
   revisionUnixMs: z.number().int().nonnegative(),
   groups: z.array(DataPlaneSyncGroupSchema),
@@ -90,10 +106,28 @@ export const DataPlaneSyncSnapshotSchema = z.object({
   accounts: z.array(DataPlaneSyncAccountSchema),
   apiKeys: z.array(DataPlaneSyncApiKeySchema),
   wallets: z.array(DataPlaneSyncWalletSchema),
+  /** Lets slipgate-core hold and settle at the same prices the BFF bills (empty = built-in rates). */
+  priceRules: z.array(DataPlaneSyncPriceRuleSchema).optional(),
+  /** Per-user / per-group RPM and concurrency caps slipgate-net enforces at the edge (user_limits.ts). */
+  userLimits: DataPlaneSyncUserLimitsSchema.optional(),
 });
 export type DataPlaneSyncSnapshot = z.infer<typeof DataPlaneSyncSnapshotSchema>;
 
+/** Server-minted settlement ids: never a client-supplied value such as X-Request-Id. */
+export const SettlementIdSchema = z.string().regex(/^[A-Za-z0-9_-]{8,128}$/);
+
 export const TurnSettlementEventSchema = z.object({
+  /**
+   * Billing idempotency key minted by slipgate-net once per settled turn and reused on every
+   * delivery retry. When absent (older edge builds) the BFF mints one, so the turn is charged.
+   */
+  settlementId: SettlementIdSchema.optional(),
+  /**
+   * false when slipgate-core could not settle the hold (IPC failure, or the hold was lost when the
+   * core restarted): costNanoUsd is then "0" and the BFF prices the reported tokens itself.
+   */
+  coreSettled: z.boolean().optional(),
+  /** Caller's X-Request-Id (or an edge-generated one): correlation and display only, never billing. */
   requestId: z.string().min(1),
   userId: z.string().min(1),
   apiKeyId: z.string().min(1),
@@ -117,7 +151,7 @@ export const TurnSettlementEventSchema = z.object({
 });
 export type TurnSettlementEvent = z.infer<typeof TurnSettlementEventSchema>;
 
-export const UsageLogItemSchema = TurnSettlementEventSchema.extend({
+export const UsageLogItemSchema = TurnSettlementEventSchema.omit({ settlementId: true, coreSettled: true }).extend({
   id: z.string().min(1),
   formattedCostUsd: z.string(),
   createdAtIso: z.string(),

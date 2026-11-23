@@ -7,9 +7,22 @@ export interface JwtClaims {
   sub: string;
   email: string;
   role: UserRole;
+  /**
+   * The user's token version when the token was issued. Password changes and resets, suspension,
+   * role changes and "sign out everywhere" bump the stored version, which ends every older token.
+   */
+  ver: number;
+  /** Unique token id: a signed-out token's id stays on the denylist until the token expires. */
+  jti: string;
   iat: number;
   exp: number;
 }
+
+/** Access token lifetime (the console signs in again after it; revocation is checked per request). */
+export const ACCESS_TOKEN_TTL_SECONDS = 86_400;
+/** Anything longer is not a token this service issued; refused before any parsing. */
+const MAX_TOKEN_LENGTH = 4096;
+const JTI_RE = /^[A-Za-z0-9_-]{16,128}$/;
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const buf = new ArrayBuffer(bytes.byteLength);
@@ -108,6 +121,20 @@ export async function verifyPassword(password: string, stored: string): Promise<
   return timingSafeEqual(new Uint8Array(derived), expected);
 }
 
+let dummyHash: Promise<string> | null = null;
+
+/**
+ * verifyPassword against `stored`, or against a throwaway hash when there is none (unknown email,
+ * account without a password), so a failed sign-in costs the same time whether or not the account
+ * exists. Always false without a stored hash.
+ */
+export async function verifyPasswordOrDummy(password: string, stored: string | null | undefined): Promise<boolean> {
+  if (stored) return verifyPassword(password, stored);
+  dummyHash ??= hashPassword(toHex(crypto.getRandomValues(new Uint8Array(16))));
+  await verifyPassword(password, await dummyHash);
+  return false;
+}
+
 async function importHmacKey(secret: string, usage: KeyUsage[]): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",
@@ -118,14 +145,19 @@ async function importHmacKey(secret: string, usage: KeyUsage[]): Promise<CryptoK
   );
 }
 
+/** Signs an HS256 access token; a fresh random `jti` and the iat/exp pair are added here. */
 export async function signJwt(
-  claims: Omit<JwtClaims, "iat" | "exp">,
+  claims: Omit<JwtClaims, "iat" | "exp" | "jti">,
   secret: string,
-  ttlSeconds = 86_400,
-): Promise<{ token: string; expiresAtIso: string }> {
+  ttlSeconds = ACCESS_TOKEN_TTL_SECONDS,
+): Promise<{ token: string; expiresAtIso: string; claims: JwtClaims }> {
   const nowSec = Math.floor(Date.now() / 1000);
   const payload: JwtClaims = {
-    ...claims,
+    sub: claims.sub,
+    email: claims.email,
+    role: claims.role,
+    ver: claims.ver,
+    jti: toHex(crypto.getRandomValues(new Uint8Array(16))),
     iat: nowSec,
     exp: nowSec + ttlSeconds,
   };
@@ -138,10 +170,17 @@ export async function signJwt(
   return {
     token: `${signingInput}.${bytesToBase64Url(new Uint8Array(sig))}`,
     expiresAtIso: new Date(payload.exp * 1000).toISOString(),
+    claims: payload,
   };
 }
 
+/**
+ * Signature, shape and expiry of an access token. Tokens without a token version or id (issued
+ * before sessions became revocable) are refused, so every accepted token can be signed out.
+ * Whether the session is still valid (user, status, version, denylist) is SessionManager's job.
+ */
 export async function verifyJwt(token: string, secret: string): Promise<JwtClaims | null> {
+  if (token.length > MAX_TOKEN_LENGTH) return null;
   const segments = token.split(".");
   if (segments.length !== 3) return null;
   const [headerSeg, payloadSeg, sigSeg] = segments;
@@ -158,14 +197,25 @@ export async function verifyJwt(token: string, secret: string): Promise<JwtClaim
     if (!valid) return null;
 
     const claims = JSON.parse(decoder.decode(base64UrlToBytes(payloadSeg))) as JwtClaims;
-    if (!claims.sub || !claims.email || (claims.role !== "admin" && claims.role !== "user")) {
-      return null;
-    }
+    if (!claims || typeof claims !== "object") return null;
+    if (typeof claims.sub !== "string" || !claims.sub || typeof claims.email !== "string" || !claims.email) return null;
+    if (claims.role !== "admin" && claims.role !== "user") return null;
+    if (!Number.isSafeInteger(claims.ver) || claims.ver < 0) return null;
+    if (typeof claims.jti !== "string" || !JTI_RE.test(claims.jti)) return null;
     const nowSec = Math.floor(Date.now() / 1000);
     if (typeof claims.exp !== "number" || claims.exp <= nowSec) {
       return null;
     }
-    return claims;
+    if (typeof claims.iat !== "number") return null;
+    return {
+      sub: claims.sub,
+      email: claims.email,
+      role: claims.role,
+      ver: claims.ver,
+      jti: claims.jti,
+      iat: claims.iat,
+      exp: claims.exp,
+    };
   } catch {
     return null;
   }

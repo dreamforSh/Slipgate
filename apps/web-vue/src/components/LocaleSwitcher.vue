@@ -12,7 +12,7 @@ const root = ref<HTMLElement | null>(null);
 const current = computed(() => availableLocales.find((l) => l.code === locale.value) ?? availableLocales[0]!);
 
 function choose(code: LocaleCode) {
-  setLocale(code);
+  void setLocale(code);
   open.value = false;
 }
 

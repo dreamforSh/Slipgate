@@ -20,11 +20,16 @@ import UiCard from "../../components/ui/UiCard.vue";
 import UiIcon from "../../components/ui/UiIcon.vue";
 import UiModal from "../../components/ui/UiModal.vue";
 import UiSwitch from "../../components/ui/UiSwitch.vue";
+import { nanoToUsdInput, normalizeUsdInput, parseUsdToNano, USD_INPUT_PATTERN } from "../../components/admin/users/money";
+import GroupApiKeysDrawer from "../../components/admin/groups/GroupApiKeysDrawer.vue";
+import GroupRateMultipliersModal from "../../components/admin/groups/GroupRateMultipliersModal.vue";
+import { parseLimit, useLimitText } from "../../components/admin/users/limits";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
-import { PROVIDER_OPTIONS } from "../../lib/format";
+import { PROVIDER_OPTIONS, formatUsd } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 
 const { t } = useI18n();
+const { capText: limitText } = useLimitText();
 const auth = useAuthStore();
 
 const groups = ref<GroupItem[]>([]);
@@ -225,7 +230,23 @@ interface GroupForm {
   allowlistText: string;
   isExclusive: boolean;
   enabled: boolean;
+  /** Subscription caps as typed USD ("0" or empty = unlimited). */
+  dailyLimitUsd: string;
+  weeklyLimitUsd: string;
+  monthlyLimitUsd: string;
+  defaultValidityDays: number;
+  /** Per-user caps inside the group across the user's keys (0 = none). Typed text or number. */
+  rpmLimit: number | string;
+  concurrencyLimit: number | string;
 }
+
+type CapField = "dailyLimitUsd" | "weeklyLimitUsd" | "monthlyLimitUsd";
+type CapNanoField = "dailyLimitNanoUsd" | "weeklyLimitNanoUsd" | "monthlyLimitNanoUsd";
+const CAP_FIELDS: { field: CapField; nano: CapNanoField; key: "daily" | "weekly" | "monthly" }[] = [
+  { field: "dailyLimitUsd", nano: "dailyLimitNanoUsd", key: "daily" },
+  { field: "weeklyLimitUsd", nano: "weeklyLimitNanoUsd", key: "weekly" },
+  { field: "monthlyLimitUsd", nano: "monthlyLimitNanoUsd", key: "monthly" },
+];
 
 const formOpen = ref(false);
 const saving = ref(false);
@@ -242,10 +263,45 @@ function blankForm(): GroupForm {
     allowlistText: "",
     isExclusive: false,
     enabled: true,
+    dailyLimitUsd: "0",
+    weeklyLimitUsd: "0",
+    monthlyLimitUsd: "0",
+    defaultValidityDays: 30,
+    rpmLimit: 0,
+    concurrencyLimit: 0,
   };
 }
 
 const form = reactive<GroupForm>(blankForm());
+
+/** Empty input means unlimited. */
+function capText(value: string): string {
+  return value.trim() === "" ? "0" : value;
+}
+
+function capInvalid(field: CapField): boolean {
+  return normalizeUsdInput(capText(form[field])) === null;
+}
+
+const validityInvalid = computed(
+  () => !Number.isInteger(form.defaultValidityDays) || form.defaultValidityDays < 1 || form.defaultValidityDays > 3650,
+);
+
+const capsInvalid = computed(
+  () => form.subscriptionType === "subscription" && (CAP_FIELDS.some((c) => capInvalid(c.field)) || validityInvalid.value),
+);
+
+/** Per-user caps: empty means 0 (no cap). */
+const userCap = (v: number | string) => (String(v).trim() === "" ? 0 : parseLimit(v));
+const userCapsInvalid = computed(() => userCap(form.rpmLimit) === null || userCap(form.concurrencyLimit) === null);
+
+/** Compact "D $10 · W $50" chips for the table; windows without a cap are left out. */
+function groupCaps(group: GroupItem): { key: string; text: string }[] {
+  return CAP_FIELDS.filter((c) => /^\d+$/.test(group[c.nano]) && !/^0+$/.test(group[c.nano])).map((c) => ({
+    key: c.key,
+    text: `${t(`groups.caps.short.${c.key}`)} ${formatUsd(group[c.nano])}`,
+  }));
+}
 
 function parseAllowlist(text: string): string[] {
   const seen = new Set<string>();
@@ -274,6 +330,12 @@ function openEdit(group: GroupItem) {
     allowlistText: group.modelAllowlist.join("\n"),
     isExclusive: group.isExclusive,
     enabled: group.enabled,
+    dailyLimitUsd: nanoToUsdInput(group.dailyLimitNanoUsd),
+    weeklyLimitUsd: nanoToUsdInput(group.weeklyLimitNanoUsd),
+    monthlyLimitUsd: nanoToUsdInput(group.monthlyLimitNanoUsd),
+    defaultValidityDays: group.defaultValidityDays,
+    rpmLimit: group.rpmLimit ?? 0,
+    concurrencyLimit: group.concurrencyLimit ?? 0,
   } satisfies GroupForm);
   formOpen.value = true;
 }
@@ -291,10 +353,29 @@ function buildPatch(original: GroupItem): UpdateGroupRequest {
   if (allowlist.join("\n") !== original.modelAllowlist.join("\n")) patch.modelAllowlist = allowlist;
   if (form.isExclusive !== original.isExclusive) patch.isExclusive = form.isExclusive;
   if (form.enabled !== original.enabled) patch.enabled = form.enabled;
+  const rpmCap = userCap(form.rpmLimit);
+  const concCap = userCap(form.concurrencyLimit);
+  if (rpmCap !== null && rpmCap !== (original.rpmLimit ?? 0)) patch.rpmLimit = rpmCap;
+  if (concCap !== null && concCap !== (original.concurrencyLimit ?? 0)) patch.concurrencyLimit = concCap;
+  // Caps only matter (and are only shown) for subscription billing.
+  if (form.subscriptionType === "subscription") {
+    for (const c of CAP_FIELDS) {
+      const next = parseUsdToNano(capText(form[c.field]));
+      let current: bigint | null;
+      try {
+        current = BigInt(original[c.nano] || "0");
+      } catch {
+        current = null;
+      }
+      if (next !== null && next !== current) patch[c.field] = nanoToUsdInput(next);
+    }
+    if (form.defaultValidityDays !== original.defaultValidityDays) patch.defaultValidityDays = form.defaultValidityDays;
+  }
   return patch;
 }
 
 async function submitForm() {
+  if (capsInvalid.value || userCapsInvalid.value) return;
   errorMessage.value = null;
   notice.value = null;
   saving.value = true;
@@ -328,6 +409,16 @@ async function submitForm() {
         isExclusive: form.isExclusive,
         sortOrder: form.sortOrder,
         enabled: form.enabled,
+        rpmLimit: userCap(form.rpmLimit) ?? 0,
+        concurrencyLimit: userCap(form.concurrencyLimit) ?? 0,
+        ...(form.subscriptionType === "subscription"
+          ? {
+              dailyLimitUsd: normalizeUsdInput(capText(form.dailyLimitUsd)) ?? "0",
+              weeklyLimitUsd: normalizeUsdInput(capText(form.weeklyLimitUsd)) ?? "0",
+              monthlyLimitUsd: normalizeUsdInput(capText(form.monthlyLimitUsd)) ?? "0",
+              defaultValidityDays: form.defaultValidityDays,
+            }
+          : { dailyLimitUsd: "0", weeklyLimitUsd: "0", monthlyLimitUsd: "0", defaultValidityDays: 30 }),
       };
       const res = await auth.apiFetch("/api/v1/admin/groups", {
         method: "POST",
@@ -348,6 +439,21 @@ async function submitForm() {
   } finally {
     saving.value = false;
   }
+}
+
+/* ---------------- Per-user rates & group keys ---------------- */
+
+const ratesOpen = ref(false);
+const keysOpen = ref(false);
+const target = ref<GroupItem | null>(null);
+
+function openRates(group: GroupItem) {
+  target.value = group;
+  ratesOpen.value = true;
+}
+function openKeys(group: GroupItem) {
+  target.value = group;
+  keysOpen.value = true;
 }
 
 onMounted(() => {
@@ -454,9 +560,30 @@ onMounted(() => {
               </td>
               <td><UiBadge tone="accent">{{ platformLabel(g.platform) }}</UiBadge></td>
               <td class="whitespace-nowrap text-xs text-fg">
-                {{ g.subscriptionType === "subscription" ? t("groups.billing.subscription") : t("groups.billing.balance") }}
+                <template v-if="g.subscriptionType === 'subscription'">
+                  <p class="flex items-center gap-1.5">
+                    <UiIcon name="badge-check" :size="12" class="text-violet" />
+                    {{ t("groups.billing.subscription") }}
+                    <span class="text-2xs text-fg-subtle">· {{ t("groups.caps.days", { n: g.defaultValidityDays }) }}</span>
+                  </p>
+                  <p class="mt-1 flex flex-wrap gap-1">
+                    <template v-if="groupCaps(g).length">
+                      <span v-for="c in groupCaps(g)" :key="c.key" class="code-chip tabular-nums">{{ c.text }}</span>
+                    </template>
+                    <span v-else class="code-chip">∞ {{ t("groups.caps.unlimited") }}</span>
+                  </p>
+                </template>
+                <template v-else>{{ t("groups.billing.balance") }}</template>
               </td>
-              <td class="text-right font-mono text-xs tabular-nums text-fg">{{ g.rateMultiplier }}×</td>
+              <td class="whitespace-nowrap text-right">
+                <p class="font-mono text-xs tabular-nums text-fg">{{ g.rateMultiplier }}×</p>
+                <p v-if="g.rpmLimit > 0 || g.concurrencyLimit > 0" class="mt-1 flex justify-end gap-1">
+                  <span v-if="g.rpmLimit > 0" class="code-chip tabular-nums" :title="t('userLimits.groupForm.rpm')">{{ limitText(g.rpmLimit, "rpm") }}</span>
+                  <span v-if="g.concurrencyLimit > 0" class="code-chip tabular-nums" :title="t('userLimits.groupForm.concurrency')">
+                    {{ limitText(g.concurrencyLimit, "concurrency") }}
+                  </span>
+                </p>
+              </td>
               <td>
                 <UiBadge :tone="g.isExclusive ? 'violet' : 'neutral'">
                   {{ g.isExclusive ? t("groups.type.exclusive") : t("groups.type.public") }}
@@ -472,7 +599,19 @@ onMounted(() => {
                   <UiIcon name="chevron-right" :size="12" />
                 </RouterLink>
               </td>
-              <td class="text-right font-mono text-xs tabular-nums text-fg">{{ g.apiKeyCount }}</td>
+              <td class="text-right">
+                <button
+                  type="button"
+                  class="inline-flex cursor-pointer items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 font-mono text-xs tabular-nums transition-colors hover:bg-accent/10 hover:text-accent"
+                  :class="g.apiKeyCount > 0 ? 'text-fg' : 'text-fg-subtle'"
+                  :title="t('userLimits.groupKeys.open')"
+                  :aria-label="t('userLimits.groupKeys.openFor', { name: g.name })"
+                  @click="openKeys(g)"
+                >
+                  {{ g.apiKeyCount }}
+                  <UiIcon name="chevron-right" :size="12" />
+                </button>
+              </td>
               <td>
                 <UiSwitch
                   :model-value="g.enabled"
@@ -483,6 +622,15 @@ onMounted(() => {
               </td>
               <td class="text-right">
                 <div class="inline-flex items-center gap-0.5">
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon btn-xs"
+                    :title="t('userLimits.groupRates.open')"
+                    :aria-label="t('userLimits.groupRates.openFor', { name: g.name })"
+                    @click="openRates(g)"
+                  >
+                    <UiIcon name="percent" :size="13" />
+                  </button>
                   <button
                     type="button"
                     class="btn btn-ghost btn-icon btn-xs"
@@ -563,6 +711,59 @@ onMounted(() => {
           <p class="label">{{ t("groups.form.billing") }}</p>
           <SegmentedControl v-model="form.subscriptionType" :options="billingOptions" size="md" block />
         </div>
+        <Transition
+          enter-active-class="transition duration-200 ease-out"
+          leave-active-class="transition duration-150 ease-in"
+          enter-from-class="-translate-y-1 opacity-0"
+          leave-to-class="-translate-y-1 opacity-0"
+        >
+          <fieldset
+            v-if="form.subscriptionType === 'subscription'"
+            class="min-w-0 rounded-lg border border-violet/25 bg-violet/[0.04] p-3.5 sm:col-span-2"
+          >
+            <legend class="sr-only">{{ t("groups.caps.title") }}</legend>
+            <div class="mb-3 flex items-start gap-2.5">
+              <span class="icon-chip icon-chip-violet h-7 w-7"><UiIcon name="gauge" :size="14" /></span>
+              <div class="min-w-0">
+                <p class="text-sm font-medium text-fg">{{ t("groups.caps.title") }}</p>
+                <p class="text-xs text-fg-subtle">{{ t("groups.caps.hint") }}</p>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <FormField v-for="c in CAP_FIELDS" :key="c.field" :label="t(`groups.caps.${c.key}`)">
+                <span class="relative block">
+                  <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 font-mono text-sm text-fg-subtle">$</span>
+                  <input
+                    v-model="form[c.field]"
+                    type="text"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    :pattern="USD_INPUT_PATTERN"
+                    placeholder="0"
+                    class="input pl-7 font-mono"
+                    :class="capInvalid(c.field) ? '!border-danger focus:!ring-danger/20' : ''"
+                    :aria-invalid="capInvalid(c.field)"
+                  />
+                </span>
+              </FormField>
+              <FormField :label="t('groups.caps.validity')">
+                <input
+                  v-model.number="form.defaultValidityDays"
+                  type="number"
+                  min="1"
+                  max="3650"
+                  step="1"
+                  required
+                  class="input font-mono"
+                  :class="validityInvalid ? '!border-danger focus:!ring-danger/20' : ''"
+                />
+              </FormField>
+            </div>
+            <p class="hint" :class="capsInvalid ? '!text-danger' : ''">
+              {{ capsInvalid ? t("groups.caps.invalid") : t("groups.caps.validityHint") }}
+            </p>
+          </fieldset>
+        </Transition>
         <FormField :label="t('groups.form.rate')">
           <input
             v-model.number="form.rateMultiplier"
@@ -577,6 +778,47 @@ onMounted(() => {
         <FormField :label="t('groups.form.sortOrder')">
           <input v-model.number="form.sortOrder" type="number" step="1" class="input font-mono" />
         </FormField>
+        <fieldset class="min-w-0 rounded-lg border border-line/80 bg-surface-2/30 p-3.5 sm:col-span-2">
+          <legend class="sr-only">{{ t("userLimits.groupForm.title") }}</legend>
+          <div class="mb-3 flex items-start gap-2.5">
+            <span class="icon-chip icon-chip-accent h-7 w-7"><UiIcon name="gauge" :size="14" /></span>
+            <div class="min-w-0">
+              <p class="text-sm font-medium text-fg">{{ t("userLimits.groupForm.title") }}</p>
+              <p class="text-xs text-fg-subtle">{{ t("userLimits.groupForm.hint") }}</p>
+            </div>
+          </div>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <FormField :label="t('userLimits.groupForm.rpm')">
+              <input
+                v-model.number="form.rpmLimit"
+                type="number"
+                min="0"
+                max="1000000"
+                step="1"
+                placeholder="0"
+                class="input font-mono"
+                :class="userCap(form.rpmLimit) === null ? '!border-danger focus:!ring-danger/20' : ''"
+                :aria-invalid="userCap(form.rpmLimit) === null || undefined"
+              />
+            </FormField>
+            <FormField :label="t('userLimits.groupForm.concurrency')">
+              <input
+                v-model.number="form.concurrencyLimit"
+                type="number"
+                min="0"
+                max="1000000"
+                step="1"
+                placeholder="0"
+                class="input font-mono"
+                :class="userCap(form.concurrencyLimit) === null ? '!border-danger focus:!ring-danger/20' : ''"
+                :aria-invalid="userCap(form.concurrencyLimit) === null || undefined"
+              />
+            </FormField>
+          </div>
+          <p class="hint" :class="userCapsInvalid ? '!text-danger' : ''">
+            {{ userCapsInvalid ? t("userLimits.groupForm.invalid") : t("userLimits.groupForm.zeroNone") }}
+          </p>
+        </fieldset>
         <FormField :label="t('groups.form.allowlist')" class="sm:col-span-2">
           <textarea
             v-model="form.allowlistText"
@@ -603,11 +845,14 @@ onMounted(() => {
       </form>
       <template #footer>
         <button type="button" class="btn btn-secondary" @click="formOpen = false">{{ t("common.cancel") }}</button>
-        <button type="submit" form="group-form" class="btn btn-primary" :disabled="saving">
+        <button type="submit" form="group-form" class="btn btn-primary" :disabled="saving || capsInvalid || userCapsInvalid">
           <UiIcon v-if="saving" name="loader" :size="15" spin />
           {{ editing ? t("groups.form.submitSave") : t("groups.form.submitCreate") }}
         </button>
       </template>
     </UiModal>
+
+    <GroupRateMultipliersModal v-model:open="ratesOpen" :group="target" />
+    <GroupApiKeysDrawer v-model:open="keysOpen" :group="target" />
   </div>
 </template>

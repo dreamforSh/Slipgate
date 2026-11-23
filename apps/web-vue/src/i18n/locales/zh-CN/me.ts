@@ -1,0 +1,77 @@
+/** Signed-in user's dashboard. */
+export default {
+  me: {
+    title: "仪表盘",
+    greeting: {
+      night: "夜深了，{name}",
+      morning: "早上好，{name}",
+      noon: "中午好，{name}",
+      afternoon: "下午好，{name}",
+      evening: "晚上好，{name}",
+    },
+    subtitle: "这里是你的用量概览，数据每分钟自动刷新。",
+    actions: {
+      createKey: "创建密钥",
+      redeem: "兑换充值",
+      usage: "使用记录",
+    },
+    overview: "用量概览",
+    updatedAt: "更新于 {time}",
+    retry: "重试",
+    loadFailed: "加载仪表盘数据失败",
+    truncated: "所选时间范围内的请求较多，统计结果为下限值。",
+    range: {
+      h24: "24 小时",
+      d7: "7 天",
+      d30: "30 天",
+    },
+    kpi: {
+      balance: "账户余额",
+      topUp: "去充值",
+      spent: "累计消费",
+      spentHint: "账户创建以来的总消费",
+      keys: "API 密钥（启用 / 全部）",
+      manageKeys: "管理密钥",
+      subs: "生效中的订阅",
+      viewSubs: "查看订阅",
+      todayRequests: "今日请求",
+      successRate: "成功率 {rate}%",
+      noRequestsToday: "今天还没有请求",
+      todayTokens: "今日 Token",
+      tokenSplit: "输入 {input} · 输出 {output}",
+      todayCost: "今日消费",
+      avgLatency: "平均耗时 {latency}",
+      periodRequests: "近 {range} 请求",
+      periodCost: "期间消费 {cost}",
+    },
+    metric: {
+      requests: "请求数",
+      tokens: "Token",
+      cost: "费用",
+      input: "输入",
+      output: "输出",
+    },
+    trend: {
+      requests: "请求趋势",
+      tokens: "Token 趋势",
+      cost: "费用趋势",
+      empty: "所选时间范围内还没有请求",
+    },
+    models: {
+      title: "常用模型",
+    },
+    keys: {
+      title: "密钥用量",
+    },
+    breakdown: {
+      empty: "暂无数据",
+      meta: "{requests} 次请求 · {tokens} Token · {cost}",
+    },
+    recent: {
+      title: "最近请求",
+      viewAll: "查看全部",
+      empty: "还没有请求记录",
+      tokens: "{input} / {output} Token",
+    },
+  },
+};

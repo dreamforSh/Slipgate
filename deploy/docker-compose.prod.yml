@@ -22,6 +22,36 @@ services:
       - ../migrations/core/0005_group_account_management.sql:/docker-entrypoint-initdb.d/12_core_group_account_mgmt.sql:ro
       - ../migrations/core/0006_account_lifecycle.sql:/docker-entrypoint-initdb.d/13_core_account_lifecycle.sql:ro
       - ../migrations/net/0006_cluster_node_host_key.sql:/docker-entrypoint-initdb.d/14_net_cluster_node_host_key.sql:ro
+      - ../migrations/commerce/0003_operations.sql:/docker-entrypoint-initdb.d/15_commerce_operations.sql:ro
+      - ../migrations/core/0007_group_caps_and_spend.sql:/docker-entrypoint-initdb.d/16_core_group_caps_and_spend.sql:ro
+      - ../migrations/commerce/0004_payments.sql:/docker-entrypoint-initdb.d/17_commerce_payments.sql:ro
+      - ../migrations/core/0008_api_key_limits.sql:/docker-entrypoint-initdb.d/18_core_api_key_limits.sql:ro
+      - ../migrations/commerce/0005_email.sql:/docker-entrypoint-initdb.d/19_commerce_email.sql:ro
+      - ../migrations/core/0009_settlement_integrity.sql:/docker-entrypoint-initdb.d/20_core_settlement_integrity.sql:ro
+      - ../migrations/commerce/0006_payments_integrity.sql:/docker-entrypoint-initdb.d/21_commerce_payments_integrity.sql:ro
+      - ../migrations/core/0010_session_security.sql:/docker-entrypoint-initdb.d/22_core_session_security.sql:ro
+      - ../migrations/commerce/0007_ops_integrity.sql:/docker-entrypoint-initdb.d/23_commerce_ops_integrity.sql:ro
+      - ../migrations/core/0011_user_limits.sql:/docker-entrypoint-initdb.d/24_core_user_limits.sql:ro
+      - ../migrations/commerce/0008_auth_guards.sql:/docker-entrypoint-initdb.d/25_commerce_auth_guards.sql:ro
+      - ../migrations/commerce/0009_payment_providers.sql:/docker-entrypoint-initdb.d/26_commerce_payment_providers.sql:ro
+      - ../migrations/core/0012_pricing_engine.sql:/docker-entrypoint-initdb.d/27_core_pricing_engine.sql:ro
+      - ../migrations/commerce/0010_announcement_targeting.sql:/docker-entrypoint-initdb.d/28_commerce_announcement_targeting.sql:ro
+      - ../migrations/commerce/0011_db_backups.sql:/docker-entrypoint-initdb.d/29_commerce_db_backups.sql:ro
+      - ../migrations/core/0013_platform_quotas.sql:/docker-entrypoint-initdb.d/30_core_platform_quotas.sql:ro
+      - ../migrations/commerce/0012_passkeys.sql:/docker-entrypoint-initdb.d/31_commerce_passkeys.sql:ro
+      - ../migrations/commerce/0013_payment_settings.sql:/docker-entrypoint-initdb.d/32_commerce_payment_settings.sql:ro
+      - ../migrations/core/0014_request_errors.sql:/docker-entrypoint-initdb.d/33_core_request_errors.sql:ro
+      - ../migrations/core/0015_usage_rollups.sql:/docker-entrypoint-initdb.d/34_core_usage_rollups.sql:ro
+      - ../migrations/commerce/0014_site_pages.sql:/docker-entrypoint-initdb.d/35_commerce_site_pages.sql:ro
+      - ../migrations/commerce/0015_oauth_extras.sql:/docker-entrypoint-initdb.d/36_commerce_oauth_extras.sql:ro
+      - ../migrations/commerce/0016_user_attributes.sql:/docker-entrypoint-initdb.d/37_commerce_user_attributes.sql:ro
+      - ../migrations/commerce/0017_affiliate.sql:/docker-entrypoint-initdb.d/38_commerce_affiliate.sql:ro
+      - ../migrations/commerce/0018_redeem_extras.sql:/docker-entrypoint-initdb.d/39_commerce_redeem_extras.sql:ro
+      - ../migrations/commerce/0019_alerts.sql:/docker-entrypoint-initdb.d/40_commerce_alerts.sql:ro
+      - ../migrations/commerce/0020_channel_monitors.sql:/docker-entrypoint-initdb.d/41_commerce_channel_monitors.sql:ro
+      - ../migrations/core/0016_moderation.sql:/docker-entrypoint-initdb.d/42_core_moderation.sql:ro
+      - ../migrations/commerce/0021_system_logs.sql:/docker-entrypoint-initdb.d/43_commerce_system_logs.sql:ro
+      - ../migrations/core/0017_media_billing.sql:/docker-entrypoint-initdb.d/44_core_media_billing.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slipgate} -d ${POSTGRES_DB:-slipgate}"]
       interval: 5s
