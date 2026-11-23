@@ -49,7 +49,7 @@ import {
 } from "./ops_shared.ts";
 import { filterTargeted, readStatusPage } from "./postgres_announcements.ts";
 import { AUDIT_DELETE_BATCH } from "./ops_types.ts";
-import { backfillWalletSpend, ensureUsageLogIndexes } from "./postgres_settlement.ts";
+import { backfillWalletSpend, ensureUsageLogIndexes, ensureUsageLogPartitions } from "./postgres_settlement.ts";
 import type {
   AdminUserCreateInput,
   AdminUserUpdateInput,
@@ -266,6 +266,7 @@ export async function ensureUsageIndexesInBackground(sql: Sql): Promise<void> {
   } catch (err) {
     console.warn(`[slipgate-bff] wallet spend backfill skipped: ${err instanceof Error ? err.message : err}`);
   }
+  await ensureUsageLogPartitions(sql);
   await ensureUsageLogIndexes(sql);
 }
 
@@ -556,6 +557,28 @@ export class PostgresOpsStore implements OpsStore {
     `;
   }
 
+  async updateBlob(
+    key: string,
+    mutator: (current: Record<string, unknown> | null) => Record<string, unknown> | Promise<Record<string, unknown>>,
+  ): Promise<Record<string, unknown>> {
+    return this.sql.begin(async (txRaw) => {
+      const tx = txRaw as unknown as Sql;
+      await tx`SELECT pg_advisory_xact_lock(727172803, hashtext(${key}::text))`;
+      const rows = await tx<{ value_json: unknown }[]>`
+        SELECT value_json FROM commerce.portal_settings WHERE key = ${key} FOR UPDATE
+      `;
+      const v = jsonValue<unknown>(rows[0]?.value_json);
+      const current = v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+      const next = await mutator(current);
+      await tx`
+        INSERT INTO commerce.portal_settings (key, value_json, updated_at)
+        VALUES (${key}, ${tx.json(next as postgres.JSONValue)}, NOW())
+        ON CONFLICT (key) DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = NOW()
+      `;
+      return next;
+    });
+  }
+
   async saveEmailCode(email: string, purpose: string, codeHash: string, expiresAtIso: string): Promise<void> {
     await this.sql`
       INSERT INTO commerce.email_codes (email, purpose, code_hash, expires_at, attempts, created_at)
@@ -627,6 +650,7 @@ export class PostgresOpsStore implements OpsStore {
     const normalized = normalizePortalSettings(settings);
     await this.sql.begin(async (txRaw) => {
       const tx = txRaw as unknown as Sql;
+      await tx`SELECT pg_advisory_xact_lock(727172802)`;
       await tx`
         INSERT INTO commerce.portal_settings (key, value_json, updated_at)
         VALUES ('portal_settings', ${tx.json(normalized)}, NOW())
@@ -643,6 +667,40 @@ export class PostgresOpsStore implements OpsStore {
       `;
     });
     return this.getSettings();
+  }
+
+  async updateSettings(
+    mutator: (current: PortalSettings) => PortalSettings | Promise<PortalSettings>,
+  ): Promise<{ previous: PortalSettings; saved: PortalSettings }> {
+    return this.sql.begin(async (txRaw) => {
+      const tx = txRaw as unknown as Sql;
+      await tx`SELECT pg_advisory_xact_lock(727172802)`;
+      const rows = await tx<{ key: string; value_json: unknown }[]>`
+        SELECT key, value_json FROM commerce.portal_settings WHERE key IN ('portal_settings', 'setup_state') FOR UPDATE
+      `;
+      const stored = jsonValue<Record<string, unknown>>(rows.find((r) => r.key === "portal_settings")?.value_json) ?? {};
+      const setup = jsonValue<Record<string, unknown>>(rows.find((r) => r.key === "setup_state")?.value_json) ?? {};
+      const merged: Record<string, unknown> = { ...stored };
+      if (typeof setup.siteName === "string" && setup.siteName) merged.siteName = setup.siteName;
+      if (typeof setup.allowRegistration === "boolean") merged.allowRegistration = setup.allowRegistration;
+      const previous = normalizePortalSettings(merged);
+      const next = normalizePortalSettings(await mutator(previous));
+      await tx`
+        INSERT INTO commerce.portal_settings (key, value_json, updated_at)
+        VALUES ('portal_settings', ${tx.json(next)}, NOW())
+        ON CONFLICT (key) DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = NOW()
+      `;
+      await tx`
+        UPDATE commerce.portal_settings
+           SET value_json = value_json || ${tx.json({
+             siteName: next.siteName,
+             allowRegistration: next.allowRegistration,
+           })}::jsonb,
+               updated_at = NOW()
+         WHERE key = 'setup_state' AND jsonb_typeof(value_json) = 'object'
+      `;
+      return { previous, saved: next };
+    });
   }
 
   /* ---------------- Users ---------------- */
@@ -841,6 +899,9 @@ export class PostgresOpsStore implements OpsStore {
         throw new StoreError("conflict", "This user has earned referral rebates; suspend the account instead");
       }
       await tx`DELETE FROM core.api_keys WHERE user_id = ${userId}`;
+      await tx`DELETE FROM core.ledger_entries WHERE user_id = ${userId}`;
+      await tx`DELETE FROM core.quota_wallets WHERE user_id = ${userId}`;
+      await tx`DELETE FROM commerce.revoked_tokens WHERE user_id = ${userId}`;
       await tx`DELETE FROM commerce.users WHERE id = ${userId}`;
     });
   }
@@ -865,6 +926,37 @@ export class PostgresOpsStore implements OpsStore {
       SELECT balance_nano_usd::text AS b FROM core.quota_wallets WHERE user_id = ${userId}
     `;
     return BigInt(rows[0]?.b ?? "0");
+  }
+
+  async adjustWalletAtomic(
+    userId: string,
+    operation: "add" | "subtract" | "set",
+    amountNano: bigint,
+    idempotencyKey: string,
+    reason: string,
+  ): Promise<{ balanceNano: bigint; deltaNano: bigint }> {
+    return this.sql.begin(async (txRaw) => {
+      const tx = txRaw as unknown as Sql;
+      const exists = await tx<{ id: string }[]>`SELECT id FROM commerce.users WHERE id = ${userId}`;
+      if (!exists[0]) throw new StoreError("not_found", `User ${userId} not found`);
+      await tx`
+        INSERT INTO core.quota_wallets (user_id, balance_nano_usd, held_nano_usd)
+        VALUES (${userId}, 0, 0)
+        ON CONFLICT (user_id) DO NOTHING
+      `;
+      const locked = await tx<{ b: string }[]>`
+        SELECT balance_nano_usd::text AS b FROM core.quota_wallets WHERE user_id = ${userId} FOR UPDATE
+      `;
+      const current = BigInt(locked[0]?.b ?? "0");
+      const deltaNano =
+        operation === "add" ? amountNano : operation === "subtract" ? -amountNano : amountNano - current;
+      if (deltaNano === 0n) return { balanceNano: current, deltaNano: 0n };
+      await pgApplyWalletDelta(tx, userId, deltaNano, idempotencyKey, "adjust", reason);
+      const after = await tx<{ b: string }[]>`
+        SELECT balance_nano_usd::text AS b FROM core.quota_wallets WHERE user_id = ${userId}
+      `;
+      return { balanceNano: BigInt(after[0]?.b ?? "0"), deltaNano };
+    });
   }
 
   async listLedger(userId: string, limit: number): Promise<BalanceLedgerItem[]> {

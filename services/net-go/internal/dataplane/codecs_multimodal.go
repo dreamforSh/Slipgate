@@ -24,6 +24,8 @@ const (
 type mediaTaskAffinity struct {
 	taskID        string
 	ownerKeyID    string
+	userID        string
+	groupID       string
 	accountID     string
 	provider      string
 	publicModel   string
@@ -32,15 +34,14 @@ type mediaTaskAffinity struct {
 }
 
 type mediaTaskStore struct {
-	mu    sync.Mutex
-	tasks map[string]mediaTaskAffinity
-	order []string
+	mu         sync.Mutex
+	tasks      map[string]mediaTaskAffinity
+	order      []string
+	persistPut func(entry mediaTaskAffinity)
+	persistGet func(apiKeyID, taskID string) (mediaTaskAffinity, bool)
 }
 
-func (m *mediaTaskStore) put(entry mediaTaskAffinity) {
-	if m == nil || entry.taskID == "" {
-		return
-	}
+func (m *mediaTaskStore) storeLocal(entry mediaTaskAffinity) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.tasks == nil {
@@ -67,17 +68,40 @@ func (m *mediaTaskStore) put(entry mediaTaskAffinity) {
 	m.tasks[entry.taskID] = entry
 }
 
+func (m *mediaTaskStore) put(entry mediaTaskAffinity) {
+	if m == nil || entry.taskID == "" {
+		return
+	}
+	m.storeLocal(entry)
+	m.mu.Lock()
+	putFn := m.persistPut
+	m.mu.Unlock()
+	if putFn != nil {
+		putFn(entry)
+	}
+}
+
 func (m *mediaTaskStore) get(apiKeyID, taskID string) (mediaTaskAffinity, bool) {
 	if m == nil || apiKeyID == "" || taskID == "" {
 		return mediaTaskAffinity{}, false
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	ent, ok := m.tasks[taskID]
-	if !ok || ent.ownerKeyID != apiKeyID || time.Now().After(ent.expiresAt) {
+	fetchFn := m.persistGet
+	if ok && ent.ownerKeyID == apiKeyID && time.Now().Before(ent.expiresAt) {
+		m.mu.Unlock()
+		return ent, true
+	}
+	m.mu.Unlock()
+	if fetchFn == nil {
 		return mediaTaskAffinity{}, false
 	}
-	return ent, true
+	loaded, found := fetchFn(apiKeyID, taskID)
+	if !found || time.Now().After(loaded.expiresAt) {
+		return mediaTaskAffinity{}, false
+	}
+	m.storeLocal(loaded)
+	return loaded, true
 }
 
 func isEmbeddingsEndpoint(path string) bool {
@@ -556,6 +580,8 @@ func relayMultimodalResponse(
 			tasks.put(mediaTaskAffinity{
 				taskID:        strings.TrimSpace(vidResp.ID),
 				ownerKeyID:    directive.APIKeyID,
+				userID:        directive.UserID,
+				groupID:       directive.GroupID,
 				accountID:     directive.AccountID,
 				provider:      directive.Provider,
 				publicModel:   directive.PublicModel,

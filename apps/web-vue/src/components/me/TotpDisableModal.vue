@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import type { AuthSessionResponse } from "@slipgate/contracts";
 import { apiJson } from "../../lib/api";
 import { useAuthStore } from "../../stores/auth";
 import UiAlert from "../ui/UiAlert.vue";
@@ -46,12 +47,13 @@ async function submit() {
   busy.value = true;
   error.value = null;
   try {
-    await apiJson("/api/v1/user/totp/disable", {
+    const res = await apiJson<{ enabled: boolean; session?: AuthSessionResponse }>("/api/v1/user/totp/disable", {
       method: "POST",
       body: { password: password.value, code: code.value },
       fallbackError: t("security.totp.errors.disable"),
     });
-    if (auth.user) auth.user.totpEnabled = false;
+    if (res.session) auth.setSession(res.session);
+    else if (auth.user) auth.user.totpEnabled = false;
     password.value = "";
     code.value = "";
     emit("disabled");

@@ -486,23 +486,59 @@ export class PostgresPaymentsStore implements PaymentsStore {
   }
 
   async createOrder(input: OrderInput) {
-    if (input.kind === "subscription" && (await this.subscriptionGroupProblem(this.sql, input.groupId))) {
-      throw new StoreError("conflict", "This plan cannot be purchased right now");
-    }
     const id = `ord_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-    try {
-      await this.sql`
-        INSERT INTO commerce.payment_orders (id, user_id, provider, amount_nano_usd, currency, status, idempotency_key,
-                                             kind, plan_id, plan_name, method, amount_minor, group_id, validity_days, expires_at,
-                                             provider_instance_id)
-        VALUES (${id}, ${input.userId}, ${input.provider}, ${input.creditNano.toString()}::numeric, ${input.currency}, 'pending',
-                ${`order:${id}`}, ${input.kind}, ${input.planId}, ${input.planName}, ${input.method}, ${input.amountMinor},
-                ${input.groupId}, ${input.validityDays}, ${new Date(input.expiresAtIso)}, ${input.providerInstanceId ?? null})
-      `;
-    } catch (err) {
-      if ((err as { code?: string })?.code === "23503") throw new StoreError("not_found", "User not found");
-      throw err;
-    }
+    await this.sql.begin(async (txRaw) => {
+      const tx = txRaw as unknown as Sql;
+      // Serialise order creation per user so maxPendingOrders cannot be pierced concurrently.
+      await tx`SELECT pg_advisory_xact_lock(74210051, hashtext(${input.userId}::text))`;
+      if (input.maxPendingOrders !== undefined && input.maxPendingOrders > 0) {
+        const pending = await tx<{ n: number }[]>`
+          SELECT COUNT(*)::int AS n FROM commerce.payment_orders
+           WHERE user_id = ${input.userId} AND status = 'pending' AND (expires_at IS NULL OR expires_at > NOW())
+        `;
+        if ((pending[0]?.n ?? 0) >= input.maxPendingOrders) {
+          throw new StoreError("conflict", "Too many unpaid orders; pay or cancel one first");
+        }
+      }
+      if (
+        input.merchantDailyLimitMinor !== undefined &&
+        input.merchantDailyLimitMinor > 0 &&
+        input.merchantUsageKey &&
+        input.dayStartIso
+      ) {
+        await tx`SELECT pg_advisory_xact_lock(74210052, hashtext(${input.merchantUsageKey}::text))`;
+        const [mKey, chType] = input.merchantUsageKey.split("|");
+        const statuses = [...REVENUE_ORDER_STATUSES];
+        const usedRows = await tx<{ total: string }[]>`
+          SELECT COALESCE(SUM(amount_minor), 0)::text AS total
+            FROM commerce.payment_orders
+           WHERE created_at >= ${new Date(input.dayStartIso)}
+             AND COALESCE(provider_instance_id, 'builtin:' || provider) = ${mKey ?? ""}
+             AND COALESCE(method, provider) = ${chType ?? ""}
+             AND (status = ANY(${statuses}::text[]) OR (status = 'pending' AND (expires_at IS NULL OR expires_at > NOW())))
+        `;
+        const used = Number(usedRows[0]?.total ?? "0");
+        if (used + input.amountMinor > input.merchantDailyLimitMinor) {
+          throw new StoreError("conflict", "This payment method has reached its limit for this amount; try another method or amount");
+        }
+      }
+      if (input.kind === "subscription" && (await this.subscriptionGroupProblem(tx, input.groupId, true))) {
+        throw new StoreError("conflict", "This plan cannot be purchased right now");
+      }
+      try {
+        await tx`
+          INSERT INTO commerce.payment_orders (id, user_id, provider, amount_nano_usd, currency, status, idempotency_key,
+                                               kind, plan_id, plan_name, method, amount_minor, group_id, validity_days, expires_at,
+                                               provider_instance_id)
+          VALUES (${id}, ${input.userId}, ${input.provider}, ${input.creditNano.toString()}::numeric, ${input.currency}, 'pending',
+                  ${`order:${id}`}, ${input.kind}, ${input.planId}, ${input.planName}, ${input.method}, ${input.amountMinor},
+                  ${input.groupId}, ${input.validityDays}, ${new Date(input.expiresAtIso)}, ${input.providerInstanceId ?? null})
+        `;
+      } catch (err) {
+        if ((err as { code?: string })?.code === "23503") throw new StoreError("not_found", "User not found");
+        throw err;
+      }
+    });
     return (await this.getOrder(id))!;
   }
 

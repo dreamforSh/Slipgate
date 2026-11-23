@@ -132,10 +132,33 @@ fi
 tar -xzf "${TMP_DIR}/${ARCHIVE_NAME}" -C "$TMP_DIR"
 BUNDLE_DIR="${TMP_DIR}/slipgate-${ASSET_PREFIX}-linux-${ARCH}${MUSL_SUFFIX}"
 
-mkdir -p "$PREFIX" /etc/slipgate /var/run/slipgate/hotupdate
+mkdir -p "$PREFIX" /etc/slipgate /var/lib/slipgate /var/run/slipgate/hotupdate
 cp -R "${BUNDLE_DIR}/." "${PREFIX}/"
 chmod 0755 "${PREFIX}/slipgate" "${PREFIX}/slipgate-core" "${PREFIX}/slipgate-guestd" "${PREFIX}/slipgate-bff"
 ln -sf "${PREFIX}/slipgate" /usr/local/bin/slipgate
+
+# Ensure PostgreSQL client tools (pg_dump / pg_restore / psql) are installed for DB backups & restores.
+if ! command -v pg_dump >/dev/null 2>&1 || ! command -v pg_restore >/dev/null 2>&1; then
+  echo "==> Installing PostgreSQL client utilities for database backups..."
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-client || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache postgresql-client || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q postgresql || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q postgresql || true
+  fi
+fi
+
+# Provision a dedicated unprivileged system account for systemd execution.
+if ! getent group slipgate >/dev/null 2>&1; then
+  groupadd --system slipgate 2>/dev/null || addgroup -S slipgate 2>/dev/null || true
+fi
+if ! id -u slipgate >/dev/null 2>&1; then
+  useradd --system --gid slipgate --home-dir /var/lib/slipgate --shell /usr/sbin/nologin slipgate 2>/dev/null \
+    || adduser -S -G slipgate -h /var/lib/slipgate -s /sbin/nologin slipgate 2>/dev/null || true
+fi
 
 gen_secret() {
   if command -v openssl >/dev/null 2>&1; then
@@ -170,7 +193,18 @@ if [[ ! -f /etc/slipgate/slipgate.env ]]; then
   echo "    Back up SLIPGATE_VAULT_SECRET: stored account credentials cannot be decrypted without it."
 fi
 
+if id -u slipgate >/dev/null 2>&1; then
+  chown -R root:slipgate /etc/slipgate
+  chmod 0750 /etc/slipgate
+  [[ -f /etc/slipgate/slipgate.env ]] && chmod 0640 /etc/slipgate/slipgate.env
+  chown -R slipgate:slipgate /var/lib/slipgate /var/run/slipgate "${PREFIX}"
+fi
+
 if [[ "$USE_SYSTEMD" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+  SERVICE_USER_LINES=""
+  if id -u slipgate >/dev/null 2>&1; then
+    SERVICE_USER_LINES=$'User=slipgate\nGroup=slipgate\nRuntimeDirectory=slipgate slipgate/hotupdate\nStateDirectory=slipgate\nNoNewPrivileges=true'
+  fi
   cat > /etc/systemd/system/slipgate.service <<EOF
 [Unit]
 Description=Slipgate Unified AI Gateway
@@ -179,6 +213,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+${SERVICE_USER_LINES}
 WorkingDirectory=${PREFIX}
 EnvironmentFile=/etc/slipgate/slipgate.env
 Environment=SLIPGATE_CORE_BIN=${PREFIX}/slipgate-core

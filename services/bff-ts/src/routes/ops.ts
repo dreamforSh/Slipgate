@@ -529,7 +529,11 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
     if (!enabled || !secret) throw new StoreError("conflict", "Two-factor authentication is off");
     if (!(await verifyTotp(secret, req.code, claims.sub))) throw new StoreError("bad_request", "The code is not valid");
     await ops.setTotp(claims.sub, null, false);
-    return c.json({ enabled: false });
+    const version = await ops.bumpTokenVersion(claims.sub);
+    sessions.invalidate(claims.sub);
+    const user = await store.getUserById(claims.sub);
+    const session = user && version !== null ? await sessions.issue(user, version) : null;
+    return c.json({ enabled: false, ...(session ? { session } : {}) });
   });
 
   /** Model plaza for the signed-in user: public groups plus exclusive groups they were granted. */
@@ -680,9 +684,28 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
 
   app.patch("/api/v1/admin/settings", async (c) => {
     const patch = await body(c, UpdatePortalSettingsRequestSchema);
-    const current = await ops.getSettings();
-    // Shortening audit retention deletes history: only PUT /audit-logs/retention, with a fresh code.
-    if (patch.auditLogRetentionDays !== undefined && auditRetentionShortens(current.auditLogRetentionDays, patch.auditLogRetentionDays)) {
+    let retentionBlocked = false;
+    const { previous, saved } = await ops.updateSettings((current) => {
+      // Shortening audit retention deletes history: only PUT /audit-logs/retention, with a fresh code.
+      if (
+        patch.auditLogRetentionDays !== undefined &&
+        auditRetentionShortens(current.auditLogRetentionDays, patch.auditLogRetentionDays)
+      ) {
+        retentionBlocked = true;
+        return current;
+      }
+      const { defaultBalanceUsd, ...rest } = patch;
+      const next = PortalSettingsSchema.safeParse({
+        ...current,
+        ...rest,
+        ...(defaultBalanceUsd !== undefined ? { defaultBalanceNanoUsd: usd(defaultBalanceUsd).toString() } : {}),
+      });
+      if (!next.success) bad(next.error.issues);
+      const crossIssues = portalSettingsIssues(next.data);
+      if (crossIssues.length > 0) throw new StoreError("bad_request", crossIssues.join("; "));
+      return next.data;
+    });
+    if (retentionBlocked) {
       return c.json(
         {
           error: "retention_step_up",
@@ -691,18 +714,8 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
         403,
       );
     }
-    const { defaultBalanceUsd, ...rest } = patch;
-    const next = PortalSettingsSchema.safeParse({
-      ...current,
-      ...rest,
-      ...(defaultBalanceUsd !== undefined ? { defaultBalanceNanoUsd: usd(defaultBalanceUsd).toString() } : {}),
-    });
-    if (!next.success) bad(next.error.issues);
-    const crossIssues = portalSettingsIssues(next.data);
-    if (crossIssues.length > 0) throw new StoreError("bad_request", crossIssues.join("; "));
-    const saved = await ops.saveSettings(next.data);
     // Default user caps travel in the data-plane snapshot (userLimits).
-    if (saved.defaultUserRpm !== current.defaultUserRpm || saved.defaultUserConcurrency !== current.defaultUserConcurrency) {
+    if (saved.defaultUserRpm !== previous.defaultUserRpm || saved.defaultUserConcurrency !== previous.defaultUserConcurrency) {
       await syncDataPlane();
     }
     return c.json(saved);
@@ -789,20 +802,23 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
     const userId = c.req.param("userId");
     const req = await body(c, AdminAdjustBalanceRequestSchema);
     const amount = usd(req.amountUsd);
-    const current = BigInt((await store.getWallet(userId)).balanceNanoUsd);
-    let delta: bigint;
-    if (req.operation === "add") delta = amount;
-    else if (req.operation === "subtract") delta = -amount;
-    else delta = amount - current;
-    if (delta === 0n) return c.json({ balanceNanoUsd: current.toString(), deltaNanoUsd: "0" });
     const reason = req.reason || `admin_${req.operation}`;
-    const balance = await ops.adjustWallet(userId, delta, `admin:${crypto.randomUUID()}`, reason);
-    await syncDataPlane();
-    return c.json({ balanceNanoUsd: balance.toString(), deltaNanoUsd: delta.toString() });
+    const { balanceNano, deltaNano } = await ops.adjustWalletAtomic(
+      userId,
+      req.operation,
+      amount,
+      `admin:${crypto.randomUUID()}`,
+      reason,
+    );
+    if (deltaNano !== 0n) await syncDataPlane();
+    return c.json({ balanceNanoUsd: balanceNano.toString(), deltaNanoUsd: deltaNano.toString() });
   });
 
   app.post("/api/v1/admin/users/:userId/totp/reset", async (c) => {
-    await ops.setTotp(c.req.param("userId"), null, false);
+    const userId = c.req.param("userId");
+    await ops.setTotp(userId, null, false);
+    await ops.bumpTokenVersion(userId);
+    sessions.invalidate(userId);
     return c.json({ enabled: false });
   });
 

@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 export type DumpRunnerCheck =
@@ -117,13 +118,58 @@ async function runTool(cmd: string[], env: Record<string, string | undefined>, s
   }
 }
 
+/**
+ * Verifies that a legacy plain-SQL dump contains no client-side psql backslash meta-commands
+ * (`\!`, `\i`, `\o`, `\copy`, `\setenv`, etc.) outside COPY ... FROM stdin data blocks.
+ * PostgreSQL 17.6+ `\restrict` / `\unrestrict` guards are permitted.
+ */
+export async function assertSafePlainSqlDump(dumpPath: string): Promise<void> {
+  const decoder = new TextDecoder();
+  let carry = "";
+  let inCopyData = false;
+  const reader = Bun.file(dumpPath).stream().getReader();
+  const processLine = (raw: string) => {
+    const line = raw.replace(/\r$/, "");
+    if (inCopyData) {
+      if (line === "\\.") inCopyData = false;
+      return;
+    }
+    if (/^COPY\s+.+\s+FROM\s+stdin\b/i.test(line)) {
+      inCopyData = true;
+      return;
+    }
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("\\")) {
+      if (/^\\(?:restrict|unrestrict)\s+[A-Za-z0-9_-]+$/.test(trimmed)) return;
+      throw new Error(`Refusing plain SQL dump with psql backslash meta-command: ${trimmed.slice(0, 32)}`);
+    }
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const lines = (carry + decoder.decode(value, { stream: true })).split("\n");
+      carry = lines.pop() ?? "";
+      for (const raw of lines) processLine(raw);
+    }
+    if (carry) processLine(carry);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function isCustomArchive(dumpPath: string): Promise<boolean> {
+  const head = new Uint8Array(await Bun.file(dumpPath).slice(0, 5).arrayBuffer());
+  return head.byteLength === 5 && head[0] === 0x50 && head[1] === 0x47 && head[2] === 0x44 && head[3] === 0x4d && head[4] === 0x50;
+}
+
 const CHECK_TTL_MS = 60_000;
 
 /**
- * pg_dump (plain SQL) for backups; psql for restores, running a schema-dropping preamble and the
- * dump in one transaction (`--single-transaction`, ON_ERROR_STOP): a failed restore changes nothing.
- * pg_restore is not used because its --clean cannot drop objects the archive does not know about,
- * so it could only merge into a database that gained tables since the backup.
+ * Uses pg_dump custom archive format (`--format=custom --compress=0`) + `pg_restore` (`--clean
+ * --if-exists --single-transaction --exit-on-error`) when `pg_restore` is installed, eliminating
+ * psql backslash meta-command risk; retains backward-compatible plain-SQL restore (hardened with
+ * `assertSafePlainSqlDump`) for archives written by earlier versions.
  */
 export class PgToolRunner implements DbDumpRunner {
   private cached: { at: number; result: DumpRunnerCheck } | null = null;
@@ -148,9 +194,10 @@ export class PgToolRunner implements DbDumpRunner {
 
   private async checkNow(): Promise<DumpRunnerCheck> {
     const pgDump = toolPath("pg_dump", this.binDir);
+    const pgRestore = toolPath("pg_restore", this.binDir);
     const psql = toolPath("psql", this.binDir);
-    if (!pgDump || !psql) {
-      const missing = [!pgDump && "pg_dump", !psql && "psql"].filter(Boolean).join(", ");
+    if (!pgDump || (!pgRestore && !psql)) {
+      const missing = [!pgDump && "pg_dump", !pgRestore && !psql && "pg_restore/psql"].filter(Boolean).join(", ");
       return { ok: false, reason: "tool_missing", detail: `${missing} not found (install the PostgreSQL client tools or set SLIPGATE_PG_BIN_DIR)` };
     }
     try {
@@ -174,9 +221,11 @@ export class PgToolRunner implements DbDumpRunner {
   async dump(outPath: string, signal: AbortSignal): Promise<void> {
     const pgDump = toolPath("pg_dump", this.binDir);
     if (!pgDump) throw new Error("pg_dump not found");
+    const pgRestore = toolPath("pg_restore", this.binDir);
     const { url } = toolConnection(this.databaseUrl);
+    const formatArgs = pgRestore ? ["--format=custom", "--compress=0"] : ["--format=plain"];
     await runTool(
-      [pgDump, "--format=plain", "--no-owner", "--no-acl", "--encoding=UTF8", `--file=${outPath}`, `--dbname=${url}`],
+      [pgDump, ...formatArgs, "--no-owner", "--no-acl", "--encoding=UTF8", `--file=${outPath}`, `--dbname=${url}`],
       this.env(),
       signal,
       "pg_dump",
@@ -184,18 +233,45 @@ export class PgToolRunner implements DbDumpRunner {
   }
 
   async restore(dumpPath: string, signal: AbortSignal): Promise<void> {
+    const { url } = toolConnection(this.databaseUrl);
+    if (await isCustomArchive(dumpPath)) {
+      const pgRestore = toolPath("pg_restore", this.binDir);
+      if (!pgRestore) throw new Error("pg_restore not found for custom-format archive");
+      await runTool(
+        [
+          pgRestore,
+          "--clean",
+          "--if-exists",
+          "--no-owner",
+          "--no-acl",
+          "--single-transaction",
+          "--exit-on-error",
+          `--dbname=${url}`,
+          dumpPath,
+        ],
+        this.env(),
+        signal,
+        "pg_restore",
+      );
+      return;
+    }
+
     const psql = toolPath("psql", this.binDir);
     if (!psql) throw new Error("psql not found");
+    await assertSafePlainSqlDump(dumpPath);
     const schemas = await dumpSchemas(dumpPath);
     if (schemas.length === 0) throw new Error("The backup does not contain any schema to restore");
     const preamblePath = `${dumpPath}.preamble.sql`;
     await Bun.write(preamblePath, restorePreamble(schemas));
-    const { url } = toolConnection(this.databaseUrl);
-    await runTool(
-      [psql, "-X", "-q", "-v", "ON_ERROR_STOP=1", "--single-transaction", `--dbname=${url}`, "-f", preamblePath, "-f", dumpPath],
-      this.env(),
-      signal,
-      "psql",
-    );
+    try {
+      await runTool(
+        [psql, "-X", "-q", "-v", "ON_ERROR_STOP=1", "--single-transaction", `--dbname=${url}`, "-f", preamblePath, "-f", dumpPath],
+        this.env(),
+        signal,
+        "psql",
+      );
+    } finally {
+      await unlink(preamblePath).catch(() => undefined);
+    }
   }
 }

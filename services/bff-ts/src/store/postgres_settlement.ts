@@ -99,6 +99,10 @@ export interface UsageLogIndexSpec {
 export const USAGE_LOG_INDEXES: readonly UsageLogIndexSpec[] = [
   // Per-group status pages and usage queries (0007).
   { parent: "idx_core_usage_logs_group_time", suffix: "group_time", columns: "(group_id, created_at DESC)" },
+  // Per-account stats and today's usage rollups (0006 / M-07).
+  { parent: "idx_core_usage_logs_account_time", suffix: "account_time", columns: "(account_id, created_at DESC)" },
+  // Per-user usage queries and platform totals (M-07).
+  { parent: "idx_core_usage_logs_user_time", suffix: "user_time", columns: "(user_id, created_at DESC)" },
   // Per-key spend windows on the settlement path: covering, so the sums read index pages only.
   {
     parent: "idx_core_usage_logs_key_time_cost",
@@ -177,6 +181,88 @@ function ident(name: string): string {
 
 function partitionIndexName(partition: string, suffix: string): string {
   return ident(`${partition}_${suffix}_idx`.slice(0, 63));
+}
+
+/**
+ * Ensures monthly range partitions on core.usage_logs exist for [-1, +2] UTC months around `now`
+ * whenever the default partition holds no rows inside the target month's range (avoiding 23514
+ * overlap errors on older databases whose historical rows landed in usage_logs_default).
+ */
+export async function ensureUsageLogPartitions(
+  sql: Sql,
+  log: Logger = (m) => console.warn(m),
+  now: Date = new Date(),
+): Promise<void> {
+  let conn: Awaited<ReturnType<Sql["reserve"]>> | null = null;
+  try {
+    conn = await sql.reserve();
+  } catch (err) {
+    log(`[slipgate-bff] usage_logs partition maintenance skipped: ${err instanceof Error ? err.message : err}`);
+    return;
+  }
+  const db = conn as unknown as Sql;
+  let locked = false;
+  try {
+    const lock = await db<{ ok: boolean }[]>`SELECT pg_try_advisory_lock(${USAGE_INDEX_LOCK_KEY}) AS ok`;
+    locked = Boolean(lock[0]?.ok);
+    if (!locked) return;
+
+    const partitioned = await db<{ ok: boolean }[]>`
+      SELECT (c.relkind = 'p') AS ok
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'core' AND c.relname = 'usage_logs'
+    `;
+    if (!partitioned[0]?.ok) return;
+
+    const existing = new Set(
+      (
+        await db<{ name: string }[]>`
+          SELECT c.relname AS name
+            FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE i.inhparent = 'core.usage_logs'::regclass AND n.nspname = 'core'
+        `
+      ).map((r) => r.name),
+    );
+    const hasDefault = existing.has("usage_logs_default");
+
+    for (const monthOffset of [-1, 0, 1, 2]) {
+      const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + monthOffset, 1, 0, 0, 0, 0));
+      const end = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1, 0, 0, 0, 0));
+      const ym = `${start.getUTCFullYear()}m${String(start.getUTCMonth() + 1).padStart(2, "0")}`;
+      const partName = ident(`usage_logs_y${ym}`);
+      if (existing.has(partName)) continue;
+
+      if (hasDefault) {
+        const overlap = await db`
+          SELECT 1 FROM core.usage_logs_default
+           WHERE created_at >= ${start} AND created_at < ${end}
+           LIMIT 1
+        `;
+        if (overlap.length > 0) continue;
+      }
+
+      try {
+        await runWithShortLockWait(
+          db,
+          `CREATE TABLE IF NOT EXISTS core.${partName} PARTITION OF core.usage_logs FOR VALUES FROM ('${start.toISOString()}') TO ('${end.toISOString()}')`,
+        );
+        existing.add(partName);
+      } catch (err) {
+        log(`[slipgate-bff] usage_logs partition core.${partName} skipped: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  } catch (err) {
+    log(`[slipgate-bff] usage_logs partition maintenance failed: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    try {
+      if (locked) await db`SELECT pg_advisory_unlock(${USAGE_INDEX_LOCK_KEY})`;
+    } catch {
+      // Released on session end.
+    }
+    conn.release();
+  }
 }
 
 /**

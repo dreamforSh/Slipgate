@@ -274,38 +274,57 @@ export class MemoryPaymentsStore implements PaymentsStore {
   }
 
   async createOrder(input: OrderInput) {
-    if (!this.core.users.has(input.userId)) throw new StoreError("not_found", "User not found");
-    if (input.kind === "subscription" && this.subscriptionGroupProblem(input.groupId)) {
-      throw new StoreError("conflict", "This plan cannot be purchased right now");
-    }
-    const rec: OrderRecord = {
-      ...input,
-      providerInstanceId: input.providerInstanceId ?? null,
-      id: `ord_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
-      status: "pending",
-      providerTradeNo: null,
-      payUrl: null,
-      qrCode: null,
-      checkout: null,
-      createdAtIso: new Date().toISOString(),
-      updatedAtMs: Date.now(),
-      paidAtIso: null,
-      subscriptionId: null,
-      deliveryError: null,
-      refundAmountMinor: 0,
-      priorRefundAmountMinor: 0,
-      refundReason: null,
-      refundError: null,
-      providerRefundId: null,
-      refundReclaim: false,
-      refundForce: false,
-      refundReclaimedNano: 0n,
-      refundedAtIso: null,
-      refundRequestedAtIso: null,
-      refundRequestReason: null,
-    };
-    this.orders.set(rec.id, rec);
-    return this.toOrder(rec);
+    return this.locked(`create:${input.userId}`, async () => {
+      if (!this.core.users.has(input.userId)) throw new StoreError("not_found", "User not found");
+      if (input.maxPendingOrders !== undefined && input.maxPendingOrders > 0) {
+        if ((await this.countPendingOrders(input.userId)) >= input.maxPendingOrders) {
+          throw new StoreError("conflict", "Too many unpaid orders; pay or cancel one first");
+        }
+      }
+      if (
+        input.merchantDailyLimitMinor !== undefined &&
+        input.merchantDailyLimitMinor > 0 &&
+        input.merchantUsageKey &&
+        input.dayStartIso
+      ) {
+        const usage = await this.instanceUsage(input.dayStartIso);
+        const used = usage[input.merchantUsageKey] ?? 0;
+        if (used + input.amountMinor > input.merchantDailyLimitMinor) {
+          throw new StoreError("conflict", "This payment method has reached its limit for this amount; try another method or amount");
+        }
+      }
+      if (input.kind === "subscription" && this.subscriptionGroupProblem(input.groupId)) {
+        throw new StoreError("conflict", "This plan cannot be purchased right now");
+      }
+      const rec: OrderRecord = {
+        ...input,
+        providerInstanceId: input.providerInstanceId ?? null,
+        id: `ord_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        status: "pending",
+        providerTradeNo: null,
+        payUrl: null,
+        qrCode: null,
+        checkout: null,
+        createdAtIso: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        paidAtIso: null,
+        subscriptionId: null,
+        deliveryError: null,
+        refundAmountMinor: 0,
+        priorRefundAmountMinor: 0,
+        refundReason: null,
+        refundError: null,
+        providerRefundId: null,
+        refundReclaim: false,
+        refundForce: false,
+        refundReclaimedNano: 0n,
+        refundedAtIso: null,
+        refundRequestedAtIso: null,
+        refundRequestReason: null,
+      };
+      this.orders.set(rec.id, rec);
+      return this.toOrder(rec);
+    });
   }
 
   async setOrderPayment(id: string, patch: OrderPaymentPatch) {

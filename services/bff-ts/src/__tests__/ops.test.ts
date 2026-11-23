@@ -520,8 +520,12 @@ describe("two-factor authentication", () => {
     expect((await login({ totpCode: current })).status).toBe(401);
 
     await call("POST", `/api/v1/admin/users/${jack.id}/totp/reset`, admin);
-    expect((await login()).status).toBe(200);
-    const state = await call<{ enabled: boolean }>("GET", "/api/v1/user/totp", jack.headers);
+    // Resetting 2FA bumps token_version so any session issued before the reset is revoked.
+    expect((await call("GET", "/api/v1/user/totp", jack.headers)).status).toBe(401);
+    const relogin = await login();
+    expect(relogin.status).toBe(200);
+    const freshHeaders = { ...JSON_HEADERS, Authorization: `Bearer ${relogin.body.accessToken}` };
+    const state = await call<{ enabled: boolean }>("GET", "/api/v1/user/totp", freshHeaders);
     expect(state.body.enabled).toBe(false);
   });
 });

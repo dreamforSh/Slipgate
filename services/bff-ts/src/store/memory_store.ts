@@ -14,6 +14,8 @@ import {
   type CreateGroupRequest,
   type DataPlaneSyncSnapshot,
   type GroupItem,
+  ModelPricingRuleSchema,
+  type ModelPricingRule,
   type RecordRiskBanInput,
   type RiskBanEvent,
   type SetupInitializeRequest,
@@ -49,6 +51,7 @@ import {
   type AccountSecretRecord,
   type ApiKeyBulkResult,
   type ControlStore,
+  type PersistedMediaTaskRecord,
   type StoredCredential,
   type StoredUserRecord,
   type UserCredentialRecord,
@@ -114,6 +117,8 @@ export class MemoryControlStore implements ControlStore {
   /** Settlement id -> the usage row it recorded (billing idempotency, see recordTurnSettlement). */
   private readonly settlements = new Map<string, { usageId: string; createdAtIso: string }>();
   private readonly usageLogs: UsageLogItem[] = [];
+  private pricingRules: ModelPricingRule[] | null = null;
+  private readonly mediaTasks = new Map<string, PersistedMediaTaskRecord>();
   private readonly riskEvents: RiskBanEvent[] = [];
   private readonly activeRiskBans = new Map<
     string,
@@ -977,8 +982,11 @@ export class MemoryControlStore implements ControlStore {
     };
     this.rememberSettlement(settlementId, item.id, createdAtIso);
     this.usageLogs.unshift(item);
-    if (this.usageLogs.length > 500) {
-      this.usageLogs.length = 500;
+    if (this.usageLogs.length > 50_000) {
+      const cutoff = Date.now() - 35 * 24 * HOUR_MS;
+      while (this.usageLogs.length > 50_000 || (this.usageLogs.length > 5_000 && Date.parse(this.usageLogs.at(-1)!.createdAtIso) < cutoff)) {
+        this.usageLogs.pop();
+      }
     }
     return {
       ...ev,
@@ -1050,5 +1058,62 @@ export class MemoryControlStore implements ControlStore {
 
   async listRiskBanEvents(limit = 50): Promise<RiskBanEvent[]> {
     return this.riskEvents.slice(0, Math.max(1, Math.min(200, limit))).map((e) => ({ ...e }));
+  }
+
+  async listPricingRules(): Promise<ModelPricingRule[]> {
+    if (this.pricingRules === null) {
+      const blob = await this.ops.getBlob("model_pricing");
+      const legacy = Array.isArray(blob?.rules) ? blob.rules : [];
+      this.pricingRules = legacy.flatMap((r) => {
+        const parsed = ModelPricingRuleSchema.safeParse(r);
+        return parsed.success ? [parsed.data] : [];
+      });
+    }
+    return structuredClone(this.pricingRules);
+  }
+
+  async savePricingRules(rules: ModelPricingRule[]): Promise<void> {
+    this.pricingRules = structuredClone(rules);
+  }
+
+  async upsertMediaTask(task: Omit<PersistedMediaTaskRecord, "createdAtIso">): Promise<PersistedMediaTaskRecord> {
+    const nowMs = Date.now();
+    for (const [k, v] of this.mediaTasks) {
+      if (Date.parse(v.expiresAtIso) <= nowMs) this.mediaTasks.delete(k);
+    }
+    const pk = `${task.kind}:${task.id}`;
+    const prev = this.mediaTasks.get(pk);
+    const saved: PersistedMediaTaskRecord = {
+      ...structuredClone(task),
+      createdAtIso: prev?.createdAtIso ?? new Date(nowMs).toISOString(),
+    };
+    this.mediaTasks.set(pk, saved);
+    return structuredClone(saved);
+  }
+
+  async getMediaTask(
+    apiKeyId: string,
+    kind: PersistedMediaTaskRecord["kind"],
+    id: string,
+  ): Promise<PersistedMediaTaskRecord | null> {
+    const pk = `${kind}:${id}`;
+    const rec = this.mediaTasks.get(pk);
+    if (!rec || rec.apiKeyId !== apiKeyId || rec.kind !== kind || Date.parse(rec.expiresAtIso) <= Date.now()) {
+      return null;
+    }
+    return structuredClone(rec);
+  }
+
+  async deleteMediaTask(
+    apiKeyId: string,
+    kind: PersistedMediaTaskRecord["kind"],
+    id: string,
+  ): Promise<boolean> {
+    const pk = `${kind}:${id}`;
+    const rec = this.mediaTasks.get(pk);
+    if (!rec || rec.apiKeyId !== apiKeyId || rec.kind !== kind || Date.parse(rec.expiresAtIso) <= Date.now()) {
+      return false;
+    }
+    return this.mediaTasks.delete(pk);
   }
 }

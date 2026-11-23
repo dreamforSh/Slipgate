@@ -17,6 +17,8 @@ import {
   type CreateGroupRequest,
   type DataPlaneSyncSnapshot,
   type GroupItem,
+  ModelPricingRuleSchema,
+  type ModelPricingRule,
   type RecordRiskBanInput,
   type RiskBanEvent,
   type SetupInitializeRequest,
@@ -60,6 +62,7 @@ import {
   type AccountSecretRecord,
   type ApiKeyBulkResult,
   type ControlStore,
+  type PersistedMediaTaskRecord,
   type StoredCredential,
   type TurnSettlementResult,
   type UserCredentialRecord,
@@ -467,37 +470,56 @@ export class PostgresControlStore implements ControlStore {
           per_image_nano_usd                  NUMERIC(39, 0) NOT NULL DEFAULT 0,
           per_video_second_nano_usd           NUMERIC(39, 0) NOT NULL DEFAULT 0,
           long_context_threshold_tokens       INTEGER NOT NULL DEFAULT 0,
-          long_context_input_multiplier       NUMERIC(12, 6) NOT NULL DEFAULT 1.000000,
-          long_context_output_multiplier      NUMERIC(12, 6) NOT NULL DEFAULT 1.000000,
-          service_tier_fast_multiplier        NUMERIC(12, 6) NOT NULL DEFAULT 2.000000,
-          service_tier_flex_multiplier        NUMERIC(12, 6) NOT NULL DEFAULT 0.500000,
+          long_context_input_multiplier       NUMERIC(12, 6),
+          long_context_output_multiplier      NUMERIC(12, 6),
+          service_tier_fast_multiplier        NUMERIC(12, 6),
+          service_tier_flex_multiplier        NUMERIC(12, 6),
           reasoning_effort_multipliers        JSONB NOT NULL DEFAULT '{}'::jsonb,
           enabled                             BOOLEAN NOT NULL DEFAULT TRUE,
           notes                               TEXT NOT NULL DEFAULT '',
           updated_at                          TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
+      ALTER TABLE core.model_pricing_rules
+          ALTER COLUMN long_context_input_multiplier DROP NOT NULL,
+          ALTER COLUMN long_context_output_multiplier DROP NOT NULL,
+          ALTER COLUMN service_tier_fast_multiplier DROP NOT NULL,
+          ALTER COLUMN service_tier_flex_multiplier DROP NOT NULL;
+
       CREATE TABLE IF NOT EXISTS core.media_tasks (
           id                  TEXT PRIMARY KEY,
-          upstream_task_id    TEXT NOT NULL,
-          user_id             TEXT NOT NULL,
+          upstream_task_id    TEXT NOT NULL DEFAULT '',
+          user_id             TEXT NOT NULL DEFAULT '',
           api_key_id          TEXT NOT NULL,
-          account_id          TEXT NOT NULL,
-          group_id            TEXT NOT NULL,
-          platform            TEXT NOT NULL,
-          kind                TEXT NOT NULL CHECK (kind IN ('image', 'video')),
-          public_model        TEXT NOT NULL,
-          upstream_model      TEXT NOT NULL,
-          status              TEXT NOT NULL DEFAULT 'queued',
+          account_id          TEXT NOT NULL DEFAULT '',
+          group_id            TEXT NOT NULL DEFAULT '',
+          platform            TEXT NOT NULL DEFAULT '',
+          kind                TEXT NOT NULL DEFAULT 'video',
+          public_model        TEXT NOT NULL DEFAULT '',
+          upstream_model      TEXT NOT NULL DEFAULT '',
+          status              TEXT NOT NULL DEFAULT 'pending',
           video_seconds       NUMERIC(12, 3) NOT NULL DEFAULT 0,
           image_count         INTEGER NOT NULL DEFAULT 0,
           cost_nano_usd       NUMERIC(39, 0) NOT NULL DEFAULT 0,
           result_json         JSONB NOT NULL DEFAULT '{}'::jsonb,
           created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          expires_at          TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours')
       );
+      ALTER TABLE core.media_tasks
+          ADD COLUMN IF NOT EXISTS group_id TEXT NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS video_seconds NUMERIC(12, 3) NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS image_count INTEGER NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS cost_nano_usd NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+          ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours');
+      ALTER TABLE core.media_tasks DROP CONSTRAINT IF EXISTS media_tasks_kind_check;
       CREATE INDEX IF NOT EXISTS idx_core_media_tasks_key_created
           ON core.media_tasks (api_key_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_media_tasks_key_expires
+          ON core.media_tasks (api_key_id, kind, expires_at DESC);
     `);
     // Before PG_OPS_SCHEMA_SQL: its spent_nano_usd guard must see whether this start adds the column.
     await this.sql.unsafe(PG_SETTLEMENT_SCHEMA_SQL);
@@ -2339,5 +2361,229 @@ export class PostgresControlStore implements ControlStore {
         createdAtIso: toIso(r.created_at),
       };
     });
+  }
+
+  async listPricingRules(): Promise<ModelPricingRule[]> {
+    const rows = await this.sql<
+      {
+        id: string;
+        pattern: string;
+        input: string;
+        output: string;
+        cache_read: string;
+        cache_write: string;
+        per_req: string;
+        per_img: string;
+        per_vid: string;
+        lc_thresh: number;
+        lc_in: string | null;
+        lc_out: string | null;
+        tier_fast: string | null;
+        tier_flex: string | null;
+        effort_json: unknown;
+        enabled: boolean;
+        notes: string;
+        updated_at: Date;
+      }[]
+    >`
+      SELECT id, pattern,
+             input_nano_per_mtok::text AS input,
+             output_nano_per_mtok::text AS output,
+             cache_read_nano_per_mtok::text AS cache_read,
+             cache_write_nano_per_mtok::text AS cache_write,
+             per_request_nano_usd::text AS per_req,
+             per_image_nano_usd::text AS per_img,
+             per_video_second_nano_usd::text AS per_vid,
+             long_context_threshold_tokens AS lc_thresh,
+             long_context_input_multiplier::text AS lc_in,
+             long_context_output_multiplier::text AS lc_out,
+             service_tier_fast_multiplier::text AS tier_fast,
+             service_tier_flex_multiplier::text AS tier_flex,
+             reasoning_effort_multipliers AS effort_json,
+             enabled, notes, updated_at
+        FROM core.model_pricing_rules
+       ORDER BY updated_at ASC, id ASC
+    `;
+    if (rows.length === 0) {
+      // One-time transparent migration from legacy portal_settings.model_pricing JSON blob.
+      const blob = await this.ops.getBlob("model_pricing");
+      const legacy = Array.isArray(blob?.rules) ? blob.rules : [];
+      const migrated = legacy.flatMap((r) => {
+        const parsed = ModelPricingRuleSchema.safeParse(r);
+        return parsed.success ? [parsed.data] : [];
+      });
+      if (migrated.length > 0) {
+        await this.savePricingRules(migrated);
+        return migrated;
+      }
+      return [];
+    }
+    return rows.flatMap((r) => {
+      const effort = jsonColumn<Record<string, unknown>>(r.effort_json);
+      const hasEffort = effort && typeof effort === "object" && Object.keys(effort).length > 0;
+      const candidate: Record<string, unknown> = {
+        id: r.id,
+        pattern: r.pattern,
+        inputNanoPerMTok: r.input,
+        outputNanoPerMTok: r.output,
+        cacheReadNanoPerMTok: r.cache_read,
+        cacheWriteNanoPerMTok: r.cache_write,
+        ...(r.per_req !== "0" ? { perRequestNanoUsd: r.per_req } : {}),
+        ...(r.per_img !== "0" ? { perImageNanoUsd: r.per_img } : {}),
+        ...(r.per_vid !== "0" ? { perVideoSecondNanoUsd: r.per_vid } : {}),
+        ...(r.lc_thresh > 0 ? { longContextThresholdTokens: r.lc_thresh } : {}),
+        ...(r.lc_in !== null ? { longContextInputMultiplier: Number(r.lc_in) } : {}),
+        ...(r.lc_out !== null ? { longContextOutputMultiplier: Number(r.lc_out) } : {}),
+        ...(r.tier_fast !== null ? { serviceTierFastMultiplier: Number(r.tier_fast) } : {}),
+        ...(r.tier_flex !== null ? { serviceTierFlexMultiplier: Number(r.tier_flex) } : {}),
+        ...(hasEffort ? { reasoningEffortMultipliers: effort } : {}),
+        enabled: r.enabled,
+        notes: r.notes,
+        updatedAtIso: toIso(r.updated_at),
+      };
+      const parsed = ModelPricingRuleSchema.safeParse(candidate);
+      return parsed.success ? [parsed.data] : [];
+    });
+  }
+
+  async savePricingRules(rules: ModelPricingRule[]): Promise<void> {
+    await this.sql.begin(async (txRaw) => {
+      const tx = txRaw as unknown as typeof this.sql;
+      await tx`SELECT pg_advisory_xact_lock(727172804)`;
+      const ids = rules.map((r) => r.id);
+      if (ids.length === 0) {
+        await tx`DELETE FROM core.model_pricing_rules`;
+      } else {
+        await tx`DELETE FROM core.model_pricing_rules WHERE NOT (id = ANY(${ids}::text[]))`;
+      }
+      for (const r of rules) {
+        await tx`
+          INSERT INTO core.model_pricing_rules (
+            id, pattern, input_nano_per_mtok, output_nano_per_mtok,
+            cache_read_nano_per_mtok, cache_write_nano_per_mtok,
+            per_request_nano_usd, per_image_nano_usd, per_video_second_nano_usd,
+            long_context_threshold_tokens, long_context_input_multiplier, long_context_output_multiplier,
+            service_tier_fast_multiplier, service_tier_flex_multiplier, reasoning_effort_multipliers,
+            enabled, notes, updated_at
+          )
+          VALUES (
+            ${r.id}, ${r.pattern}, ${r.inputNanoPerMTok}::numeric, ${r.outputNanoPerMTok}::numeric,
+            ${r.cacheReadNanoPerMTok}::numeric, ${r.cacheWriteNanoPerMTok}::numeric,
+            ${(r.perRequestNanoUsd ?? "0")}::numeric, ${(r.perImageNanoUsd ?? "0")}::numeric, ${(r.perVideoSecondNanoUsd ?? "0")}::numeric,
+            ${r.longContextThresholdTokens ?? 0},
+            ${r.longContextInputMultiplier ?? null},
+            ${r.longContextOutputMultiplier ?? null},
+            ${r.serviceTierFastMultiplier ?? null},
+            ${r.serviceTierFlexMultiplier ?? null},
+            ${tx.json((r.reasoningEffortMultipliers ?? {}) as postgres.JSONValue)},
+            ${r.enabled}, ${r.notes}, ${new Date(r.updatedAtIso)}
+          )
+          ON CONFLICT (pattern) DO UPDATE SET
+            id = EXCLUDED.id,
+            input_nano_per_mtok = EXCLUDED.input_nano_per_mtok,
+            output_nano_per_mtok = EXCLUDED.output_nano_per_mtok,
+            cache_read_nano_per_mtok = EXCLUDED.cache_read_nano_per_mtok,
+            cache_write_nano_per_mtok = EXCLUDED.cache_write_nano_per_mtok,
+            per_request_nano_usd = EXCLUDED.per_request_nano_usd,
+            per_image_nano_usd = EXCLUDED.per_image_nano_usd,
+            per_video_second_nano_usd = EXCLUDED.per_video_second_nano_usd,
+            long_context_threshold_tokens = EXCLUDED.long_context_threshold_tokens,
+            long_context_input_multiplier = EXCLUDED.long_context_input_multiplier,
+            long_context_output_multiplier = EXCLUDED.long_context_output_multiplier,
+            service_tier_fast_multiplier = EXCLUDED.service_tier_fast_multiplier,
+            service_tier_flex_multiplier = EXCLUDED.service_tier_flex_multiplier,
+            reasoning_effort_multipliers = EXCLUDED.reasoning_effort_multipliers,
+            enabled = EXCLUDED.enabled,
+            notes = EXCLUDED.notes,
+            updated_at = EXCLUDED.updated_at
+        `;
+      }
+    });
+  }
+
+  async upsertMediaTask(task: Omit<PersistedMediaTaskRecord, "createdAtIso">): Promise<PersistedMediaTaskRecord> {
+    const pk = `${task.kind}:${task.id}`;
+    const rows = await this.sql<{ created_at: Date }[]>`
+      INSERT INTO core.media_tasks (
+        id, upstream_task_id, user_id, api_key_id, account_id, group_id, platform, kind,
+        public_model, upstream_model, status, result_json, expires_at, updated_at
+      )
+      VALUES (
+        ${pk}, ${task.upstreamTaskId}, ${task.userId}, ${task.apiKeyId}, ${task.accountId},
+        ${task.groupId}, ${task.platform}, ${task.kind}, ${task.publicModel}, ${task.upstreamModel},
+        ${task.status}, ${this.sql.json(task.resultJson as postgres.JSONValue)}, ${new Date(task.expiresAtIso)}, NOW()
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        status = EXCLUDED.status,
+        result_json = EXCLUDED.result_json,
+        expires_at = EXCLUDED.expires_at,
+        updated_at = NOW()
+      RETURNING created_at
+    `;
+    await this.sql`DELETE FROM core.media_tasks WHERE expires_at <= NOW()`.catch(() => undefined);
+    return { ...task, createdAtIso: toIso(rows[0]?.created_at) };
+  }
+
+  async getMediaTask(
+    apiKeyId: string,
+    kind: PersistedMediaTaskRecord["kind"],
+    id: string,
+  ): Promise<PersistedMediaTaskRecord | null> {
+    const pk = `${kind}:${id}`;
+    const rows = await this.sql<
+      {
+        upstream_task_id: string;
+        user_id: string;
+        api_key_id: string;
+        account_id: string;
+        group_id: string;
+        platform: string;
+        public_model: string;
+        upstream_model: string;
+        status: string;
+        result_json: unknown;
+        expires_at: Date;
+        created_at: Date;
+      }[]
+    >`
+      SELECT upstream_task_id, user_id, api_key_id, account_id, group_id, platform,
+             public_model, upstream_model, status, result_json, expires_at, created_at
+        FROM core.media_tasks
+       WHERE id = ${pk} AND api_key_id = ${apiKeyId} AND kind = ${kind} AND expires_at > NOW()
+       LIMIT 1
+    `;
+    const r = rows[0];
+    if (!r) return null;
+    const decoded = jsonColumn<Record<string, unknown>>(r.result_json) ?? {};
+    return {
+      id,
+      apiKeyId: r.api_key_id,
+      userId: r.user_id,
+      accountId: r.account_id,
+      groupId: r.group_id,
+      platform: r.platform,
+      kind,
+      upstreamTaskId: r.upstream_task_id,
+      publicModel: r.public_model,
+      upstreamModel: r.upstream_model,
+      status: r.status,
+      resultJson: decoded && typeof decoded === "object" && !Array.isArray(decoded) ? decoded : {},
+      expiresAtIso: toIso(r.expires_at),
+      createdAtIso: toIso(r.created_at),
+    };
+  }
+
+  async deleteMediaTask(
+    apiKeyId: string,
+    kind: PersistedMediaTaskRecord["kind"],
+    id: string,
+  ): Promise<boolean> {
+    const pk = `${kind}:${id}`;
+    const rows = await this.sql`
+      DELETE FROM core.media_tasks
+       WHERE id = ${pk} AND api_key_id = ${apiKeyId} AND kind = ${kind} AND expires_at > NOW()
+      RETURNING id
+    `;
+    return rows.length > 0;
   }
 }

@@ -26,10 +26,10 @@ import { WindowLimiter } from "../insights.ts";
 import type { AuthEnv } from "../middleware/auth.ts";
 import { airwallexVerifyWebhook } from "../payments/airwallex.ts";
 import { alipayVerifyNotification } from "../payments/alipay.ts";
-import { alipayCreds, channelType, createCheckout, wxpayCreds, wxpayJsapiReady, type Merchant } from "../payments/gateway.ts";
+import { alipayCreds, channelType, createCheckout, merchantKey, wxpayCreds, wxpayJsapiReady, type Merchant } from "../payments/gateway.ts";
 import { decimalToMinor, errorText, parseJsonObject, str } from "../payments/http.ts";
 import { easypayVerify, stripeVerifySignature } from "../payments/providers.ts";
-import { CNY_ONLY_PROVIDERS, PaymentService } from "../payments/service.ts";
+import { CNY_ONLY_PROVIDERS, PaymentService, startOfUtcDayIso } from "../payments/service.ts";
 import {
   orderFromResumeToken,
   orderResumeToken,
@@ -376,7 +376,22 @@ export function registerPaymentRoutes(app: App, ctx: PaymentRouteContext): Payme
       }
     }
 
-    const order = await payments.createOrder({ ...input, providerInstanceId: merchant?.id ?? null });
+    let order: PaymentOrderItem;
+    try {
+      order = await payments.createOrder({
+        ...input,
+        providerInstanceId: merchant?.id ?? null,
+        maxPendingOrders: config.maxPendingOrders,
+        merchantUsageKey: merchant ? `${merchantKey(merchant)}|${type}` : null,
+        merchantDailyLimitMinor: merchant ? (merchant.limits[type]?.dailyLimitMinor ?? 0) : 0,
+        dayStartIso: startOfUtcDayIso(),
+      });
+    } catch (err) {
+      if (err instanceof StoreError && err.code === "conflict" && err.message.includes("reached its limit")) {
+        return c.json({ error: "payment_limit_exceeded", message: err.message }, 409);
+      }
+      throw err;
+    }
     const empty: PaymentCheckout = { flow: "manual", payUrl: null, qrCode: null, appLink: null, jsapi: null, airwallex: null };
     let checkout = empty;
     let tradeNo: string | null = null;

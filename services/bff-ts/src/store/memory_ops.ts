@@ -241,6 +241,8 @@ export class MemoryOpsStore implements OpsStore {
   private readonly subs = new Map<string, SubscriptionRecord>();
 
   private readonly blobs = new Map<string, Record<string, unknown>>();
+  private readonly blobLocks = new Map<string, Promise<void>>();
+  private settingsLock: Promise<void> = Promise.resolve();
   private readonly identities: { userId: string; provider: string; subject: string; createdAtIso: string }[] = [];
 
   async findUserIdByIdentity(provider: string, subject: string): Promise<string | null> {
@@ -290,6 +292,27 @@ export class MemoryOpsStore implements OpsStore {
 
   async setBlob(key: string, value: Record<string, unknown>): Promise<void> {
     this.blobs.set(key, structuredClone(value));
+  }
+
+  async updateBlob(
+    key: string,
+    mutator: (current: Record<string, unknown> | null) => Record<string, unknown> | Promise<Record<string, unknown>>,
+  ): Promise<Record<string, unknown>> {
+    const prev = this.blobLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const tail = prev.then(() => gate);
+    this.blobLocks.set(key, tail);
+    await prev;
+    try {
+      const current = await this.getBlob(key);
+      const next = await mutator(current);
+      await this.setBlob(key, next);
+      return structuredClone(next);
+    } finally {
+      release();
+      if (this.blobLocks.get(key) === tail) this.blobLocks.delete(key);
+    }
   }
 
   async saveEmailCode(email: string, purpose: string, codeHash: string, expiresAtIso: string): Promise<void> {
@@ -396,6 +419,24 @@ export class MemoryOpsStore implements OpsStore {
     this.settings = normalizePortalSettings(settings);
     this.core.patchSetup({ siteName: this.settings.siteName, allowRegistration: this.settings.allowRegistration });
     return this.getSettings();
+  }
+
+  async updateSettings(
+    mutator: (current: PortalSettings) => PortalSettings | Promise<PortalSettings>,
+  ): Promise<{ previous: PortalSettings; saved: PortalSettings }> {
+    const prev = this.settingsLock;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const tail = prev.then(() => gate);
+    this.settingsLock = tail;
+    await prev;
+    try {
+      const previous = await this.getSettings();
+      const saved = await this.saveSettings(await mutator(previous));
+      return { previous, saved };
+    } finally {
+      release();
+    }
   }
 
   /* ---------------- Users ---------------- */
@@ -568,6 +609,10 @@ export class MemoryOpsStore implements OpsStore {
     if (refs.orders > 0) throw new StoreError("conflict", "This user has payment orders; suspend the account instead");
     if (refs.rebates > 0) throw new StoreError("conflict", "This user has earned referral rebates; suspend the account instead");
     this.core.users.delete(userId);
+    this.core.wallets.delete(userId);
+    for (let i = this.core.ledger.length - 1; i >= 0; i--) {
+      if (this.core.ledger[i]!.userId === userId) this.core.ledger.splice(i, 1);
+    }
     this.meta.delete(userId);
     this.tokenVersions.delete(userId);
     for (const [id, k] of this.core.apiKeys) if (k.userId === userId) this.core.apiKeys.delete(id);
@@ -593,6 +638,22 @@ export class MemoryOpsStore implements OpsStore {
     this.requireUser(userId);
     applyMemoryWalletDelta(this.core, userId, deltaNano, idempotencyKey, "adjust", reason);
     return this.core.wallets.get(userId)?.balanceNano ?? 0n;
+  }
+
+  async adjustWalletAtomic(
+    userId: string,
+    operation: "add" | "subtract" | "set",
+    amountNano: bigint,
+    idempotencyKey: string,
+    reason: string,
+  ): Promise<{ balanceNano: bigint; deltaNano: bigint }> {
+    this.requireUser(userId);
+    const current = this.core.wallets.get(userId)?.balanceNano ?? 0n;
+    const deltaNano =
+      operation === "add" ? amountNano : operation === "subtract" ? -amountNano : amountNano - current;
+    if (deltaNano === 0n) return { balanceNano: current, deltaNano: 0n };
+    applyMemoryWalletDelta(this.core, userId, deltaNano, idempotencyKey, "adjust", reason);
+    return { balanceNano: this.core.wallets.get(userId)?.balanceNano ?? 0n, deltaNano };
   }
 
   async listLedger(userId: string, limit: number): Promise<BalanceLedgerItem[]> {

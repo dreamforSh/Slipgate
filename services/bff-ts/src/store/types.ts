@@ -8,6 +8,7 @@ import type {
   CreateGroupRequest,
   DataPlaneSyncSnapshot,
   GroupItem,
+  ModelPricingRule,
   RecordRiskBanInput,
   RiskBanEvent,
   SetupInitializeRequest,
@@ -219,4 +220,36 @@ export interface ControlStore {
 
   recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent>;
   listRiskBanEvents(limit?: number): Promise<RiskBanEvent[]>;
+
+  listPricingRules(): Promise<ModelPricingRule[]>;
+  savePricingRules(rules: ModelPricingRule[]): Promise<void>;
+
+  upsertMediaTask(task: Omit<PersistedMediaTaskRecord, "createdAtIso">): Promise<PersistedMediaTaskRecord>;
+  getMediaTask(
+    apiKeyId: string,
+    kind: PersistedMediaTaskRecord["kind"],
+    id: string,
+  ): Promise<PersistedMediaTaskRecord | null>;
+  deleteMediaTask(
+    apiKeyId: string,
+    kind: PersistedMediaTaskRecord["kind"],
+    id: string,
+  ): Promise<boolean>;
+}
+
+export interface PersistedMediaTaskRecord {
+  id: string;
+  apiKeyId: string;
+  userId: string;
+  accountId: string;
+  groupId: string;
+  platform: string;
+  kind: "image" | "video" | "response_state";
+  upstreamTaskId: string;
+  publicModel: string;
+  upstreamModel: string;
+  status: string;
+  resultJson: Record<string, unknown>;
+  expiresAtIso: string;
+  createdAtIso: string;
 }

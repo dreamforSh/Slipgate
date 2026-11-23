@@ -141,10 +141,19 @@ export interface OpsStore {
   getSettings(): Promise<PortalSettings>;
   /** Persists the full settings object; siteName/allowRegistration are mirrored into the setup state. */
   saveSettings(settings: PortalSettings): Promise<PortalSettings>;
+  /** Atomically reads, mutates, validates and writes portal settings under an exclusive lock. */
+  updateSettings(
+    mutator: (current: PortalSettings) => PortalSettings | Promise<PortalSettings>,
+  ): Promise<{ previous: PortalSettings; saved: PortalSettings }>;
 
   /** Opaque JSON documents in commerce.portal_settings (email config, …). */
   getBlob(key: string): Promise<Record<string, unknown> | null>;
   setBlob(key: string, value: Record<string, unknown>): Promise<void>;
+  /** Atomically reads, mutates and writes a JSON document in commerce.portal_settings under a per-key lock. */
+  updateBlob(
+    key: string,
+    mutator: (current: Record<string, unknown> | null) => Record<string, unknown> | Promise<Record<string, unknown>>,
+  ): Promise<Record<string, unknown>>;
 
   /* ---- Email codes & password resets ---- */
   /** Replaces any earlier code for this (email, purpose). */
@@ -187,6 +196,17 @@ export interface OpsStore {
   setUsersStatus(userIds: string[], status: "active" | "suspended"): Promise<number>;
   /** Signed wallet movement recorded as an `adjust` ledger entry (idempotent by key). */
   adjustWallet(userId: string, deltaNano: bigint, idempotencyKey: string, reason: string): Promise<bigint>;
+  /**
+   * Atomically reads the locked wallet balance, computes the delta for `add` / `subtract` / `set`,
+   * and applies it in one transaction (race-free against concurrent adjustments or settlements).
+   */
+  adjustWalletAtomic(
+    userId: string,
+    operation: "add" | "subtract" | "set",
+    amountNano: bigint,
+    idempotencyKey: string,
+    reason: string,
+  ): Promise<{ balanceNano: bigint; deltaNano: bigint }>;
   listLedger(userId: string, limit: number): Promise<BalanceLedgerItem[]>;
   countAdmins(): Promise<number>;
   listUserAccess(): Promise<UserAccessRecord[]>;

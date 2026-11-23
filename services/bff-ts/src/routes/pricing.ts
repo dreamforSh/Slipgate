@@ -12,8 +12,6 @@ import { cached } from "../insights.ts";
 import type { AuthEnv } from "../middleware/auth.ts";
 import { StoreError, type ControlStore } from "../store/types.ts";
 
-const BLOB_KEY = "model_pricing";
-
 export interface PricingService {
   /** Current enabled + disabled rules (cached ~15 s). */
   rules(): Promise<ModelPricingRule[]>;
@@ -241,12 +239,7 @@ function usd(text: string): string {
 /** `onChange` runs after every rule edit: the data plane snapshot carries the enabled rules. */
 export function registerPricingRoutes(app: Hono<AuthEnv>, store: ControlStore, onChange?: () => void): PricingService {
   async function load(): Promise<ModelPricingRule[]> {
-    const blob = await store.ops.getBlob(BLOB_KEY);
-    const list = Array.isArray(blob?.rules) ? blob.rules : [];
-    return list.flatMap((r) => {
-      const parsed = ModelPricingRuleSchema.safeParse(r);
-      return parsed.success ? [parsed.data] : [];
-    });
+    return store.listPricingRules();
   }
   let cache = cached(15_000, load);
   const service: PricingService = {
@@ -256,7 +249,7 @@ export function registerPricingRoutes(app: Hono<AuthEnv>, store: ControlStore, o
     },
   };
   async function save(rules: ModelPricingRule[]) {
-    await store.ops.setBlob(BLOB_KEY, { rules });
+    await store.savePricingRules(rules);
     service.invalidate();
     onChange?.();
   }

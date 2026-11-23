@@ -7,27 +7,39 @@ import {
   CreateGroupRequestSchema,
   CreatePromoCodeRequestSchema,
   formatNanoUsd,
+  ModelPricingRuleSchema,
   normalizePortalSettings,
   UpsertAnnouncementRequestSchema,
   type ConfigBackupFile,
   type ConfigBackupSection,
   type ConfigImportResult,
 } from "@slipgate/contracts";
+import { AutoTestConfigSchema } from "../autotest.ts";
 import type { AuthEnv } from "../middleware/auth.ts";
 import { StoreError, type ControlStore } from "../store/types.ts";
 import { remapTargetingGroups } from "./announcements.ts";
 
+function parseNonNegBigInt(raw: unknown): bigint | null {
+  const s = String(raw ?? "0").trim();
+  if (!/^\d{1,38}$/.test(s)) return null;
+  try {
+    return BigInt(s);
+  } catch {
+    return null;
+  }
+}
+
 /** Export/merge-import of hand-made configuration; never includes secrets or user data. */
 export function registerBackupRoutes(app: Hono<AuthEnv>, store: ControlStore, onChanged: () => Promise<void>) {
   app.get("/api/v1/admin/backup/export", async (c) => {
-    const [settings, groups, routes, plans, promos, announcements, pricing, autoTest, plugins] = await Promise.all([
+    const [settings, groups, routes, plans, promos, announcements, pricingRules, autoTest, plugins] = await Promise.all([
       store.ops.getSettings(),
       store.listGroups(false),
       store.listCompositeRoutes(),
       store.payments.listPlans(true),
       store.ops.listPromoCodes(),
       store.ops.listAnnouncements(),
-      store.ops.getBlob("model_pricing"),
+      store.listPricingRules(),
       store.ops.getBlob("account_autotest"),
       store.ops.getBlob("plugins"),
     ]);
@@ -41,7 +53,7 @@ export function registerBackupRoutes(app: Hono<AuthEnv>, store: ControlStore, on
       paymentPlans: plans.map((p) => ({ ...p })),
       promoCodes: promos.map(({ usedCount: _u, ...p }) => p),
       announcements: announcements.map(({ readCount: _r, ...a }) => a),
-      pricingRules: Array.isArray(pricing?.rules) ? (pricing.rules as Record<string, unknown>[]) : [],
+      pricingRules: pricingRules.map((r) => ({ ...r })),
       autoTest: autoTest ?? null,
       disabledPlugins: Array.isArray(plugins?.disabled) ? (plugins.disabled as string[]) : [],
     };
@@ -75,21 +87,21 @@ export function registerBackupRoutes(app: Hono<AuthEnv>, store: ControlStore, on
     const fail = (what: string, err: unknown) => result.errors.push(`${what}: ${err instanceof Error ? err.message : String(err)}`);
 
     if (want.has("portalSettings") && file.portalSettings) {
-      const imported = normalizePortalSettings(file.portalSettings);
-      // A shorter audit retention deletes history: that needs a fresh two-factor code on the
-      // retention endpoint, so an import never shortens it (keeping entries longer is fine).
-      // A backup made before the setting existed leaves it as it is.
-      const current = (await store.ops.getSettings()).auditLogRetentionDays;
-      if (!("auditLogRetentionDays" in file.portalSettings)) {
-        imported.auditLogRetentionDays = current;
-      } else if (auditRetentionShortens(current, imported.auditLogRetentionDays)) {
-        result.errors.push(
-          `portalSettings.auditLogRetentionDays: kept the current ${current === 0 ? "keep-forever" : `${current}-day`} retention; ` +
-            "shorten it on the audit log page (needs a two-factor code)",
-        );
-        imported.auditLogRetentionDays = current;
-      }
-      await store.ops.saveSettings(imported);
+      const rawPortal = file.portalSettings;
+      await store.ops.updateSettings((prev) => {
+        const imported = normalizePortalSettings(rawPortal);
+        const current = prev.auditLogRetentionDays;
+        if (!("auditLogRetentionDays" in rawPortal)) {
+          imported.auditLogRetentionDays = current;
+        } else if (auditRetentionShortens(current, imported.auditLogRetentionDays)) {
+          result.errors.push(
+            `portalSettings.auditLogRetentionDays: kept the current ${current === 0 ? "keep-forever" : `${current}-day`} retention; ` +
+              "shorten it on the audit log page (needs a two-factor code)",
+          );
+          imported.auditLogRetentionDays = current;
+        }
+        return imported;
+      });
       result.updated.push("portalSettings");
     }
 
@@ -107,11 +119,18 @@ export function registerBackupRoutes(app: Hono<AuthEnv>, store: ControlStore, on
           bump("skipped", "groups");
           continue;
         }
+        const daily = parseNonNegBigInt(raw.dailyLimitNanoUsd ?? "0");
+        const weekly = parseNonNegBigInt(raw.weeklyLimitNanoUsd ?? "0");
+        const monthly = parseNonNegBigInt(raw.monthlyLimitNanoUsd ?? "0");
+        if (daily === null || weekly === null || monthly === null) {
+          fail(`group ${name}`, "Invalid limit amount");
+          continue;
+        }
         const req = CreateGroupRequestSchema.safeParse({
           ...raw,
-          dailyLimitUsd: formatNanoUsd(BigInt(String(raw.dailyLimitNanoUsd ?? "0"))),
-          weeklyLimitUsd: formatNanoUsd(BigInt(String(raw.weeklyLimitNanoUsd ?? "0"))),
-          monthlyLimitUsd: formatNanoUsd(BigInt(String(raw.monthlyLimitNanoUsd ?? "0"))),
+          dailyLimitUsd: formatNanoUsd(daily),
+          weeklyLimitUsd: formatNanoUsd(weekly),
+          monthlyLimitUsd: formatNanoUsd(monthly),
         });
         if (!req.success) {
           fail(`group ${name}`, req.error.issues[0]?.message);
@@ -167,6 +186,11 @@ export function registerBackupRoutes(app: Hono<AuthEnv>, store: ControlStore, on
           bump("skipped", "paymentPlans");
           continue;
         }
+        const creditNano = parseNonNegBigInt(raw.creditNanoUsd ?? "0");
+        if (creditNano === null) {
+          fail(`plan ${name}`, "Invalid creditNanoUsd");
+          continue;
+        }
         try {
           await store.payments.createPlan({
             name,
@@ -174,7 +198,7 @@ export function registerBackupRoutes(app: Hono<AuthEnv>, store: ControlStore, on
             kind,
             priceMinor: Math.max(1, Math.trunc(Number(raw.priceMinor) || 0)),
             currency: raw.currency === "USD" ? "USD" : "CNY",
-            creditNano: BigInt(String(raw.creditNanoUsd ?? "0")),
+            creditNano,
             groupId,
             validityDays: kind === "subscription" ? Math.max(1, Math.trunc(Number(raw.validityDays) || 30)) : null,
             badge: String(raw.badge ?? ""),
@@ -197,7 +221,11 @@ export function registerBackupRoutes(app: Hono<AuthEnv>, store: ControlStore, on
           bump("skipped", "promoCodes");
           continue;
         }
-        const bonus = BigInt(String(raw.bonusNanoUsd ?? "0"));
+        const bonus = parseNonNegBigInt(raw.bonusNanoUsd ?? "0");
+        if (bonus === null) {
+          fail(`promo ${code}`, "Invalid bonusNanoUsd");
+          continue;
+        }
         const req = CreatePromoCodeRequestSchema.safeParse({ ...raw, bonusUsd: formatNanoUsd(bonus) });
         if (!req.success) {
           fail(`promo ${code}`, req.error.issues[0]?.message);
@@ -239,29 +267,44 @@ export function registerBackupRoutes(app: Hono<AuthEnv>, store: ControlStore, on
     }
 
     if (want.has("pricingRules") && file.pricingRules.length) {
-      const blob = await store.ops.getBlob("model_pricing");
-      const current = Array.isArray(blob?.rules) ? (blob.rules as Record<string, unknown>[]) : [];
-      const patterns = new Set(current.map((r) => String(r.pattern)));
+      const current = await store.listPricingRules();
+      const patterns = new Set(current.map((r) => r.pattern));
+      let added = 0;
       for (const raw of file.pricingRules) {
-        if (patterns.has(String(raw.pattern))) {
+        const pattern = String(raw.pattern ?? "");
+        if (patterns.has(pattern)) {
           bump("skipped", "pricingRules");
           continue;
         }
-        current.push({ ...raw, id: `price_${crypto.randomUUID()}` });
-        patterns.add(String(raw.pattern));
+        const validated = ModelPricingRuleSchema.safeParse({
+          ...raw,
+          id: `price_${crypto.randomUUID()}`,
+          updatedAtIso: typeof raw.updatedAtIso === "string" ? raw.updatedAtIso : new Date().toISOString(),
+        });
+        if (!validated.success) {
+          fail(`pricingRule ${pattern || "?"}`, validated.error.issues[0]?.message);
+          continue;
+        }
+        current.push(validated.data);
+        patterns.add(validated.data.pattern);
         bump("created", "pricingRules");
+        added++;
       }
-      await store.ops.setBlob("model_pricing", { rules: current });
+      if (added > 0) await store.savePricingRules(current);
     }
 
     if (want.has("autoTest") && file.autoTest) {
-      await store.ops.setBlob("account_autotest", file.autoTest);
-      result.updated.push("autoTest");
+      const checked = AutoTestConfigSchema.safeParse(file.autoTest);
+      if (!checked.success) {
+        fail("autoTest", checked.error.issues[0]?.message);
+      } else {
+        await store.ops.setBlob("account_autotest", checked.data);
+        result.updated.push("autoTest");
+      }
     }
 
     if (want.has("plugins")) {
-      const blob = (await store.ops.getBlob("plugins")) ?? {};
-      await store.ops.setBlob("plugins", { ...blob, disabled: file.disabledPlugins });
+      await store.ops.updateBlob("plugins", (blob) => ({ ...(blob ?? {}), disabled: file.disabledPlugins }));
       result.updated.push("plugins");
     }
 

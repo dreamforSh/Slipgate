@@ -1173,6 +1173,78 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return c.json({ ok: true, accountId: account.id, cooldownUntilIso: account.cooldownUntilIso });
   });
 
+  app.post("/api/v1/internal/dataplane/media-tasks", async (c) => {
+    if (!verifyInternalHeader(c)) {
+      return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
+    }
+    const raw = (await readJsonBody(c.req.raw)) as Record<string, unknown>;
+    const id = typeof raw?.id === "string" ? raw.id.trim() : "";
+    const apiKeyId = typeof raw?.apiKeyId === "string" ? raw.apiKeyId.trim() : "";
+    const kind =
+      raw?.kind === "image" || raw?.kind === "video" || raw?.kind === "response_state" ? raw.kind : null;
+    if (!id || !apiKeyId || !kind) {
+      return c.json({ error: "invalid_request", message: "id, apiKeyId and valid kind are required" }, 400);
+    }
+    const expiresAtIso =
+      typeof raw?.expiresAtIso === "string" && !Number.isNaN(Date.parse(raw.expiresAtIso))
+        ? raw.expiresAtIso
+        : new Date(Date.now() + 24 * 3_600_000).toISOString();
+    const resultJson =
+      raw?.resultJson && typeof raw.resultJson === "object" && !Array.isArray(raw.resultJson)
+        ? (raw.resultJson as Record<string, unknown>)
+        : {};
+    const saved = await store.upsertMediaTask({
+      id,
+      apiKeyId,
+      userId: typeof raw?.userId === "string" ? raw.userId : "",
+      accountId: typeof raw?.accountId === "string" ? raw.accountId : "",
+      groupId: typeof raw?.groupId === "string" ? raw.groupId : "",
+      platform: typeof raw?.platform === "string" ? raw.platform : "",
+      kind,
+      upstreamTaskId: typeof raw?.upstreamTaskId === "string" && raw.upstreamTaskId ? raw.upstreamTaskId : id,
+      publicModel: typeof raw?.publicModel === "string" ? raw.publicModel : "",
+      upstreamModel: typeof raw?.upstreamModel === "string" ? raw.upstreamModel : "",
+      status: typeof raw?.status === "string" && raw.status ? raw.status : "completed",
+      resultJson,
+      expiresAtIso,
+    });
+    return c.json({ ok: true, item: saved });
+  });
+
+  app.get("/api/v1/internal/dataplane/media-tasks/:kind/:id", async (c) => {
+    if (!verifyInternalHeader(c)) {
+      return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
+    }
+    const kindParam = c.req.param("kind");
+    const kind =
+      kindParam === "image" || kindParam === "video" || kindParam === "response_state" ? kindParam : null;
+    const apiKeyId = (c.req.query("apiKeyId") ?? "").trim();
+    const id = c.req.param("id").trim();
+    if (!kind || !apiKeyId || !id) {
+      return c.json({ error: "invalid_request", message: "kind, id and apiKeyId query are required" }, 400);
+    }
+    const item = await store.getMediaTask(apiKeyId, kind, id);
+    if (!item) return c.json({ error: "not_found", message: "Task not found" }, 404);
+    return c.json({ ok: true, item });
+  });
+
+  app.delete("/api/v1/internal/dataplane/media-tasks/:kind/:id", async (c) => {
+    if (!verifyInternalHeader(c)) {
+      return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
+    }
+    const kindParam = c.req.param("kind");
+    const kind =
+      kindParam === "image" || kindParam === "video" || kindParam === "response_state" ? kindParam : null;
+    const apiKeyId = (c.req.query("apiKeyId") ?? "").trim();
+    const id = c.req.param("id").trim();
+    if (!kind || !apiKeyId || !id) {
+      return c.json({ error: "invalid_request", message: "kind, id and apiKeyId query are required" }, 400);
+    }
+    const deleted = await store.deleteMediaTask(apiKeyId, kind, id);
+    if (!deleted) return c.json({ error: "not_found", message: "Task not found" }, 404);
+    return c.json({ ok: true, deleted: true });
+  });
+
   // ---------------------------------------------------------------------------
   // Admin Console Endpoints (RBAC: admin required)
   // ---------------------------------------------------------------------------

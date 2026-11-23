@@ -24,10 +24,19 @@ type storedResponseEntry struct {
 	history      []CanonicalMessage
 }
 
+type persistedResponseStatePayload struct {
+	ResponseJSON map[string]any     `json:"responseJson"`
+	InputItems   []map[string]any   `json:"inputItems"`
+	History      []CanonicalMessage `json:"history"`
+}
+
 type responseStateStore struct {
-	mu    sync.Mutex
-	items map[string]*storedResponseEntry
-	order []string
+	mu            sync.Mutex
+	items         map[string]*storedResponseEntry
+	order         []string
+	persistPut    func(apiKeyID, respID, publicModel string, expiresAt time.Time, payload persistedResponseStatePayload)
+	persistGet    func(apiKeyID, respID string) (persistedResponseStatePayload, time.Time, bool)
+	persistDelete func(apiKeyID, respID string) bool
 }
 
 func (s *responseStateStore) sweepLocked(now time.Time) {
@@ -54,6 +63,47 @@ func (s *responseStateStore) sweepLocked(now time.Time) {
 	}
 }
 
+func (s *responseStateStore) loadOrFetch(apiKeyID, respID string) (*storedResponseEntry, bool) {
+	if s == nil || apiKeyID == "" || respID == "" {
+		return nil, false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	ent, ok := s.items[respID]
+	fetchFn := s.persistGet
+	if ok && ent.ownerKeyID == apiKeyID && now.Before(ent.expiresAt) {
+		s.mu.Unlock()
+		return ent, true
+	}
+	s.mu.Unlock()
+	if fetchFn == nil {
+		return nil, false
+	}
+	payload, exp, found := fetchFn(apiKeyID, respID)
+	if !found || now.After(exp) {
+		return nil, false
+	}
+	loaded := &storedResponseEntry{
+		id:           respID,
+		ownerKeyID:   apiKeyID,
+		expiresAt:    exp,
+		responseJSON: payload.ResponseJSON,
+		inputItems:   payload.InputItems,
+		history:      payload.History,
+	}
+	s.mu.Lock()
+	if s.items == nil {
+		s.items = make(map[string]*storedResponseEntry)
+	}
+	s.sweepLocked(now)
+	if _, exists := s.items[respID]; !exists {
+		s.order = append(s.order, respID)
+	}
+	s.items[respID] = loaded
+	s.mu.Unlock()
+	return loaded, true
+}
+
 func (s *responseStateStore) hydratePreviousTurn(apiKeyID string, turn *CanonicalTurn) {
 	if s == nil || turn == nil || apiKeyID == "" {
 		return
@@ -62,13 +112,12 @@ func (s *responseStateStore) hydratePreviousTurn(apiKeyID string, turn *Canonica
 	if prevID == "" {
 		return
 	}
-	now := time.Now()
-	s.mu.Lock()
-	ent, ok := s.items[prevID]
-	var prior []CanonicalMessage
-	if ok && ent.ownerKeyID == apiKeyID && now.Before(ent.expiresAt) {
-		prior = cloneCanonicalMessages(ent.history)
+	ent, ok := s.loadOrFetch(apiKeyID, prevID)
+	if !ok {
+		return
 	}
+	s.mu.Lock()
+	prior := cloneCanonicalMessages(ent.history)
 	s.mu.Unlock()
 	if len(prior) == 0 {
 		return
@@ -102,8 +151,8 @@ func (s *responseStateStore) captureTurn(apiKeyID, publicModel string, turn *Can
 	}
 
 	now := time.Now()
+	exp := now.Add(responseStateTTL)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.items == nil {
 		s.items = make(map[string]*storedResponseEntry)
 	}
@@ -114,22 +163,26 @@ func (s *responseStateStore) captureTurn(apiKeyID, publicModel string, turn *Can
 	s.items[id] = &storedResponseEntry{
 		id:           id,
 		ownerKeyID:   apiKeyID,
-		expiresAt:    now.Add(responseStateTTL),
+		expiresAt:    exp,
 		responseJSON: respObj,
 		inputItems:   inputItems,
 		history:      history,
 	}
+	putFn := s.persistPut
+	s.mu.Unlock()
+
+	if putFn != nil {
+		putFn(apiKeyID, id, publicModel, exp, persistedResponseStatePayload{
+			ResponseJSON: respObj,
+			InputItems:   inputItems,
+			History:      history,
+		})
+	}
 }
 
 func (s *responseStateStore) get(apiKeyID, respID string) (map[string]any, bool) {
-	if s == nil || apiKeyID == "" || respID == "" {
-		return nil, false
-	}
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ent, ok := s.items[respID]
-	if !ok || ent.ownerKeyID != apiKeyID || now.After(ent.expiresAt) {
+	ent, ok := s.loadOrFetch(apiKeyID, respID)
+	if !ok {
 		return nil, false
 	}
 	return ent.responseJSON, true
@@ -141,24 +194,24 @@ func (s *responseStateStore) delete(apiKeyID, respID string) bool {
 	}
 	now := time.Now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	ent, ok := s.items[respID]
-	if !ok || ent.ownerKeyID != apiKeyID || now.After(ent.expiresAt) {
-		return false
+	deletedLocal := false
+	if ok && ent.ownerKeyID == apiKeyID && now.Before(ent.expiresAt) {
+		delete(s.items, respID)
+		deletedLocal = true
 	}
-	delete(s.items, respID)
-	return true
+	delFn := s.persistDelete
+	s.mu.Unlock()
+	deletedRemote := false
+	if delFn != nil {
+		deletedRemote = delFn(apiKeyID, respID)
+	}
+	return deletedLocal || deletedRemote
 }
 
 func (s *responseStateStore) inputItems(apiKeyID, respID string) ([]map[string]any, bool) {
-	if s == nil || apiKeyID == "" || respID == "" {
-		return nil, false
-	}
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ent, ok := s.items[respID]
-	if !ok || ent.ownerKeyID != apiKeyID || now.After(ent.expiresAt) {
+	ent, ok := s.loadOrFetch(apiKeyID, respID)
+	if !ok {
 		return nil, false
 	}
 	return ent.inputItems, true

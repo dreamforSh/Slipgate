@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -263,6 +264,7 @@ type Coordinator struct {
 	accessLogEnabled func() bool
 
 	mu                 sync.RWMutex
+	keyByHash          map[string]edgeKeyMeta
 	keyIPAllowlists    map[string][]string
 	keyIPDenylists     map[string][]string
 	accountAuthKinds   map[string]string
@@ -311,11 +313,19 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		trustedProxies:        trustedProxies,
 		logger:                logger,
 		accessLogEnabled: opts.AccessLogEnabled,
+		keyByHash:        make(map[string]edgeKeyMeta),
 		keyIPAllowlists:  make(map[string][]string),
 		keyIPDenylists:   make(map[string][]string),
 		accountAuthKinds: make(map[string]string),
 		accountTiers:     make(map[string]string),
 		accountMetas:     make(map[string]accountMeta),
+	}
+	if bffOrigin != "" && opts.InternalToken != "" {
+		c.responsesState.persistPut = c.persistResponseStatePut
+		c.responsesState.persistGet = c.persistResponseStateGet
+		c.responsesState.persistDelete = c.persistResponseStateDelete
+		c.mediaTasks.persistPut = c.persistMediaTaskPut
+		c.mediaTasks.persistGet = c.persistMediaTaskGet
 	}
 	spoolDir := strings.TrimSpace(opts.SettlementSpoolDir)
 	if spoolDir == "" {
@@ -483,6 +493,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	}
 
 	now := time.Now()
+	nextKeyByHash := make(map[string]edgeKeyMeta, len(snap.APIKeys))
 	nextIPAllowlists := make(map[string][]string)
 	nextIPDenylists := make(map[string][]string)
 	coreKeys := make([]coreAPIKey, 0, len(snap.APIKeys))
@@ -499,11 +510,20 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		if len(k.IPDenylist) > 0 {
 			nextIPDenylists[k.ID] = append([]string(nil), k.IPDenylist...)
 		}
+		normHash := strings.ToLower(strings.TrimSpace(k.KeyHashHex))
+		if normHash != "" {
+			nextKeyByHash[normHash] = edgeKeyMeta{
+				ID:      k.ID,
+				UserID:  k.UserID,
+				GroupID: k.GroupID,
+				Enabled: enabled,
+			}
+		}
 		coreKeys = append(coreKeys, coreAPIKey{
 			ID:               k.ID,
 			UserID:           k.UserID,
 			GroupID:          k.GroupID,
-			KeyHashHex:       strings.ToLower(strings.TrimSpace(k.KeyHashHex)),
+			KeyHashHex:       normHash,
 			RPMLimit:         max(1, k.RPMLimit),
 			ConcurrencyLimit: max(1, k.ConcurrencyLimit),
 			Enabled:          enabled,
@@ -589,6 +609,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	}
 
 	c.mu.Lock()
+	c.keyByHash = nextKeyByHash
 	c.keyIPAllowlists = nextIPAllowlists
 	c.keyIPDenylists = nextIPDenylists
 	c.accountAuthKinds = nextAuthKinds
@@ -902,6 +923,22 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	apiKey := extractAPIKey(r)
 	clientIP := c.clientIPFromRequest(r)
+	// [M-06] Enforce IP allowlist/denylist and pre-check user/group caps BEFORE calling slipgate-core
+	// so unauthorized client IPs or throttled users cannot burn legitimate per-key RPM in core-zig.
+	if km, known := c.lookupKeyByPlaintext(apiKey); known && km.Enabled {
+		if !c.isClientIPAllowed(km.ID, clientIP) {
+			WriteProtocolError(w, turn.IngressCodec, http.StatusForbidden, "permission_error", "ip_not_allowed", "client IP is not in API key allowlist")
+			return
+		}
+		if !isModelsReq {
+			if rej := c.userLimits.precheck(km.UserID, km.GroupID); rej != nil {
+				setRetryAfter(w.Header(), rej.retryAfterMs)
+				WriteProtocolError(w, turn.IngressCodec, rej.status, rej.errType, rej.code, rej.message)
+				return
+			}
+		}
+	}
+
 	sessionKey := deriveSessionKey(r, turn, apiKey)
 	baseEvalReq := coreTurnEvalRequest{
 		RequestID:            requestID,
@@ -1729,11 +1766,23 @@ func isStatefulResponsesLookup(method, path string) bool {
 
 func (c *Coordinator) authenticateAPIKeyViaCore(ctx context.Context, r *http.Request, requestID string, startedAt time.Time) (coreDispatchDirective, bool) {
 	clientIP := c.clientIPFromRequest(r)
+	rawKey := extractAPIKey(r)
+	if km, known := c.lookupKeyByPlaintext(rawKey); known && km.Enabled {
+		if !c.isClientIPAllowed(km.ID, clientIP) {
+			return coreDispatchDirective{
+				Action:    "reject",
+				Status:    http.StatusForbidden,
+				ErrorType: "permission_error",
+				ErrorCode: "ip_not_allowed",
+				Message:   "client IP is not in API key allowlist",
+			}, false
+		}
+	}
 	evalPayload, _ := json.Marshal(coreTurnEvalRequest{
 		RequestID: requestID,
 		Method:    http.MethodGet,
 		Path:      "/v1/models",
-		APIKey:    extractAPIKey(r),
+		APIKey:    rawKey,
 		ClientIP:  clientIP,
 		NowUnixMs: startedAt.UnixMilli(),
 	})
@@ -1925,4 +1974,207 @@ func normalizeBanDuration(d string) string {
 	default:
 		return "10m"
 	}
+}
+
+type edgeKeyMeta struct {
+	ID      string
+	UserID  string
+	GroupID string
+	Enabled bool
+}
+
+func (c *Coordinator) lookupKeyByPlaintext(apiKey string) (edgeKeyMeta, bool) {
+	trimmed := strings.TrimSpace(apiKey)
+	if trimmed == "" {
+		return edgeKeyMeta{}, false
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	hashHex := hex.EncodeToString(sum[:])
+	c.mu.RLock()
+	meta, ok := c.keyByHash[hashHex]
+	c.mu.RUnlock()
+	return meta, ok
+}
+
+func (c *Coordinator) persistResponseStatePut(
+	apiKeyID, respID, publicModel string,
+	expiresAt time.Time,
+	payload persistedResponseStatePayload,
+) {
+	if c.bffOrigin == "" || c.internalToken == "" {
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"id":           respID,
+		"apiKeyId":     apiKeyID,
+		"kind":         "response_state",
+		"publicModel":  publicModel,
+		"status":       "completed",
+		"expiresAtIso": expiresAt.UTC().Format(time.RFC3339),
+		"resultJson":   payload,
+	})
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.bffOrigin+"/api/v1/internal/dataplane/media-tasks", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Slipgate-Internal-Token", c.internalToken)
+	if resp, err := c.bffClient.Do(req); err == nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16*1024))
+		_ = resp.Body.Close()
+	}
+}
+
+func (c *Coordinator) persistResponseStateGet(apiKeyID, respID string) (persistedResponseStatePayload, time.Time, bool) {
+	if c.bffOrigin == "" || c.internalToken == "" {
+		return persistedResponseStatePayload{}, time.Time{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	target := fmt.Sprintf("%s/api/v1/internal/dataplane/media-tasks/response_state/%s?apiKeyId=%s",
+		c.bffOrigin, url.PathEscape(respID), url.QueryEscape(apiKeyID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return persistedResponseStatePayload{}, time.Time{}, false
+	}
+	req.Header.Set("X-Slipgate-Internal-Token", c.internalToken)
+	resp, err := c.bffClient.Do(req)
+	if err != nil {
+		return persistedResponseStatePayload{}, time.Time{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return persistedResponseStatePayload{}, time.Time{}, false
+	}
+	var env struct {
+		Item struct {
+			ExpiresAtISO string                        `json:"expiresAtIso"`
+			ResultJSON   persistedResponseStatePayload `json:"resultJson"`
+		} `json:"item"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&env) != nil {
+		return persistedResponseStatePayload{}, time.Time{}, false
+	}
+	exp, err := time.Parse(time.RFC3339, env.Item.ExpiresAtISO)
+	if err != nil {
+		exp = time.Now().Add(responseStateTTL)
+	}
+	return env.Item.ResultJSON, exp, len(env.Item.ResultJSON.ResponseJSON) > 0
+}
+
+func (c *Coordinator) persistResponseStateDelete(apiKeyID, respID string) bool {
+	if c.bffOrigin == "" || c.internalToken == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	target := fmt.Sprintf("%s/api/v1/internal/dataplane/media-tasks/response_state/%s?apiKeyId=%s",
+		c.bffOrigin, url.PathEscape(respID), url.QueryEscape(apiKeyID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, target, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("X-Slipgate-Internal-Token", c.internalToken)
+	resp, err := c.bffClient.Do(req)
+	if err != nil {
+		return false
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16*1024))
+	_ = resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func (c *Coordinator) persistMediaTaskPut(entry mediaTaskAffinity) {
+	if c.bffOrigin == "" || c.internalToken == "" {
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"id":             entry.taskID,
+		"upstreamTaskId": entry.taskID,
+		"apiKeyId":       entry.ownerKeyID,
+		"userId":         entry.userID,
+		"groupId":        entry.groupID,
+		"accountId":      entry.accountID,
+		"platform":       entry.provider,
+		"kind":           "video",
+		"publicModel":    entry.publicModel,
+		"upstreamModel":  entry.upstreamModel,
+		"status":         "pending",
+		"expiresAtIso":   entry.expiresAt.UTC().Format(time.RFC3339),
+		"resultJson":     map[string]any{},
+	})
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.bffOrigin+"/api/v1/internal/dataplane/media-tasks", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Slipgate-Internal-Token", c.internalToken)
+	if resp, err := c.bffClient.Do(req); err == nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16*1024))
+		_ = resp.Body.Close()
+	}
+}
+
+func (c *Coordinator) persistMediaTaskGet(apiKeyID, taskID string) (mediaTaskAffinity, bool) {
+	if c.bffOrigin == "" || c.internalToken == "" {
+		return mediaTaskAffinity{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	target := fmt.Sprintf("%s/api/v1/internal/dataplane/media-tasks/video/%s?apiKeyId=%s",
+		c.bffOrigin, url.PathEscape(taskID), url.QueryEscape(apiKeyID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return mediaTaskAffinity{}, false
+	}
+	req.Header.Set("X-Slipgate-Internal-Token", c.internalToken)
+	resp, err := c.bffClient.Do(req)
+	if err != nil {
+		return mediaTaskAffinity{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return mediaTaskAffinity{}, false
+	}
+	var env struct {
+		Item struct {
+			ID            string `json:"id"`
+			APIKeyID      string `json:"apiKeyId"`
+			UserID        string `json:"userId"`
+			GroupID       string `json:"groupId"`
+			AccountID     string `json:"accountId"`
+			Platform      string `json:"platform"`
+			PublicModel   string `json:"publicModel"`
+			UpstreamModel string `json:"upstreamModel"`
+			ExpiresAtISO  string `json:"expiresAtIso"`
+		} `json:"item"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&env) != nil || env.Item.AccountID == "" {
+		return mediaTaskAffinity{}, false
+	}
+	exp, err := time.Parse(time.RFC3339, env.Item.ExpiresAtISO)
+	if err != nil {
+		exp = time.Now().Add(24 * time.Hour)
+	}
+	return mediaTaskAffinity{
+		taskID:        taskID,
+		ownerKeyID:    apiKeyID,
+		userID:        env.Item.UserID,
+		groupID:       env.Item.GroupID,
+		accountID:     env.Item.AccountID,
+		provider:      env.Item.Platform,
+		publicModel:   env.Item.PublicModel,
+		upstreamModel: env.Item.UpstreamModel,
+		expiresAt:     exp,
+	}, true
 }

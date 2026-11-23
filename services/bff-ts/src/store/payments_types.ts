@@ -40,6 +40,11 @@ export interface OrderInput {
   expiresAtIso: string;
   /** Provider instance chosen by the load balancer; null = the built-in EasyPay / Stripe block or manual. */
   providerInstanceId?: string | null;
+  /** Atomic cap checks enforced inside createOrder so concurrent requests cannot pierce pending or daily limits. */
+  maxPendingOrders?: number;
+  merchantUsageKey?: string | null;
+  merchantDailyLimitMinor?: number;
+  dayStartIso?: string;
 }
 
 /** What the gateway handed back for a new order (see PaymentOrderItem.checkout). */

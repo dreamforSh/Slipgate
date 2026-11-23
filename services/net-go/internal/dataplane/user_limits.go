@@ -230,6 +230,57 @@ func counterFor(m map[string]*limitCounter, key string, minute, nowMs int64, tra
 	return c
 }
 
+// precheck inspects whether (userID, groupID) has already hit an RPM or concurrency cap without
+// mutating counters. Used before slipgate-core IPC so a throttled user does not burn key RPM.
+func (g *userLimitGate) precheck(userID, groupID string) *userLimitRejection {
+	if userID == "" {
+		return nil
+	}
+	nowMs := g.clock().UnixMilli()
+	minute := nowMs / 60_000
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	policy := g.policy
+	if policy == nil {
+		return nil
+	}
+	userCap, groupCap := policy.capsFor(userID, groupID)
+	untilNextMinute := uint64((minute+1)*60_000 - nowMs)
+	if groupID != "" && groupCap.rpm > 0 {
+		if gc := g.pairs[pairKey(userID, groupID)]; gc.rpmAt(minute) >= groupCap.rpm {
+			return &userLimitRejection{
+				status: http.StatusTooManyRequests, errType: "rate_limit_error", code: "group_rpm_exceeded",
+				message: "group requests-per-minute limit exceeded", retryAfterMs: untilNextMinute,
+			}
+		}
+	}
+	if userCap.rpm > 0 {
+		if uc := g.users[userID]; uc.rpmAt(minute) >= userCap.rpm {
+			return &userLimitRejection{
+				status: http.StatusTooManyRequests, errType: "rate_limit_error", code: "user_rpm_exceeded",
+				message: "user requests-per-minute limit exceeded", retryAfterMs: untilNextMinute,
+			}
+		}
+	}
+	if groupID != "" && groupCap.concurrency > 0 {
+		if gc := g.pairs[pairKey(userID, groupID)]; gc != nil && gc.inFlight >= groupCap.concurrency {
+			return &userLimitRejection{
+				status: http.StatusTooManyRequests, errType: "rate_limit_error", code: "group_concurrency_exceeded",
+				message: "group concurrent request limit exceeded", retryAfterMs: 1000,
+			}
+		}
+	}
+	if userCap.concurrency > 0 {
+		if uc := g.users[userID]; uc != nil && uc.inFlight >= userCap.concurrency {
+			return &userLimitRejection{
+				status: http.StatusTooManyRequests, errType: "rate_limit_error", code: "user_concurrency_exceeded",
+				message: "user concurrent request limit exceeded", retryAfterMs: 1000,
+			}
+		}
+	}
+	return nil
+}
+
 // admit decides one turn. On success it returns a release func (idempotent) that frees the
 // turn's concurrency slots; on refusal it returns the rejection and a no-op release.
 func (g *userLimitGate) admit(userID, groupID string) (func(), *userLimitRejection) {
