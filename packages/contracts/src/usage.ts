@@ -156,7 +156,7 @@ export type ModelPrice = z.infer<typeof ModelPriceSchema>;
 export const PlazaModelSchema = z.object({
   id: z.string(),
   provider: z.string(),
-  source: z.enum(["allowlist", "route", "builtin"]),
+  source: z.enum(["allowlist", "route", "builtin", "discovered"]),
   price: ModelPriceSchema,
 });
 export type PlazaModel = z.infer<typeof PlazaModelSchema>;
@@ -293,6 +293,21 @@ const PerMillionUsdSchema = z
   .trim()
   .regex(/^\d{1,9}(?:\.\d{1,6})?$/, "Expected a price such as 3 or 0.25");
 
+const PerUnitUsdSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{1,9}(?:\.\d{1,9})?$/, "Expected a USD amount such as 0.04 or 0.005");
+
+const PriceMultiplierSchema = z.number().positive().max(100);
+
+export const ReasoningEffortMultipliersSchema = z.object({
+  low: PriceMultiplierSchema.optional(),
+  medium: PriceMultiplierSchema.optional(),
+  high: PriceMultiplierSchema.optional(),
+  xhigh: PriceMultiplierSchema.optional(),
+});
+export type ReasoningEffortMultipliers = z.infer<typeof ReasoningEffortMultipliersSchema>;
+
 export const ModelPricingRuleSchema = z.object({
   id: z.string(),
   /** Exact model id, or a prefix ending in "*" (e.g. "claude-opus-*"). */
@@ -302,6 +317,19 @@ export const ModelPricingRuleSchema = z.object({
   outputNanoPerMTok: z.string().regex(/^\d+$/),
   cacheReadNanoPerMTok: z.string().regex(/^\d+$/),
   cacheWriteNanoPerMTok: z.string().regex(/^\d+$/),
+  /** Optional flat per-request & multimodal unit fees in nano-USD. */
+  perRequestNanoUsd: z.string().regex(/^\d+$/).optional(),
+  perImageNanoUsd: z.string().regex(/^\d+$/).optional(),
+  perVideoSecondNanoUsd: z.string().regex(/^\d+$/).optional(),
+  /** Long-context tiered pricing (> threshold input tokens, e.g. 200000). */
+  longContextThresholdTokens: z.number().int().nonnegative().optional(),
+  longContextInputMultiplier: PriceMultiplierSchema.optional(),
+  longContextOutputMultiplier: PriceMultiplierSchema.optional(),
+  /** Service tier multipliers ("fast" / "priority" vs "flex"). */
+  serviceTierFastMultiplier: PriceMultiplierSchema.optional(),
+  serviceTierFlexMultiplier: PriceMultiplierSchema.optional(),
+  /** Optional per-reasoning-effort multipliers. */
+  reasoningEffortMultipliers: ReasoningEffortMultipliersSchema.optional(),
   enabled: z.boolean(),
   notes: z.string(),
   updatedAtIso: z.string(),
@@ -320,6 +348,15 @@ export const UpsertModelPricingRuleSchema = z.object({
   /** Defaults: cache read 10% and cache write 125% of the input price. */
   cacheReadPerMTokUsd: PerMillionUsdSchema.optional(),
   cacheWritePerMTokUsd: PerMillionUsdSchema.optional(),
+  perRequestUsd: PerUnitUsdSchema.optional(),
+  perImageUsd: PerUnitUsdSchema.optional(),
+  perVideoSecondUsd: PerUnitUsdSchema.optional(),
+  longContextThresholdTokens: z.number().int().min(0).max(10_000_000).optional(),
+  longContextInputMultiplier: PriceMultiplierSchema.optional(),
+  longContextOutputMultiplier: PriceMultiplierSchema.optional(),
+  serviceTierFastMultiplier: PriceMultiplierSchema.optional(),
+  serviceTierFlexMultiplier: PriceMultiplierSchema.optional(),
+  reasoningEffortMultipliers: ReasoningEffortMultipliersSchema.optional(),
   enabled: z.boolean().default(true),
   notes: z.string().trim().max(200).default(""),
 });

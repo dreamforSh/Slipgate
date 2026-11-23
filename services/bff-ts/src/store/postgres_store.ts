@@ -449,6 +449,55 @@ export class PostgresControlStore implements ControlStore {
 
       ALTER TABLE core.api_keys
           ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT 'default';
+
+      ALTER TABLE core.usage_logs
+          ADD COLUMN IF NOT EXISTS service_tier TEXT NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS reasoning_effort TEXT NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS image_count INTEGER NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS video_seconds NUMERIC(12, 3) NOT NULL DEFAULT 0;
+
+      CREATE TABLE IF NOT EXISTS core.model_pricing_rules (
+          id                                  TEXT PRIMARY KEY,
+          pattern                             TEXT NOT NULL UNIQUE,
+          input_nano_per_mtok                 NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          output_nano_per_mtok                NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          cache_read_nano_per_mtok            NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          cache_write_nano_per_mtok           NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          per_request_nano_usd                NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          per_image_nano_usd                  NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          per_video_second_nano_usd           NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          long_context_threshold_tokens       INTEGER NOT NULL DEFAULT 0,
+          long_context_input_multiplier       NUMERIC(12, 6) NOT NULL DEFAULT 1.000000,
+          long_context_output_multiplier      NUMERIC(12, 6) NOT NULL DEFAULT 1.000000,
+          service_tier_fast_multiplier        NUMERIC(12, 6) NOT NULL DEFAULT 2.000000,
+          service_tier_flex_multiplier        NUMERIC(12, 6) NOT NULL DEFAULT 0.500000,
+          reasoning_effort_multipliers        JSONB NOT NULL DEFAULT '{}'::jsonb,
+          enabled                             BOOLEAN NOT NULL DEFAULT TRUE,
+          notes                               TEXT NOT NULL DEFAULT '',
+          updated_at                          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS core.media_tasks (
+          id                  TEXT PRIMARY KEY,
+          upstream_task_id    TEXT NOT NULL,
+          user_id             TEXT NOT NULL,
+          api_key_id          TEXT NOT NULL,
+          account_id          TEXT NOT NULL,
+          group_id            TEXT NOT NULL,
+          platform            TEXT NOT NULL,
+          kind                TEXT NOT NULL CHECK (kind IN ('image', 'video')),
+          public_model        TEXT NOT NULL,
+          upstream_model      TEXT NOT NULL,
+          status              TEXT NOT NULL DEFAULT 'queued',
+          video_seconds       NUMERIC(12, 3) NOT NULL DEFAULT 0,
+          image_count         INTEGER NOT NULL DEFAULT 0,
+          cost_nano_usd       NUMERIC(39, 0) NOT NULL DEFAULT 0,
+          result_json         JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_core_media_tasks_key_created
+          ON core.media_tasks (api_key_id, created_at DESC);
     `);
     // Before PG_OPS_SCHEMA_SQL: its spent_nano_usd guard must see whether this start adds the column.
     await this.sql.unsafe(PG_SETTLEMENT_SCHEMA_SQL);
@@ -1063,7 +1112,9 @@ export class PostgresControlStore implements ControlStore {
         temp_unsched_until: Date | null;
         temp_unsched_reason: string | null;
         window_5h_used_bps: number | null;
+        window_5h_reset_at: Date | null;
         window_7d_used_bps: number | null;
+        window_7d_reset_at: Date | null;
         last_used_at: Date | null;
         last_test_at: Date | null;
         last_test_ok: boolean | null;
@@ -1092,7 +1143,9 @@ export class PostgresControlStore implements ControlStore {
         a.temp_unsched_until,
         a.temp_unsched_reason,
         q.window_5h_used_bps,
+        q.window_5h_reset_at,
         q.window_7d_used_bps,
+        q.window_7d_reset_at,
         q.last_used_at,
         a.last_test_at,
         a.last_test_ok,
@@ -1137,8 +1190,8 @@ export class PostgresControlStore implements ControlStore {
         ...lifecycle,
         effectiveStatus: effectiveAccountStatus(lifecycle, nowMs),
         cooldownReason: r.temp_unsched_reason ?? "",
-        window5hUsedBps: r.window_5h_used_bps ?? 0,
-        window7dUsedBps: r.window_7d_used_bps ?? 0,
+        window5hUsedBps: r.window_5h_reset_at && r.window_5h_reset_at.getTime() <= nowMs ? 0 : (r.window_5h_used_bps ?? 0),
+        window7dUsedBps: r.window_7d_reset_at && r.window_7d_reset_at.getTime() <= nowMs ? 0 : (r.window_7d_used_bps ?? 0),
         lastTest:
           r.last_test_at && r.last_test_ok !== null
             ? {
@@ -1767,7 +1820,9 @@ export class PostgresControlStore implements ControlStore {
           auto_pause_on_expired: boolean | null;
           temp_unsched_until: Date | null;
           window_5h_used_bps: number | null;
+          window_5h_reset_at: Date | null;
           window_7d_used_bps: number | null;
+          window_7d_reset_at: Date | null;
         }[]
       >`
         SELECT
@@ -1785,7 +1840,9 @@ export class PostgresControlStore implements ControlStore {
           a.auto_pause_on_expired,
           a.temp_unsched_until,
           q.window_5h_used_bps,
-          q.window_7d_used_bps
+          q.window_5h_reset_at,
+          q.window_7d_used_bps,
+          q.window_7d_reset_at
         FROM core.accounts a
         LEFT JOIN core.account_window_quotas q ON q.account_id = a.id
         ORDER BY a.priority ASC, a.id ASC
@@ -1881,8 +1938,14 @@ export class PostgresControlStore implements ControlStore {
             },
             nowMs,
           ),
-          window5hUsedBps: a.window_5h_used_bps ?? 0,
-          window7dUsedBps: a.window_7d_used_bps ?? 0,
+          window5hUsedBps: a.window_5h_reset_at && a.window_5h_reset_at.getTime() <= nowMs ? 0 : (a.window_5h_used_bps ?? 0),
+          window7dUsedBps: a.window_7d_reset_at && a.window_7d_reset_at.getTime() <= nowMs ? 0 : (a.window_7d_used_bps ?? 0),
+          ...(a.window_5h_reset_at && a.window_5h_reset_at.getTime() > nowMs
+            ? { window5hResetAtUnixMs: a.window_5h_reset_at.getTime() }
+            : {}),
+          ...(a.window_7d_reset_at && a.window_7d_reset_at.getTime() > nowMs
+            ? { window7dResetAtUnixMs: a.window_7d_reset_at.getTime() }
+            : {}),
         };
       }),
       apiKeys: keyRows.map((k) => ({
@@ -2006,7 +2069,8 @@ export class PostgresControlStore implements ControlStore {
           id, request_id, user_id, api_key_id, account_id, group_id,
           platform, public_model, upstream_model, ingress_codec, egress_codec,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-          cost_nano_usd, ttft_ms, duration_ms, status_code
+          cost_nano_usd, ttft_ms, duration_ms, status_code,
+          service_tier, reasoning_effort, image_count, video_seconds
         )
         VALUES (
           ${usageId},
@@ -2027,23 +2091,39 @@ export class PostgresControlStore implements ControlStore {
           ${costNano.toString()}::numeric,
           ${ev.ttftMs},
           ${ev.durationMs},
-          ${ev.statusCode}
+          ${ev.statusCode},
+          ${ev.serviceTier ?? ""},
+          ${ev.reasoningEffort ?? ""},
+          ${ev.imageCount ?? 0},
+          ${ev.videoSeconds ?? 0}
         )
         RETURNING created_at
       `;
 
       const totalTokens = ev.inputTokens + ev.outputTokens;
+      const reset5hDate = ev.window5hResetAtUnixMs ? new Date(ev.window5hResetAtUnixMs) : null;
+      const reset7dDate = ev.window7dResetAtUnixMs ? new Date(ev.window7dResetAtUnixMs) : null;
       // An account deleted while the turn was in flight must not fail the whole settlement (the
       // foreign key would roll back the charge, and every redelivery would fail the same way).
       await tx`
         INSERT INTO core.account_window_quotas (
-          account_id, window_5h_used_bps, window_7d_used_bps, lifetime_tokens, lifetime_cost_nano_usd,
-          last_used_at, updated_at
+          account_id, window_5h_used_bps, window_5h_reset_at, window_7d_used_bps, window_7d_reset_at,
+          lifetime_tokens, lifetime_cost_nano_usd, last_used_at, updated_at
         )
         SELECT
           ${ev.accountId},
           ${ev.window5hUsedBps}::int,
+          CASE
+            WHEN ${reset5hDate}::timestamptz IS NOT NULL THEN ${reset5hDate}::timestamptz
+            WHEN ${ev.window5hUsedBps}::int > 0 THEN NOW() + INTERVAL '5 hours'
+            ELSE NULL
+          END,
           ${ev.window7dUsedBps}::int,
+          CASE
+            WHEN ${reset7dDate}::timestamptz IS NOT NULL THEN ${reset7dDate}::timestamptz
+            WHEN ${ev.window7dUsedBps}::int > 0 THEN NOW() + INTERVAL '7 days'
+            ELSE NULL
+          END,
           ${totalTokens}::bigint,
           ${costNano.toString()}::numeric,
           NOW(),
@@ -2052,11 +2132,27 @@ export class PostgresControlStore implements ControlStore {
         ON CONFLICT (account_id) DO UPDATE SET
           window_5h_used_bps = CASE
             WHEN EXCLUDED.window_5h_used_bps > 0 THEN EXCLUDED.window_5h_used_bps
+            WHEN core.account_window_quotas.window_5h_reset_at IS NOT NULL AND core.account_window_quotas.window_5h_reset_at <= NOW() THEN 0
             ELSE core.account_window_quotas.window_5h_used_bps
+          END,
+          window_5h_reset_at = CASE
+            WHEN ${reset5hDate}::timestamptz IS NOT NULL THEN ${reset5hDate}::timestamptz
+            WHEN EXCLUDED.window_5h_used_bps > 0 AND (core.account_window_quotas.window_5h_reset_at IS NULL OR core.account_window_quotas.window_5h_reset_at <= NOW())
+              THEN NOW() + INTERVAL '5 hours'
+            WHEN core.account_window_quotas.window_5h_reset_at IS NOT NULL AND core.account_window_quotas.window_5h_reset_at <= NOW() THEN NULL
+            ELSE core.account_window_quotas.window_5h_reset_at
           END,
           window_7d_used_bps = CASE
             WHEN EXCLUDED.window_7d_used_bps > 0 THEN EXCLUDED.window_7d_used_bps
+            WHEN core.account_window_quotas.window_7d_reset_at IS NOT NULL AND core.account_window_quotas.window_7d_reset_at <= NOW() THEN 0
             ELSE core.account_window_quotas.window_7d_used_bps
+          END,
+          window_7d_reset_at = CASE
+            WHEN ${reset7dDate}::timestamptz IS NOT NULL THEN ${reset7dDate}::timestamptz
+            WHEN EXCLUDED.window_7d_used_bps > 0 AND (core.account_window_quotas.window_7d_reset_at IS NULL OR core.account_window_quotas.window_7d_reset_at <= NOW())
+              THEN NOW() + INTERVAL '7 days'
+            WHEN core.account_window_quotas.window_7d_reset_at IS NOT NULL AND core.account_window_quotas.window_7d_reset_at <= NOW() THEN NULL
+            ELSE core.account_window_quotas.window_7d_reset_at
           END,
           lifetime_tokens = core.account_window_quotas.lifetime_tokens + EXCLUDED.lifetime_tokens,
           lifetime_cost_nano_usd = core.account_window_quotas.lifetime_cost_nano_usd + EXCLUDED.lifetime_cost_nano_usd,

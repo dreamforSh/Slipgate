@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -23,13 +25,35 @@ var (
 type AccountSecret struct {
 	APIKey           string            `json:"apiKey"`
 	RefreshToken     string            `json:"refreshToken,omitempty"`
+	ExpiresAtUnixMs  int64             `json:"expiresAtUnixMs,omitempty"`
+	ClientID         string            `json:"clientId,omitempty"`
+	ClientSecret     string            `json:"clientSecret,omitempty"`
+	Scope            string            `json:"scope,omitempty"`
+	Email            string            `json:"email,omitempty"`
 	SubscriptionTier string            `json:"subscriptionTier,omitempty"`
 	ChatGPTAccountID string            `json:"chatgptAccountId,omitempty"`
 	ProjectID        string            `json:"projectId,omitempty"`
 	OrganizationID   string            `json:"organizationId,omitempty"`
-	BaseURL          string            `json:"baseUrl"`
-	UTLSProfileID    string            `json:"utlsProfileId"`
+	BaseURL          string            `json:"baseUrl,omitempty"`
+	UTLSProfileID    string            `json:"utlsProfileId,omitempty"`
 	Headers          map[string]string `json:"headers,omitempty"`
+}
+
+// NeedsOAuthRefresh reports whether an OAuth credential has a refresh token and expires within 5 minutes.
+func (s AccountSecret) NeedsOAuthRefresh(now time.Time) bool {
+	if strings.TrimSpace(s.RefreshToken) == "" || s.ExpiresAtUnixMs <= 0 {
+		return false
+	}
+	return now.UnixMilli() >= s.ExpiresAtUnixMs-5*60*1000
+}
+
+// SerializeCanonicalJSON encodes the AccountSecret into canonical JSON for encrypted BFF persistence.
+func (s AccountSecret) SerializeCanonicalJSON() string {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return s.APIKey
+	}
+	return string(raw)
 }
 
 // IsMock returns true when the account uses a deterministic local synthetic responder (`mock://ok`, `mock://echo`, etc.).
@@ -143,35 +167,55 @@ func ParseAccountSecret(raw string) AccountSecret {
 			AltSubTier       string            `json:"subscription_tier"`
 			PlanType         string            `json:"planType"`
 			AltPlanType      string            `json:"plan_type"`
+			ExpiresAtUnixMs    int64             `json:"expiresAtUnixMs"`
+			AltExpiresAtUnixMs int64             `json:"expires_at_unix_ms"`
+			AltExpiresAt       json.RawMessage   `json:"expiresAt"`
+			AltExpiresAtSnk  json.RawMessage   `json:"expires_at"`
+			AltExpiryDate    json.RawMessage   `json:"expiry_date"`
+			ClientID         string            `json:"clientId"`
+			AltClientID      string            `json:"client_id"`
+			ClientSecret     string            `json:"clientSecret"`
+			AltClientSecret  string            `json:"client_secret"`
+			Scope            string            `json:"scope"`
+			Email            string            `json:"email"`
 			Headers          map[string]string `json:"headers"`
 			// Direct support for pasted .claude/.credentials.json and .codex/auth.json structures.
 			ClaudeAiOauth *struct {
-				AccessToken      string `json:"accessToken"`
-				RefreshToken     string `json:"refreshToken"`
-				SubscriptionType string `json:"subscriptionType"`
-				RateLimitTier    string `json:"rateLimitTier"`
+				AccessToken      string          `json:"accessToken"`
+				RefreshToken     string          `json:"refreshToken"`
+				ExpiresAt        json.RawMessage `json:"expiresAt"`
+				Scopes           []string        `json:"scopes"`
+				SubscriptionType string          `json:"subscriptionType"`
+				RateLimitTier    string          `json:"rateLimitTier"`
 			} `json:"claudeAiOauth"`
 			CodexOPENAIKey string `json:"OPENAI_API_KEY"`
 			CodexTokens    *struct {
 				AccessToken  string `json:"access_token"`
 				RefreshToken string `json:"refresh_token"`
+				IDToken      string `json:"id_token"`
 				AccountID    string `json:"account_id"`
 				PlanType     string `json:"plan_type"`
 			} `json:"tokens"`
 		}
 		if err := json.Unmarshal([]byte(trimmed), &envelope); err == nil {
-			var claudeTok, claudeRef, claudeTier string
+			var claudeTok, claudeRef, claudeTier, claudeScope string
+			var claudeExpMs int64
 			if envelope.ClaudeAiOauth != nil {
 				claudeTok = envelope.ClaudeAiOauth.AccessToken
 				claudeRef = envelope.ClaudeAiOauth.RefreshToken
 				claudeTier = firstNonEmpty(envelope.ClaudeAiOauth.RateLimitTier, envelope.ClaudeAiOauth.SubscriptionType)
+				claudeExpMs = parseFlexibleExpiryMs(envelope.ClaudeAiOauth.ExpiresAt)
+				if len(envelope.ClaudeAiOauth.Scopes) > 0 {
+					claudeScope = strings.Join(envelope.ClaudeAiOauth.Scopes, " ")
+				}
 			}
-			var codexTok, codexRef, codexAcc, codexPlan string
+			var codexTok, codexRef, codexAcc, codexPlan, codexIDTok string
 			if envelope.CodexTokens != nil {
 				codexTok = envelope.CodexTokens.AccessToken
 				codexRef = envelope.CodexTokens.RefreshToken
 				codexAcc = envelope.CodexTokens.AccountID
 				codexPlan = envelope.CodexTokens.PlanType
+				codexIDTok = envelope.CodexTokens.IDToken
 			}
 			key := firstNonEmpty(
 				envelope.APIKey, envelope.AltAPIKey,
@@ -181,19 +225,44 @@ func ParseAccountSecret(raw string) AccountSecret {
 				claudeTok, codexTok, envelope.CodexOPENAIKey,
 			)
 			refresh := firstNonEmpty(envelope.RefreshToken, envelope.AltRefreshToken, claudeRef, codexRef)
+			jwtExpMs, jwtEmail, jwtAccID, jwtPlan := parseJWTTokenHints(firstNonEmpty(codexIDTok, key))
 			tier := NormalizeSubscriptionTier(firstNonEmpty(
 				envelope.SubscriptionTier, envelope.AltSubTier,
 				envelope.PlanType, envelope.AltPlanType,
-				claudeTier, codexPlan,
+				claudeTier, codexPlan, jwtPlan,
 			))
-			chatgptAcc := firstNonEmpty(envelope.ChatGPTAccountID, envelope.AltChatGPTAccID, codexAcc, envelope.AccountID, envelope.AltAccountID)
+			chatgptAcc := firstNonEmpty(envelope.ChatGPTAccountID, envelope.AltChatGPTAccID, codexAcc, envelope.AccountID, envelope.AltAccountID, jwtAccID)
 			proj := firstNonEmpty(envelope.ProjectID, envelope.AltProjectID, envelope.CompanionProject)
 			org := firstNonEmpty(envelope.OrganizationID, envelope.AltOrgID)
 			base := firstNonEmpty(envelope.BaseURL, envelope.AltBaseURL)
 			prof := firstNonEmpty(envelope.UTLSProfileID, envelope.AltProfileID)
+			expMs := envelope.ExpiresAtUnixMs
+			if expMs <= 0 {
+				expMs = envelope.AltExpiresAtUnixMs
+			}
+			if expMs <= 0 {
+				expMs = parseFlexibleExpiryMs(envelope.AltExpiresAt)
+			}
+			if expMs <= 0 {
+				expMs = parseFlexibleExpiryMs(envelope.AltExpiresAtSnk)
+			}
+			if expMs <= 0 {
+				expMs = parseFlexibleExpiryMs(envelope.AltExpiryDate)
+			}
+			if expMs <= 0 {
+				expMs = claudeExpMs
+			}
+			if expMs <= 0 && refresh != "" {
+				expMs = jwtExpMs
+			}
 			return AccountSecret{
 				APIKey:           key,
 				RefreshToken:     refresh,
+				ExpiresAtUnixMs:  expMs,
+				ClientID:         firstNonEmpty(envelope.ClientID, envelope.AltClientID),
+				ClientSecret:     firstNonEmpty(envelope.ClientSecret, envelope.AltClientSecret),
+				Scope:            firstNonEmpty(envelope.Scope, claudeScope),
+				Email:            firstNonEmpty(envelope.Email, jwtEmail),
 				SubscriptionTier: tier,
 				ChatGPTAccountID: chatgptAcc,
 				ProjectID:        proj,
@@ -344,6 +413,69 @@ func SubscriptionTierMultiplier(provider, tier string) uint16 {
 	default:
 		return 1
 	}
+}
+
+// Snapshot returns a deep copy of all decrypted secrets currently cached in the vault.
+func (v *Vault) Snapshot() map[string]AccountSecret {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	out := make(map[string]AccountSecret, len(v.m))
+	for id, sec := range v.m {
+		out[id] = cloneAccountSecret(sec)
+	}
+	return out
+}
+
+func parseFlexibleExpiryMs(raw json.RawMessage) int64 {
+	if len(raw) == 0 {
+		return 0
+	}
+	var num float64
+	if err := json.Unmarshal(raw, &num); err == nil && num > 0 {
+		if num < 1e11 {
+			return int64(num * 1000)
+		}
+		return int64(num)
+	}
+	var str string
+	if err := json.Unmarshal(raw, &str); err == nil {
+		str = strings.TrimSpace(str)
+		if t, perr := time.Parse(time.RFC3339, str); perr == nil {
+			return t.UnixMilli()
+		}
+	}
+	return 0
+}
+
+func parseJWTTokenHints(tok string) (expMs int64, email, chatgptAccountID, planType string) {
+	parts := strings.Split(strings.TrimSpace(tok), ".")
+	if len(parts) != 3 {
+		return 0, "", "", ""
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0, "", "", ""
+	}
+	var claims struct {
+		Exp        int64  `json:"exp"`
+		Email      string `json:"email"`
+		OpenAIAuth *struct {
+			ChatGPTAccountID string `json:"chatgpt_account_id"`
+			ChatGPTPlanType  string `json:"chatgpt_plan_type"`
+		} `json:"https://api.openai.com/auth"`
+	}
+	if json.Unmarshal(decoded, &claims) != nil {
+		return 0, "", "", ""
+	}
+	if claims.Exp > 0 {
+		expMs = claims.Exp * 1000
+	}
+	email = strings.TrimSpace(claims.Email)
+	if claims.OpenAIAuth != nil {
+		chatgptAccountID = strings.TrimSpace(claims.OpenAIAuth.ChatGPTAccountID)
+		planType = strings.TrimSpace(claims.OpenAIAuth.ChatGPTPlanType)
+	}
+	return expMs, email, chatgptAccountID, planType
 }
 
 func cloneHeaders(in map[string]string) map[string]string {

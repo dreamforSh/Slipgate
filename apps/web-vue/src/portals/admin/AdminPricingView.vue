@@ -31,6 +31,7 @@ const loaded = ref(false);
 const loadError = ref<string | null>(null);
 const busyIds = ref(new Set<string>());
 const testerMatchId = ref<string | null>(null);
+const syncingPresets = ref(false);
 
 const enabledCount = computed(() => rules.value.filter((r) => r.enabled).length);
 
@@ -111,6 +112,28 @@ function onSaved(item: ModelPricingRule, created: boolean) {
   toast.success(created ? t("pricing.notice.created", { pattern: item.pattern }) : t("pricing.notice.saved", { pattern: item.pattern }));
 }
 
+async function syncPresets() {
+  if (syncingPresets.value) return;
+  syncingPresets.value = true;
+  try {
+    const res = await apiJson<{ added: number; updated: number; total: number; items: ModelPricingRule[] }>(
+      "/api/v1/admin/pricing/sync-presets",
+      {
+        method: "POST",
+        body: { overwrite: false },
+        fallbackError: t("pricing.errors.syncPresets"),
+      },
+    );
+    rules.value = sortRules(res.items);
+    loaded.value = true;
+    toast.success(t("pricing.notice.presetsSynced", { added: res.added, total: res.total }));
+  } catch (err) {
+    toast.error(errorText(err, t("pricing.errors.syncPresets")));
+  } finally {
+    syncingPresets.value = false;
+  }
+}
+
 /* ---------------- Row actions ---------------- */
 
 async function toggle(rule: ModelPricingRule) {
@@ -164,6 +187,10 @@ onMounted(refresh);
           <UiIcon name="refresh" :size="15" :spin="loading" />
           <span class="hidden sm:inline">{{ t("common.refresh") }}</span>
         </button>
+        <button type="button" class="btn btn-secondary" :disabled="syncingPresets" @click="syncPresets">
+          <UiIcon :name="syncingPresets ? 'loader' : 'download'" :size="15" :spin="syncingPresets" />
+          <span class="hidden sm:inline">{{ t("pricing.actions.syncPresets") }}</span>
+        </button>
         <button type="button" class="btn btn-primary" @click="openCreate()">
           <UiIcon name="plus" :size="15" />
           {{ t("pricing.actions.create") }}
@@ -200,6 +227,7 @@ onMounted(refresh);
       :busy-ids="busyIds"
       :highlight-id="testerMatchId"
       @create="openCreate()"
+      @sync-presets="syncPresets"
       @edit="openEdit"
       @toggle="toggle"
       @remove="remove"

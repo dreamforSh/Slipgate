@@ -54,22 +54,42 @@ export function detectBuiltinProvider(model: string): Provider | null {
     return "codex";
   }
   if (model.startsWith("claude-") || model.startsWith("anthropic/")) return "anthropic";
-  if (model.startsWith("gemini-") || model.startsWith("google/")) return "gemini";
+  if (
+    model.startsWith("gemini-") ||
+    model.startsWith("google/") ||
+    model.startsWith("imagen-") ||
+    model.startsWith("veo-") ||
+    model.startsWith("text-embedding-004")
+  ) {
+    return "gemini";
+  }
   if (
     model.startsWith("gpt-") ||
+    model.startsWith("chatgpt-") ||
     model.startsWith("o1") ||
     model.startsWith("o3") ||
     model.startsWith("o4") ||
+    model.startsWith("text-embedding-") ||
+    model.startsWith("dall-e-") ||
+    model.startsWith("sora-") ||
+    model.startsWith("omni-moderation-") ||
     model.startsWith("openai/")
   ) {
     return "openai";
   }
   if (model.startsWith("grok-") || model.startsWith("xai/")) return "grok";
   if (model.startsWith("deepseek-")) return "deepseek";
-  if (model.startsWith("glm-")) return "glm";
+  if (
+    model.startsWith("glm-") ||
+    model.startsWith("cogview-") ||
+    model.startsWith("cogvideox-") ||
+    model.startsWith("embedding-3")
+  ) {
+    return "glm";
+  }
   if (model.startsWith("kimi-") || model.startsWith("moonshot-")) return "kimi";
   if (model.startsWith("minimax-") || model.startsWith("abab")) return "minimax";
-  if (model.startsWith("qwen-")) return "qwen";
+  if (model.startsWith("qwen-") || model.startsWith("wanx-")) return "qwen";
   return null;
 }
 
@@ -145,6 +165,8 @@ export function buildModelPlaza(
   rules: readonly ModelPricingRule[] = [],
   /** Exclusive groups the viewer may use (all for admins); public plaza passes none. */
   visibleExclusive: ReadonlySet<string> | "all" = new Set(),
+  /** SWR-discovered upstream model IDs per provider from slipgate-net. */
+  discoveredModels: Record<string, readonly string[]> = {},
 ): ModelPlazaResponse {
   const out: ModelPlazaResponse["groups"] = [];
   for (const g of groups) {
@@ -166,6 +188,12 @@ export function buildModelPlaza(
       for (const m of BUILTIN_MODEL_CANDIDATES) {
         const provider = detectBuiltinProvider(m);
         if (provider && providerServes(provider, g.platform, activeProviders)) add(m, provider, "builtin");
+      }
+      for (const [provider, ids] of Object.entries(discoveredModels)) {
+        if (!providerServes(provider, g.platform, activeProviders)) continue;
+        for (const id of ids) {
+          if (id) add(id, provider, "discovered");
+        }
       }
     }
     out.push({
@@ -409,7 +437,7 @@ export function usageCsv(rows: UsageRow[]): string {
  * "key"/"keys" (the EasyPay merchant `key`, customKey, sshKey…), "pem" (sshKeyPem), signatures,
  * one-time codes and mnemonics.
  */
-const SECRET_NAME = /pass|secret|token|credential|apikey|private|auth|cookie|seed|signature|mnemonic|totp|^otp|otp(?:code)?$|pem$|keys?$/;
+const SECRET_NAME = /pass|secret|token|credential|apikey|private|auth|cookie|seed|signature|mnemonic|totp|^otp|otp(?:code)?$|codeinput|verifier|pem$|keys?$/;
 
 /**
  * Credentials recognisable by their shape wherever they appear, e.g. in free-text or URL fields.

@@ -40,6 +40,7 @@ import {
   SetupInitializeRequestSchema,
   SLIPGATE_ACCOUNT_EXPORT_TYPE,
   SlotSeedSnapshotSchema,
+  SubscriptionTierSchema,
   SystemUpdateStatusSchema,
   TriggerUpdateSyncRequestSchema,
   TurnSettlementEventSchema,
@@ -50,6 +51,7 @@ import {
   UpdateVmSeedRequestSchema,
   UpdateVmTelemetryRequestSchema,
   VmSlotSummarySchema,
+  isSubscriptionTierAllowedForProvider,
   type AccountBulkResult,
   type AccountExportFile,
   type AccountImportResult,
@@ -86,6 +88,7 @@ import { registerPluginRoutes } from "./routes/plugins.ts";
 import { registerBackupRoutes } from "./routes/backup.ts";
 import { mountDbBackups, type DbBackupAppOptions } from "./routes/db_backups.ts";
 import { registerOAuthRoutes } from "./routes/oauth.ts";
+import { registerAccountOAuthRoutes } from "./routes/account_oauth.ts";
 import { AuthGuards, BACKEND_MODE_REFUSAL, conflictRefusal, refusalResponse, registerAuthGuardRoutes } from "./auth_guards.ts";
 import { RegistrationGuardError } from "./store/auth_guards_store.ts";
 import { registerUserLimitRoutes, repriceForUser, UserRateCache, withApiKeyDefaults, withUserLimits } from "./routes/user_limits.ts";
@@ -1119,6 +1122,55 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
     const event = await store.recordRiskBanEvent(parsed.data);
     return c.json({ ok: true, event });
+  });
+
+  app.post("/api/v1/internal/dataplane/accounts/:accountId/credentials", async (c) => {
+    if (!verifyInternalHeader(c)) {
+      return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
+    }
+    const accountId = c.req.param("accountId");
+    const raw = (await readJsonBody(c.req.raw)) as Record<string, unknown>;
+    const credentialSecret = typeof raw?.credentialSecret === "string" ? raw.credentialSecret.trim() : "";
+    if (!credentialSecret) {
+      return c.json({ error: "invalid_request", message: "credentialSecret is required" }, 400);
+    }
+    const current = await store.getAccount(accountId);
+    if (!current) {
+      return c.json({ error: "not_found", message: `Account ${accountId} not found` }, 404);
+    }
+    const patch: z.infer<typeof UpdateAccountRequestSchema> = {};
+    if (typeof raw?.subscriptionTier === "string") {
+      const tier = SubscriptionTierSchema.safeParse(raw.subscriptionTier);
+      if (tier.success && tier.data !== "standard" && isSubscriptionTierAllowedForProvider(current.platform, tier.data)) {
+        patch.subscriptionTier = tier.data;
+      }
+    }
+    const account = await store.updateAccount(accountId, patch, await sealCredential(credentialSecret));
+    scheduleDataPlaneSync(250);
+    return c.json({ ok: true, accountId: account.id });
+  });
+
+  app.post("/api/v1/internal/dataplane/accounts/:accountId/cooldown", async (c) => {
+    if (!verifyInternalHeader(c)) {
+      return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
+    }
+    const accountId = c.req.param("accountId");
+    const raw = (await readJsonBody(c.req.raw)) as Record<string, unknown>;
+    const cooldownUntilIso = typeof raw?.cooldownUntilIso === "string" ? raw.cooldownUntilIso.trim() : "";
+    if (!cooldownUntilIso || Number.isNaN(Date.parse(cooldownUntilIso))) {
+      return c.json({ error: "invalid_request", message: "Valid cooldownUntilIso is required" }, 400);
+    }
+    const cooldownReason =
+      typeof raw?.cooldownReason === "string" && raw.cooldownReason.trim()
+        ? raw.cooldownReason.trim().slice(0, 200)
+        : "upstream_rate_limited";
+    const account = await store.updateAccount(accountId, {
+      status: "cooldown",
+      cooldownUntilIso,
+      cooldownReason,
+    });
+    scheduleDataPlaneSync(250);
+    return c.json({ ok: true, accountId: account.id, cooldownUntilIso: account.cooldownUntilIso });
   });
 
   // ---------------------------------------------------------------------------
@@ -2429,17 +2481,53 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     );
   });
 
+  app.post("/api/v1/admin/models/sync", async (c) => {
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/models/sync", {
+        method: "POST",
+        timeoutMs: 30_000,
+      });
+      if (forwarded.configured) {
+        await syncDataPlaneBestEffort();
+        return c.json(forwarded.payload, forwarded.status);
+      }
+      return c.json({ ok: true, mode: "standalone", discovered: {} });
+    } catch (err) {
+      return c.json(
+        { error: "net_supervisor_unreachable", message: err instanceof Error ? err.message : String(err) },
+        502,
+      );
+    }
+  });
+
   // Before the ops routes: its public-page guards and settings-write hook wrap their handlers.
   registerAuthGuardRoutes(app, guards);
+  const discoveredModelsCache = cached(30_000, async (): Promise<Record<string, readonly string[]>> => {
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/models/catalog", { timeoutMs: 3_000 });
+      if (!forwarded.configured || forwarded.status !== 200) return {};
+      const map = forwarded.payload.models;
+      if (!map || typeof map !== "object") return {};
+      const out: Record<string, readonly string[]> = {};
+      for (const [k, v] of Object.entries(map as Record<string, unknown>)) {
+        if (Array.isArray(v)) out[k] = v.filter((x): x is string => typeof x === "string");
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  });
   registerOpsRoutes(app, {
     store,
     vaultSecret,
     syncDataPlane: syncDataPlaneBestEffort,
     mailReady: () => mail.ready(),
     pricingRules: () => pricing.rules(),
+    discoveredModels: discoveredModelsCache,
     sessions,
     publicCaptcha: () => guards.publicCaptcha(),
   });
+  registerAccountOAuthRoutes(app, { store, fetchImpl: options.oauthFetch });
   registerUserLimitRoutes(app, { store, sessions, syncDataPlane: syncDataPlaneBestEffort, internalToken });
   mail = registerMailRoutes(app, { store, vaultSecret, sessions, deliver: options.mailDelivery, guards });
   // Price rules travel in the data-plane snapshot, so an edit is pushed like any other change.

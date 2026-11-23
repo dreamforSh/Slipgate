@@ -66,7 +66,7 @@ export type BeginRefundResult =
   | { order?: undefined; requiresForce: { balanceNano: bigint; reclaimNano: bigint } };
 
 /** Statuses an admin refund may start from (refund_pending = re-send or settle a stuck one). */
-export const REFUNDABLE_STATUSES = ["paid", "refund_requested", "refund_failed", "refund_pending"] as const;
+export const REFUNDABLE_STATUSES = ["paid", "partially_refunded", "refund_requested", "refund_failed", "refund_pending"] as const;
 
 export interface RebatePolicy {
   enabled: boolean;

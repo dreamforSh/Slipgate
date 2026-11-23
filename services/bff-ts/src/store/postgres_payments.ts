@@ -48,7 +48,8 @@ type Fragment = postgres.Fragment;
 const PG_PAYMENTS_INTEGRITY_SQL = `
   ALTER TABLE commerce.payment_orders
       ADD COLUMN IF NOT EXISTS subscription_id TEXT,
-      ADD COLUMN IF NOT EXISTS delivery_error TEXT;
+      ADD COLUMN IF NOT EXISTS delivery_error TEXT,
+      ADD COLUMN IF NOT EXISTS prior_refund_amount_minor INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE commerce.affiliate_commissions ADD COLUMN IF NOT EXISTS reversed_at TIMESTAMPTZ;
   CREATE INDEX IF NOT EXISTS idx_commerce_affiliate_commissions_order ON commerce.affiliate_commissions (source_order_id);
   DO $$
@@ -284,6 +285,7 @@ interface RefundOrderRow {
   subscription_id: string | null;
   delivery_error: string | null;
   refund_amount_minor: number;
+  prior_refund_amount_minor: number;
   refund_reclaim: boolean;
   refund_request_reason: string | null;
   updated_at: Date;
@@ -636,7 +638,7 @@ export class PostgresPaymentsStore implements PaymentsStore {
   private async lockRefundRow(tx: Sql, id: string): Promise<RefundOrderRow> {
     const rows = await tx<RefundOrderRow[]>`
       SELECT user_id, kind, status, amount_nano_usd::text AS credit, amount_minor, group_id, validity_days, subscription_id,
-             delivery_error, refund_amount_minor, refund_reclaim, refund_request_reason, updated_at
+             delivery_error, refund_amount_minor, prior_refund_amount_minor, refund_reclaim, refund_request_reason, updated_at
         FROM commerce.payment_orders WHERE id = ${id} FOR UPDATE
     `;
     if (!rows[0]) throw new StoreError("not_found", "Order not found");
@@ -646,8 +648,11 @@ export class PostgresPaymentsStore implements PaymentsStore {
   async refundOrder(id: string, reclaim: boolean) {
     const o = await this.getOrder(id);
     if (!o) throw new StoreError("not_found", "Order not found");
-    if (o.status !== "paid" && o.status !== "refund_requested") throw new StoreError("conflict", "Only paid orders can be refunded");
-    await this.beginRefund(id, { amountMinor: o.amountMinor, reason: o.refundRequestReason ?? "", reclaim, force: true });
+    if (o.status !== "paid" && o.status !== "partially_refunded" && o.status !== "refund_requested") {
+      throw new StoreError("conflict", "Only paid orders can be refunded");
+    }
+    const already = o.status === "partially_refunded" ? o.refundAmountMinor : 0;
+    await this.beginRefund(id, { amountMinor: o.amountMinor - already, reason: o.refundRequestReason ?? "", reclaim, force: true });
     return this.completeRefund(id, null);
   }
 
@@ -687,7 +692,9 @@ export class PostgresPaymentsStore implements PaymentsStore {
   async rejectRefund(id: string) {
     const rows = await this.sql`
       UPDATE commerce.payment_orders
-         SET status = 'paid', refund_amount_minor = 0, refund_reason = NULL, refund_error = NULL, provider_refund_id = NULL,
+         SET status = CASE WHEN prior_refund_amount_minor > 0 THEN 'partially_refunded' ELSE 'paid' END,
+             refund_amount_minor = prior_refund_amount_minor,
+             refund_reason = NULL, refund_error = NULL, provider_refund_id = NULL,
              refund_reclaim = FALSE, refund_force = FALSE, updated_at = NOW()
        WHERE id = ${id} AND status IN ('refund_requested', 'refund_failed')
       RETURNING id
@@ -710,8 +717,15 @@ export class PostgresPaymentsStore implements PaymentsStore {
       if (o.status === "refund_pending" && Date.now() - new Date(o.updated_at).getTime() < REFUND_RESEND_AFTER_MS) {
         throw new StoreError("conflict", REFUND_IN_PROGRESS_MESSAGE);
       }
-      if (!Number.isInteger(input.amountMinor) || input.amountMinor < 1 || input.amountMinor > o.amount_minor) {
-        throw new StoreError("bad_request", "Refund amount must be between 0.01 and the order amount");
+      const priorMinor =
+        o.status === "partially_refunded"
+          ? o.refund_amount_minor
+          : o.status === "refund_failed" || o.status === "refund_pending"
+            ? o.prior_refund_amount_minor
+            : 0;
+      const remainingMinor = o.amount_minor - priorMinor;
+      if (!Number.isInteger(input.amountMinor) || input.amountMinor < 1 || input.amountMinor > remainingMinor) {
+        throw new StoreError("bad_request", "Refund amount must be between 0.01 and the remaining refundable amount");
       }
       if (input.reclaim && o.kind === "recharge" && !input.force) {
         const reclaimNano = proportion(BigInt(o.credit), input.amountMinor, o.amount_minor);
@@ -721,9 +735,9 @@ export class PostgresPaymentsStore implements PaymentsStore {
       const reason = input.reason || o.refund_request_reason || null;
       await tx`
         UPDATE commerce.payment_orders
-           SET status = 'refund_pending', refund_amount_minor = ${input.amountMinor}, refund_reason = ${reason},
-               refund_reclaim = ${input.reclaim}, refund_force = ${input.force}, refund_error = NULL,
-               provider_refund_id = NULL, updated_at = NOW()
+           SET status = 'refund_pending', prior_refund_amount_minor = ${priorMinor}, refund_amount_minor = ${input.amountMinor},
+               refund_reason = ${reason}, refund_reclaim = ${input.reclaim}, refund_force = ${input.force},
+               refund_error = NULL, provider_refund_id = NULL, updated_at = NOW()
          WHERE id = ${id}
       `;
       return null;
@@ -752,6 +766,10 @@ export class PostgresPaymentsStore implements PaymentsStore {
       const o = await this.lockRefundRow(tx, id);
       if (o.status !== "refund_pending") throw new StoreError("conflict", "The refund is no longer pending");
       const part = o.refund_amount_minor;
+      const priorMinor = o.prior_refund_amount_minor;
+      const totalRefundedMinor = priorMinor + part;
+      const remainingBeforePart = Math.max(1, o.amount_minor - priorMinor);
+      const ledgerSuffix = priorMinor > 0 ? `:${totalRefundedMinor}` : "";
       const credit = BigInt(o.credit);
       let reclaimed = 0n;
       if (o.refund_reclaim && o.kind === "recharge" && credit > 0n) {
@@ -759,7 +777,9 @@ export class PostgresPaymentsStore implements PaymentsStore {
         const want = proportion(credit, part, o.amount_minor);
         const free = await availableBalanceTx(tx, o.user_id);
         const take = want < free ? want : free;
-        if (take > 0n && (await pgApplyWalletDelta(tx, o.user_id, -take, `refund:${id}`, "adjust", `refund:${id}`))) reclaimed = take;
+        if (take > 0n && (await pgApplyWalletDelta(tx, o.user_id, -take, `refund:${id}${ledgerSuffix}`, "adjust", `refund:${id}${ledgerSuffix}`))) {
+          reclaimed = take;
+        }
       }
       // A subscription order with a delivery error never granted anything.
       if (o.refund_reclaim && o.kind === "subscription" && o.delivery_error === null) {
@@ -776,16 +796,24 @@ export class PostgresPaymentsStore implements PaymentsStore {
       if (rebate[0]) {
         const r = rebate[0];
         const whole = BigInt(r.amount);
-        const back = proportion(whole, part, o.amount_minor);
-        if (back > 0n) await pgApplyWalletDelta(tx, r.beneficiary_id, -back, `rebate-refund:${id}`, "adjust", `rebate-refund:${id}`);
+        const back = proportion(whole, part, remainingBeforePart);
+        if (back > 0n) {
+          await pgApplyWalletDelta(tx, r.beneficiary_id, -back, `rebate-refund:${id}${ledgerSuffix}`, "adjust", `rebate-refund:${id}${ledgerSuffix}`);
+        }
         if (back >= whole) await tx`UPDATE commerce.affiliate_commissions SET status = 'reversed', reversed_at = NOW() WHERE id = ${r.id}`;
         else await tx`UPDATE commerce.affiliate_commissions SET amount_nano_usd = ${(whole - back).toString()}::numeric WHERE id = ${r.id}`;
       }
-      const status = part >= o.amount_minor ? "refunded" : "partially_refunded";
+      const status = totalRefundedMinor >= o.amount_minor ? "refunded" : "partially_refunded";
       await tx`
         UPDATE commerce.payment_orders
-           SET status = ${status}, refunded_at = NOW(), refund_reclaimed_nano_usd = ${reclaimed.toString()}::numeric,
-               refund_error = NULL, provider_refund_id = COALESCE(${providerRefundId}, provider_refund_id), updated_at = NOW()
+           SET status = ${status},
+               refund_amount_minor = ${totalRefundedMinor},
+               prior_refund_amount_minor = ${totalRefundedMinor},
+               refunded_at = NOW(),
+               refund_reclaimed_nano_usd = refund_reclaimed_nano_usd + ${reclaimed.toString()}::numeric,
+               refund_error = NULL,
+               provider_refund_id = COALESCE(${providerRefundId}, provider_refund_id),
+               updated_at = NOW()
          WHERE id = ${id}
       `;
     });
@@ -896,8 +924,10 @@ export class PostgresPaymentsStore implements PaymentsStore {
          GROUP BY plan_name ORDER BY COALESCE(SUM(${kept}), 0) DESC, plan_name COLLATE "C" LIMIT 8
       `,
       sql<{ total: string }[]>`
-        SELECT COALESCE(SUM(amount_nano_usd), 0)::text AS total FROM commerce.affiliate_commissions
-         WHERE created_at >= ${since} AND status <> 'reversed'
+        SELECT COALESCE(SUM(c.amount_nano_usd), 0)::text AS total
+          FROM commerce.affiliate_commissions c
+          JOIN commerce.payment_orders o ON o.id = c.source_order_id
+         WHERE c.created_at >= ${since} AND c.status <> 'reversed' AND o.currency = ${currency}
       `,
     ]);
     const DAY = 86_400_000;

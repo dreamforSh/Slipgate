@@ -23,6 +23,7 @@ export const CreateCompositeRouteRequestSchema = z.object({
       "chat_completions",
       "embeddings",
       "images",
+      "videos",
       "gemini",
     ])
     .default("any"),
@@ -61,6 +62,8 @@ export const DataPlaneSyncAccountSchema = z.object({
   status: z.string(),
   window5hUsedBps: z.number().int().min(0).max(10000).default(0),
   window7dUsedBps: z.number().int().min(0).max(10000).default(0),
+  window5hResetAtUnixMs: z.number().int().nonnegative().optional(),
+  window7dResetAtUnixMs: z.number().int().nonnegative().optional(),
 });
 export type DataPlaneSyncAccount = z.infer<typeof DataPlaneSyncAccountSchema>;
 
@@ -96,6 +99,18 @@ export const DataPlaneSyncPriceRuleSchema = z.object({
   outputNanoPerMTok: z.string().regex(/^\d+$/),
   cacheReadNanoPerMTok: z.string().regex(/^\d+$/),
   cacheWriteNanoPerMTok: z.string().regex(/^\d+$/),
+  perRequestNanoUsd: z.string().regex(/^\d+$/).optional(),
+  perImageNanoUsd: z.string().regex(/^\d+$/).optional(),
+  perVideoSecondNanoUsd: z.string().regex(/^\d+$/).optional(),
+  longContextThresholdTokens: z.number().int().nonnegative().optional(),
+  longContextInputMultiplierMicros: z.number().int().positive().optional(),
+  longContextOutputMultiplierMicros: z.number().int().positive().optional(),
+  serviceTierFastMultiplierMicros: z.number().int().positive().optional(),
+  serviceTierFlexMultiplierMicros: z.number().int().positive().optional(),
+  reasoningEffortLowMultiplierMicros: z.number().int().positive().optional(),
+  reasoningEffortMediumMultiplierMicros: z.number().int().positive().optional(),
+  reasoningEffortHighMultiplierMicros: z.number().int().positive().optional(),
+  reasoningEffortXhighMultiplierMicros: z.number().int().positive().optional(),
 });
 export type DataPlaneSyncPriceRule = z.infer<typeof DataPlaneSyncPriceRuleSchema>;
 
@@ -120,6 +135,8 @@ export const DataPlaneSyncSnapshotSchema = z.object({
   riskBans: z.array(DataPlaneSyncRiskBanSchema).optional(),
   /** Per-user / per-group RPM and concurrency caps slipgate-net enforces at the edge (user_limits.ts). */
   userLimits: DataPlaneSyncUserLimitsSchema.optional(),
+  /** SWR-discovered upstream model IDs per provider from active accounts. */
+  discoveredModels: z.record(z.string(), z.array(z.string())).optional(),
 });
 export type DataPlaneSyncSnapshot = z.infer<typeof DataPlaneSyncSnapshotSchema>;
 
@@ -157,6 +174,12 @@ export const TurnSettlementEventSchema = z.object({
   durationMs: z.number().int().nonnegative().default(0),
   window5hUsedBps: z.number().int().min(0).max(10000).default(0),
   window7dUsedBps: z.number().int().min(0).max(10000).default(0),
+  window5hResetAtUnixMs: z.number().int().nonnegative().optional(),
+  window7dResetAtUnixMs: z.number().int().nonnegative().optional(),
+  serviceTier: z.string().max(32).optional(),
+  reasoningEffort: z.string().max(32).optional(),
+  imageCount: z.number().int().nonnegative().optional(),
+  videoSeconds: z.number().nonnegative().optional(),
   statusCode: z.number().int().min(100).max(599),
 });
 export type TurnSettlementEvent = z.infer<typeof TurnSettlementEventSchema>;

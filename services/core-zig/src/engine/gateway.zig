@@ -72,6 +72,8 @@ pub const SyncAccountJson = struct {
     status: []const u8 = "active",
     window5hUsedBps: u16 = 0,
     window7dUsedBps: u16 = 0,
+    window5hResetAtUnixMs: i64 = 0,
+    window7dResetAtUnixMs: i64 = 0,
 };
 
 pub const SyncApiKeyJson = struct {
@@ -89,15 +91,37 @@ pub const SyncWalletJson = struct {
     balanceNanoUsd: []const u8 = "0",
 };
 
+pub const SyncUserGroupRateJson = struct {
+    userId: []const u8,
+    groupId: []const u8,
+    rateMultiplierMicros: u64 = 1_000_000,
+};
+
+pub const SyncProviderModelsJson = struct {
+    provider: []const u8,
+    models: []const []const u8 = &.{},
+};
+
 /// Enabled admin price rule from the BFF (nano-USD per 1M tokens, before the group multiplier).
-/// NOTE: written without a Zig toolchain in the loop (not compiled); mirrors
-/// DataPlaneSyncPriceRuleSchema and the BFF's priceTurn/matchPricingRule.
+/// Mirrors DataPlaneSyncPriceRuleSchema and the BFF's priceTurn/matchPricingRule.
 pub const SyncPriceRuleJson = struct {
     pattern: []const u8,
     inputNanoPerMTok: []const u8 = "0",
     outputNanoPerMTok: []const u8 = "0",
     cacheReadNanoPerMTok: []const u8 = "0",
     cacheWriteNanoPerMTok: []const u8 = "0",
+    perRequestNanoUsd: []const u8 = "0",
+    perImageNanoUsd: []const u8 = "0",
+    perVideoSecondNanoUsd: []const u8 = "0",
+    longContextThresholdTokens: u64 = 0,
+    longContextInputMultiplierMicros: u64 = 1_000_000,
+    longContextOutputMultiplierMicros: u64 = 1_000_000,
+    serviceTierFastMultiplierMicros: u64 = 2_000_000,
+    serviceTierFlexMultiplierMicros: u64 = 500_000,
+    reasoningEffortLowMultiplierMicros: u64 = 1_000_000,
+    reasoningEffortMediumMultiplierMicros: u64 = 1_000_000,
+    reasoningEffortHighMultiplierMicros: u64 = 1_000_000,
+    reasoningEffortXhighMultiplierMicros: u64 = 1_000_000,
 };
 
 pub const SyncRiskBanJson = struct {
@@ -108,6 +132,7 @@ pub const SyncRiskBanJson = struct {
 };
 
 pub const SyncStatePayload = struct {
+    revisionUnixMs: i64 = 0,
     groups: []const SyncGroupJson = &.{},
     routes: []const SyncRouteJson = &.{},
     accounts: []const SyncAccountJson = &.{},
@@ -115,6 +140,8 @@ pub const SyncStatePayload = struct {
     wallets: []const SyncWalletJson = &.{},
     priceRules: []const SyncPriceRuleJson = &.{},
     riskBans: []const SyncRiskBanJson = &.{},
+    userGroupRates: []const SyncUserGroupRateJson = &.{},
+    providerModels: []const SyncProviderModelsJson = &.{},
 };
 
 pub const TurnEvalRequest = struct {
@@ -129,6 +156,15 @@ pub const TurnEvalRequest = struct {
     estimatedInputTokens: u64 = 64,
     bodyExcerpt: []const u8 = "",
     nowUnixMs: i64 = 0,
+    sessionKey: []const u8 = "",
+    excludeAccountIds: []const []const u8 = &.{},
+    rebindHoldId: u64 = 0,
+    rebindCooldownAccountId: []const u8 = "",
+    rebindCooldownMs: u64 = 0,
+    serviceTier: []const u8 = "",
+    reasoningEffort: []const u8 = "",
+    imageCount: u32 = 0,
+    videoSeconds: u32 = 0,
 };
 
 pub const TurnSettleRequest = struct {
@@ -142,6 +178,14 @@ pub const TurnSettleRequest = struct {
     cacheWriteTokens: u64 = 0,
     window5hUsedBps: u16 = 0,
     window7dUsedBps: u16 = 0,
+    window5hResetAtUnixMs: i64 = 0,
+    window7dResetAtUnixMs: i64 = 0,
+    cooldownDurationMs: u64 = 0,
+    serviceTier: []const u8 = "",
+    reasoningEffort: []const u8 = "",
+    imageCount: u32 = 0,
+    videoSeconds: u32 = 0,
+    nowUnixMs: i64 = 0,
 };
 
 pub const DispatchResponse = struct {
@@ -210,17 +254,34 @@ const AccountRecord = struct {
     quota_window: slot_window.SlotQuotaWindow,
 };
 
-fn accountBeats(
+const UserGroupRateRecord = struct {
+    user_id: []const u8,
+    group_id: []const u8,
+    rate_multiplier_micros: u64,
+};
+
+const ProviderModelsRecord = struct {
+    provider: composite.Provider,
+    models: []const []const u8,
+};
+
+const SessionBinding = struct {
+    account_id: []u8,
+    expires_ms: i64,
+};
+
+fn accountBeatsAt(
     cand: AccountRecord,
     cand_inflight: u32,
     inc: AccountRecord,
     inc_inflight: u32,
+    now_ms: i64,
 ) bool {
     if (cand.priority != inc.priority) return cand.priority < inc.priority;
     const cand_mult: u64 = @max(@as(u64, 1), cand.tier_multiplier);
     const inc_mult: u64 = @max(@as(u64, 1), inc.tier_multiplier);
-    const cand_load: u64 = (@as(u64, cand_inflight) *| 10_000) +| @as(u64, cand.quota_window.maxUsedBps());
-    const inc_load: u64 = (@as(u64, inc_inflight) *| 10_000) +| @as(u64, inc.quota_window.maxUsedBps());
+    const cand_load: u64 = (@as(u64, cand_inflight) *| 10_000) +| @as(u64, cand.quota_window.maxUsedBpsAt(now_ms));
+    const inc_load: u64 = (@as(u64, inc_inflight) *| 10_000) +| @as(u64, inc.quota_window.maxUsedBpsAt(now_ms));
     const lhs = cand_load *| inc_mult;
     const rhs = inc_load *| cand_mult;
     if (lhs != rhs) return lhs < rhs;
@@ -257,6 +318,8 @@ const ActiveHold = struct {
     model: []u8,
     /// Public model the caller asked for: price rules match it before the upstream model.
     public_model: []u8,
+    service_tier: []u8,
+    reasoning_effort: []u8,
     held_nano: i128,
     rate_multiplier_micros: u64,
     is_balance_group: bool,
@@ -294,13 +357,32 @@ fn lookupModelRate(model: []const u8) ModelRate {
     return .{ .in_nano_per_token = 1_000, .out_nano_per_token = 4_000 };
 }
 
-/// Admin price rule (nano-USD per 1M tokens). NOTE: not compiled here (no Zig toolchain).
+/// Admin price rule (nano-USD per 1M tokens + flat/media/tiered dimensions).
 const PriceRule = struct {
     pattern: []const u8,
     input_per_mtok: i128,
     output_per_mtok: i128,
     cache_read_per_mtok: i128,
     cache_write_per_mtok: i128,
+    per_request_nano: i128 = 0,
+    per_image_nano: i128 = 0,
+    per_video_sec_nano: i128 = 0,
+    long_ctx_threshold: u64 = 0,
+    long_ctx_in_micros: u64 = 1_000_000,
+    long_ctx_out_micros: u64 = 1_000_000,
+    tier_fast_micros: u64 = 2_000_000,
+    tier_flex_micros: u64 = 500_000,
+    effort_low_micros: u64 = 1_000_000,
+    effort_medium_micros: u64 = 1_000_000,
+    effort_high_micros: u64 = 1_000_000,
+    effort_xhigh_micros: u64 = 1_000_000,
+};
+
+const TurnPricingDims = struct {
+    service_tier: []const u8 = "",
+    reasoning_effort: []const u8 = "",
+    image_count: u32 = 0,
+    video_seconds: u32 = 0,
 };
 
 /// Same as the BFF's matchPricingRule: an exact pattern wins, else the longest "prefix*".
@@ -319,8 +401,7 @@ fn matchPriceRule(rules: []const PriceRule, model: []const u8) ?PriceRule {
 }
 
 /// Turn cost under the billed prices: a matching admin rule (public model first, then upstream,
-/// exactly as the BFF reprices), otherwise the built-in table. Rule math equals the BFF's
-/// priceTurn: sum(tokens x nano/MTok) x multiplier_micros / 1e6 / 1e6.
+/// exactly as the BFF reprices), otherwise the built-in table.
 fn priceTurnCostNano(
     rules: []const PriceRule,
     public_model: []const u8,
@@ -329,17 +410,62 @@ fn priceTurnCostNano(
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    dims: TurnPricingDims,
     rate_multiplier_micros: u64,
 ) i128 {
     const rule = matchPriceRule(rules, public_model) orelse matchPriceRule(rules, upstream_model) orelse
-        return computeTurnCostNano(upstream_model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, rate_multiplier_micros);
-    const in_part = @as(i128, @intCast(input_tokens)) *| rule.input_per_mtok;
-    const out_part = @as(i128, @intCast(output_tokens)) *| rule.output_per_mtok;
-    const cr_part = @as(i128, @intCast(cache_read_tokens)) *| rule.cache_read_per_mtok;
-    const cw_part = @as(i128, @intCast(cache_write_tokens)) *| rule.cache_write_per_mtok;
-    const base = in_part +| out_part +| cr_part +| cw_part;
+        return computeTurnCostNano(upstream_model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, dims, rate_multiplier_micros);
+
+    const total_ctx = input_tokens +| cache_read_tokens +| cache_write_tokens;
+    const is_long = rule.long_ctx_threshold > 0 and total_ctx > rule.long_ctx_threshold;
+    const in_rate = if (is_long and rule.long_ctx_in_micros != 1_000_000)
+        @divTrunc(rule.input_per_mtok *| @as(i128, @intCast(rule.long_ctx_in_micros)), 1_000_000)
+    else
+        rule.input_per_mtok;
+    const out_rate = if (is_long and rule.long_ctx_out_micros != 1_000_000)
+        @divTrunc(rule.output_per_mtok *| @as(i128, @intCast(rule.long_ctx_out_micros)), 1_000_000)
+    else
+        rule.output_per_mtok;
+    const cr_rate = if (is_long and rule.long_ctx_in_micros != 1_000_000)
+        @divTrunc(rule.cache_read_per_mtok *| @as(i128, @intCast(rule.long_ctx_in_micros)), 1_000_000)
+    else
+        rule.cache_read_per_mtok;
+    const cw_rate = if (is_long and rule.long_ctx_in_micros != 1_000_000)
+        @divTrunc(rule.cache_write_per_mtok *| @as(i128, @intCast(rule.long_ctx_in_micros)), 1_000_000)
+    else
+        rule.cache_write_per_mtok;
+
+    const in_part = @as(i128, @intCast(input_tokens)) *| in_rate;
+    const out_part = @as(i128, @intCast(output_tokens)) *| out_rate;
+    const cr_part = @as(i128, @intCast(cache_read_tokens)) *| cr_rate;
+    const cw_part = @as(i128, @intCast(cache_write_tokens)) *| cw_rate;
+    const unit_nano = rule.per_request_nano +|
+        (@as(i128, @intCast(dims.image_count)) *| rule.per_image_nano) +|
+        (@as(i128, @intCast(dims.video_seconds)) *| rule.per_video_sec_nano);
+    const base = in_part +| out_part +| cr_part +| cw_part +| (unit_nano *| 1_000_000);
+
+    const tier_micros: u64 = if (std.ascii.eqlIgnoreCase(dims.service_tier, "priority") or std.ascii.eqlIgnoreCase(dims.service_tier, "fast"))
+        rule.tier_fast_micros
+    else if (std.ascii.eqlIgnoreCase(dims.service_tier, "flex"))
+        rule.tier_flex_micros
+    else
+        1_000_000;
+
+    const effort_micros: u64 = if (std.ascii.eqlIgnoreCase(dims.reasoning_effort, "low"))
+        rule.effort_low_micros
+    else if (std.ascii.eqlIgnoreCase(dims.reasoning_effort, "medium"))
+        rule.effort_medium_micros
+    else if (std.ascii.eqlIgnoreCase(dims.reasoning_effort, "high"))
+        rule.effort_high_micros
+    else if (std.ascii.eqlIgnoreCase(dims.reasoning_effort, "xhigh") or std.ascii.eqlIgnoreCase(dims.reasoning_effort, "max"))
+        rule.effort_xhigh_micros
+    else
+        1_000_000;
+
+    const after_tier = if (tier_micros == 1_000_000) base else @divTrunc(base *| @as(i128, @intCast(tier_micros)), 1_000_000);
+    const after_effort = if (effort_micros == 1_000_000) after_tier else @divTrunc(after_tier *| @as(i128, @intCast(effort_micros)), 1_000_000);
     const mult = @as(i128, @intCast(@max(@as(u64, 1), rate_multiplier_micros)));
-    return @divTrunc(@divTrunc(base *| mult, 1_000_000), 1_000_000);
+    return @divTrunc(@divTrunc(after_effort *| mult, 1_000_000), 1_000_000);
 }
 
 fn computeTurnCostNano(
@@ -348,6 +474,7 @@ fn computeTurnCostNano(
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    dims: TurnPricingDims,
     rate_multiplier_micros: u64,
 ) i128 {
     const rate = lookupModelRate(model);
@@ -355,9 +482,17 @@ fn computeTurnCostNano(
     const out_cost = @as(i128, @intCast(output_tokens)) *| rate.out_nano_per_token;
     const cache_r_cost = @divTrunc(@as(i128, @intCast(cache_read_tokens)) *| rate.in_nano_per_token, 10);
     const cache_w_cost = @divTrunc((@as(i128, @intCast(cache_write_tokens)) *| rate.in_nano_per_token) *| 5, 4);
-    const base_total = in_cost +| out_cost +| cache_r_cost +| cache_w_cost;
+    const media_cost = (@as(i128, @intCast(dims.image_count)) *| 40_000_000) +|
+        (@as(i128, @intCast(dims.video_seconds)) *| 100_000_000);
+    const base_total = in_cost +| out_cost +| cache_r_cost +| cache_w_cost +| media_cost;
+    const tier_scaled = if (std.ascii.eqlIgnoreCase(dims.service_tier, "priority") or std.ascii.eqlIgnoreCase(dims.service_tier, "fast"))
+        base_total *| 2
+    else if (std.ascii.eqlIgnoreCase(dims.service_tier, "flex"))
+        @divTrunc(base_total, 2)
+    else
+        base_total;
     const mult = @as(i128, @intCast(@max(@as(u64, 1), rate_multiplier_micros)));
-    return @divTrunc(base_total *| mult, 1_000_000);
+    return @divTrunc(tier_scaled *| mult, 1_000_000);
 }
 
 fn constantTimeEq32(a: [32]u8, b: [32]u8) bool {
@@ -391,8 +526,10 @@ fn inferEndpoint(path: []const u8) composite.EndpointKind {
     if (std.mem.startsWith(u8, path, "/v1/chat/completions")) return .chat_completions;
     if (std.mem.startsWith(u8, path, "/v1/embeddings")) return .embeddings;
     if (std.mem.startsWith(u8, path, "/v1/images")) return .images;
+    if (std.mem.startsWith(u8, path, "/v1/videos")) return .videos;
     if (std.mem.startsWith(u8, path, "/v1beta/")) {
         if (std.mem.endsWith(u8, path, ":countTokens")) return .count_tokens;
+        if (std.mem.endsWith(u8, path, ":embedContent") or std.mem.endsWith(u8, path, ":batchEmbedContents")) return .embeddings;
         return .gemini;
     }
     return .any;
@@ -454,6 +591,13 @@ fn effectiveProvider(group: GroupRecord, route_match: composite.RouteMatch) comp
     return route_match.provider;
 }
 
+fn isExcludedAccount(excluded: []const []const u8, account_id: []const u8) bool {
+    for (excluded) |ex| {
+        if (std.mem.eql(u8, ex, account_id)) return true;
+    }
+    return false;
+}
+
 /// Same eligibility filter the scheduler applies, minus the transient quota/concurrency checks.
 fn accountServes(group: GroupRecord, acc: AccountRecord, provider: composite.Provider) bool {
     if (!acc.active or acc.platform != provider) return false;
@@ -480,10 +624,16 @@ pub const GatewayEngine = struct {
     accounts: []AccountRecord = &.{},
     api_keys: []ApiKeyRecord = &.{},
     price_rules: []PriceRule = &.{},
+    user_group_rates: []UserGroupRateRecord = &.{},
+    provider_models: []ProviderModelsRecord = &.{},
+    last_sync_revision_ms: i64 = 0,
 
     wallets: std.StringHashMap(fixed_point.Wallet),
+    wallet_dirty_ms: std.StringHashMap(i64),
     key_rates: std.StringHashMap(KeyRateState),
     account_inflight: std.StringHashMap(u32),
+    account_cooldown_until: std.StringHashMap(i64),
+    session_bindings: std.StringHashMap(SessionBinding),
     bans: std.StringHashMap(BanRecord),
     holds: std.AutoHashMap(u64, ActiveHold),
     next_hold_id: u64 = 1,
@@ -493,8 +643,11 @@ pub const GatewayEngine = struct {
             .backing = backing,
             .catalog_arena = std.heap.ArenaAllocator.init(backing),
             .wallets = std.StringHashMap(fixed_point.Wallet).init(backing),
+            .wallet_dirty_ms = std.StringHashMap(i64).init(backing),
             .key_rates = std.StringHashMap(KeyRateState).init(backing),
             .account_inflight = std.StringHashMap(u32).init(backing),
+            .account_cooldown_until = std.StringHashMap(i64).init(backing),
+            .session_bindings = std.StringHashMap(SessionBinding).init(backing),
             .bans = std.StringHashMap(BanRecord).init(backing),
             .holds = std.AutoHashMap(u64, ActiveHold).init(backing),
             .next_hold_id = bootHoldIdBase(),
@@ -515,6 +668,10 @@ pub const GatewayEngine = struct {
         while (w_it.next()) |k| self.backing.free(k.*);
         self.wallets.deinit();
 
+        var wd_it = self.wallet_dirty_ms.keyIterator();
+        while (wd_it.next()) |k| self.backing.free(k.*);
+        self.wallet_dirty_ms.deinit();
+
         var kr_it = self.key_rates.keyIterator();
         while (kr_it.next()) |k| self.backing.free(k.*);
         self.key_rates.deinit();
@@ -522,6 +679,17 @@ pub const GatewayEngine = struct {
         var ai_it = self.account_inflight.keyIterator();
         while (ai_it.next()) |k| self.backing.free(k.*);
         self.account_inflight.deinit();
+
+        var ac_it = self.account_cooldown_until.keyIterator();
+        while (ac_it.next()) |k| self.backing.free(k.*);
+        self.account_cooldown_until.deinit();
+
+        var sb_it = self.session_bindings.iterator();
+        while (sb_it.next()) |entry| {
+            self.backing.free(entry.key_ptr.*);
+            self.backing.free(entry.value_ptr.account_id);
+        }
+        self.session_bindings.deinit();
 
         var b_it = self.bans.keyIterator();
         while (b_it.next()) |k| self.backing.free(k.*);
@@ -541,6 +709,8 @@ pub const GatewayEngine = struct {
         self.backing.free(h.account_id);
         self.backing.free(h.model);
         self.backing.free(h.public_model);
+        self.backing.free(h.service_tier);
+        self.backing.free(h.reasoning_effort);
     }
 
     pub fn applySyncJson(self: *GatewayEngine, turn_alloc: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
@@ -611,6 +781,8 @@ pub const GatewayEngine = struct {
                 .quota_window = .{
                     .used_5h_bps = a.window5hUsedBps,
                     .used_7d_bps = a.window7dUsedBps,
+                    .reset_5h_unix_ms = a.window5hResetAtUnixMs,
+                    .reset_7d_unix_ms = a.window7dResetAtUnixMs,
                 },
             });
         }
@@ -641,6 +813,41 @@ pub const GatewayEngine = struct {
                 .output_per_mtok = std.fmt.parseInt(i128, r.outputNanoPerMTok, 10) catch continue,
                 .cache_read_per_mtok = std.fmt.parseInt(i128, r.cacheReadNanoPerMTok, 10) catch continue,
                 .cache_write_per_mtok = std.fmt.parseInt(i128, r.cacheWriteNanoPerMTok, 10) catch continue,
+                .per_request_nano = std.fmt.parseInt(i128, r.perRequestNanoUsd, 10) catch 0,
+                .per_image_nano = std.fmt.parseInt(i128, r.perImageNanoUsd, 10) catch 0,
+                .per_video_sec_nano = std.fmt.parseInt(i128, r.perVideoSecondNanoUsd, 10) catch 0,
+                .long_ctx_threshold = r.longContextThresholdTokens,
+                .long_ctx_in_micros = if (r.longContextInputMultiplierMicros == 0) 1_000_000 else r.longContextInputMultiplierMicros,
+                .long_ctx_out_micros = if (r.longContextOutputMultiplierMicros == 0) 1_000_000 else r.longContextOutputMultiplierMicros,
+                .tier_fast_micros = if (r.serviceTierFastMultiplierMicros == 0) 2_000_000 else r.serviceTierFastMultiplierMicros,
+                .tier_flex_micros = if (r.serviceTierFlexMultiplierMicros == 0) 500_000 else r.serviceTierFlexMultiplierMicros,
+                .effort_low_micros = if (r.reasoningEffortLowMultiplierMicros == 0) 1_000_000 else r.reasoningEffortLowMultiplierMicros,
+                .effort_medium_micros = if (r.reasoningEffortMediumMultiplierMicros == 0) 1_000_000 else r.reasoningEffortMediumMultiplierMicros,
+                .effort_high_micros = if (r.reasoningEffortHighMultiplierMicros == 0) 1_000_000 else r.reasoningEffortHighMultiplierMicros,
+                .effort_xhigh_micros = if (r.reasoningEffortXhighMultiplierMicros == 0) 1_000_000 else r.reasoningEffortXhighMultiplierMicros,
+            });
+        }
+
+        var next_user_rates = std.ArrayList(UserGroupRateRecord).init(cat);
+        for (in.userGroupRates) |ugr| {
+            if (ugr.userId.len == 0 or ugr.groupId.len == 0 or ugr.rateMultiplierMicros == 0) continue;
+            try next_user_rates.append(.{
+                .user_id = try cat.dupe(u8, ugr.userId),
+                .group_id = try cat.dupe(u8, ugr.groupId),
+                .rate_multiplier_micros = ugr.rateMultiplierMicros,
+            });
+        }
+
+        var next_provider_models = std.ArrayList(ProviderModelsRecord).init(cat);
+        for (in.providerModels) |pm| {
+            const prov = std.meta.stringToEnum(composite.Provider, pm.provider) orelse continue;
+            const list = try cat.alloc([]const u8, pm.models.len);
+            for (pm.models, 0..) |m, idx| {
+                list[idx] = try cat.dupe(u8, m);
+            }
+            try next_provider_models.append(.{
+                .provider = prov,
+                .models = list,
             });
         }
 
@@ -654,12 +861,28 @@ pub const GatewayEngine = struct {
         self.accounts = next_accounts.items;
         self.api_keys = next_keys.items;
         self.price_rules = next_rules.items;
+        self.user_group_rates = next_user_rates.items;
+        self.provider_models = next_provider_models.items;
+        if (in.revisionUnixMs > self.last_sync_revision_ms) {
+            self.last_sync_revision_ms = in.revisionUnixMs;
+        }
         old_arena.deinit();
 
         for (in.wallets) |w| {
             const parsed_bal = std.fmt.parseInt(i128, w.balanceNanoUsd, 10) catch 0;
             if (self.wallets.getPtr(w.userId)) |existing| {
-                existing.balance_nano = parsed_bal;
+                const dirty_ms = self.wallet_dirty_ms.get(w.userId) orelse 0;
+                // Avoid clobbering un-flushed local deductions when an older snapshot arrives.
+                if (in.revisionUnixMs == 0 or in.revisionUnixMs >= dirty_ms) {
+                    existing.balance_nano = parsed_bal;
+                    if (dirty_ms > 0) {
+                        if (self.wallet_dirty_ms.fetchRemove(w.userId)) |removed| {
+                            self.backing.free(removed.key);
+                        }
+                    }
+                } else if (parsed_bal < existing.balance_nano) {
+                    existing.balance_nano = parsed_bal;
+                }
             } else {
                 const owned_id = try self.backing.dupe(u8, w.userId);
                 errdefer self.backing.free(owned_id);
@@ -669,6 +892,8 @@ pub const GatewayEngine = struct {
                 });
             }
         }
+
+        self.pruneStaleRuntimeMapsLocked(turn_alloc);
 
         for (in.riskBans) |rb| {
             if (!std.mem.eql(u8, rb.subjectKind, "api_key") or rb.subjectHash.len == 0) continue;
@@ -796,8 +1021,10 @@ pub const GatewayEngine = struct {
             }, .{});
         }
 
-        // 4. GET /v1/models and /v1/models/{id}: list what this key's group can actually route.
-        if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/v1/models")) {
+        // 4. GET /v1/models, /v1/models/{id}, and /v1beta/models: list what this key's group can actually route.
+        const is_v1_models = std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/v1/models");
+        const is_v1beta_models = std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, std.mem.trimRight(u8, req.path, "/"), "/v1beta/models");
+        if (is_v1_models or is_v1beta_models) {
             const models_group = self.findGroupLocked(api_key.group_id) orelse {
                 return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
                     .action = "reject",
@@ -817,7 +1044,7 @@ pub const GatewayEngine = struct {
                 }, .{});
             }
             const models = try self.collectModelsLocked(turn_alloc, models_group);
-            const wanted = std.mem.trim(u8, req.path["/v1/models".len..], "/");
+            const wanted = if (is_v1beta_models) "" else std.mem.trim(u8, req.path["/v1/models".len..], "/");
             if (wanted.len == 0) {
                 return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
                     .action = "models",
@@ -850,34 +1077,49 @@ pub const GatewayEngine = struct {
             }, .{});
         }
 
-        // 5. Sliding/bucketed RPM & Concurrency check.
+        // Check if this is a pre-first-byte failover rebind from an existing hold of this API key.
+        var rebind_hold: ?ActiveHold = null;
+        if (req.rebindHoldId > 0) {
+            if (self.holds.get(req.rebindHoldId)) |live| {
+                if (std.mem.eql(u8, live.api_key_id, api_key.id)) {
+                    rebind_hold = live;
+                }
+            }
+        }
+        if (req.rebindCooldownAccountId.len > 0 and req.rebindCooldownMs > 0) {
+            try self.setAccountCooldownLocked(req.rebindCooldownAccountId, now_ms, req.rebindCooldownMs);
+        }
+
+        // 5. Sliding/bucketed RPM & Concurrency check (skipped on failover rebind within same turn).
         const rate_ptr = try self.getOrCreateKeyRateLocked(api_key.id);
         const current_min = @divTrunc(now_ms, 60_000);
         if (rate_ptr.minute_bucket != current_min) {
             rate_ptr.minute_bucket = current_min;
             rate_ptr.minute_count = 0;
         }
-        if (rate_ptr.minute_count >= api_key.rpm_limit) {
-            return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
-                .action = "reject",
-                .status = 429,
-                .apiKeyId = api_key.id,
-                .errorType = "rate_limit_error",
-                .errorCode = "rpm_limit_exceeded",
-                .message = "API key requests-per-minute limit exceeded",
-                .retryAfterMs = msUntil(now_ms, (current_min +| 1) *| 60_000),
-            }, .{});
-        }
-        if (rate_ptr.active_inflight >= api_key.concurrency_limit) {
-            return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
-                .action = "reject",
-                .status = 429,
-                .apiKeyId = api_key.id,
-                .errorType = "rate_limit_error",
-                .errorCode = "concurrency_limit_exceeded",
-                .message = "API key concurrent request limit exceeded",
-                .retryAfterMs = 1000,
-            }, .{});
+        if (rebind_hold == null) {
+            if (rate_ptr.minute_count >= api_key.rpm_limit) {
+                return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
+                    .action = "reject",
+                    .status = 429,
+                    .apiKeyId = api_key.id,
+                    .errorType = "rate_limit_error",
+                    .errorCode = "rpm_limit_exceeded",
+                    .message = "API key requests-per-minute limit exceeded",
+                    .retryAfterMs = msUntil(now_ms, (current_min +| 1) *| 60_000),
+                }, .{});
+            }
+            if (rate_ptr.active_inflight >= api_key.concurrency_limit) {
+                return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
+                    .action = "reject",
+                    .status = 429,
+                    .apiKeyId = api_key.id,
+                    .errorType = "rate_limit_error",
+                    .errorCode = "concurrency_limit_exceeded",
+                    .message = "API key concurrent request limit exceeded",
+                    .retryAfterMs = 1000,
+                }, .{});
+            }
         }
 
         // 6. Group check & Model allowlist.
@@ -942,21 +1184,45 @@ pub const GatewayEngine = struct {
             }, .{});
         };
 
-        // 8. Select healthy schedulable upstream account (priority ASC, lowest inflight, <95% 5h/7d window).
+        // 8. Select healthy schedulable upstream account (sticky session affinity first, then priority ASC / weighted load).
         var chosen_account: ?AccountRecord = null;
         var chosen_inflight: u32 = std.math.maxInt(u32);
         const target_provider = effectiveProvider(group, route_match);
+        const trimmed_session = std.mem.trim(u8, req.sessionKey, " \t\r\n");
+        const sticky_lookup_key = if (trimmed_session.len > 0 and trimmed_session.len <= 256)
+            try std.fmt.allocPrint(turn_alloc, "{s}\x1f{s}\x1f{s}", .{ group.id, @tagName(target_provider), trimmed_session })
+        else
+            "";
 
-        for (self.accounts) |acc| {
-            if (!accountServes(group, acc, target_provider)) continue;
-            if (!acc.quota_window.isSchedulable()) continue;
+        if (sticky_lookup_key.len > 0) {
+            if (self.session_bindings.get(sticky_lookup_key)) |binding| {
+                if (binding.expires_ms > now_ms and !isExcludedAccount(req.excludeAccountIds, binding.account_id)) {
+                    for (self.accounts) |acc| {
+                        if (!std.mem.eql(u8, acc.id, binding.account_id)) continue;
+                        if (!self.isAccountEligibleAtLocked(group, acc, target_provider, now_ms)) break;
+                        const cur_inflight = self.account_inflight.get(acc.id) orelse 0;
+                        if (cur_inflight < acc.max_concurrency) {
+                            chosen_account = acc;
+                            chosen_inflight = cur_inflight;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
-            const cur_inflight = self.account_inflight.get(acc.id) orelse 0;
-            if (cur_inflight >= acc.max_concurrency) continue;
+        if (chosen_account == null) {
+            for (self.accounts) |acc| {
+                if (isExcludedAccount(req.excludeAccountIds, acc.id)) continue;
+                if (!self.isAccountEligibleAtLocked(group, acc, target_provider, now_ms)) continue;
 
-            if (chosen_account == null or accountBeats(acc, cur_inflight, chosen_account.?, chosen_inflight)) {
-                chosen_account = acc;
-                chosen_inflight = cur_inflight;
+                const cur_inflight = self.account_inflight.get(acc.id) orelse 0;
+                if (cur_inflight >= acc.max_concurrency) continue;
+
+                if (chosen_account == null or accountBeatsAt(acc, cur_inflight, chosen_account.?, chosen_inflight, now_ms)) {
+                    chosen_account = acc;
+                    chosen_inflight = cur_inflight;
+                }
             }
         }
 
@@ -970,21 +1236,43 @@ pub const GatewayEngine = struct {
             }, .{});
         };
 
-        // 9. Two-phase i128 nano-USD pre-auth hold on balance groups. Token counting is free:
-        //    it takes no hold and always settles at zero cost.
+        // 9. Two-phase i128 nano-USD pre-auth hold on balance groups (honoring custom user-group rate & 64k maxTokens).
         const est_in = @max(@as(u64, 16), req.estimatedInputTokens);
         const requested_out = if (req.maxTokens == 0) @as(u64, 1024) else req.maxTokens;
-        const est_out = @min(@as(u64, 4096), @max(@as(u64, 64), requested_out));
+        const est_out = @min(@as(u64, 65_536), @max(@as(u64, 64), requested_out));
+        const effective_rate_micros = self.effectiveRateMultiplierMicrosLocked(api_key.user_id, group);
+        const dims = TurnPricingDims{
+            .service_tier = req.serviceTier,
+            .reasoning_effort = req.reasoningEffort,
+            .image_count = req.imageCount,
+            .video_seconds = req.videoSeconds,
+        };
         var hold_nano: i128 = 0;
         const is_free = endpoint_kind == .count_tokens;
         const is_balance = group.subscription_type == .balance and !is_free;
+
+        // If rebinding an existing hold, release the prior hold's wallet reservation temporarily to check/hold cleanly.
+        if (rebind_hold) |prev| {
+            if (prev.is_balance_group) {
+                if (self.wallets.getPtr(prev.user_id)) |wp| {
+                    wp.release(prev.held_nano) catch {};
+                }
+            }
+        }
+
         if (is_balance) {
             hold_nano = @max(
                 @as(i128, 1_000),
-                priceTurnCostNano(self.price_rules, public_model, route_match.upstream_model, est_in, est_out, 0, 0, group.rate_multiplier_micros),
+                priceTurnCostNano(self.price_rules, public_model, route_match.upstream_model, est_in, est_out, 0, 0, dims, effective_rate_micros),
             );
             const wallet_ptr = try self.getOrCreateWalletLocked(api_key.user_id);
             wallet_ptr.hold(hold_nano) catch {
+                // Restore previous hold if rebind failed wallet check.
+                if (rebind_hold) |prev| {
+                    if (prev.is_balance_group) {
+                        wallet_ptr.hold(prev.held_nano) catch {};
+                    }
+                }
                 return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
                     .action = "reject",
                     .status = 402,
@@ -999,6 +1287,13 @@ pub const GatewayEngine = struct {
         errdefer if (is_balance) {
             if (self.wallets.getPtr(api_key.user_id)) |wp| {
                 wp.release(hold_nano) catch {};
+            }
+            if (rebind_hold) |prev| {
+                if (prev.is_balance_group) {
+                    if (self.wallets.getPtr(prev.user_id)) |wp| {
+                        wp.hold(prev.held_nano) catch {};
+                    }
+                }
             }
         };
 
@@ -1035,6 +1330,20 @@ pub const GatewayEngine = struct {
         errdefer self.backing.free(m_copy);
         const pm_copy = try self.backing.dupe(u8, public_model);
         errdefer self.backing.free(pm_copy);
+        const st_copy = try self.backing.dupe(u8, req.serviceTier);
+        errdefer self.backing.free(st_copy);
+        const re_copy = try self.backing.dupe(u8, req.reasoningEffort);
+        errdefer self.backing.free(re_copy);
+
+        // Finalize previous hold retirement if this was a failover rebind.
+        if (rebind_hold != null) {
+            if (self.holds.fetchRemove(req.rebindHoldId)) |old_kv| {
+                if (self.account_inflight.getPtr(old_kv.value.account_id)) |old_inf| {
+                    if (old_inf.* > 0) old_inf.* -= 1;
+                }
+                self.freeHoldStrings(old_kv.value);
+            }
+        }
 
         self.next_hold_id +|= 1;
         self.holds.putAssumeCapacity(hold_id, .{
@@ -1044,15 +1353,23 @@ pub const GatewayEngine = struct {
             .account_id = a_copy,
             .model = m_copy,
             .public_model = pm_copy,
+            .service_tier = st_copy,
+            .reasoning_effort = re_copy,
             .held_nano = hold_nano,
-            .rate_multiplier_micros = group.rate_multiplier_micros,
+            .rate_multiplier_micros = effective_rate_micros,
             .is_balance_group = is_balance,
             .is_free = is_free,
         });
 
-        rate_ptr.minute_count +|= 1;
-        rate_ptr.active_inflight +|= 1;
+        if (rebind_hold == null) {
+            rate_ptr.minute_count +|= 1;
+            rate_ptr.active_inflight +|= 1;
+        }
         inflight_ptr.* +|= 1;
+
+        if (sticky_lookup_key.len > 0) {
+            self.bindStickySessionLocked(sticky_lookup_key, selected_acc.id, now_ms +| (60 * 60 * 1000)) catch {};
+        }
 
         return resp_json;
     }
@@ -1094,11 +1411,33 @@ pub const GatewayEngine = struct {
         if (self.account_inflight.getPtr(hold.account_id)) |inf| {
             if (inf.* > 0) inf.* -= 1;
         }
-        if (req.window5hUsedBps > 0 or req.window7dUsedBps > 0) {
+        const now_ms = if (req.nowUnixMs > 0) req.nowUnixMs else std.time.milliTimestamp();
+        if (req.cooldownDurationMs > 0) {
+            self.setAccountCooldownLocked(hold.account_id, now_ms, req.cooldownDurationMs) catch {};
+        }
+        if (req.window5hUsedBps > 0 or req.window7dUsedBps > 0 or req.window5hResetAtUnixMs > 0 or req.window7dResetAtUnixMs > 0) {
             for (self.accounts) |*acc| {
                 if (std.mem.eql(u8, acc.id, hold.account_id)) {
-                    if (req.window5hUsedBps > 0) acc.quota_window.used_5h_bps = req.window5hUsedBps;
-                    if (req.window7dUsedBps > 0) acc.quota_window.used_7d_bps = req.window7dUsedBps;
+                    if (req.window5hUsedBps > 0) {
+                        acc.quota_window.used_5h_bps = req.window5hUsedBps;
+                        if (req.window5hResetAtUnixMs > 0) {
+                            acc.quota_window.reset_5h_unix_ms = req.window5hResetAtUnixMs;
+                        } else if (acc.quota_window.reset_5h_unix_ms <= now_ms) {
+                            acc.quota_window.reset_5h_unix_ms = now_ms +| (5 * 60 * 60 * 1000);
+                        }
+                    } else if (req.window5hResetAtUnixMs > 0) {
+                        acc.quota_window.reset_5h_unix_ms = req.window5hResetAtUnixMs;
+                    }
+                    if (req.window7dUsedBps > 0) {
+                        acc.quota_window.used_7d_bps = req.window7dUsedBps;
+                        if (req.window7dResetAtUnixMs > 0) {
+                            acc.quota_window.reset_7d_unix_ms = req.window7dResetAtUnixMs;
+                        } else if (acc.quota_window.reset_7d_unix_ms <= now_ms) {
+                            acc.quota_window.reset_7d_unix_ms = now_ms +| (7 * 24 * 60 * 60 * 1000);
+                        }
+                    } else if (req.window7dResetAtUnixMs > 0) {
+                        acc.quota_window.reset_7d_unix_ms = req.window7dResetAtUnixMs;
+                    }
                     break;
                 }
             }
@@ -1115,10 +1454,16 @@ pub const GatewayEngine = struct {
 
         var settled_cost: i128 = 0;
         var balance_after: i128 = 0;
+        const settle_dims = TurnPricingDims{
+            .service_tier = if (req.serviceTier.len > 0) req.serviceTier else hold.service_tier,
+            .reasoning_effort = if (req.reasoningEffort.len > 0) req.reasoningEffort else hold.reasoning_effort,
+            .image_count = req.imageCount,
+            .video_seconds = req.videoSeconds,
+        };
 
-        const billable_tokens = !hold.is_free and
-            (req.inputTokens > 0 or req.outputTokens > 0 or req.cacheReadTokens > 0 or req.cacheWriteTokens > 0);
-        if (billable_tokens) {
+        const billable_usage = !hold.is_free and
+            (req.inputTokens > 0 or req.outputTokens > 0 or req.cacheReadTokens > 0 or req.cacheWriteTokens > 0 or req.imageCount > 0 or req.videoSeconds > 0);
+        if (billable_usage) {
             settled_cost = priceTurnCostNano(
                 self.price_rules,
                 hold.public_model,
@@ -1127,17 +1472,21 @@ pub const GatewayEngine = struct {
                 req.outputTokens,
                 req.cacheReadTokens,
                 req.cacheWriteTokens,
+                settle_dims,
                 hold.rate_multiplier_micros,
             );
         }
 
         if (hold.is_balance_group) {
             const wallet_ptr = try self.getOrCreateWalletLocked(hold.user_id);
-            if (req.upstreamStatus >= 400 and !billable_tokens) {
+            if (req.upstreamStatus >= 400 and !billable_usage) {
                 wallet_ptr.release(hold.held_nano) catch {};
                 settled_cost = 0;
             } else {
                 wallet_ptr.settle(hold.held_nano, settled_cost) catch {};
+                if (settled_cost > 0) {
+                    self.markWalletDirtyLocked(hold.user_id, now_ms) catch {};
+                }
             }
             balance_after = wallet_ptr.balance_nano;
         }
@@ -1176,8 +1525,120 @@ pub const GatewayEngine = struct {
         return false;
     }
 
+    fn isAccountEligibleAtLocked(self: *GatewayEngine, group: GroupRecord, acc: AccountRecord, provider: composite.Provider, now_ms: i64) bool {
+        if (!accountServes(group, acc, provider)) return false;
+        if (!acc.quota_window.isSchedulableAt(now_ms)) return false;
+        if (self.account_cooldown_until.get(acc.id)) |until_ms| {
+            if (now_ms < until_ms) return false;
+        }
+        return true;
+    }
+
+    fn effectiveRateMultiplierMicrosLocked(self: *GatewayEngine, user_id: []const u8, group: GroupRecord) u64 {
+        for (self.user_group_rates) |ugr| {
+            if (std.mem.eql(u8, ugr.user_id, user_id) and std.mem.eql(u8, ugr.group_id, group.id)) {
+                return ugr.rate_multiplier_micros;
+            }
+        }
+        return group.rate_multiplier_micros;
+    }
+
+    fn setAccountCooldownLocked(self: *GatewayEngine, acc_id: []const u8, now_ms: i64, duration_ms: u64) !void {
+        const capped = @min(duration_ms, 24 * 60 * 60 * 1000);
+        const deadline = now_ms +| @as(i64, @intCast(capped));
+        if (self.account_cooldown_until.getPtr(acc_id)) |ptr| {
+            if (deadline > ptr.*) ptr.* = deadline;
+            return;
+        }
+        const owned = try self.backing.dupe(u8, acc_id);
+        errdefer self.backing.free(owned);
+        try self.account_cooldown_until.put(owned, deadline);
+    }
+
+    fn markWalletDirtyLocked(self: *GatewayEngine, user_id: []const u8, now_ms: i64) !void {
+        if (self.wallet_dirty_ms.getPtr(user_id)) |ptr| {
+            if (now_ms > ptr.*) ptr.* = now_ms;
+            return;
+        }
+        const owned = try self.backing.dupe(u8, user_id);
+        errdefer self.backing.free(owned);
+        try self.wallet_dirty_ms.put(owned, now_ms);
+    }
+
+    fn bindStickySessionLocked(self: *GatewayEngine, key: []const u8, account_id: []const u8, expires_ms: i64) !void {
+        if (self.session_bindings.getPtr(key)) |existing| {
+            if (std.mem.eql(u8, existing.account_id, account_id)) {
+                existing.expires_ms = expires_ms;
+                return;
+            }
+            const acc_copy = try self.backing.dupe(u8, account_id);
+            self.backing.free(existing.account_id);
+            existing.account_id = acc_copy;
+            existing.expires_ms = expires_ms;
+            return;
+        }
+        if (self.session_bindings.count() >= 4096) {
+            var victim_key: ?[]const u8 = null;
+            var sb_it = self.session_bindings.iterator();
+            while (sb_it.next()) |entry| {
+                victim_key = entry.key_ptr.*;
+                break;
+            }
+            if (victim_key) |vk| {
+                if (self.session_bindings.fetchRemove(vk)) |removed| {
+                    self.backing.free(removed.key);
+                    self.backing.free(removed.value.account_id);
+                }
+            }
+        }
+        const owned_key = try self.backing.dupe(u8, key);
+        errdefer self.backing.free(owned_key);
+        const owned_acc = try self.backing.dupe(u8, account_id);
+        errdefer self.backing.free(owned_acc);
+        try self.session_bindings.put(owned_key, .{
+            .account_id = owned_acc,
+            .expires_ms = expires_ms,
+        });
+    }
+
+    fn pruneStaleRuntimeMapsLocked(self: *GatewayEngine, turn_alloc: std.mem.Allocator) void {
+        var dead_keys = std.ArrayList([]const u8).init(turn_alloc);
+        var kr_it = self.key_rates.iterator();
+        while (kr_it.next()) |entry| {
+            if (entry.value_ptr.active_inflight > 0) continue;
+            var found = false;
+            for (self.api_keys) |k| {
+                if (std.mem.eql(u8, k.id, entry.key_ptr.*)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) dead_keys.append(entry.key_ptr.*) catch {};
+        }
+        for (dead_keys.items) |dk| {
+            if (self.key_rates.fetchRemove(dk)) |removed| self.backing.free(removed.key);
+        }
+
+        var dead_accs = std.ArrayList([]const u8).init(turn_alloc);
+        var ai_it = self.account_inflight.iterator();
+        while (ai_it.next()) |entry| {
+            if (entry.value_ptr.* > 0) continue;
+            var found = false;
+            for (self.accounts) |a| {
+                if (std.mem.eql(u8, a.id, entry.key_ptr.*)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) dead_accs.append(entry.key_ptr.*) catch {};
+        }
+        for (dead_accs.items) |da| {
+            if (self.account_inflight.fetchRemove(da)) |removed| self.backing.free(removed.key);
+        }
+    }
+
     /// Sorted, de-duplicated model ids a group can serve: its allowlist when one is set, otherwise
-    /// its enabled exact routes plus builtin candidates whose provider has an active account.
+    /// its enabled exact routes plus SWR-discovered models plus builtin candidates whose provider has an active account.
     fn collectModelsLocked(self: *GatewayEngine, turn_alloc: std.mem.Allocator, group: GroupRecord) ![]const []const u8 {
         var out = std.ArrayList([]const u8).init(turn_alloc);
         if (group.model_allowlist.len > 0) {
@@ -1188,6 +1649,11 @@ pub const GatewayEngine = struct {
                 if (!rule.enabled or rule.match_type != .exact) continue;
                 if (self.groupReachesProviderLocked(group, rule.target_platform)) {
                     try out.append(rule.public_model);
+                }
+            }
+            for (self.provider_models) |pm| {
+                if (self.groupReachesProviderLocked(group, pm.provider)) {
+                    try out.appendSlice(pm.models);
                 }
             }
             for (builtin_model_candidates) |candidate| {

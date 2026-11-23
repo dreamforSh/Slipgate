@@ -17,6 +17,57 @@ const accountProbeTimeout = 90 * time.Second
 
 func (s *Server) registerAccountInternalRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/net/accounts/{id}/test", s.handleTestAccount)
+	mux.HandleFunc("POST /internal/net/accounts/{id}/oauth/refresh", s.handleRefreshAccountOAuth)
+	mux.HandleFunc("GET /internal/net/models/discovered", s.handleGetDiscoveredModels)
+	mux.HandleFunc("POST /internal/net/models/sync", s.handleSyncDiscoveredModels)
+}
+
+func (s *Server) handleRefreshAccountOAuth(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.dpCoord == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "dataplane_coordinator_unavailable"})
+		return
+	}
+	accountID := strings.TrimSpace(r.PathValue("id"))
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "message": "account id is required"})
+		return
+	}
+	sec, err := s.dpCoord.RefreshAccountOAuth(r.Context(), accountID, true)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "oauth_refresh_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"subscriptionTier": sec.SubscriptionTier,
+		"expiresAtUnixMs":  sec.ExpiresAtUnixMs,
+	})
+}
+
+func (s *Server) handleGetDiscoveredModels(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.dpCoord == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": map[string][]string{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": s.dpCoord.DiscoveredModels()})
+}
+
+func (s *Server) handleSyncDiscoveredModels(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.dpCoord == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "dataplane_coordinator_unavailable"})
+		return
+	}
+	models := s.dpCoord.RefreshUpstreamModelCatalog(r.Context(), true)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": models})
 }
 
 // handleTestAccount streams a ProbeEvent sequence as text/event-stream for one upstream account.

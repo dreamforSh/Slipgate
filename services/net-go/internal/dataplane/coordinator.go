@@ -3,6 +3,8 @@ package dataplane
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,19 +57,21 @@ type SyncRouteInput struct {
 
 // SyncAccountInput matches DataPlaneSyncAccountSchema from @slipgate/contracts.
 type SyncAccountInput struct {
-	ID                string `json:"id"`
-	GroupID           string `json:"groupId"`
-	Platform          string `json:"platform"`
-	ExecutionMode     string `json:"executionMode"`
-	AuthKind          string `json:"authKind"`
-	SubscriptionTier  string `json:"subscriptionTier"`
-	TierMultiplier    uint16 `json:"tierMultiplier"`
-	CredentialsEncHex string `json:"credentialsEncHex"`
-	MaxConcurrency    uint32 `json:"maxConcurrency"`
-	Priority          int32  `json:"priority"`
-	Status            string `json:"status"`
-	Window5hUsedBps   uint16 `json:"window5hUsedBps"`
-	Window7dUsedBps   uint16 `json:"window7dUsedBps"`
+	ID                    string `json:"id"`
+	GroupID               string `json:"groupId"`
+	Platform              string `json:"platform"`
+	ExecutionMode         string `json:"executionMode"`
+	AuthKind              string `json:"authKind"`
+	SubscriptionTier      string `json:"subscriptionTier"`
+	TierMultiplier        uint16 `json:"tierMultiplier"`
+	CredentialsEncHex     string `json:"credentialsEncHex"`
+	MaxConcurrency        uint32 `json:"maxConcurrency"`
+	Priority              int32  `json:"priority"`
+	Status                string `json:"status"`
+	Window5hUsedBps       uint16 `json:"window5hUsedBps"`
+	Window7dUsedBps       uint16 `json:"window7dUsedBps"`
+	Window5hResetAtUnixMs int64  `json:"window5hResetAtUnixMs,omitempty"`
+	Window7dResetAtUnixMs int64  `json:"window7dResetAtUnixMs,omitempty"`
 }
 
 // SyncApiKeyInput matches DataPlaneSyncApiKeySchema from @slipgate/contracts.
@@ -94,11 +99,23 @@ type SyncWalletInput struct {
 // SyncPriceRuleInput matches DataPlaneSyncPriceRuleSchema: an enabled admin price rule in nano-USD
 // per 1M tokens, forwarded to slipgate-core so its holds and settlements use the billed prices.
 type SyncPriceRuleInput struct {
-	Pattern               string `json:"pattern"`
-	InputNanoPerMTok      string `json:"inputNanoPerMTok"`
-	OutputNanoPerMTok     string `json:"outputNanoPerMTok"`
-	CacheReadNanoPerMTok  string `json:"cacheReadNanoPerMTok"`
-	CacheWriteNanoPerMTok string `json:"cacheWriteNanoPerMTok"`
+	Pattern                              string `json:"pattern"`
+	InputNanoPerMTok                     string `json:"inputNanoPerMTok"`
+	OutputNanoPerMTok                    string `json:"outputNanoPerMTok"`
+	CacheReadNanoPerMTok                 string `json:"cacheReadNanoPerMTok"`
+	CacheWriteNanoPerMTok                string `json:"cacheWriteNanoPerMTok"`
+	PerRequestNanoUSD                    string `json:"perRequestNanoUsd,omitempty"`
+	PerImageNanoUSD                      string `json:"perImageNanoUsd,omitempty"`
+	PerVideoSecondNanoUSD                string `json:"perVideoSecondNanoUsd,omitempty"`
+	LongContextThresholdTokens           uint64 `json:"longContextThresholdTokens,omitempty"`
+	LongContextInputMultiplierMicros     uint64 `json:"longContextInputMultiplierMicros,omitempty"`
+	LongContextOutputMultiplierMicros    uint64 `json:"longContextOutputMultiplierMicros,omitempty"`
+	ServiceTierFastMultiplierMicros      uint64 `json:"serviceTierFastMultiplierMicros,omitempty"`
+	ServiceTierFlexMultiplierMicros      uint64 `json:"serviceTierFlexMultiplierMicros,omitempty"`
+	ReasoningEffortLowMultiplierMicros    uint64 `json:"reasoningEffortLowMultiplierMicros,omitempty"`
+	ReasoningEffortMediumMultiplierMicros uint64 `json:"reasoningEffortMediumMultiplierMicros,omitempty"`
+	ReasoningEffortHighMultiplierMicros   uint64 `json:"reasoningEffortHighMultiplierMicros,omitempty"`
+	ReasoningEffortXhighMultiplierMicros  uint64 `json:"reasoningEffortXhighMultiplierMicros,omitempty"`
 }
 
 // SyncRiskBanInput matches DataPlaneSyncRiskBanSchema: an active risk ban restored into slipgate-core.
@@ -111,15 +128,16 @@ type SyncRiskBanInput struct {
 
 // SyncSnapshot matches DataPlaneSyncSnapshotSchema exported by slipgate-bff.
 type SyncSnapshot struct {
-	RevisionUnixMs int64                `json:"revisionUnixMs"`
-	Groups         []SyncGroupInput     `json:"groups"`
-	Routes         []SyncRouteInput     `json:"routes"`
-	Accounts       []SyncAccountInput   `json:"accounts"`
-	APIKeys        []SyncApiKeyInput    `json:"apiKeys"`
-	Wallets        []SyncWalletInput    `json:"wallets"`
-	PriceRules     []SyncPriceRuleInput `json:"priceRules"`
-	RiskBans       []SyncRiskBanInput   `json:"riskBans"`
-	UserLimits     *SyncUserLimitsInput `json:"userLimits"` // enforced in user_limits.go
+	RevisionUnixMs   int64                 `json:"revisionUnixMs"`
+	Groups           []SyncGroupInput      `json:"groups"`
+	Routes           []SyncRouteInput      `json:"routes"`
+	Accounts         []SyncAccountInput    `json:"accounts"`
+	APIKeys          []SyncApiKeyInput     `json:"apiKeys"`
+	Wallets          []SyncWalletInput     `json:"wallets"`
+	PriceRules       []SyncPriceRuleInput  `json:"priceRules"`
+	RiskBans         []SyncRiskBanInput    `json:"riskBans"`
+	UserLimits       *SyncUserLimitsInput  `json:"userLimits"` // enforced in user_limits.go
+	DiscoveredModels map[string][]string   `json:"discoveredModels,omitempty"`
 }
 
 // SyncAckResult summarizes the result of applying a DataPlaneSyncSnapshot across Go and Zig.
@@ -153,11 +171,17 @@ type TurnSettlementEvent struct {
 	CacheReadTokens  uint64 `json:"cacheReadTokens"`
 	CacheWriteTokens uint64 `json:"cacheWriteTokens"`
 	CostNanoUSD      string `json:"costNanoUsd"`
-	Window5hUsedBps  uint16 `json:"window5hUsedBps"`
-	Window7dUsedBps  uint16 `json:"window7dUsedBps"`
-	TTFTMs           uint32 `json:"ttftMs"`
-	DurationMs       uint32 `json:"durationMs"`
-	StatusCode       int    `json:"statusCode"`
+	Window5hUsedBps       uint16  `json:"window5hUsedBps"`
+	Window7dUsedBps       uint16  `json:"window7dUsedBps"`
+	Window5hResetAtUnixMs int64   `json:"window5hResetAtUnixMs,omitempty"`
+	Window7dResetAtUnixMs int64   `json:"window7dResetAtUnixMs,omitempty"`
+	ServiceTier           string  `json:"serviceTier,omitempty"`
+	ReasoningEffort       string  `json:"reasoningEffort,omitempty"`
+	ImageCount            uint32  `json:"imageCount,omitempty"`
+	VideoSeconds          float64 `json:"videoSeconds,omitempty"`
+	TTFTMs                uint32  `json:"ttftMs"`
+	DurationMs            uint32  `json:"durationMs"`
+	StatusCode            int     `json:"statusCode"`
 }
 
 // RiskBanEventPayload matches RecordRiskBanInputSchema posted back to slipgate-bff.
@@ -247,6 +271,10 @@ type Coordinator struct {
 	lastCoreSyncJSON   []byte
 	lastRevisionUnixMs int64
 	userLimits         userLimitGate // per-user / per-group caps (user_limits.go)
+	oauthRefresher     oauthRefreshDeduper
+	responsesState     responseStateStore
+	mediaTasks         mediaTaskStore
+	modelCatalog       modelCatalogCache
 }
 
 // NewCoordinator constructs a DataPlane Coordinator.
@@ -366,18 +394,20 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		Enabled              bool     `json:"enabled"`
 	}
 	type coreAccount struct {
-		ID               string `json:"id"`
-		GroupID          string `json:"groupId"`
-		Platform         string `json:"platform"`
-		ExecutionMode    string `json:"executionMode"`
-		AuthKind         string `json:"authKind"`
-		SubscriptionTier string `json:"subscriptionTier"`
-		TierMultiplier   uint16 `json:"tierMultiplier"`
-		MaxConcurrency   uint32 `json:"maxConcurrency"`
-		Priority         int32  `json:"priority"`
-		Status           string `json:"status"`
-		Window5hUsedBps  uint16 `json:"window5hUsedBps"`
-		Window7dUsedBps  uint16 `json:"window7dUsedBps"`
+		ID                    string `json:"id"`
+		GroupID               string `json:"groupId"`
+		Platform              string `json:"platform"`
+		ExecutionMode         string `json:"executionMode"`
+		AuthKind              string `json:"authKind"`
+		SubscriptionTier      string `json:"subscriptionTier"`
+		TierMultiplier        uint16 `json:"tierMultiplier"`
+		MaxConcurrency        uint32 `json:"maxConcurrency"`
+		Priority              int32  `json:"priority"`
+		Status                string `json:"status"`
+		Window5hUsedBps       uint16 `json:"window5hUsedBps"`
+		Window7dUsedBps       uint16 `json:"window7dUsedBps"`
+		Window5hResetAtUnixMs int64  `json:"window5hResetAtUnixMs,omitempty"`
+		Window7dResetAtUnixMs int64  `json:"window7dResetAtUnixMs,omitempty"`
 	}
 	type coreAPIKey struct {
 		ID               string `json:"id"`
@@ -435,18 +465,20 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 			TierMultiplier:   tierMult,
 		}
 		coreAccounts = append(coreAccounts, coreAccount{
-			ID:               a.ID,
-			GroupID:          a.GroupID,
-			Platform:         a.Platform,
-			ExecutionMode:    a.ExecutionMode,
-			AuthKind:         authKind,
-			SubscriptionTier: subTier,
-			TierMultiplier:   tierMult,
-			MaxConcurrency:   max(1, a.MaxConcurrency),
-			Priority:         a.Priority,
-			Status:           a.Status,
-			Window5hUsedBps:  a.Window5hUsedBps,
-			Window7dUsedBps:  a.Window7dUsedBps,
+			ID:                    a.ID,
+			GroupID:               a.GroupID,
+			Platform:              a.Platform,
+			ExecutionMode:         a.ExecutionMode,
+			AuthKind:              authKind,
+			SubscriptionTier:      subTier,
+			TierMultiplier:        tierMult,
+			MaxConcurrency:        max(1, a.MaxConcurrency),
+			Priority:              a.Priority,
+			Status:                a.Status,
+			Window5hUsedBps:       a.Window5hUsedBps,
+			Window7dUsedBps:       a.Window7dUsedBps,
+			Window5hResetAtUnixMs: a.Window5hResetAtUnixMs,
+			Window7dResetAtUnixMs: a.Window7dResetAtUnixMs,
 		})
 	}
 
@@ -499,14 +531,58 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		riskBans = []SyncRiskBanInput{}
 	}
 
+	type coreUserGroupRate struct {
+		UserID               string `json:"userId"`
+		GroupID              string `json:"groupId"`
+		RateMultiplierMicros uint64 `json:"rateMultiplierMicros"`
+	}
+	var userGroupRates []coreUserGroupRate
+	if snap.UserLimits != nil {
+		for _, ov := range snap.UserLimits.Overrides {
+			if ov.RateMultiplier == nil || *ov.RateMultiplier <= 0 || strings.TrimSpace(ov.UserID) == "" || strings.TrimSpace(ov.GroupID) == "" {
+				continue
+			}
+			userGroupRates = append(userGroupRates, coreUserGroupRate{
+				UserID:               ov.UserID,
+				GroupID:              ov.GroupID,
+				RateMultiplierMicros: uint64(max(1, int64(math.Round(*ov.RateMultiplier*1_000_000)))),
+			})
+		}
+	}
+	if userGroupRates == nil {
+		userGroupRates = []coreUserGroupRate{}
+	}
+
+	type coreProviderModels struct {
+		Provider string   `json:"provider"`
+		Models   []string `json:"models"`
+	}
+	mergedDiscovered := make(map[string][]string)
+	for prov, list := range snap.DiscoveredModels {
+		mergedDiscovered[strings.ToLower(strings.TrimSpace(prov))] = append([]string(nil), list...)
+	}
+	for prov, list := range c.modelCatalog.snapshot() {
+		mergedDiscovered[prov] = append(mergedDiscovered[prov], list...)
+	}
+	providerModels := make([]coreProviderModels, 0, len(mergedDiscovered))
+	for prov, list := range mergedDiscovered {
+		uniq := dedupSortedStrings(list)
+		if prov != "" && len(uniq) > 0 {
+			providerModels = append(providerModels, coreProviderModels{Provider: prov, Models: uniq})
+		}
+	}
+
 	corePayload, err := json.Marshal(map[string]any{
-		"groups":     coreGroups,
-		"routes":     routes,
-		"accounts":   coreAccounts,
-		"apiKeys":    coreKeys,
-		"wallets":    coreWallets,
-		"priceRules": priceRules,
-		"riskBans":   riskBans,
+		"revisionUnixMs": snap.RevisionUnixMs,
+		"groups":         coreGroups,
+		"routes":         routes,
+		"accounts":       coreAccounts,
+		"apiKeys":        coreKeys,
+		"wallets":        coreWallets,
+		"priceRules":     priceRules,
+		"riskBans":       riskBans,
+		"userGroupRates": userGroupRates,
+		"providerModels": providerModels,
 	})
 	if err != nil {
 		return SyncAckResult{}, err
@@ -646,29 +722,46 @@ func (c *Coordinator) StartBackgroundSync(ctx context.Context) {
 
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
+		var tickCount uint64
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				tickCount++
 				_ = c.PullSnapshotFromBFF(ctx)
+				if tickCount%4 == 0 {
+					c.ProactiveRefreshSweep(ctx)
+				}
+				if tickCount%40 == 1 {
+					go c.RefreshUpstreamModelCatalog(ctx, false)
+				}
 			}
 		}
 	}()
 }
 
 type coreTurnEvalRequest struct {
-	RequestID            string `json:"requestId"`
-	Method               string `json:"method"`
-	Path                 string `json:"path"`
-	APIKey               string `json:"apiKey"`
-	ClientIP             string `json:"clientIp"`
-	Model                string `json:"model"`
-	Stream               bool   `json:"stream"`
-	MaxTokens            uint64 `json:"maxTokens"`
-	EstimatedInputTokens uint64 `json:"estimatedInputTokens"`
-	BodyExcerpt          string `json:"bodyExcerpt"`
-	NowUnixMs            int64  `json:"nowUnixMs"`
+	RequestID               string   `json:"requestId"`
+	Method                  string   `json:"method"`
+	Path                    string   `json:"path"`
+	APIKey                  string   `json:"apiKey"`
+	ClientIP                string   `json:"clientIp"`
+	Model                   string   `json:"model"`
+	Stream                  bool     `json:"stream"`
+	MaxTokens               uint64   `json:"maxTokens"`
+	EstimatedInputTokens    uint64   `json:"estimatedInputTokens"`
+	BodyExcerpt             string   `json:"bodyExcerpt"`
+	NowUnixMs               int64    `json:"nowUnixMs"`
+	SessionKey              string   `json:"sessionKey,omitempty"`
+	ExcludeAccountIDs       []string `json:"excludeAccountIds,omitempty"`
+	RebindHoldID            uint64   `json:"rebindHoldId,omitempty"`
+	RebindCooldownAccountID string   `json:"rebindCooldownAccountId,omitempty"`
+	RebindCooldownMs        uint64   `json:"rebindCooldownMs,omitempty"`
+	ServiceTier             string   `json:"serviceTier,omitempty"`
+	ReasoningEffort         string   `json:"reasoningEffort,omitempty"`
+	ImageCount              uint32   `json:"imageCount,omitempty"`
+	VideoSeconds            uint32   `json:"videoSeconds,omitempty"`
 }
 
 type coreDispatchDirective struct {
@@ -704,14 +797,22 @@ type coreDispatchDirective struct {
 type coreSettleReport struct {
 	HoldID uint64 `json:"holdId"`
 	// APIKeyID lets the core refuse a report whose hold id now names another turn's hold.
-	APIKeyID         string `json:"apiKeyId,omitempty"`
-	UpstreamStatus   uint16 `json:"upstreamStatus"`
-	InputTokens      uint64 `json:"inputTokens"`
-	OutputTokens     uint64 `json:"outputTokens"`
-	CacheReadTokens  uint64 `json:"cacheReadTokens"`
-	CacheWriteTokens uint64 `json:"cacheWriteTokens"`
-	Window5hUsedBps  uint16 `json:"window5hUsedBps"`
-	Window7dUsedBps  uint16 `json:"window7dUsedBps"`
+	APIKeyID              string `json:"apiKeyId,omitempty"`
+	UpstreamStatus        uint16 `json:"upstreamStatus"`
+	InputTokens           uint64 `json:"inputTokens"`
+	OutputTokens          uint64 `json:"outputTokens"`
+	CacheReadTokens       uint64 `json:"cacheReadTokens"`
+	CacheWriteTokens      uint64 `json:"cacheWriteTokens"`
+	Window5hUsedBps       uint16 `json:"window5hUsedBps"`
+	Window7dUsedBps       uint16 `json:"window7dUsedBps"`
+	Window5hResetAtUnixMs int64  `json:"window5hResetAtUnixMs,omitempty"`
+	Window7dResetAtUnixMs int64  `json:"window7dResetAtUnixMs,omitempty"`
+	CooldownDurationMs    uint64 `json:"cooldownDurationMs,omitempty"`
+	ServiceTier           string `json:"serviceTier,omitempty"`
+	ReasoningEffort       string `json:"reasoningEffort,omitempty"`
+	ImageCount            uint32 `json:"imageCount,omitempty"`
+	VideoSeconds          uint32 `json:"videoSeconds,omitempty"`
+	NowUnixMs             int64  `json:"nowUnixMs,omitempty"`
 }
 
 type coreSettleAck struct {
@@ -745,6 +846,15 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isStatefulResponsesLookup(r.Method, r.URL.Path) {
+		c.handleStatefulResponsesRoute(w, r, requestID, startedAt)
+		return
+	}
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/videos/") {
+		c.handleGetVideoTask(w, r, requestID, startedAt)
+		return
+	}
+
 	var rawBody []byte
 	if r.Body != nil {
 		var readErr error
@@ -759,12 +869,24 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	isModelsReq := r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/models")
+	isV1BetaModelsReq := r.Method == http.MethodGet && strings.TrimSuffix(r.URL.Path, "/") == "/v1beta/models"
+	isModelsReq := (r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/models")) || isV1BetaModelsReq
+	isMultimodal := r.Method == http.MethodPost && (isEmbeddingsEndpoint(r.URL.Path) || isImagesEndpoint(r.URL.Path) || isVideosPostEndpoint(r.URL.Path))
 	var turn *CanonicalTurn
 	if isModelsReq {
 		turn = &CanonicalTurn{
 			IngressCodec: CodecOpenAIChat,
 			MaxTokens:    64,
+		}
+		if isV1BetaModelsReq {
+			turn.IngressCodec = CodecGeminiGenerate
+		}
+	} else if isMultimodal {
+		var parseErr error
+		turn, parseErr = parseMultimodalIngress(r, rawBody)
+		if parseErr != nil {
+			WriteProtocolError(w, ingressCodec, http.StatusBadRequest, "invalid_request_error", "malformed_json", parseErr.Error())
+			return
 		}
 	} else {
 		var parseErr error
@@ -778,12 +900,14 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	access.setTurn(turn)
 
+	apiKey := extractAPIKey(r)
 	clientIP := c.clientIPFromRequest(r)
-	evalPayload, _ := json.Marshal(coreTurnEvalRequest{
+	sessionKey := deriveSessionKey(r, turn, apiKey)
+	baseEvalReq := coreTurnEvalRequest{
 		RequestID:            requestID,
 		Method:               r.Method,
 		Path:                 r.URL.Path,
-		APIKey:               extractAPIKey(r),
+		APIKey:               apiKey,
 		ClientIP:             clientIP,
 		Model:                turn.PublicModel,
 		Stream:               turn.Stream,
@@ -791,7 +915,13 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		EstimatedInputTokens: turn.EstimatedInputTokens,
 		BodyExcerpt:          turn.BodyExcerpt,
 		NowUnixMs:            startedAt.UnixMilli(),
-	})
+		SessionKey:           sessionKey,
+		ServiceTier:          turn.ServiceTier,
+		ReasoningEffort:      turn.ReasoningEffort,
+		ImageCount:           turn.ImageCount,
+		VideoSeconds:         turn.VideoSeconds,
+	}
+	evalPayload, _ := json.Marshal(baseEvalReq)
 
 	ipcCtx, ipcCancel := context.WithTimeout(r.Context(), 5*time.Second)
 	replyFrame, ipcErr := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
@@ -828,6 +958,18 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch directive.Action {
 	case "models":
+		if isV1BetaModelsReq {
+			gemModels := make([]map[string]any, 0, len(directive.Models))
+			for _, id := range directive.Models {
+				gemModels = append(gemModels, map[string]any{
+					"name":                       "models/" + id,
+					"displayName":                id,
+					"supportedGenerationMethods": []string{"generateContent", "streamGenerateContent", "countTokens"},
+				})
+			}
+			writeJSONResponse(w, http.StatusOK, map[string]any{"models": gemModels})
+			return
+		}
 		items := make([]map[string]any, 0, len(directive.Models))
 		for _, id := range directive.Models {
 			items = append(items, modelObject(id))
@@ -880,15 +1022,23 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			statusU16 = uint16(metrics.UpstreamStatus)
 		}
 		reportRaw, _ := json.Marshal(coreSettleReport{
-			HoldID:           directive.HoldID,
-			APIKeyID:         directive.APIKeyID,
-			UpstreamStatus:   statusU16,
-			InputTokens:      metrics.InputTokens,
-			OutputTokens:     metrics.OutputTokens,
-			CacheReadTokens:  metrics.CacheReadTokens,
-			CacheWriteTokens: metrics.CacheWriteTokens,
-			Window5hUsedBps:  metrics.Window5hUsedBps,
-			Window7dUsedBps:  metrics.Window7dUsedBps,
+			HoldID:                directive.HoldID,
+			APIKeyID:              directive.APIKeyID,
+			UpstreamStatus:        statusU16,
+			InputTokens:           metrics.InputTokens,
+			OutputTokens:          metrics.OutputTokens,
+			CacheReadTokens:       metrics.CacheReadTokens,
+			CacheWriteTokens:      metrics.CacheWriteTokens,
+			Window5hUsedBps:       metrics.Window5hUsedBps,
+			Window7dUsedBps:       metrics.Window7dUsedBps,
+			Window5hResetAtUnixMs: metrics.Window5hResetAtUnixMs,
+			Window7dResetAtUnixMs: metrics.Window7dResetAtUnixMs,
+			CooldownDurationMs:    metrics.CooldownDurationMs,
+			ServiceTier:           turn.ServiceTier,
+			ReasoningEffort:       turn.ReasoningEffort,
+			ImageCount:            metrics.ImageCount,
+			VideoSeconds:          metrics.VideoSeconds,
+			NowUnixMs:             time.Now().UnixMilli(),
 		})
 		var (
 			ackFrame dpbridge.Frame
@@ -965,121 +1115,242 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	secret, hasSecret := c.vault.Get(directive.AccountID)
-	if !hasSecret {
-		settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
-		WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "account_secret_unavailable", "upstream account credentials not yet synchronized in vault")
-		return
+	if turn.IngressCodec == CodecOpenAIResponses && turn.PreviousResponseID != "" {
+		c.responsesState.hydratePreviousTurn(directive.APIKeyID, turn)
 	}
 
 	cleanseMode := firstNonEmpty(directive.CleanseMode, "zero")
 	tracker := &NativeTurnTracker{}
-	subTier := firstNonEmpty(
-		NormalizeSubscriptionTier(directive.SubscriptionTier),
-		c.accountTier(directive.AccountID),
-		secret.SubscriptionTier,
-		"standard",
+
+	var (
+		upstreamResp    *http.Response
+		egressCodec     CodecKind
+		pctx            OutboundPersonaContext
+		subTier         string
+		excludedAccIDs  []string
+		pendingCooldown uint64
 	)
-	tierMult := directive.TierMultiplier
-	if tierMult == 0 {
-		tierMult = SubscriptionTierMultiplier(directive.Provider, subTier)
-	}
-	pctx := OutboundPersonaContext{
-		Provider:         directive.Provider,
-		AuthKind:         firstNonEmpty(directive.AuthKind, c.accountAuthKind(directive.AccountID)),
-		SubscriptionTier: subTier,
-		TierMultiplier:   tierMult,
-		ExecutionMode:    directive.ExecutionMode,
-		AccountID:        directive.AccountID,
-		CleanseMode:      cleanseMode,
-		RequestID:        requestID,
-	}
 
-	if directive.ExecutionMode == "vm_slot" {
-		if c.vmSlots == nil {
-			settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
-			WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "vm_fleet_unavailable", "VM slot manager is not attached")
-			return
-		}
-		slot, ok := c.vmSlots.GetSlotByAccount(directive.AccountID)
-		if !ok {
-			settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
-			WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "vm_slot_not_provisioned", "no VM slot provisioned for selected vm_slot account")
-			return
-		}
-		if err := c.vmSlots.AcquireSubagentSeat(slot.ID); err != nil {
-			status := http.StatusServiceUnavailable
-			code := "vm_slot_not_ready"
-			if errors.Is(err, vmslot.ErrSubagentCapacityFull) {
-				status = http.StatusTooManyRequests
-				code = "vm_subagent_capacity_full"
+	const maxDispatchAttempts = 3
+	for attempt := 0; attempt < maxDispatchAttempts; attempt++ {
+		secret, hasSecret := c.vault.Get(directive.AccountID)
+		if !hasSecret {
+			if attempt+1 < maxDispatchAttempts && tracker.CanFailover() {
+				excludedAccIDs = append(excludedAccIDs, directive.AccountID)
+				if nextDir, ok := c.tryRebindFailover(r.Context(), baseEvalReq, directive.HoldID, excludedAccIDs, "", 0); ok {
+					directive = nextDir
+					access.setDirective(&directive)
+					continue
+				}
 			}
-			settleHold(RelayMetrics{UpstreamStatus: status})
-			WriteProtocolError(w, turn.IngressCodec, status, "overloaded_error", code, err.Error())
+			settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
+			WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "account_secret_unavailable", "upstream account credentials not yet synchronized in vault")
 			return
 		}
-		defer func() { _ = c.vmSlots.ReleaseSubagentSeat(slot.ID) }()
 
-		guestEndpoint := strings.TrimSpace(slot.GuestUDSPath)
-		if guestEndpoint != "" && !strings.HasPrefix(guestEndpoint, "sandbox://") && !strings.HasPrefix(guestEndpoint, "ssh://") {
-			pingCtx, pingCancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
-			pingErr := dpbridge.Ping(pingCtx, guestEndpoint)
-			pingCancel()
-			if pingErr != nil {
+		// Proactive OAuth token renewal when expiring within 5 minutes.
+		if secret.NeedsOAuthRefresh(time.Now()) {
+			if refreshed, refErr := c.RefreshAccountOAuth(r.Context(), directive.AccountID, false); refErr == nil {
+				secret = refreshed
+			}
+		}
+
+		subTier = firstNonEmpty(
+			NormalizeSubscriptionTier(directive.SubscriptionTier),
+			c.accountTier(directive.AccountID),
+			secret.SubscriptionTier,
+			"standard",
+		)
+		tierMult := directive.TierMultiplier
+		if tierMult == 0 {
+			tierMult = SubscriptionTierMultiplier(directive.Provider, subTier)
+		}
+		pctx = OutboundPersonaContext{
+			Provider:         directive.Provider,
+			AuthKind:         firstNonEmpty(directive.AuthKind, c.accountAuthKind(directive.AccountID)),
+			SubscriptionTier: subTier,
+			TierMultiplier:   tierMult,
+			ExecutionMode:    directive.ExecutionMode,
+			AccountID:        directive.AccountID,
+			CleanseMode:      cleanseMode,
+			RequestID:        requestID,
+		}
+
+		var releaseVMSeat func()
+		if directive.ExecutionMode == "vm_slot" {
+			if c.vmSlots == nil {
 				settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
-				WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "vm_guestd_unreachable", "slipgate-guestd failed health check: "+pingErr.Error())
+				WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "vm_fleet_unavailable", "VM slot manager is not attached")
 				return
 			}
+			slot, ok := c.vmSlots.GetSlotByAccount(directive.AccountID)
+			if !ok {
+				settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
+				WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "vm_slot_not_provisioned", "no VM slot provisioned for selected vm_slot account")
+				return
+			}
+			if err := c.vmSlots.AcquireSubagentSeat(slot.ID); err != nil {
+				status := http.StatusServiceUnavailable
+				code := "vm_slot_not_ready"
+				if errors.Is(err, vmslot.ErrSubagentCapacityFull) {
+					status = http.StatusTooManyRequests
+					code = "vm_subagent_capacity_full"
+				}
+				settleHold(RelayMetrics{UpstreamStatus: status})
+				WriteProtocolError(w, turn.IngressCodec, status, "overloaded_error", code, err.Error())
+				return
+			}
+			releaseVMSeat = func() { _ = c.vmSlots.ReleaseSubagentSeat(slot.ID) }
+
+			guestEndpoint := strings.TrimSpace(slot.GuestUDSPath)
+			if guestEndpoint != "" && !strings.HasPrefix(guestEndpoint, "sandbox://") && !strings.HasPrefix(guestEndpoint, "ssh://") {
+				pingCtx, pingCancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
+				pingErr := dpbridge.Ping(pingCtx, guestEndpoint)
+				pingCancel()
+				if pingErr != nil {
+					releaseVMSeat()
+					settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
+					WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "vm_guestd_unreachable", "slipgate-guestd failed health check: "+pingErr.Error())
+					return
+				}
+			}
+			if strings.TrimSpace(slot.CleanseMode) != "" {
+				cleanseMode = slot.CleanseMode
+			}
+			pctx.CleanseMode = cleanseMode
+			pctx.GuestMachineID = slot.Persona.GuestMachineID
+			pctx.RuntimeProfile = string(slot.RuntimeProfile)
+			w.Header().Set("X-Slipgate-VM-Slot", slot.ID)
+			if slot.RuntimeProfile != "" {
+				w.Header().Set("X-Slipgate-VM-Runtime", string(slot.RuntimeProfile))
+			}
 		}
-		if strings.TrimSpace(slot.CleanseMode) != "" {
-			cleanseMode = slot.CleanseMode
+
+		execOnce := func(sec AccountSecret) (*http.Response, CodecKind, error) {
+			if isMultimodal {
+				if sec.IsMock() {
+					return executeMockMultimodalTurn(turn, directive.UpstreamModel), turn.IngressCodec, nil
+				}
+				mReq, mCodec, bErr := buildMultimodalUpstreamRequest(r.Context(), r.URL.Path, pctx, directive.UpstreamModel, sec, turn)
+				if bErr != nil {
+					return nil, mCodec, errRequestTranscode{err: bErr}
+				}
+				resp, dErr := c.executeOutbound(r.Context(), pctx, sec, mReq, directive.UpstreamModel, mCodec, turn)
+				return resp, mCodec, dErr
+			}
+			uReq, uCodec, bErr := BuildUpstreamHTTPRequestWithPersona(r.Context(), pctx, directive.UpstreamModel, sec, turn)
+			if bErr != nil {
+				return nil, uCodec, errRequestTranscode{err: bErr}
+			}
+			resp, dErr := c.executeOutbound(r.Context(), pctx, sec, uReq, directive.UpstreamModel, uCodec, turn)
+			return resp, uCodec, dErr
 		}
-		pctx.CleanseMode = cleanseMode
-		pctx.GuestMachineID = slot.Persona.GuestMachineID
-		pctx.RuntimeProfile = string(slot.RuntimeProfile)
-		w.Header().Set("X-Slipgate-VM-Slot", slot.ID)
-		if slot.RuntimeProfile != "" {
-			w.Header().Set("X-Slipgate-VM-Runtime", string(slot.RuntimeProfile))
+
+		var execErr error
+		upstreamResp, egressCodec, execErr = execOnce(secret)
+		if mutErr, isTranscodeErr := execErr.(errRequestTranscode); isTranscodeErr {
+			if releaseVMSeat != nil {
+				releaseVMSeat()
+			}
+			settleHold(RelayMetrics{UpstreamStatus: http.StatusBadRequest})
+			WriteProtocolError(w, turn.IngressCodec, http.StatusBadRequest, "invalid_request_error", "request_transcode_failed", mutErr.err.Error())
+			return
 		}
+
+		// Reactive 401 OAuth RefreshToken retry on the same account before failing over.
+		if execErr == nil && upstreamResp != nil && upstreamResp.StatusCode == http.StatusUnauthorized && strings.TrimSpace(secret.RefreshToken) != "" {
+			if refreshed, refErr := c.RefreshAccountOAuth(r.Context(), directive.AccountID, true); refErr == nil {
+				_ = upstreamResp.Body.Close()
+				secret = refreshed
+				upstreamResp, egressCodec, execErr = execOnce(secret)
+			}
+		}
+
+		if execErr != nil {
+			c.logTurn("warn", "outbound dispatch failed: "+execErr.Error(), requestID, &directive, turn.PublicModel,
+				"execution_mode", directive.ExecutionMode, "upstream_model", directive.UpstreamModel)
+			if attempt+1 < maxDispatchAttempts && tracker.CanFailover() {
+				if releaseVMSeat != nil {
+					releaseVMSeat()
+				}
+				excludedAccIDs = append(excludedAccIDs, directive.AccountID)
+				if nextDir, ok := c.tryRebindFailover(r.Context(), baseEvalReq, directive.HoldID, excludedAccIDs, "", 0); ok {
+					directive = nextDir
+					access.setDirective(&directive)
+					continue
+				}
+			}
+			if releaseVMSeat != nil {
+				defer releaseVMSeat()
+			}
+			settleHold(RelayMetrics{UpstreamStatus: http.StatusBadGateway})
+			WriteProtocolError(w, turn.IngressCodec, http.StatusBadGateway, "upstream_error", "outbound_dispatch_failed", execErr.Error())
+			return
+		}
+
+		// Check pre-first-byte upstream HTTP errors eligible for cooldown and cross-account failover.
+		if isFailoverEligibleStatus(upstreamResp.StatusCode) {
+			cooldownMs := computeUpstreamCooldownMs(upstreamResp.StatusCode, upstreamResp.Header)
+			if cooldownMs > 0 {
+				pendingCooldown = cooldownMs
+				c.persistAccountCooldownBounded(directive.AccountID, cooldownMs, fmt.Sprintf("upstream_http_%d", upstreamResp.StatusCode))
+			}
+			if attempt+1 < maxDispatchAttempts && tracker.CanFailover() {
+				excludedAccIDs = append(excludedAccIDs, directive.AccountID)
+				if nextDir, ok := c.tryRebindFailover(r.Context(), baseEvalReq, directive.HoldID, excludedAccIDs, directive.AccountID, cooldownMs); ok {
+					_ = upstreamResp.Body.Close()
+					if releaseVMSeat != nil {
+						releaseVMSeat()
+					}
+					pendingCooldown = 0
+					directive = nextDir
+					access.setDirective(&directive)
+					continue
+				}
+			}
+		}
+
+		if releaseVMSeat != nil {
+			defer releaseVMSeat()
+		}
+		break
 	}
+	defer upstreamResp.Body.Close()
 
 	w.Header().Set("X-Slipgate-Execution-Mode", directive.ExecutionMode)
 	w.Header().Set("X-Slipgate-Provider", directive.Provider)
 	w.Header().Set("X-Slipgate-Subscription-Tier", subTier)
 
-	upstreamReq, egressCodec, buildErr := BuildUpstreamHTTPRequestWithPersona(
-		r.Context(),
-		pctx,
-		directive.UpstreamModel,
-		secret,
-		turn,
+	var (
+		metrics  RelayMetrics
+		relayErr error
 	)
-	if buildErr != nil {
-		settleHold(RelayMetrics{UpstreamStatus: http.StatusBadRequest})
-		WriteProtocolError(w, turn.IngressCodec, http.StatusBadRequest, "invalid_request_error", "request_transcode_failed", buildErr.Error())
-		return
+	if isMultimodal {
+		metrics, relayErr = relayMultimodalResponse(w, upstreamResp, egressCodec, turn, &directive, startedAt, &c.mediaTasks)
+	} else {
+		targetWriter := w
+		var respCapturer *responseCaptureWriter
+		if turn.IngressCodec == CodecOpenAIResponses {
+			respCapturer = newResponseCaptureWriter(w, 2*1024*1024)
+			targetWriter = respCapturer
+		}
+		metrics, relayErr = RelayAndTranscodeResponse(
+			targetWriter,
+			upstreamResp,
+			egressCodec,
+			turn,
+			directive.PublicModel,
+			cleanseMode,
+			startedAt,
+			tracker.OnVisibleToolDelta,
+		)
+		if respCapturer != nil && metrics.UpstreamStatus >= 200 && metrics.UpstreamStatus < 300 {
+			c.responsesState.captureTurn(directive.APIKeyID, directive.PublicModel, turn, respCapturer.buf.Bytes())
+		}
 	}
-
-	upstreamResp, execErr := c.executeOutbound(r.Context(), pctx, secret, upstreamReq, directive.UpstreamModel, egressCodec, turn)
-	if execErr != nil {
-		c.logTurn("warn", "outbound dispatch failed: "+execErr.Error(), requestID, &directive, turn.PublicModel,
-			"execution_mode", directive.ExecutionMode, "upstream_model", directive.UpstreamModel)
-		settleHold(RelayMetrics{UpstreamStatus: http.StatusBadGateway})
-		WriteProtocolError(w, turn.IngressCodec, http.StatusBadGateway, "upstream_error", "outbound_dispatch_failed", execErr.Error())
-		return
+	if pendingCooldown > 0 && metrics.CooldownDurationMs == 0 {
+		metrics.CooldownDurationMs = pendingCooldown
 	}
-	defer upstreamResp.Body.Close()
-
-	metrics, relayErr := RelayAndTranscodeResponse(
-		w,
-		upstreamResp,
-		egressCodec,
-		turn,
-		directive.PublicModel,
-		cleanseMode,
-		startedAt,
-		tracker.OnVisibleToolDelta,
-	)
 	if relayErr != nil {
 		// Structured (logx): the system log keeps the request, user, key, account, platform and model.
 		c.logTurn("warn", fmt.Sprintf("stream relay interrupted: %v", relayErr), requestID, &directive, turn.PublicModel,
@@ -1090,28 +1361,34 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	durationMs := elapsedMs(startedAt)
 
 	c.postSettlementBounded(TurnSettlementEvent{
-		SettlementID:     newSettlementID(),
-		CoreSettled:      ack.settled,
-		RequestID:        requestID,
-		UserID:           directive.UserID,
-		APIKeyID:         directive.APIKeyID,
-		AccountID:        directive.AccountID,
-		GroupID:          directive.GroupID,
-		Platform:         directive.Provider,
-		PublicModel:      directive.PublicModel,
-		UpstreamModel:    directive.UpstreamModel,
-		IngressCodec:     string(turn.IngressCodec),
-		EgressCodec:      string(egressCodec),
-		InputTokens:      metrics.InputTokens,
-		OutputTokens:     metrics.OutputTokens,
-		CacheReadTokens:  metrics.CacheReadTokens,
-		CacheWriteTokens: metrics.CacheWriteTokens,
-		CostNanoUSD:      firstNonEmpty(ack.SettledCostNanoUSD, "0"),
-		Window5hUsedBps:  metrics.Window5hUsedBps,
-		Window7dUsedBps:  metrics.Window7dUsedBps,
-		TTFTMs:           metrics.TTFTMs,
-		DurationMs:       durationMs,
-		StatusCode:       metrics.UpstreamStatus,
+		SettlementID:          newSettlementID(),
+		CoreSettled:           ack.settled,
+		RequestID:             requestID,
+		UserID:                directive.UserID,
+		APIKeyID:              directive.APIKeyID,
+		AccountID:             directive.AccountID,
+		GroupID:               directive.GroupID,
+		Platform:              directive.Provider,
+		PublicModel:           directive.PublicModel,
+		UpstreamModel:         directive.UpstreamModel,
+		IngressCodec:          string(turn.IngressCodec),
+		EgressCodec:           string(egressCodec),
+		InputTokens:           metrics.InputTokens,
+		OutputTokens:          metrics.OutputTokens,
+		CacheReadTokens:       metrics.CacheReadTokens,
+		CacheWriteTokens:      metrics.CacheWriteTokens,
+		CostNanoUSD:           firstNonEmpty(ack.SettledCostNanoUSD, "0"),
+		Window5hUsedBps:       metrics.Window5hUsedBps,
+		Window7dUsedBps:       metrics.Window7dUsedBps,
+		Window5hResetAtUnixMs: metrics.Window5hResetAtUnixMs,
+		Window7dResetAtUnixMs: metrics.Window7dResetAtUnixMs,
+		ServiceTier:           turn.ServiceTier,
+		ReasoningEffort:       turn.ReasoningEffort,
+		ImageCount:            metrics.ImageCount,
+		VideoSeconds:          float64(metrics.VideoSeconds),
+		TTFTMs:                metrics.TTFTMs,
+		DurationMs:            durationMs,
+		StatusCode:            metrics.UpstreamStatus,
 	})
 }
 
@@ -1288,31 +1565,310 @@ func modelObject(id string) map[string]any {
 	}
 }
 
-// isSupportedDataPlaneRoute lists the AI endpoints the DataPlane implements. Anything else under
-// /v1 (embeddings, images, files, ...) gets a clean 404 instead of being misread as a chat turn.
+// isSupportedDataPlaneRoute lists the AI endpoints the DataPlane implements.
 func isSupportedDataPlaneRoute(method, path string) bool {
 	if path == "/mcp" || strings.HasPrefix(path, "/mcp/") {
 		return true
 	}
+	trimmed := strings.TrimSuffix(path, "/")
 	if method == http.MethodGet {
-		return path == "/v1/models" || strings.HasPrefix(path, "/v1/models/")
+		if trimmed == "/v1/models" || strings.HasPrefix(path, "/v1/models/") || trimmed == "/v1beta/models" {
+			return true
+		}
+		if strings.HasPrefix(trimmed, "/v1/responses/") || strings.HasPrefix(trimmed, "/v1/videos/") {
+			return true
+		}
+		return false
+	}
+	if method == http.MethodDelete {
+		return strings.HasPrefix(trimmed, "/v1/responses/") && !strings.HasSuffix(trimmed, "/input_items")
 	}
 	if method != http.MethodPost {
 		return false
 	}
-	switch strings.TrimSuffix(path, "/") {
-	case "/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens":
+	switch trimmed {
+	case "/v1/chat/completions",
+		"/v1/responses",
+		"/v1/messages",
+		"/v1/messages/count_tokens",
+		"/v1/embeddings",
+		"/v1/images/generations",
+		"/v1/images/edits",
+		"/v1/videos",
+		"/v1/videos/generations":
 		return true
 	}
 	if rest, ok := strings.CutPrefix(path, "/v1beta/models/"); ok {
 		if idx := strings.LastIndexByte(rest, ':'); idx > 0 {
 			switch rest[idx+1:] {
-			case "generateContent", "streamGenerateContent", "countTokens":
+			case "generateContent", "streamGenerateContent", "countTokens", "embedContent", "batchEmbedContents":
 				return true
 			}
 		}
 	}
 	return false
+}
+
+type errRequestTranscode struct {
+	err error
+}
+
+func (e errRequestTranscode) Error() string { return e.err.Error() }
+
+func isFailoverEligibleStatus(code int) bool {
+	switch code {
+	case http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+		529:
+		return true
+	default:
+		return false
+	}
+}
+
+func computeUpstreamCooldownMs(status int, h http.Header) uint64 {
+	if status != http.StatusTooManyRequests && status != 529 {
+		return 0
+	}
+	if msRaw := strings.TrimSpace(h.Get("Retry-After-Ms")); msRaw != "" {
+		if ms, err := strconv.ParseUint(msRaw, 10, 64); err == nil && ms > 0 {
+			return min(uint64(3600_000), max(uint64(5_000), ms))
+		}
+	}
+	if secRaw := strings.TrimSpace(h.Get("Retry-After")); secRaw != "" {
+		if sec, err := strconv.ParseUint(secRaw, 10, 64); err == nil && sec > 0 {
+			return min(uint64(3600_000), max(uint64(5_000), sec*1000))
+		}
+		if when, err := http.ParseTime(secRaw); err == nil {
+			if diff := time.Until(when).Milliseconds(); diff > 0 {
+				return min(uint64(3600_000), max(uint64(5_000), uint64(diff)))
+			}
+		}
+	}
+	if status == 529 {
+		return 30_000
+	}
+	return 60_000
+}
+
+func (c *Coordinator) tryRebindFailover(
+	ctx context.Context,
+	baseReq coreTurnEvalRequest,
+	currentHoldID uint64,
+	excluded []string,
+	cooldownAccID string,
+	cooldownMs uint64,
+) (coreDispatchDirective, bool) {
+	if strings.TrimSpace(c.coreIPC) == "" || currentHoldID == 0 {
+		return coreDispatchDirective{}, false
+	}
+	req := baseReq
+	req.RebindHoldID = currentHoldID
+	req.ExcludeAccountIDs = excluded
+	req.RebindCooldownAccountID = cooldownAccID
+	req.RebindCooldownMs = cooldownMs
+	req.NowUnixMs = time.Now().UnixMilli()
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return coreDispatchDirective{}, false
+	}
+	ipcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	reply, err := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
+		StreamID: c.streamSeq.Add(1),
+		Type:     dpbridge.FrameReqHeaders,
+		Flags:    dpbridge.FlagEndStream,
+		Payload:  payload,
+	})
+	if err != nil {
+		return coreDispatchDirective{}, false
+	}
+	var next coreDispatchDirective
+	if json.Unmarshal(reply.Payload, &next) != nil || next.Action != "dispatch" || next.AccountID == "" {
+		return coreDispatchDirective{}, false
+	}
+	return next, true
+}
+
+func deriveSessionKey(r *http.Request, turn *CanonicalTurn, apiKey string) string {
+	explicit := firstNonEmpty(
+		r.Header.Get("X-Session-Id"),
+		r.Header.Get("session_id"),
+		r.Header.Get("Conversation_id"),
+		turn.SessionHint,
+	)
+	if explicit != "" {
+		sum := sha256.Sum256([]byte("sg-sess:" + apiKey + "|" + explicit))
+		return hex.EncodeToString(sum[:16])
+	}
+	if len(turn.Messages) > 0 {
+		firstMsg := turn.Messages[0].Content
+		if len(firstMsg) > 256 {
+			firstMsg = firstMsg[:256]
+		}
+		if turn.SystemPrompt != "" || firstMsg != "" {
+			sum := sha256.Sum256([]byte("sg-conv:" + apiKey + "|" + turn.SystemPrompt[:min(len(turn.SystemPrompt), 256)] + "|" + firstMsg))
+			return hex.EncodeToString(sum[:16])
+		}
+	}
+	return ""
+}
+
+func isStatefulResponsesLookup(method, path string) bool {
+	if method != http.MethodGet && method != http.MethodDelete {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSuffix(path, "/"), "/v1/responses/")
+}
+
+func (c *Coordinator) authenticateAPIKeyViaCore(ctx context.Context, r *http.Request, requestID string, startedAt time.Time) (coreDispatchDirective, bool) {
+	clientIP := c.clientIPFromRequest(r)
+	evalPayload, _ := json.Marshal(coreTurnEvalRequest{
+		RequestID: requestID,
+		Method:    http.MethodGet,
+		Path:      "/v1/models",
+		APIKey:    extractAPIKey(r),
+		ClientIP:  clientIP,
+		NowUnixMs: startedAt.UnixMilli(),
+	})
+	ipcCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	reply, err := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
+		StreamID: c.streamSeq.Add(1),
+		Type:     dpbridge.FrameReqHeaders,
+		Flags:    dpbridge.FlagEndStream,
+		Payload:  evalPayload,
+	})
+	if err != nil {
+		return coreDispatchDirective{
+			Action:    "reject",
+			Status:    http.StatusServiceUnavailable,
+			ErrorType: "core_unavailable",
+			ErrorCode: "core_unreachable",
+			Message:   "slipgate-core dataplane unreachable: " + err.Error(),
+		}, false
+	}
+	var dir coreDispatchDirective
+	_ = json.Unmarshal(reply.Payload, &dir)
+	if dir.Action == "reject" {
+		return dir, false
+	}
+	if !c.isClientIPAllowed(dir.APIKeyID, clientIP) {
+		return coreDispatchDirective{
+			Action:    "reject",
+			Status:    http.StatusForbidden,
+			ErrorType: "permission_error",
+			ErrorCode: "ip_not_allowed",
+			Message:   "client IP is not in API key allowlist",
+		}, false
+	}
+	return dir, dir.APIKeyID != ""
+}
+
+func (c *Coordinator) handleStatefulResponsesRoute(w http.ResponseWriter, r *http.Request, requestID string, startedAt time.Time) {
+	dir, ok := c.authenticateAPIKeyViaCore(r.Context(), r, requestID, startedAt)
+	if !ok {
+		setRetryAfter(w.Header(), dir.RetryAfterMs)
+		WriteProtocolError(w, CodecOpenAIResponses, max(http.StatusUnauthorized, dir.Status), dir.ErrorType, dir.ErrorCode, dir.Message)
+		return
+	}
+	rest := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/"), "/v1/responses/")
+	if strings.HasSuffix(rest, "/input_items") && r.Method == http.MethodGet {
+		respID := strings.TrimSuffix(rest, "/input_items")
+		items, found := c.responsesState.inputItems(dir.APIKeyID, respID)
+		if !found {
+			WriteProtocolError(w, CodecOpenAIResponses, http.StatusNotFound, "not_found_error", "response_not_found", "Response not found")
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]any{
+			"object":   "list",
+			"data":     items,
+			"has_more": false,
+		})
+		return
+	}
+
+	respID := rest
+	if r.Method == http.MethodDelete {
+		if !c.responsesState.delete(dir.APIKeyID, respID) {
+			WriteProtocolError(w, CodecOpenAIResponses, http.StatusNotFound, "not_found_error", "response_not_found", "Response not found")
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]any{
+			"id":      respID,
+			"object":  "response.deleted",
+			"deleted": true,
+		})
+		return
+	}
+
+	obj, found := c.responsesState.get(dir.APIKeyID, respID)
+	if !found {
+		WriteProtocolError(w, CodecOpenAIResponses, http.StatusNotFound, "not_found_error", "response_not_found", "Response not found")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, obj)
+}
+
+func (c *Coordinator) handleGetVideoTask(w http.ResponseWriter, r *http.Request, requestID string, startedAt time.Time) {
+	dir, ok := c.authenticateAPIKeyViaCore(r.Context(), r, requestID, startedAt)
+	if !ok {
+		setRetryAfter(w.Header(), dir.RetryAfterMs)
+		WriteProtocolError(w, CodecOpenAIChat, max(http.StatusUnauthorized, dir.Status), dir.ErrorType, dir.ErrorCode, dir.Message)
+		return
+	}
+	taskID := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/"), "/v1/videos/")
+	task, found := c.mediaTasks.get(dir.APIKeyID, taskID)
+	if !found {
+		WriteProtocolError(w, CodecOpenAIChat, http.StatusNotFound, "not_found_error", "video_not_found", "Video generation task not found")
+		return
+	}
+	sec, hasSec := c.vault.Get(task.accountID)
+	if !hasSec {
+		WriteProtocolError(w, CodecOpenAIChat, http.StatusServiceUnavailable, "overloaded_error", "account_secret_unavailable", "Upstream account credentials unavailable")
+		return
+	}
+	if sec.IsMock() {
+		writeJSONResponse(w, http.StatusOK, map[string]any{
+			"id":     task.taskID,
+			"object": "video",
+			"status": "completed",
+			"model":  task.publicModel,
+		})
+		return
+	}
+	meta, _ := c.accountMetaFor(task.accountID)
+	baseURL := resolveProviderBaseURL(task.provider, sec.BaseURL)
+	targetURL := joinProviderPath(baseURL, "/v1/videos/"+task.taskID)
+	reqCtx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	upReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		WriteProtocolError(w, CodecOpenAIChat, http.StatusBadRequest, "invalid_request_error", "bad_video_id", err.Error())
+		return
+	}
+	applyUpstreamAuthHeaders(upReq, OutboundPersonaContext{
+		Provider:      task.provider,
+		AuthKind:      meta.AuthKind,
+		ExecutionMode: meta.ExecutionMode,
+		AccountID:     task.accountID,
+	}, sec)
+	resp, err := c.executeControlHTTPRequest(reqCtx, task.accountID, meta, sec, upReq)
+	if err != nil {
+		WriteProtocolError(w, CodecOpenAIChat, http.StatusBadGateway, "upstream_error", "outbound_dispatch_failed", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	w.Header().Set("Content-Type", firstNonEmpty(resp.Header.Get("Content-Type"), "application/json; charset=utf-8"))
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(rewriteTopLevelModel(raw, CodecOpenAIChat, task.publicModel))
 }
 
 func extractAPIKey(r *http.Request) string {

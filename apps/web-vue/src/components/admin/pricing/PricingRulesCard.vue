@@ -10,7 +10,7 @@ import UiCard from "../../ui/UiCard.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
 import { formatDateTime, formatRelative } from "../../../lib/format";
-import { cacheIsDefault, formatPerM, isPrefixPattern, rulePrices, STAGGER_CLASS, stagger, type PriceSet } from "./pricingUtil";
+import { cacheIsDefault, formatPerM, isPrefixPattern, nanoToUsdText, rulePrices, STAGGER_CLASS, stagger, type PriceSet } from "./pricingUtil";
 
 /** Rule list: table on md+, stacked cards on phones. Mutations are delegated to the page. */
 const props = defineProps<{
@@ -24,6 +24,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "create"): void;
+  (e: "syncPresets"): void;
   (e: "edit", rule: ModelPricingRule): void;
   (e: "toggle", rule: ModelPricingRule): void;
   (e: "remove", rule: ModelPricingRule): void;
@@ -83,6 +84,23 @@ function cacheTitle(row: Row, key: (typeof priceCols)[number]["key"]): string | 
   if (key === "cacheWrite" && row.defaults.write) return t("pricing.cacheDefault.write");
   return undefined;
 }
+
+function extraBadges(rule: ModelPricingRule): string[] {
+  const out: string[] = [];
+  if (rule.perImageNanoUsd && rule.perImageNanoUsd !== "0") {
+    out.push(`$${nanoToUsdText(BigInt(rule.perImageNanoUsd))}/img`);
+  }
+  if (rule.perVideoSecondNanoUsd && rule.perVideoSecondNanoUsd !== "0") {
+    out.push(`$${nanoToUsdText(BigInt(rule.perVideoSecondNanoUsd))}/s`);
+  }
+  if (rule.perRequestNanoUsd && rule.perRequestNanoUsd !== "0") {
+    out.push(`$${nanoToUsdText(BigInt(rule.perRequestNanoUsd))}/req`);
+  }
+  if (rule.longContextThresholdTokens && rule.longContextThresholdTokens > 0) {
+    out.push(`>${Math.round(rule.longContextThresholdTokens / 1000)}k`);
+  }
+  return out;
+}
 </script>
 
 <template>
@@ -133,10 +151,16 @@ function cacheTitle(row: Row, key: (typeof priceCols)[number]["key"]): string | 
 
     <EmptyState v-else-if="rules.length === 0" icon="sliders" :title="t('pricing.list.empty')">
       <p class="w-full max-w-sm text-xs text-fg-subtle">{{ t("pricing.list.emptyHint") }}</p>
-      <button type="button" class="btn btn-primary btn-sm" @click="emit('create')">
-        <UiIcon name="plus" :size="14" />
-        {{ t("pricing.actions.create") }}
-      </button>
+      <div class="flex flex-wrap items-center justify-center gap-2">
+        <button type="button" class="btn btn-secondary btn-sm" @click="emit('syncPresets')">
+          <UiIcon name="download" :size="14" />
+          {{ t("pricing.actions.syncPresets") }}
+        </button>
+        <button type="button" class="btn btn-primary btn-sm" @click="emit('create')">
+          <UiIcon name="plus" :size="14" />
+          {{ t("pricing.actions.create") }}
+        </button>
+      </div>
     </EmptyState>
 
     <EmptyState v-else-if="rows.length === 0 && hasFilters" icon="search" :title="t('pricing.list.noMatch')" compact>
@@ -184,6 +208,7 @@ function cacheTitle(row: Row, key: (typeof priceCols)[number]["key"]): string | 
                     {{ row.rule.pattern }}
                   </span>
                   <UiBadge v-if="row.prefix" tone="info">{{ t("pricing.kind.prefix") }}</UiBadge>
+                  <UiBadge v-for="b in extraBadges(row.rule)" :key="b" tone="neutral">{{ b }}</UiBadge>
                 </div>
               </td>
               <td

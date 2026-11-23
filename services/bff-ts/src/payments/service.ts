@@ -445,7 +445,8 @@ export class PaymentService {
     const payments = this.deps.store.payments;
     const order = await payments.getOrder(orderId);
     if (!order) throw new StoreError("not_found", "Order not found");
-    const amountMinor = req.amountMinor ?? order.amountMinor;
+    const alreadyRefunded = order.status === "partially_refunded" ? order.refundAmountMinor : 0;
+    const amountMinor = req.amountMinor ?? Math.max(0, order.amountMinor - alreadyRefunded);
     const m = await this.merchantFor(order);
     const gatewayCapable = m !== null && m.ready && m.refundEnabled;
     const viaProvider = req.viaProvider ?? gatewayCapable;
@@ -523,6 +524,49 @@ export class PaymentService {
       return { result: { order, outcome: "pending", message: errMessage(err) } };
     }
     return { result: await this.applyRefundResult(order, m, r) };
+  }
+
+  /**
+   * Reconciles a provider-initiated refund notification (Stripe charge.refunded, WeChat Pay
+   * REFUND.SUCCESS, Airwallex refund.settled) idempotently against local wallet/rebate state.
+   */
+  async reconcileExternalRefund(
+    orderId: string,
+    opts: { cumulativeRefundedMinor?: number; deltaRefundMinor?: number; providerRefundId?: string | null },
+  ): Promise<PaymentOrderItem | null> {
+    const payments = this.deps.store.payments;
+    const order = await payments.getOrder(orderId);
+    if (!order) return null;
+    if (order.status === "refunded") return order;
+    if (order.status === "refund_pending") {
+      const done = await payments.completeRefund(order.id, opts.providerRefundId ?? null);
+      await this.deps.syncDataPlane();
+      return done;
+    }
+    if (
+      order.status !== "paid" &&
+      order.status !== "partially_refunded" &&
+      order.status !== "refund_requested" &&
+      order.status !== "refund_failed"
+    ) {
+      return order;
+    }
+    const already = order.status === "partially_refunded" ? order.refundAmountMinor : 0;
+    const remaining = order.amountMinor - already;
+    if (remaining <= 0) return order;
+    const rawDelta =
+      opts.cumulativeRefundedMinor !== undefined ? opts.cumulativeRefundedMinor - already : (opts.deltaRefundMinor ?? 0);
+    if (!Number.isFinite(rawDelta) || rawDelta <= 0) return order;
+    const amountMinor = Math.min(Math.round(rawDelta), remaining);
+    await payments.beginRefund(order.id, {
+      amountMinor,
+      reason: "provider_webhook_refund",
+      reclaim: true,
+      force: true,
+    });
+    const done = await payments.completeRefund(order.id, opts.providerRefundId ?? null);
+    await this.deps.syncDataPlane();
+    return done;
   }
 
   /* ---------------- Sweeper ---------------- */

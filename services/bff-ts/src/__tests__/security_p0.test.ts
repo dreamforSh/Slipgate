@@ -61,7 +61,11 @@ describe("P0 security regressions", () => {
     const authHeaders = { ...JSON_HEADERS, Authorization: `Bearer ${accessToken}` };
 
     // Set up and enable 2FA on the admin account.
-    const setupTotpRes = await app.request("/api/v1/user/totp/setup", { method: "POST", headers: authHeaders });
+    const setupTotpRes = await app.request("/api/v1/user/totp/setup", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ password: adminPassword }),
+    });
     expect(setupTotpRes.status).toBe(200);
     const { secret } = (await setupTotpRes.json()) as { secret: string };
     const step0 = Math.floor(Date.now() / 1000 / TOTP_STEP_SECONDS);

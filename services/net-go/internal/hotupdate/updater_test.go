@@ -249,7 +249,10 @@ func TestSyncEndToEndHotRestartsSupervisorAndOverridesWebUI(t *testing.T) {
 	defer srv.Close()
 	srvURL = srv.URL
 
-	var overriddenDir string
+	var (
+		overriddenDir   string
+		planesRestarted int
+	)
 	mgr := NewManager(Options{
 		Config: config.Config{
 			Mode:               "dev",
@@ -268,11 +271,17 @@ func TestSyncEndToEndHotRestartsSupervisorAndOverridesWebUI(t *testing.T) {
 		OnWebUIDir: func(dir string) {
 			overriddenDir = dir
 		},
+		OnPlanesRestarted: func(_ context.Context) {
+			planesRestarted++
+		},
 	})
 
 	status, err := mgr.Sync(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("full hot-update Sync failed: %v", err)
+	}
+	if planesRestarted != 1 {
+		t.Fatalf("expected OnPlanesRestarted callback to fire once after RestartAll ([H-05]), got %d", planesRestarted)
 	}
 	if status.ActiveCommit != "deadbeef12345678" || !status.WebUIOverridden || !status.EdgeBinaryStaged || status.ReloadCount != 1 {
 		t.Fatalf("unexpected updated status: %+v", status)

@@ -69,6 +69,8 @@ type InternalGroup = Omit<GroupItem, "accountCount" | "activeAccountCount" | "ap
 interface InternalAccount extends Omit<UpstreamAccount, "groupName" | "effectiveStatus"> {
   credentialsEnc: Uint8Array;
   credentialFingerprint: string | null;
+  window5hResetAtMs: number | null;
+  window7dResetAtMs: number | null;
 }
 
 type ComputedKeyFields =
@@ -450,10 +452,24 @@ export class MemoryControlStore implements ControlStore {
     });
   }
 
+  private effectiveWindowQuotas(acc: InternalAccount, nowMs: number) {
+    const r5 = acc.window5hResetAtMs;
+    const r7 = acc.window7dResetAtMs;
+    return {
+      window5hUsedBps: r5 !== null && r5 <= nowMs ? 0 : acc.window5hUsedBps,
+      window7dUsedBps: r7 !== null && r7 <= nowMs ? 0 : acc.window7dUsedBps,
+      window5hResetAtUnixMs: r5 !== null && r5 > nowMs ? r5 : undefined,
+      window7dResetAtUnixMs: r7 !== null && r7 > nowMs ? r7 : undefined,
+    };
+  }
+
   private toPublicAccount(acc: InternalAccount, nowMs = Date.now()): UpstreamAccount {
-    const { credentialsEnc: _enc, credentialFingerprint: _fp, ...rest } = acc;
+    const { credentialsEnc: _enc, credentialFingerprint: _fp, window5hResetAtMs: _r5, window7dResetAtMs: _r7, ...rest } = acc;
+    const win = this.effectiveWindowQuotas(acc, nowMs);
     return {
       ...rest,
+      window5hUsedBps: win.window5hUsedBps,
+      window7dUsedBps: win.window7dUsedBps,
       lastTest: acc.lastTest ? { ...acc.lastTest } : null,
       groupName: this.groups.get(acc.groupId)?.name ?? acc.groupId,
       effectiveStatus: effectiveAccountStatus(acc, nowMs),
@@ -511,6 +527,8 @@ export class MemoryControlStore implements ControlStore {
       cooldownReason: "",
       window5hUsedBps: 0,
       window7dUsedBps: 0,
+      window5hResetAtMs: null,
+      window7dResetAtMs: null,
       lastTest: null,
       lastUsedAtIso: null,
       createdAtIso: new Date().toISOString(),
@@ -842,22 +860,27 @@ export class MemoryControlStore implements ControlStore {
         enabled: g.enabled,
       })),
       routes: await this.listCompositeRoutes(),
-      accounts: Array.from(this.accounts.values()).map((a) => ({
-        id: a.id,
-        groupId: a.groupId,
-        platform: a.platform,
-        executionMode: a.executionMode,
-        authKind: a.authKind,
-        subscriptionTier: a.subscriptionTier,
-        tierMultiplier: a.tierMultiplier,
-        credentialsEncHex: bytesToHex(a.credentialsEnc),
-        maxConcurrency: a.maxConcurrency,
-        priority: a.priority,
-        // The data plane only schedules "active"; expiry and cooldown deadlines resolve here.
-        status: effectiveAccountStatus(a, nowMs),
-        window5hUsedBps: a.window5hUsedBps,
-        window7dUsedBps: a.window7dUsedBps,
-      })),
+      accounts: Array.from(this.accounts.values()).map((a) => {
+        const win = this.effectiveWindowQuotas(a, nowMs);
+        return {
+          id: a.id,
+          groupId: a.groupId,
+          platform: a.platform,
+          executionMode: a.executionMode,
+          authKind: a.authKind,
+          subscriptionTier: a.subscriptionTier,
+          tierMultiplier: a.tierMultiplier,
+          credentialsEncHex: bytesToHex(a.credentialsEnc),
+          maxConcurrency: a.maxConcurrency,
+          priority: a.priority,
+          // The data plane only schedules "active"; expiry and cooldown deadlines resolve here.
+          status: effectiveAccountStatus(a, nowMs),
+          window5hUsedBps: win.window5hUsedBps,
+          window7dUsedBps: win.window7dUsedBps,
+          ...(win.window5hResetAtUnixMs !== undefined ? { window5hResetAtUnixMs: win.window5hResetAtUnixMs } : {}),
+          ...(win.window7dResetAtUnixMs !== undefined ? { window7dResetAtUnixMs: win.window7dResetAtUnixMs } : {}),
+        };
+      }),
       apiKeys: Array.from(this.apiKeys.values()).map((k) => ({
         id: k.id,
         userId: k.userId,
@@ -915,8 +938,33 @@ export class MemoryControlStore implements ControlStore {
     }
     const acc = this.accounts.get(ev.accountId);
     if (acc) {
-      if (ev.window5hUsedBps > 0) acc.window5hUsedBps = ev.window5hUsedBps;
-      if (ev.window7dUsedBps > 0) acc.window7dUsedBps = ev.window7dUsedBps;
+      const nowMs = Date.now();
+      if (acc.window5hResetAtMs !== null && acc.window5hResetAtMs <= nowMs) {
+        acc.window5hUsedBps = 0;
+        acc.window5hResetAtMs = null;
+      }
+      if (acc.window7dResetAtMs !== null && acc.window7dResetAtMs <= nowMs) {
+        acc.window7dUsedBps = 0;
+        acc.window7dResetAtMs = null;
+      }
+      if (ev.window5hUsedBps > 0) {
+        acc.window5hUsedBps = ev.window5hUsedBps;
+        acc.window5hResetAtMs =
+          ev.window5hResetAtUnixMs && ev.window5hResetAtUnixMs > nowMs
+            ? ev.window5hResetAtUnixMs
+            : (acc.window5hResetAtMs ?? nowMs + 5 * HOUR_MS);
+      } else if (ev.window5hResetAtUnixMs && ev.window5hResetAtUnixMs > nowMs) {
+        acc.window5hResetAtMs = ev.window5hResetAtUnixMs;
+      }
+      if (ev.window7dUsedBps > 0) {
+        acc.window7dUsedBps = ev.window7dUsedBps;
+        acc.window7dResetAtMs =
+          ev.window7dResetAtUnixMs && ev.window7dResetAtUnixMs > nowMs
+            ? ev.window7dResetAtUnixMs
+            : (acc.window7dResetAtMs ?? nowMs + 168 * HOUR_MS);
+      } else if (ev.window7dResetAtUnixMs && ev.window7dResetAtUnixMs > nowMs) {
+        acc.window7dResetAtMs = ev.window7dResetAtUnixMs;
+      }
       acc.lastUsedAtIso = createdAtIso;
     }
 

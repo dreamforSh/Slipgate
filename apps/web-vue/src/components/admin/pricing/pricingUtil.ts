@@ -49,11 +49,18 @@ export { matchPricingRule };
 
 /** Mirrors PerMillionUsdSchema: up to 9 integer and 6 fractional digits. */
 const PRICE_RE = /^\d{1,9}(?:\.\d{1,6})?$/;
+/** Mirrors PerUnitUsdSchema: up to 9 integer and 9 fractional digits. */
+const UNIT_PRICE_RE = /^\d{1,9}(?:\.\d{1,9})?$/;
 
 /** "$3" / " 0.25 " → "3" / "0.25"; null when the API would reject it. */
 export function normalizePriceInput(text: string): string | null {
   const v = text.trim().replace(/^\$/, "");
   return PRICE_RE.test(v) ? v : null;
+}
+
+export function normalizeUnitPriceInput(text: string): string | null {
+  const v = text.trim().replace(/^\$/, "");
+  return UNIT_PRICE_RE.test(v) ? v : null;
 }
 
 /** Typed USD per 1M → nano-USD per 1M; null when invalid. */
@@ -107,7 +114,7 @@ export function cacheIsDefault(prices: PriceSet): { read: boolean; write: boolea
 
 /**
  * Full PUT body for an existing rule. Default-derived cache prices are left out so the server
- * keeps deriving them exactly from the input price.
+ * keeps deriving them exactly from the input price; advanced multimodal & tiered fields are preserved.
  */
 export function ruleToBody(rule: ModelPricingRule, patch: Partial<Pick<UpsertModelPricingRule, "enabled">> = {}): UpsertModelPricingRule {
   const p = rulePrices(rule);
@@ -118,6 +125,17 @@ export function ruleToBody(rule: ModelPricingRule, patch: Partial<Pick<UpsertMod
     outputPerMTokUsd: nanoToApiPrice(p.output),
     ...(d.read ? {} : { cacheReadPerMTokUsd: nanoToApiPrice(p.cacheRead) }),
     ...(d.write ? {} : { cacheWritePerMTokUsd: nanoToApiPrice(p.cacheWrite) }),
+    ...(rule.perRequestNanoUsd && rule.perRequestNanoUsd !== "0" ? { perRequestUsd: nanoToUsdText(BigInt(rule.perRequestNanoUsd)) } : {}),
+    ...(rule.perImageNanoUsd && rule.perImageNanoUsd !== "0" ? { perImageUsd: nanoToUsdText(BigInt(rule.perImageNanoUsd)) } : {}),
+    ...(rule.perVideoSecondNanoUsd && rule.perVideoSecondNanoUsd !== "0"
+      ? { perVideoSecondUsd: nanoToUsdText(BigInt(rule.perVideoSecondNanoUsd)) }
+      : {}),
+    ...(rule.longContextThresholdTokens !== undefined ? { longContextThresholdTokens: rule.longContextThresholdTokens } : {}),
+    ...(rule.longContextInputMultiplier !== undefined ? { longContextInputMultiplier: rule.longContextInputMultiplier } : {}),
+    ...(rule.longContextOutputMultiplier !== undefined ? { longContextOutputMultiplier: rule.longContextOutputMultiplier } : {}),
+    ...(rule.serviceTierFastMultiplier !== undefined ? { serviceTierFastMultiplier: rule.serviceTierFastMultiplier } : {}),
+    ...(rule.serviceTierFlexMultiplier !== undefined ? { serviceTierFlexMultiplier: rule.serviceTierFlexMultiplier } : {}),
+    ...(rule.reasoningEffortMultipliers !== undefined ? { reasoningEffortMultipliers: rule.reasoningEffortMultipliers } : {}),
     enabled: patch.enabled ?? rule.enabled,
     notes: rule.notes,
   };

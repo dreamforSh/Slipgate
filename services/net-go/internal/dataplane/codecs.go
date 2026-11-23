@@ -137,6 +137,12 @@ type CanonicalTurn struct {
 	ParallelToolCalls    *bool
 	ResponseFormat       *CanonicalResponseFormat
 	ReasoningEffort      string
+	ServiceTier          string
+	PreviousResponseID   string
+	SessionHint          string
+	ImageCount           uint32
+	VideoSeconds         uint32
+	MultipartContentType string
 	ThinkingBudget       uint64
 	ThinkingAdaptive     bool
 	IncludeUsage         bool
@@ -161,15 +167,20 @@ type CanonicalTurn struct {
 
 // RelayMetrics captures post-turn token accounting, latency, and quota watermark updates.
 type RelayMetrics struct {
-	UpstreamStatus   int
-	InputTokens      uint64
-	OutputTokens     uint64
-	CacheReadTokens  uint64
-	CacheWriteTokens uint64
-	Window5hUsedBps  uint16
-	Window7dUsedBps  uint16
-	TTFTMs           uint32
-	EgressCodec      CodecKind
+	UpstreamStatus        int
+	InputTokens           uint64
+	OutputTokens          uint64
+	CacheReadTokens       uint64
+	CacheWriteTokens      uint64
+	ImageCount            uint32
+	VideoSeconds          uint32
+	Window5hUsedBps       uint16
+	Window7dUsedBps       uint16
+	Window5hResetAtUnixMs int64
+	Window7dResetAtUnixMs int64
+	CooldownDurationMs    uint64
+	TTFTMs                uint32
+	EgressCodec           CodecKind
 }
 
 // canonicalResult is one complete assistant turn decoded from any upstream protocol. StopReason
@@ -340,6 +351,9 @@ func parseOpenAIChat(raw []byte, turn *CanonicalTurn) error {
 		ParallelToolCalls   *bool           `json:"parallel_tool_calls"`
 		ResponseFormat      json.RawMessage `json:"response_format"`
 		ReasoningEffort     string          `json:"reasoning_effort"`
+		ServiceTier         string          `json:"service_tier"`
+		PromptCacheKey      string          `json:"prompt_cache_key"`
+		User                string          `json:"user"`
 		Messages            []openAIMessage `json:"messages"`
 		Tools               []struct {
 			Type     string `json:"type"`
@@ -371,6 +385,8 @@ func parseOpenAIChat(raw []byte, turn *CanonicalTurn) error {
 	turn.ParallelToolCalls = payload.ParallelToolCalls
 	turn.ResponseFormat = parseOpenAIResponseFormat(payload.ResponseFormat)
 	turn.ReasoningEffort = normalizeReasoningEffort(payload.ReasoningEffort)
+	turn.ServiceTier = strings.ToLower(strings.TrimSpace(payload.ServiceTier))
+	turn.SessionHint = firstNonEmpty(payload.PromptCacheKey, payload.User)
 
 	var sysParts []string
 	for _, msg := range payload.Messages {
@@ -442,8 +458,11 @@ func parseOpenAIResponses(raw []byte, turn *CanonicalTurn) error {
 		MaxOutputTokens   uint64          `json:"max_output_tokens"`
 		Temperature       *float64        `json:"temperature"`
 		TopP              *float64        `json:"top_p"`
-		Instructions      string          `json:"instructions"`
-		Input             json.RawMessage `json:"input"`
+		Instructions       string          `json:"instructions"`
+		PreviousResponseID string          `json:"previous_response_id"`
+		ServiceTier        string          `json:"service_tier"`
+		PromptCacheKey     string          `json:"prompt_cache_key"`
+		Input              json.RawMessage `json:"input"`
 		ToolChoice        json.RawMessage `json:"tool_choice"`
 		ParallelToolCalls *bool           `json:"parallel_tool_calls"`
 		Text              *struct {
@@ -477,6 +496,9 @@ func parseOpenAIResponses(raw []byte, turn *CanonicalTurn) error {
 	}
 	turn.Temperature = payload.Temperature
 	turn.TopP = payload.TopP
+	turn.PreviousResponseID = strings.TrimSpace(payload.PreviousResponseID)
+	turn.ServiceTier = strings.ToLower(strings.TrimSpace(payload.ServiceTier))
+	turn.SessionHint = firstNonEmpty(payload.PromptCacheKey, payload.PreviousResponseID)
 	turn.ToolChoice = parseOpenAIToolChoice(payload.ToolChoice)
 	turn.ParallelToolCalls = payload.ParallelToolCalls
 	if payload.Text != nil {
@@ -582,6 +604,10 @@ func parseAnthropicMessages(raw []byte, turn *CanonicalTurn) error {
 		TopP          *float64        `json:"top_p"`
 		TopK          *int            `json:"top_k"`
 		StopSequences []string        `json:"stop_sequences"`
+		ServiceTier   string          `json:"service_tier"`
+		Metadata      *struct {
+			UserID string `json:"user_id"`
+		} `json:"metadata"`
 		System        json.RawMessage `json:"system"`
 		Messages      []struct {
 			Role    string          `json:"role"`
@@ -633,6 +659,10 @@ func parseAnthropicMessages(raw []byte, turn *CanonicalTurn) error {
 	turn.TopP = payload.TopP
 	turn.TopK = payload.TopK
 	turn.StopSequences = payload.StopSequences
+	turn.ServiceTier = strings.ToLower(strings.TrimSpace(payload.ServiceTier))
+	if payload.Metadata != nil {
+		turn.SessionHint = strings.TrimSpace(payload.Metadata.UserID)
+	}
 	turn.SystemPrompt, _ = parseContentBlocks(payload.System)
 	if tc := payload.ToolChoice; tc != nil {
 		switch tc.Type {

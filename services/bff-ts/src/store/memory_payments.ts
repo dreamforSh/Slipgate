@@ -45,6 +45,7 @@ interface OrderRecord extends Omit<OrderInput, "creditNano" | "providerInstanceI
   /** Paid but not delivered (see PaymentOrderItem.deliveryError). */
   deliveryError: string | null;
   refundAmountMinor: number;
+  priorRefundAmountMinor: number;
   refundReason: string | null;
   refundError: string | null;
   providerRefundId: string | null;
@@ -292,6 +293,7 @@ export class MemoryPaymentsStore implements PaymentsStore {
       subscriptionId: null,
       deliveryError: null,
       refundAmountMinor: 0,
+      priorRefundAmountMinor: 0,
       refundReason: null,
       refundError: null,
       providerRefundId: null,
@@ -420,8 +422,11 @@ export class MemoryPaymentsStore implements PaymentsStore {
 
   async refundOrder(id: string, reclaim: boolean) {
     const o = this.require(id);
-    if (o.status !== "paid" && o.status !== "refund_requested") throw new StoreError("conflict", "Only paid orders can be refunded");
-    await this.beginRefund(id, { amountMinor: o.amountMinor, reason: o.refundRequestReason ?? "", reclaim, force: true });
+    if (o.status !== "paid" && o.status !== "partially_refunded" && o.status !== "refund_requested") {
+      throw new StoreError("conflict", "Only paid orders can be refunded");
+    }
+    const already = o.status === "partially_refunded" ? o.refundAmountMinor : 0;
+    await this.beginRefund(id, { amountMinor: o.amountMinor - already, reason: o.refundRequestReason ?? "", reclaim, force: true });
     return this.completeRefund(id, null);
   }
 
@@ -461,8 +466,8 @@ export class MemoryPaymentsStore implements PaymentsStore {
       if (o.status !== "refund_requested" && o.status !== "refund_failed") {
         throw new StoreError("conflict", "Only requested or failed refunds can be rejected");
       }
-      o.status = "paid";
-      o.refundAmountMinor = 0;
+      o.status = o.priorRefundAmountMinor > 0 ? "partially_refunded" : "paid";
+      o.refundAmountMinor = o.priorRefundAmountMinor;
       o.refundReason = null;
       o.refundError = null;
       o.providerRefundId = null;
@@ -483,8 +488,15 @@ export class MemoryPaymentsStore implements PaymentsStore {
       if (o.status === "refund_pending" && Date.now() - o.updatedAtMs < REFUND_RESEND_AFTER_MS) {
         throw new StoreError("conflict", REFUND_IN_PROGRESS_MESSAGE);
       }
-      if (!Number.isInteger(input.amountMinor) || input.amountMinor < 1 || input.amountMinor > o.amountMinor) {
-        throw new StoreError("bad_request", "Refund amount must be between 0.01 and the order amount");
+      const priorMinor =
+        o.status === "partially_refunded"
+          ? o.refundAmountMinor
+          : o.status === "refund_failed" || o.status === "refund_pending"
+            ? o.priorRefundAmountMinor
+            : 0;
+      const remainingMinor = o.amountMinor - priorMinor;
+      if (!Number.isInteger(input.amountMinor) || input.amountMinor < 1 || input.amountMinor > remainingMinor) {
+        throw new StoreError("bad_request", "Refund amount must be between 0.01 and the remaining refundable amount");
       }
       if (input.reclaim && o.kind === "recharge" && !input.force) {
         const reclaimNano = proportion(o.creditNano, input.amountMinor, o.amountMinor);
@@ -492,6 +504,7 @@ export class MemoryPaymentsStore implements PaymentsStore {
         if (balanceNano < reclaimNano) return { requiresForce: { balanceNano, reclaimNano } };
       }
       o.status = "refund_pending";
+      o.priorRefundAmountMinor = priorMinor;
       o.refundAmountMinor = input.amountMinor;
       o.refundReason = input.reason || o.refundRequestReason || null;
       o.refundReclaim = input.reclaim;
@@ -519,12 +532,21 @@ export class MemoryPaymentsStore implements PaymentsStore {
       const o = this.require(id);
       if (o.status !== "refund_pending") throw new StoreError("conflict", "The refund is no longer pending");
       const part = o.refundAmountMinor;
+      const priorMinor = o.priorRefundAmountMinor;
+      const totalRefundedMinor = priorMinor + part;
+      const remainingBeforePart = Math.max(1, o.amountMinor - priorMinor);
+      const ledgerSuffix = priorMinor > 0 ? `:${totalRefundedMinor}` : "";
       let reclaimed = 0n;
       if (o.refundReclaim && o.kind === "recharge" && o.creditNano > 0n) {
         // The money already went back: take the share of the credit that is still there.
         const want = proportion(o.creditNano, part, o.amountMinor);
         const take = want < this.available(o.userId) ? want : this.available(o.userId);
-        if (take > 0n && applyMemoryWalletDelta(this.core, o.userId, -take, `refund:${o.id}`, "adjust", `refund:${o.id}`)) reclaimed = take;
+        if (
+          take > 0n &&
+          applyMemoryWalletDelta(this.core, o.userId, -take, `refund:${o.id}${ledgerSuffix}`, "adjust", `refund:${o.id}${ledgerSuffix}`)
+        ) {
+          reclaimed = take;
+        }
       }
       // A subscription order with a delivery error never granted anything.
       if (o.refundReclaim && o.kind === "subscription" && o.subscriptionId && o.deliveryError === null) {
@@ -534,16 +556,25 @@ export class MemoryPaymentsStore implements PaymentsStore {
       // The referrer's rebate was earned on money that is going back: always reverse that share.
       const rebate = this.rebates.find((r) => r.orderId === o.id && r.status === "settled");
       if (rebate) {
-        const back = proportion(rebate.amountNano, part, o.amountMinor);
+        const back = proportion(rebate.amountNano, part, remainingBeforePart);
         if (back > 0n) {
-          applyMemoryWalletDelta(this.core, rebate.beneficiaryId, -back, `rebate-refund:${o.id}`, "adjust", `rebate-refund:${o.id}`);
+          applyMemoryWalletDelta(
+            this.core,
+            rebate.beneficiaryId,
+            -back,
+            `rebate-refund:${o.id}${ledgerSuffix}`,
+            "adjust",
+            `rebate-refund:${o.id}${ledgerSuffix}`,
+          );
         }
         if (back >= rebate.amountNano) rebate.status = "reversed";
         else rebate.amountNano -= back;
       }
-      o.status = part >= o.amountMinor ? "refunded" : "partially_refunded";
+      o.status = totalRefundedMinor >= o.amountMinor ? "refunded" : "partially_refunded";
+      o.refundAmountMinor = totalRefundedMinor;
+      o.priorRefundAmountMinor = totalRefundedMinor;
       o.refundedAtIso = new Date().toISOString();
-      o.refundReclaimedNano = reclaimed;
+      o.refundReclaimedNano += reclaimed;
       o.refundError = null;
       if (providerRefundId) o.providerRefundId = providerRefundId;
       this.touch(o);
@@ -643,7 +674,7 @@ export class MemoryPaymentsStore implements PaymentsStore {
       plans.set(o.planName, pl);
     }
     const rebates = this.rebates
-      .filter((r) => r.status === "settled" && Date.parse(r.createdAtIso) >= start)
+      .filter((r) => r.status === "settled" && Date.parse(r.createdAtIso) >= start && this.orders.get(r.orderId)?.currency === currency)
       .reduce((s, r) => s + r.amountNano, 0n);
     return {
       generatedAtIso: new Date(now).toISOString(),

@@ -22,6 +22,7 @@ export * from "./backup.ts";
 export * from "./db_backups.ts";
 export * from "./user_limits.ts";
 export * from "./system_logs.ts";
+export * from "./account_oauth.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 
@@ -76,6 +77,7 @@ export const RouteEndpointSchema = z.enum([
   "chat_completions",
   "embeddings",
   "images",
+  "videos",
   "gemini",
 ]);
 export type RouteEndpoint = z.infer<typeof RouteEndpointSchema>;

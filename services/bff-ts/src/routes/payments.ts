@@ -579,6 +579,15 @@ export function registerPaymentRoutes(app: App, ctx: PaymentRouteContext): Payme
     let verified = false;
     for (const s of secrets) if (s && (await stripeVerifySignature(raw, signature, s))) verified = true;
     if (!verified) return c.json({ error: "invalid_signature" }, 400);
+    if (event.type === "charge.refunded") {
+      if (found) {
+        await service.reconcileExternalRefund(found.order.id, {
+          cumulativeRefundedMinor: Number(session.amount_refunded ?? 0),
+          providerRefundId: str(session.id) || null,
+        });
+      }
+      return c.json({ received: true });
+    }
     const paidEvent =
       (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") &&
       session.payment_status === "paid";
@@ -636,7 +645,19 @@ export function registerPaymentRoutes(app: App, ctx: PaymentRouteContext): Payme
         continue;
       }
       if (!tx) return fail(400, "invalid resource");
-      if (str(notification.event_type) !== "TRANSACTION.SUCCESS" || str(tx.trade_state) !== "SUCCESS") return c.body(null, 204);
+      const eventType = str(notification.event_type);
+      if (eventType === "REFUND.SUCCESS" && str(tx.refund_status) === "SUCCESS") {
+        const order = await payments.getOrder(str(tx.out_trade_no));
+        if (order && order.provider === "wxpay" && order.providerInstanceId === m.id && str(tx.mchid) === creds.mchId) {
+          const amount = (tx.amount ?? {}) as Record<string, unknown>;
+          await service.reconcileExternalRefund(order.id, {
+            deltaRefundMinor: Number(amount.refund ?? 0),
+            providerRefundId: str(tx.refund_id) || null,
+          });
+        }
+        return c.body(null, 204);
+      }
+      if (eventType !== "TRANSACTION.SUCCESS" || str(tx.trade_state) !== "SUCCESS") return c.body(null, 204);
       const order = await payments.getOrder(str(tx.out_trade_no));
       if (!order || order.provider !== "wxpay" || order.providerInstanceId !== m.id) return fail(404, "unknown order");
       if (str(tx.mchid) !== creds.mchId) return fail(400, "merchant mismatch");
@@ -660,6 +681,17 @@ export function registerPaymentRoutes(app: App, ctx: PaymentRouteContext): Payme
       ? [found.merchant.secrets.webhookSecret ?? ""]
       : (await service.merchants(await service.loadConfig())).filter((m) => m.provider === "airwallex").map((m) => m.secrets.webhookSecret ?? "");
     if (!secrets.some((s) => airwallexVerifyWebhook(raw, ts, sig, s))) return c.json({ error: "invalid_signature" }, 400);
+    if (str(event.name) === "refund.settled") {
+      const metadata = (intent.metadata ?? {}) as Record<string, unknown>;
+      const refundOrderId = str(intent.merchant_order_id) || str(metadata.order_id);
+      if (refundOrderId) {
+        await service.reconcileExternalRefund(refundOrderId, {
+          deltaRefundMinor: decimalToMinor(intent.amount) ?? 0,
+          providerRefundId: str(intent.id) || null,
+        });
+      }
+      return c.json({ received: true });
+    }
     if (str(event.name) !== "payment_intent.succeeded") return c.json({ received: true });
     if (!found) return c.json({ error: "unknown_order" }, 404);
     if (str(intent.status).toUpperCase() !== "SUCCEEDED") return c.json({ error: "not_succeeded" }, 400);

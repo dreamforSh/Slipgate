@@ -257,6 +257,11 @@ func main() {
 		Supervisor:    sup,
 		Logger:        logger,
 		OnWebUIDir:    edge.SetWebUIOverrideDir,
+		OnPlanesRestarted: func(ctx context.Context) {
+			if err := dpCoord.ResyncCore(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Printf("[dataplane] warning: post-hotupdate core snapshot resync failed: %v", err)
+			}
+		},
 	})
 	edge.WithHotUpdater(updater)
 	updater.StartAutoSync(rootCtx)

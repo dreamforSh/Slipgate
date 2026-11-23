@@ -10,11 +10,14 @@ import {
   type AccountAuthKind,
   type AccountImportResult,
   type AccountInitialStatus,
+  type AccountOAuthProvider,
   type AccountStatus,
   type CreateAccountRequest,
+  type ExchangeAccountOAuthResponse,
   type ExecutionMode,
   type GroupItem,
   type Provider,
+  type StartAccountOAuthResponse,
   type SubscriptionTier,
   type UpdateAccountRequest,
   type UpstreamAccount,
@@ -66,7 +69,7 @@ const toast = useToastStore();
 /* ---------------- Account types ---------------- */
 
 type Tone = "orange" | "purple" | "emerald" | "sky" | "fuchsia";
-type KindKey = "claude_code" | "console" | "chatgpt" | "antigravity" | "vm_seed" | "api_key";
+type KindKey = "claude_code" | "console" | "chatgpt" | "antigravity" | "gemini_oauth" | "qwen_oauth" | "vm_seed" | "api_key";
 
 interface KindOption {
   key: KindKey;
@@ -145,6 +148,16 @@ const kindOptions = computed<KindOption[]>(() => {
         { key: "antigravity", title: "Antigravity OAuth", desc: t("accounts.form.types.antigravityDesc"), icon: "globe", tone: "sky", authKind: "oauth", mode: "stealth_http" },
         vmSeed,
       ];
+    case "gemini":
+      return [
+        { key: "gemini_oauth", title: "Gemini CLI OAuth", desc: t("accounts.form.types.antigravityDesc"), icon: "globe", tone: "sky", authKind: "oauth", mode: "stealth_http" },
+        apiKey("Gemini API"),
+      ];
+    case "qwen":
+      return [
+        { key: "qwen_oauth", title: "Qwen OAuth", desc: t("accounts.form.types.qwenDesc"), icon: "globe", tone: "emerald", authKind: "oauth", mode: "stealth_http" },
+        apiKey("Qwen API"),
+      ];
     default:
       return [apiKey(`${platformShortLabel(formPlatform.value)} API`)];
   }
@@ -181,6 +194,12 @@ const batchPrefix = ref("");
 const batchText = ref("");
 const batchSkipDup = ref(true);
 
+const oauthSession = ref<StartAccountOAuthResponse | null>(null);
+const oauthCodeInput = ref("");
+const oauthProjectId = ref("");
+const oauthStarting = ref(false);
+const oauthExchanging = ref(false);
+
 const kind = computed(() => kindOptions.value.find((k) => k.key === formKind.value) ?? kindOptions.value[0]!);
 const authKind = computed<AccountAuthKind>(() =>
   kind.value.key === "claude_code" && addMethod.value === "setup_token" ? "setup_token" : kind.value.authKind,
@@ -188,6 +207,86 @@ const authKind = computed<AccountAuthKind>(() =>
 const isApiKey = computed(() => authKind.value === "api_key");
 /** OAuth and VM seeds are pasted as JSON; API keys and setup tokens are single strings. */
 const takesJson = computed(() => authKind.value === "oauth" || authKind.value === "vm_cli_seed");
+const OAUTH_PLATFORMS: ReadonlySet<string> = new Set(["anthropic", "codex", "antigravity", "gemini", "qwen"]);
+const supportsInteractiveOAuth = computed(
+  () => (authKind.value === "oauth" || authKind.value === "setup_token") && OAUTH_PLATFORMS.has(formPlatform.value),
+);
+
+watch([formPlatform, formKind, addMethod], () => {
+  oauthSession.value = null;
+  oauthCodeInput.value = "";
+});
+
+async function startInteractiveOAuth() {
+  if (!supportsInteractiveOAuth.value || oauthStarting.value) return;
+  oauthStarting.value = true;
+  try {
+    const res = await auth.apiFetch("/api/v1/admin/accounts/oauth/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        platform: formPlatform.value as AccountOAuthProvider,
+        addMethod: authKind.value === "setup_token" ? "setup_token" : "oauth",
+        ...(oauthProjectId.value.trim() ? { projectId: oauthProjectId.value.trim() } : {}),
+      }),
+    });
+    if (!res.ok) {
+      toast.error(await readError(res, t("accounts.form.oauth.startFailed")));
+      return;
+    }
+    oauthSession.value = (await res.json()) as StartAccountOAuthResponse;
+    oauthCodeInput.value = "";
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : t("accounts.form.oauth.startFailed"));
+  } finally {
+    oauthStarting.value = false;
+  }
+}
+
+async function copyAuthorizeUrl() {
+  if (!oauthSession.value?.authorizeUrl) return;
+  try {
+    await navigator.clipboard.writeText(oauthSession.value.authorizeUrl);
+    toast.success(t("accounts.form.oauth.copied"));
+  } catch {
+    // Fallback ignored if clipboard permission denied.
+  }
+}
+
+async function exchangeInteractiveOAuth() {
+  if (!oauthSession.value || !oauthCodeInput.value.trim() || oauthExchanging.value) return;
+  oauthExchanging.value = true;
+  try {
+    const res = await auth.apiFetch("/api/v1/admin/accounts/oauth/exchange", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: oauthSession.value.sessionId,
+        codeInput: oauthCodeInput.value.trim(),
+      }),
+    });
+    if (!res.ok) {
+      toast.error(await readError(res, t("accounts.form.oauth.exchangeFailed")));
+      return;
+    }
+    const data = (await res.json()) as ExchangeAccountOAuthResponse;
+    formSecret.value = data.credentialSecret;
+    if (!editing.value && !formName.value.trim() && data.email) {
+      formName.value = data.email.slice(0, 64);
+    }
+    if (!editing.value && data.subscriptionTier !== "standard" && tierOptions.value.some((o) => o.tier === data.subscriptionTier)) {
+      formTier.value = data.subscriptionTier;
+      onTierChange();
+    }
+    oauthSession.value = null;
+    oauthCodeInput.value = "";
+    toast.success(t("accounts.form.oauth.authorized"));
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : t("accounts.form.oauth.exchangeFailed"));
+  } finally {
+    oauthExchanging.value = false;
+  }
+}
 
 const title = computed(() => {
   if (editing.value) return t("accounts.form.editTitle");
@@ -300,6 +399,8 @@ function kindFor(src: UpstreamAccount): KindKey {
   if (src.authKind === "api_key") return src.platform === "anthropic" ? "console" : "api_key";
   if (src.platform === "codex") return "chatgpt";
   if (src.platform === "antigravity") return "antigravity";
+  if (src.platform === "gemini") return "gemini_oauth";
+  if (src.platform === "qwen") return "qwen_oauth";
   if (src.platform === "anthropic") return "claude_code";
   return "api_key";
 }
@@ -330,6 +431,9 @@ function reset() {
   batchText.value = "";
   batchPrefix.value = "";
   batchSkipDup.value = true;
+  oauthSession.value = null;
+  oauthCodeInput.value = "";
+  oauthProjectId.value = "";
   formInitialStatus.value = "active";
   if (props.account) {
     loadFrom(props.account, false);
@@ -683,6 +787,96 @@ const credentialPlaceholder = computed(() => {
 
       <!-- Credentials: single -->
       <template v-if="editing || mode === 'single'">
+        <div
+          v-if="supportsInteractiveOAuth"
+          class="space-y-3 rounded-xl border border-accent/25 bg-accent/[0.04] p-3.5"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="min-w-0">
+              <p class="flex items-center gap-1.5 text-xs font-semibold text-fg">
+                <UiIcon name="link" :size="13" class="text-accent" />
+                {{ t("accounts.form.oauth.title") }}
+              </p>
+              <p class="mt-0.5 text-2xs text-fg-subtle">{{ t("accounts.form.oauth.hint") }}</p>
+            </div>
+            <button
+              type="button"
+              class="btn btn-secondary btn-xs shrink-0"
+              :disabled="oauthStarting"
+              @click="startInteractiveOAuth"
+            >
+              <UiIcon :name="oauthStarting ? 'loader' : 'external-link'" :size="12" :spin="oauthStarting" />
+              {{ oauthSession ? t("accounts.form.oauth.regenerateLink") : t("accounts.form.oauth.generateLink") }}
+            </button>
+          </div>
+
+          <div v-if="formPlatform === 'antigravity' || formPlatform === 'gemini'">
+            <label class="label text-2xs" for="account-form-oauth-project">{{ t("accounts.form.oauth.projectId") }}</label>
+            <input
+              id="account-form-oauth-project"
+              v-model="oauthProjectId"
+              type="text"
+              maxlength="128"
+              :placeholder="t('accounts.form.oauth.projectIdPlaceholder')"
+              class="input input-sm font-mono text-xs"
+            />
+          </div>
+
+          <div v-if="oauthSession" class="space-y-2.5 border-t border-line/60 pt-2.5">
+            <div>
+              <span class="mb-1 block text-2xs font-medium text-fg-subtle">{{ t("accounts.form.oauth.authorizeUrl") }}</span>
+              <div class="flex items-center gap-1.5">
+                <input
+                  :value="oauthSession.authorizeUrl"
+                  type="text"
+                  readonly
+                  class="input input-sm min-w-0 flex-1 font-mono text-2xs"
+                  @focus="($event.target as HTMLInputElement).select()"
+                />
+                <button type="button" class="btn btn-secondary btn-xs shrink-0" @click="copyAuthorizeUrl">
+                  <UiIcon name="copy" :size="12" />
+                </button>
+                <a
+                  :href="oauthSession.authorizeUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="btn btn-primary btn-xs shrink-0"
+                >
+                  <UiIcon name="external-link" :size="12" />
+                  {{ t("accounts.form.oauth.openBrowser") }}
+                </a>
+              </div>
+              <p v-if="oauthSession.instructions" class="mt-1 text-2xs text-fg-subtle">{{ oauthSession.instructions }}</p>
+            </div>
+
+            <div>
+              <label class="mb-1 block text-2xs font-medium text-fg-subtle" for="account-form-oauth-code">
+                {{ t("accounts.form.oauth.codeInput") }}
+              </label>
+              <div class="flex items-center gap-1.5">
+                <input
+                  id="account-form-oauth-code"
+                  v-model="oauthCodeInput"
+                  type="text"
+                  spellcheck="false"
+                  autocomplete="off"
+                  :placeholder="t('accounts.form.oauth.codePlaceholder')"
+                  class="input input-sm min-w-0 flex-1 font-mono text-xs"
+                />
+                <button
+                  type="button"
+                  class="btn btn-primary btn-xs shrink-0"
+                  :disabled="!oauthCodeInput.trim() || oauthExchanging"
+                  @click="exchangeInteractiveOAuth"
+                >
+                  <UiIcon :name="oauthExchanging ? 'loader' : 'check'" :size="12" :spin="oauthExchanging" />
+                  {{ t("accounts.form.oauth.exchange") }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div v-if="isApiKey" class="space-y-4">
           <div>
             <label class="label" for="account-form-base-url">{{ t("accounts.form.baseUrl") }}</label>

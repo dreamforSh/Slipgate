@@ -22,6 +22,7 @@ import {
   multiplierText,
   nanoToUsdText,
   normalizePriceInput,
+  normalizeUnitPriceInput,
   parsePriceInput,
   partCost,
   PATTERN_MAX,
@@ -58,9 +59,18 @@ const form = reactive({
   output: "",
   cacheRead: "",
   cacheWrite: "",
+  perRequest: "",
+  perImage: "",
+  perVideoSecond: "",
+  longContextThresholdTokens: "",
+  longContextInputMultiplier: "",
+  longContextOutputMultiplier: "",
+  serviceTierFastMultiplier: "",
+  serviceTierFlexMultiplier: "",
   enabled: true,
   notes: "",
 });
+const showAdvanced = ref(false);
 const submitted = ref(false);
 const saving = ref(false);
 const conflict = ref<string | null>(null);
@@ -75,6 +85,15 @@ function init() {
   if (r) {
     const p = rulePrices(r);
     const d = cacheIsDefault(p);
+    const hasAdv = Boolean(
+      (r.perRequestNanoUsd && r.perRequestNanoUsd !== "0") ||
+        (r.perImageNanoUsd && r.perImageNanoUsd !== "0") ||
+        (r.perVideoSecondNanoUsd && r.perVideoSecondNanoUsd !== "0") ||
+        (r.longContextThresholdTokens && r.longContextThresholdTokens > 0) ||
+        r.serviceTierFastMultiplier !== undefined ||
+        r.serviceTierFlexMultiplier !== undefined,
+    );
+    showAdvanced.value = hasAdv;
     Object.assign(form, {
       pattern: r.pattern,
       input: nanoToUsdText(p.input),
@@ -82,16 +101,34 @@ function init() {
       // Default-derived cache prices stay empty so they keep following the input price.
       cacheRead: d.read ? "" : nanoToUsdText(p.cacheRead),
       cacheWrite: d.write ? "" : nanoToUsdText(p.cacheWrite),
+      perRequest: r.perRequestNanoUsd && r.perRequestNanoUsd !== "0" ? nanoToUsdText(BigInt(r.perRequestNanoUsd)) : "",
+      perImage: r.perImageNanoUsd && r.perImageNanoUsd !== "0" ? nanoToUsdText(BigInt(r.perImageNanoUsd)) : "",
+      perVideoSecond:
+        r.perVideoSecondNanoUsd && r.perVideoSecondNanoUsd !== "0" ? nanoToUsdText(BigInt(r.perVideoSecondNanoUsd)) : "",
+      longContextThresholdTokens: r.longContextThresholdTokens ? String(r.longContextThresholdTokens) : "",
+      longContextInputMultiplier: r.longContextInputMultiplier !== undefined ? String(r.longContextInputMultiplier) : "",
+      longContextOutputMultiplier: r.longContextOutputMultiplier !== undefined ? String(r.longContextOutputMultiplier) : "",
+      serviceTierFastMultiplier: r.serviceTierFastMultiplier !== undefined ? String(r.serviceTierFastMultiplier) : "",
+      serviceTierFlexMultiplier: r.serviceTierFlexMultiplier !== undefined ? String(r.serviceTierFlexMultiplier) : "",
       enabled: r.enabled,
       notes: r.notes,
     });
   } else {
+    showAdvanced.value = false;
     Object.assign(form, {
       pattern: props.preset?.pattern ?? "",
       input: props.preset?.input ?? "",
       output: props.preset?.output ?? "",
       cacheRead: "",
       cacheWrite: "",
+      perRequest: "",
+      perImage: "",
+      perVideoSecond: "",
+      longContextThresholdTokens: "",
+      longContextInputMultiplier: "",
+      longContextOutputMultiplier: "",
+      serviceTierFastMultiplier: "",
+      serviceTierFlexMultiplier: "",
       enabled: true,
       notes: "",
     });
@@ -169,6 +206,35 @@ const invalid = computed(() => ({
 }));
 const anyPriceInvalid = computed(() => Object.values(invalid.value).some(Boolean));
 
+function optionalMult(text: string): { value: number | undefined; invalid: boolean } {
+  const tVal = text.trim();
+  if (!tVal) return { value: undefined, invalid: false };
+  const n = Number(tVal);
+  if (!Number.isFinite(n) || n <= 0 || n > 100) return { value: undefined, invalid: true };
+  return { value: n, invalid: false };
+}
+
+function optionalThreshold(text: string): { value: number | undefined; invalid: boolean } {
+  const tVal = text.trim();
+  if (!tVal) return { value: undefined, invalid: false };
+  const n = Number(tVal);
+  if (!Number.isInteger(n) || n < 0 || n > 10_000_000) return { value: undefined, invalid: true };
+  return { value: n, invalid: false };
+}
+
+const advancedInvalid = computed(() => {
+  const unitInvalid = [form.perRequest, form.perImage, form.perVideoSecond].some(
+    (s) => s.trim() !== "" && normalizeUnitPriceInput(s) === null,
+  );
+  const multInvalid = [
+    form.longContextInputMultiplier,
+    form.longContextOutputMultiplier,
+    form.serviceTierFastMultiplier,
+    form.serviceTierFlexMultiplier,
+  ].some((s) => optionalMult(s).invalid);
+  return unitInvalid || multInvalid || optionalThreshold(form.longContextThresholdTokens).invalid;
+});
+
 const cachePlaceholder = computed(() => {
   const input = inputNano.value;
   if (input === null) return { read: "", write: "" };
@@ -241,7 +307,14 @@ const usd = (nano: bigint) => formatUsd(nano.toString());
 /* ---------------- Submit ---------------- */
 
 const canSubmit = computed(
-  () => patternValid.value && !duplicate.value && !conflict.value && inputNano.value !== null && outputNano.value !== null && !anyPriceInvalid.value,
+  () =>
+    patternValid.value &&
+    !duplicate.value &&
+    !conflict.value &&
+    inputNano.value !== null &&
+    outputNano.value !== null &&
+    !anyPriceInvalid.value &&
+    !advancedInvalid.value,
 );
 
 function close() {
@@ -253,12 +326,29 @@ async function submit() {
   if (!canSubmit.value || saving.value) return;
   const readText = form.cacheRead.trim() ? normalizePriceInput(form.cacheRead) : null;
   const writeText = form.cacheWrite.trim() ? normalizePriceInput(form.cacheWrite) : null;
+  const perReq = form.perRequest.trim() ? normalizeUnitPriceInput(form.perRequest) : null;
+  const perImg = form.perImage.trim() ? normalizeUnitPriceInput(form.perImage) : null;
+  const perVid = form.perVideoSecond.trim() ? normalizeUnitPriceInput(form.perVideoSecond) : null;
+  const lcThresh = optionalThreshold(form.longContextThresholdTokens).value;
+  const lcIn = optionalMult(form.longContextInputMultiplier).value;
+  const lcOut = optionalMult(form.longContextOutputMultiplier).value;
+  const stFast = optionalMult(form.serviceTierFastMultiplier).value;
+  const stFlex = optionalMult(form.serviceTierFlexMultiplier).value;
   const body: UpsertModelPricingRule = {
     pattern: pattern.value,
     inputPerMTokUsd: normalizePriceInput(form.input)!,
     outputPerMTokUsd: normalizePriceInput(form.output)!,
     ...(readText ? { cacheReadPerMTokUsd: readText } : {}),
     ...(writeText ? { cacheWritePerMTokUsd: writeText } : {}),
+    ...(perReq ? { perRequestUsd: perReq } : {}),
+    ...(perImg ? { perImageUsd: perImg } : {}),
+    ...(perVid ? { perVideoSecondUsd: perVid } : {}),
+    ...(lcThresh !== undefined ? { longContextThresholdTokens: lcThresh } : {}),
+    ...(lcIn !== undefined ? { longContextInputMultiplier: lcIn } : {}),
+    ...(lcOut !== undefined ? { longContextOutputMultiplier: lcOut } : {}),
+    ...(stFast !== undefined ? { serviceTierFastMultiplier: stFast } : {}),
+    ...(stFlex !== undefined ? { serviceTierFlexMultiplier: stFlex } : {}),
+    ...(props.rule?.reasoningEffortMultipliers ? { reasoningEffortMultipliers: props.rule.reasoningEffortMultipliers } : {}),
     enabled: form.enabled,
     notes: form.notes.trim(),
   };
@@ -378,6 +468,53 @@ async function submit() {
             {{ anyPriceInvalid ? t("pricing.form.priceInvalid") : t("pricing.form.cacheHint") }}
           </p>
         </fieldset>
+
+        <div class="rounded-xl border border-line bg-surface-2/25 p-3.5">
+          <button
+            type="button"
+            class="flex w-full cursor-pointer items-center justify-between gap-2 text-left text-xs font-medium text-fg-muted hover:text-fg"
+            @click="showAdvanced = !showAdvanced"
+          >
+            <span class="flex items-center gap-1.5">
+              <UiIcon name="sliders" :size="13" />
+              {{ t("pricing.form.advancedTitle") }}
+            </span>
+            <UiIcon :name="showAdvanced ? 'chevron-down' : 'chevron-right'" :size="14" />
+          </button>
+          <div v-if="showAdvanced" class="mt-3 space-y-3 border-t border-line/60 pt-3">
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <FormField :label="t('pricing.form.perRequestUsd')">
+                <input v-model="form.perRequest" type="text" inputmode="decimal" placeholder="0" class="input input-sm font-mono tabular-nums" />
+              </FormField>
+              <FormField :label="t('pricing.form.perImageUsd')">
+                <input v-model="form.perImage" type="text" inputmode="decimal" placeholder="0.04" class="input input-sm font-mono tabular-nums" />
+              </FormField>
+              <FormField :label="t('pricing.form.perVideoSecondUsd')">
+                <input v-model="form.perVideoSecond" type="text" inputmode="decimal" placeholder="0.10" class="input input-sm font-mono tabular-nums" />
+              </FormField>
+            </div>
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <FormField :label="t('pricing.form.longContextThreshold')">
+                <input v-model="form.longContextThresholdTokens" type="number" min="0" step="1000" placeholder="200000" class="input input-sm font-mono tabular-nums" />
+              </FormField>
+              <FormField :label="t('pricing.form.longContextInputMult')">
+                <input v-model="form.longContextInputMultiplier" type="text" inputmode="decimal" placeholder="2" class="input input-sm font-mono tabular-nums" />
+              </FormField>
+              <FormField :label="t('pricing.form.longContextOutputMult')">
+                <input v-model="form.longContextOutputMultiplier" type="text" inputmode="decimal" placeholder="1.5" class="input input-sm font-mono tabular-nums" />
+              </FormField>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <FormField :label="t('pricing.form.serviceTierFastMult')">
+                <input v-model="form.serviceTierFastMultiplier" type="text" inputmode="decimal" placeholder="2" class="input input-sm font-mono tabular-nums" />
+              </FormField>
+              <FormField :label="t('pricing.form.serviceTierFlexMult')">
+                <input v-model="form.serviceTierFlexMultiplier" type="text" inputmode="decimal" placeholder="0.5" class="input input-sm font-mono tabular-nums" />
+              </FormField>
+            </div>
+            <p v-if="advancedInvalid" class="text-2xs text-danger">{{ t("pricing.form.advancedInvalid") }}</p>
+          </div>
+        </div>
 
         <FormField :label="t('pricing.form.notes')">
           <input

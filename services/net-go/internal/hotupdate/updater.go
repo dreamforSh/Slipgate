@@ -42,14 +42,15 @@ const (
 
 // Options configures the repo-synced hot-update manager.
 type Options struct {
-	Config          config.Config
-	Version         string
-	InitialCommit   string
-	Supervisor      *supervisor.Supervisor
-	Logger          *log.Logger
-	APIBaseURL      string
-	AllowCustomHost bool
-	OnWebUIDir      func(string)
+	Config            config.Config
+	Version           string
+	InitialCommit     string
+	Supervisor        *supervisor.Supervisor
+	Logger            *log.Logger
+	APIBaseURL        string
+	AllowCustomHost   bool
+	OnWebUIDir        func(string)
+	OnPlanesRestarted func(context.Context)
 }
 
 // StatusSnapshot matches packages/contracts/src/system.ts SystemUpdateStatusSchema.
@@ -93,14 +94,15 @@ type buildMeta struct {
 
 // Manager polls or triggers repo-synced hot updates in dev mode.
 type Manager struct {
-	cfg             config.Config
-	sup             *supervisor.Supervisor
-	logger          *log.Logger
-	apiBaseURL      string
-	allowCustomHost bool
-	onWebUIDir      func(string)
-	httpClient      *http.Client
-	repoDir         string
+	cfg               config.Config
+	sup               *supervisor.Supervisor
+	logger            *log.Logger
+	apiBaseURL        string
+	allowCustomHost   bool
+	onWebUIDir        func(string)
+	onPlanesRestarted func(context.Context)
+	httpClient        *http.Client
+	repoDir           string
 
 	syncMu sync.Mutex
 	mu     sync.RWMutex
@@ -143,13 +145,14 @@ func NewManager(opts Options) *Manager {
 	autoSync := opts.Config.Mode == "dev" && opts.Config.DevSyncIntervalSec > 0
 
 	m := &Manager{
-		cfg:             opts.Config,
-		sup:             opts.Supervisor,
-		logger:          logger,
-		apiBaseURL:      apiBase,
-		allowCustomHost: opts.AllowCustomHost,
-		onWebUIDir:      opts.OnWebUIDir,
-		repoDir:         repoDir,
+		cfg:               opts.Config,
+		sup:               opts.Supervisor,
+		logger:            logger,
+		apiBaseURL:        apiBase,
+		allowCustomHost:   opts.AllowCustomHost,
+		onWebUIDir:        opts.OnWebUIDir,
+		onPlanesRestarted: opts.OnPlanesRestarted,
+		repoDir:           repoDir,
 		status: StatusSnapshot{
 			Mode:             opts.Config.Mode,
 			Strategy:         opts.Config.DevSyncMode,
@@ -411,13 +414,20 @@ func (m *Manager) applyExtractedBundle(
 			reloaded = true
 			if asyncRestart {
 				time.AfterFunc(150*time.Millisecond, func() {
-					if err := m.sup.RestartAll(context.Background(), 5*time.Second); err != nil {
+					bgCtx := context.Background()
+					if err := m.sup.RestartAll(bgCtx, 5*time.Second); err != nil {
 						m.logger.Printf("[hotupdate] async plane restart warning: %v", err)
+					}
+					if m.onPlanesRestarted != nil {
+						m.onPlanesRestarted(bgCtx)
 					}
 				})
 			} else {
 				if err := m.sup.RestartAll(ctx, 5*time.Second); err != nil {
 					return false, fmt.Errorf("restart supervised planes: %w", err)
+				}
+				if m.onPlanesRestarted != nil {
+					m.onPlanesRestarted(ctx)
 				}
 			}
 		}

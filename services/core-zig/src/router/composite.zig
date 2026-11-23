@@ -22,6 +22,7 @@ pub const EndpointKind = enum {
     chat_completions,
     embeddings,
     images,
+    videos,
     gemini,
 };
 
@@ -122,14 +123,33 @@ fn detectBuiltinProvider(model: []const u8) ?Provider {
         std.mem.startsWith(u8, model, "o3-codex") or
         std.mem.startsWith(u8, model, "o4-mini-codex")) return .codex;
     if (std.mem.startsWith(u8, model, "claude-") or std.mem.startsWith(u8, model, "anthropic/")) return .anthropic;
-    if (std.mem.startsWith(u8, model, "gemini-") or std.mem.startsWith(u8, model, "google/")) return .gemini;
-    if (std.mem.startsWith(u8, model, "gpt-") or std.mem.startsWith(u8, model, "o1-") or std.mem.startsWith(u8, model, "o3-") or std.mem.startsWith(u8, model, "o4-") or std.mem.startsWith(u8, model, "openai/")) return .openai;
+    if (std.mem.startsWith(u8, model, "gemini-") or
+        std.mem.startsWith(u8, model, "google/") or
+        std.mem.startsWith(u8, model, "imagen-") or
+        std.mem.startsWith(u8, model, "veo-") or
+        std.mem.eql(u8, model, "text-embedding-004")) return .gemini;
+    if (std.mem.startsWith(u8, model, "gpt-") or
+        std.mem.startsWith(u8, model, "chatgpt-") or
+        std.mem.startsWith(u8, model, "o1-") or
+        std.mem.startsWith(u8, model, "o3-") or
+        std.mem.startsWith(u8, model, "o4-") or
+        std.mem.startsWith(u8, model, "text-embedding-") or
+        std.mem.startsWith(u8, model, "dall-e-") or
+        std.mem.startsWith(u8, model, "sora-") or
+        std.mem.startsWith(u8, model, "omni-moderation-") or
+        std.mem.startsWith(u8, model, "openai/")) return .openai;
     if (std.mem.startsWith(u8, model, "grok-") or std.mem.startsWith(u8, model, "xai/")) return .grok;
     if (std.mem.startsWith(u8, model, "deepseek-")) return .deepseek;
-    if (std.mem.startsWith(u8, model, "glm-")) return .glm;
+    if (std.mem.startsWith(u8, model, "glm-") or
+        std.mem.startsWith(u8, model, "cogview-") or
+        std.mem.startsWith(u8, model, "cogvideox-") or
+        std.mem.eql(u8, model, "embedding-3")) return .glm;
     if (std.mem.startsWith(u8, model, "kimi-") or std.mem.startsWith(u8, model, "moonshot-")) return .kimi;
     if (std.mem.startsWith(u8, model, "minimax-") or std.mem.startsWith(u8, model, "abab")) return .minimax;
-    if (std.mem.startsWith(u8, model, "qwen-") or std.mem.startsWith(u8, model, "qwq-") or std.mem.startsWith(u8, model, "qwen/")) return .qwen;
+    if (std.mem.startsWith(u8, model, "qwen-") or
+        std.mem.startsWith(u8, model, "qwq-") or
+        std.mem.startsWith(u8, model, "wanx-") or
+        std.mem.startsWith(u8, model, "qwen/")) return .qwen;
     return null;
 }
 

@@ -87,6 +87,8 @@ export interface OpsRouteContext {
   mailReady: () => Promise<boolean>;
   /** Admin model price rules (model plaza shows them instead of built-in rates). */
   pricingRules: () => Promise<ModelPricingRule[]>;
+  /** SWR-discovered upstream model IDs per provider from slipgate-net. */
+  discoveredModels?: () => Promise<Record<string, readonly string[]>>;
   /** Pushes a fresh (entitlement-filtered) snapshot to the data plane; never throws. */
   syncDataPlane: () => Promise<void>;
   /** Console sessions: re-issued on password change, invalidated after user edits, password-attempt limits. */
@@ -296,6 +298,8 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
       await store.listAccounts(),
       Date.now(),
       await ctx.pricingRules(),
+      new Set(),
+      await (ctx.discoveredModels?.() ?? Promise.resolve({})),
     ),
   );
   const status = cached(30_000, async () => {
@@ -540,6 +544,7 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
         Date.now(),
         await ctx.pricingRules(),
         granted,
+        await (ctx.discoveredModels?.() ?? Promise.resolve({})),
       ),
     );
   });
