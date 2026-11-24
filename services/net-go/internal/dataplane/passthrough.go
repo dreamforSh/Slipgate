@@ -170,6 +170,13 @@ func relayNativePassthrough(
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(raw)
 		metrics.TTFTMs = elapsedMs(startedAt)
+		if resp.StatusCode >= 400 {
+			errType, errCode, message := extractUpstreamError(raw, resp.Status)
+			metrics.ErrorType = errType
+			metrics.ErrorCode = errCode
+			metrics.ErrorMessage = message
+			metrics.ErrorBody = truncateUTF8(string(raw), requestErrorMaxBodyLen)
+		}
 		return metrics, err
 	}
 

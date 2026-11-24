@@ -216,6 +216,8 @@ const en: typeof zh = {
       tlsUpdate: "Update TLS profile",
       tlsDelete: "Delete TLS profile",
       opsDeadLetterReplay: "Replay settlement dead letters",
+      opsRequestErrorResolve: "Update request error resolution",
+      opsRequestErrorCleanup: "Clean up request error logs",
       systemUpdateSync: "Sync system update",
     },
     errors: {

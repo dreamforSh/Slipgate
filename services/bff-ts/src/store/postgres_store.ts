@@ -49,6 +49,7 @@ import { PG_PAYMENT_PROVIDERS_SCHEMA_SQL } from "./postgres_payment_providers.ts
 import { PG_SYSTEM_LOGS_SCHEMA_SQL, PostgresSystemLogStore } from "./postgres_system_logs.ts";
 import { PG_DB_BACKUPS_SCHEMA_SQL, PostgresDbBackupStore } from "./db_backups_postgres.ts";
 import { PG_USER_LIMITS_SCHEMA_SQL, PostgresUserLimitsStore } from "./postgres_user_limits.ts";
+import { PG_REQUEST_ERRORS_SCHEMA_SQL, PostgresRequestErrorStore } from "./postgres_request_errors.ts";
 import {
   PG_SETTLEMENT_SCHEMA_SQL,
   pruneSettlementIds,
@@ -130,6 +131,7 @@ export class PostgresControlStore implements ControlStore {
   readonly systemLogs: PostgresSystemLogStore;
   readonly dbBackups: PostgresDbBackupStore;
   readonly userLimits: PostgresUserLimitsStore;
+  readonly requestErrors: PostgresRequestErrorStore;
   private backgroundMaintenance: Promise<void> = Promise.resolve();
   /** Earliest time of the next opportunistic core.settlement_ids prune (off the settlement tx). */
   private settlementPruneAt = 0;
@@ -146,6 +148,7 @@ export class PostgresControlStore implements ControlStore {
     this.systemLogs = new PostgresSystemLogStore(this.sql);
     this.dbBackups = new PostgresDbBackupStore(this.sql, databaseUrl);
     this.userLimits = new PostgresUserLimitsStore(this.sql);
+    this.requestErrors = new PostgresRequestErrorStore(this.sql);
   }
 
   async init(): Promise<void> {
@@ -532,6 +535,7 @@ export class PostgresControlStore implements ControlStore {
     await this.sql.unsafe(PG_AUTH_GUARDS_SCHEMA_SQL);
     await this.sql.unsafe(PG_DB_BACKUPS_SCHEMA_SQL);
     await this.sql.unsafe(PG_USER_LIMITS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_REQUEST_ERRORS_SCHEMA_SQL);
     // Index builds and the one-time spend backfill must not delay startup or block settlements.
     // So is the one-off pass of the current audit-log redaction over rows older builds stored.
     const auditScrub = await pendingAuditSecretScrub(this.sql);

@@ -84,6 +84,7 @@ import { CoalescingRunner, KeyedThrottle } from "./settlement_guards.ts";
 import { AccountAutoTester, registerAutoTestRoutes } from "./autotest.ts";
 import { mountAuditRetention } from "./audit_retention.ts";
 import { logRouteError, mountSystemLogging, registerSystemLogRoutes } from "./routes/system_logs.ts";
+import { registerRequestErrorRoutes } from "./routes/request_errors.ts";
 import { registerAnnouncementRoutes } from "./routes/announcements.ts";
 import { paymentWebhookPlugin } from "./plugins/payment_webhook.ts";
 import { registerPluginRoutes } from "./routes/plugins.ts";
@@ -2660,6 +2661,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   registerAutoTestRoutes(app, autoTester);
   mountAuditRetention(app, store, options.startSchedulers === true, vaultSecret);
   registerSystemLogRoutes(app, store, systemLogs, { verifyInternal: verifyInternalHeader });
+  registerRequestErrorRoutes(app, store, { verifyInternal: verifyInternalHeader });
   registerAnnouncementRoutes(app, store);
   if (!registry.list().some((p) => p.name === paymentWebhookPlugin.name)) registry.register(paymentWebhookPlugin);
   const plugins = registerPluginRoutes(app, store, registry, vaultSecret);

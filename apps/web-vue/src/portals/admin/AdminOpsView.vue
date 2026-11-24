@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import { useRoute, useRouter } from "vue-router";
 import type { OpsOverview, OpsRange } from "@slipgate/contracts";
 import OpsAccountsTable from "../../components/admin/ops-monitor/OpsAccountsTable.vue";
 import OpsDeadLettersCard from "../../components/admin/ops-monitor/OpsDeadLettersCard.vue";
+import OpsErrorCenterPanel from "../../components/admin/ops-monitor/OpsErrorCenterPanel.vue";
 import OpsFleetCard from "../../components/admin/ops-monitor/OpsFleetCard.vue";
 import OpsModelsTable from "../../components/admin/ops-monitor/OpsModelsTable.vue";
 import OpsRecentErrors from "../../components/admin/ops-monitor/OpsRecentErrors.vue";
@@ -15,6 +17,7 @@ import SegmentedControl from "../../components/ui/SegmentedControl.vue";
 import StatCard from "../../components/ui/StatCard.vue";
 import UiAlert from "../../components/ui/UiAlert.vue";
 import UiIcon, { type IconName } from "../../components/ui/UiIcon.vue";
+import UiTabs from "../../components/ui/UiTabs.vue";
 import { useNow } from "../../composables/useNow";
 import { usePersistentState } from "../../composables/usePersistentState";
 import { apiJson, errorText } from "../../lib/api";
@@ -22,8 +25,34 @@ import { formatCompact, formatDurationMs, formatNumber, formatUsd, type Tone } f
 import { useToastStore } from "../../stores/toast";
 
 const { t, locale } = useI18n();
+const route = useRoute();
+const router = useRouter();
 const toast = useToastStore();
 const now = useNow(15_000);
+
+type OpsTab = "overview" | "errors";
+const tab = ref<OpsTab>(route.query.tab === "errors" ? "errors" : "overview");
+const errorsVisited = ref(tab.value === "errors");
+const openErrorCount = ref(0);
+const errorRefreshToken = ref(0);
+
+const tabs = computed(() => [
+  { key: "overview" as OpsTab, label: t("security.ops.tabs.overview"), icon: "activity" as const },
+  {
+    key: "errors" as OpsTab,
+    label: t("security.ops.tabs.errors"),
+    icon: "alert" as const,
+    ...(openErrorCount.value > 0 ? { count: openErrorCount.value } : {}),
+  },
+]);
+
+watch(tab, (value) => {
+  if (value === "errors") errorsVisited.value = true;
+  const query = { ...route.query };
+  if (value === "errors") query.tab = "errors";
+  else delete query.tab;
+  void router.replace({ query });
+});
 
 const REFRESH_MS = 30_000;
 const RANGES: OpsRange[] = ["1h", "6h", "24h"];
@@ -239,14 +268,17 @@ const stats = computed<Stat[]>(() => {
       </template>
       <template #actions>
         <SegmentedControl v-model="range" :options="rangeOptions" size="md" />
-        <button type="button" class="btn btn-secondary" :disabled="loading" @click="load">
+        <button type="button" class="btn btn-secondary" :disabled="loading" @click="load(); errorRefreshToken++">
           <UiIcon name="refresh" :size="15" :spin="loading" />
           {{ t("common.refresh") }}
         </button>
       </template>
     </PageHeader>
 
-    <UiAlert v-if="error" tone="danger" :title="t('security.ops.errors.load')">
+    <UiTabs v-model="tab" :tabs="tabs" />
+
+    <div v-show="tab === 'overview'" class="space-y-6">
+      <UiAlert v-if="error" tone="danger" :title="t('security.ops.errors.load')">
       {{ errorDetail ?? (overview ? t("security.ops.errors.stale") : t("security.ops.errors.hint")) }}
       <template #action>
         <button type="button" class="btn btn-secondary btn-xs shrink-0" :disabled="loading" @click="load">
@@ -328,5 +360,15 @@ const stats = computed<Stat[]>(() => {
 
       <OpsRecentErrors :errors="overview.recentErrors" :now="now" />
     </div>
+    </div>
+
+    <OpsErrorCenterPanel
+      v-if="errorsVisited"
+      v-show="tab === 'errors'"
+      :range="range"
+      :now="now"
+      :refresh-token="errorRefreshToken"
+      @open-count="openErrorCount = $event"
+    />
   </div>
 </template>

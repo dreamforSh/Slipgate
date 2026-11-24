@@ -89,6 +89,8 @@ export const AUDIT_ACTION_KEYS: Record<string, string> = {
   [`DELETE ${A}/tls-profiles/:id`]: "tlsDelete",
 
   [`POST ${A}/ops/settlement-dead-letters/replay`]: "opsDeadLetterReplay",
+  [`POST ${A}/ops/request-errors/:id/resolve`]: "opsRequestErrorResolve",
+  [`POST ${A}/ops/request-errors/cleanup`]: "opsRequestErrorCleanup",
 
   [`POST ${A}/system/update/sync`]: "systemUpdateSync",
 };

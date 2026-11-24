@@ -187,6 +187,10 @@ type RelayMetrics struct {
 	CooldownDurationMs    uint64
 	TTFTMs                uint32
 	EgressCodec           CodecKind
+	ErrorType             string
+	ErrorCode             string
+	ErrorMessage          string
+	ErrorBody             string
 }
 
 // canonicalResult is one complete assistant turn decoded from any upstream protocol. StopReason

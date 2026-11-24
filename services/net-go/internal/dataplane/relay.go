@@ -270,6 +270,10 @@ func RelayAndTranscodeResponse(
 		rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 		copyRetryHeaders(w.Header(), resp.Header)
 		errType, errCode, message := extractUpstreamError(rawErr, resp.Status)
+		metrics.ErrorType = errType
+		metrics.ErrorCode = errCode
+		metrics.ErrorMessage = message
+		metrics.ErrorBody = truncateUTF8(string(rawErr), requestErrorMaxBodyLen)
 		WriteProtocolError(w, turn.IngressCodec, resp.StatusCode, firstNonEmpty(errType, "upstream_error"),
 			firstNonEmpty(errCode, "upstream_http_"+strconv.Itoa(resp.StatusCode)), message)
 		return metrics, nil

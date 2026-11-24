@@ -314,5 +314,6 @@ func main() {
 	// Anything still undelivered is in the settlement spool for the next start.
 	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
 	dpCoord.FlushSettlements(flushCtx)
+	dpCoord.FlushRequestErrors(flushCtx)
 	cancelFlush()
 }

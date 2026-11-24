@@ -268,6 +268,7 @@ type Coordinator struct {
 	logger                *log.Logger
 	streamSeq             atomic.Uint32
 	settlements           *settlementOutbox
+	requestErrors         *requestErrorWorker
 	confirmOnce           sync.Once
 	confirms              chan settleConfirm
 
@@ -348,6 +349,7 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		spoolDir = strings.TrimSpace(os.Getenv(SettlementSpoolDirEnv))
 	}
 	c.settlements = newSettlementOutbox(c.postSettlementOnce, logger, spoolDir)
+	c.requestErrors = newRequestErrorWorker(c.postRequestErrorsBatch)
 	if c.settlements.spoolDir != "" {
 		logger.Printf("[dataplane] settlement spool: %s", c.settlements.spoolDir)
 	}
@@ -952,6 +954,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		var parseErr error
 		turn, parseErr = parseMultimodalIngress(r, rawBody)
 		if parseErr != nil {
+			c.reportRequestError(buildDirectiveErrorReport(
+				r, requestID, startedAt, nil, "",
+				"ingress", "malformed_json", http.StatusBadRequest, 0,
+				"invalid_request_error", "malformed_json", parseErr.Error(), "", 1, false,
+			))
 			WriteProtocolError(w, ingressCodec, http.StatusBadRequest, "invalid_request_error", "malformed_json", parseErr.Error())
 			return
 		}
@@ -959,6 +966,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		var parseErr error
 		turn, parseErr = ParseIngressRequest(r.URL.Path, r.URL.RawQuery, rawBody)
 		if parseErr != nil {
+			c.reportRequestError(buildDirectiveErrorReport(
+				r, requestID, startedAt, nil, "",
+				"ingress", "malformed_json", http.StatusBadRequest, 0,
+				"invalid_request_error", "malformed_json", parseErr.Error(), "", 1, false,
+			))
 			WriteProtocolError(w, ingressCodec, http.StatusBadRequest, "invalid_request_error", "malformed_json", parseErr.Error())
 			return
 		}
@@ -972,12 +984,30 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	// so unauthorized client IPs or throttled users cannot burn legitimate per-key RPM in core-zig.
 	if km, known := c.lookupKeyByPlaintext(apiKey); known && km.Enabled {
 		if !c.isClientIPAllowed(km.ID, clientIP) {
+			rep := buildDirectiveErrorReport(
+				r, requestID, startedAt, nil, turn.PublicModel,
+				"ingress", "ip_not_allowed", http.StatusForbidden, 0,
+				"permission_error", "ip_not_allowed", "client IP is not in API key allowlist", "", 1, false,
+			)
+			rep.UserID = optStringPtr(km.UserID)
+			rep.APIKeyID = optStringPtr(km.ID)
+			rep.GroupID = optStringPtr(km.GroupID)
+			c.reportRequestError(rep)
 			WriteProtocolError(w, turn.IngressCodec, http.StatusForbidden, "permission_error", "ip_not_allowed", "client IP is not in API key allowlist")
 			return
 		}
 		if !isModelsReq {
 			if rej := c.userLimits.precheck(km.UserID, km.GroupID); rej != nil {
 				setRetryAfter(w.Header(), rej.retryAfterMs)
+				rep := buildDirectiveErrorReport(
+					r, requestID, startedAt, nil, turn.PublicModel,
+					"ingress", rej.code, rej.status, 0,
+					rej.errType, rej.code, rej.message, "", 1, false,
+				)
+				rep.UserID = optStringPtr(km.UserID)
+				rep.APIKeyID = optStringPtr(km.ID)
+				rep.GroupID = optStringPtr(km.GroupID)
+				c.reportRequestError(rep)
 				WriteProtocolError(w, turn.IngressCodec, rej.status, rej.errType, rej.code, rej.message)
 				return
 			}
@@ -1020,6 +1050,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			c.releaseCoreHold(0, baseEvalReq.TurnNonce, "")
 		}
 		c.logTurn("error", "slipgate-core dataplane unreachable: "+ipcErr.Error(), requestID, nil, turn.PublicModel)
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, nil, turn.PublicModel,
+			"core_eval", "core_unreachable", http.StatusServiceUnavailable, 0,
+			"core_unavailable", "core_unreachable", "slipgate-core dataplane unreachable: "+ipcErr.Error(), "", 1, false,
+		))
 		WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "core_unavailable", "core_unreachable", "slipgate-core dataplane unreachable: "+ipcErr.Error())
 		return
 	}
@@ -1088,6 +1123,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 				SourceRequestID: requestID,
 			})
 		}
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, &directive, turn.PublicModel,
+			"core_eval", firstNonEmpty(directive.ErrorCode, "core_rejected"), directive.Status, 0,
+			directive.ErrorType, directive.ErrorCode, directive.Message, "", 1, false,
+		))
 		setRetryAfter(w.Header(), directive.RetryAfterMs)
 		WriteProtocolError(w, turn.IngressCodec, directive.Status, directive.ErrorType, directive.ErrorCode, directive.Message)
 		return
@@ -1095,6 +1135,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	case "dispatch":
 		// Continue below to execute three-mode upstream dispatch and guaranteed settlement.
 	default:
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, &directive, turn.PublicModel,
+			"core_eval", "unknown_core_action", http.StatusBadGateway, 0,
+			"ipc_error", "unknown_core_action", "unexpected slipgate-core action: "+directive.Action, "", 1, false,
+		))
 		WriteProtocolError(w, turn.IngressCodec, http.StatusBadGateway, "ipc_error", "unknown_core_action", "unexpected slipgate-core action: "+directive.Action)
 		return
 	}
@@ -1175,6 +1220,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	if !c.isClientIPAllowed(directive.APIKeyID, clientIP) {
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, &directive, turn.PublicModel,
+			"ingress", "ip_not_allowed", http.StatusForbidden, 0,
+			"permission_error", "ip_not_allowed", "client IP is not in API key allowlist", "", 1, false,
+		))
 		settleHold(RelayMetrics{UpstreamStatus: http.StatusForbidden})
 		WriteProtocolError(w, turn.IngressCodec, http.StatusForbidden, "permission_error", "ip_not_allowed", "client IP is not in API key allowlist")
 		return
@@ -1218,13 +1268,20 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		subTier         string
 		excludedAccIDs  []string
 		pendingCooldown uint64
+		attemptsMade    int
 	)
 
 	const maxDispatchAttempts = 3
 	for attempt := 0; attempt < maxDispatchAttempts; attempt++ {
+		attemptsMade = attempt + 1
 		secret, hasSecret := c.vault.Get(directive.AccountID)
 		if !hasSecret {
 			if attempt+1 < maxDispatchAttempts && tracker.CanFailover() {
+				c.reportRequestError(buildDirectiveErrorReport(
+					r, requestID, startedAt, &directive, turn.PublicModel,
+					"outbound", "account_secret_unavailable", http.StatusServiceUnavailable, 0,
+					"overloaded_error", "account_secret_unavailable", "upstream account credentials not yet synchronized in vault", "", attemptsMade, true,
+				))
 				excludedAccIDs = append(excludedAccIDs, directive.AccountID)
 				if nextDir, ok := c.tryRebindFailover(r.Context(), baseEvalReq, directive.HoldID, excludedAccIDs, "", 0); ok {
 					directive = nextDir
@@ -1232,6 +1289,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
+			c.reportRequestError(buildDirectiveErrorReport(
+				r, requestID, startedAt, &directive, turn.PublicModel,
+				"outbound", "account_secret_unavailable", http.StatusServiceUnavailable, 0,
+				"overloaded_error", "account_secret_unavailable", "upstream account credentials not yet synchronized in vault", "", attemptsMade, attemptsMade > 1,
+			))
 			settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
 			WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "account_secret_unavailable", "upstream account credentials not yet synchronized in vault")
 			return
@@ -1364,6 +1426,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				excludedAccIDs = append(excludedAccIDs, directive.AccountID)
 				if nextDir, ok := c.tryRebindFailover(r.Context(), baseEvalReq, directive.HoldID, excludedAccIDs, "", 0); ok {
+					c.reportRequestError(buildDirectiveErrorReport(
+						r, requestID, startedAt, &directive, turn.PublicModel,
+						"outbound", "outbound_dispatch_failed", http.StatusBadGateway, 0,
+						"upstream_error", "outbound_dispatch_failed", execErr.Error(), "", attemptsMade, true,
+					))
 					directive = nextDir
 					access.setDirective(&directive)
 					continue
@@ -1372,6 +1439,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			if releaseVMSeat != nil {
 				defer releaseVMSeat()
 			}
+			c.reportRequestError(buildDirectiveErrorReport(
+				r, requestID, startedAt, &directive, turn.PublicModel,
+				"outbound", "outbound_dispatch_failed", http.StatusBadGateway, 0,
+				"upstream_error", "outbound_dispatch_failed", execErr.Error(), "", attemptsMade, attemptsMade > 1,
+			))
 			settleHold(RelayMetrics{UpstreamStatus: http.StatusBadGateway})
 			WriteProtocolError(w, turn.IngressCodec, http.StatusBadGateway, "upstream_error", "outbound_dispatch_failed", execErr.Error())
 			return
@@ -1387,6 +1459,16 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			if attempt+1 < maxDispatchAttempts && tracker.CanFailover() {
 				excludedAccIDs = append(excludedAccIDs, directive.AccountID)
 				if nextDir, ok := c.tryRebindFailover(r.Context(), baseEvalReq, directive.HoldID, excludedAccIDs, directive.AccountID, cooldownMs); ok {
+					rawErr, _ := io.ReadAll(io.LimitReader(upstreamResp.Body, requestErrorMaxBodyLen))
+					errType, errCode, errMsg := extractUpstreamError(rawErr, upstreamResp.Status)
+					c.reportRequestError(buildDirectiveErrorReport(
+						r, requestID, startedAt, &directive, turn.PublicModel,
+						"upstream_http", fmt.Sprintf("upstream_http_%d", upstreamResp.StatusCode),
+						upstreamResp.StatusCode, upstreamResp.StatusCode,
+						firstNonEmpty(errType, "upstream_error"),
+						firstNonEmpty(errCode, fmt.Sprintf("upstream_http_%d", upstreamResp.StatusCode)),
+						errMsg, truncateUTF8(string(rawErr), requestErrorMaxBodyLen), attemptsMade, true,
+					))
 					_ = upstreamResp.Body.Close()
 					if releaseVMSeat != nil {
 						releaseVMSeat()
@@ -1444,6 +1526,25 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		// Structured (logx): the system log keeps the request, user, key, account, platform and model.
 		c.logTurn("warn", fmt.Sprintf("stream relay interrupted: %v", relayErr), requestID, &directive, turn.PublicModel,
 			"upstream_status", fmtInt(int64(metrics.UpstreamStatus)))
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, &directive, turn.PublicModel,
+			"stream_relay", "stream_relay_interrupted",
+			settlementStatusCode(metrics.UpstreamStatus), metrics.UpstreamStatus,
+			firstNonEmpty(metrics.ErrorType, "stream_error"),
+			firstNonEmpty(metrics.ErrorCode, "stream_relay_interrupted"),
+			firstNonEmpty(metrics.ErrorMessage, relayErr.Error()),
+			metrics.ErrorBody, attemptsMade, attemptsMade > 1,
+		))
+	} else if metrics.UpstreamStatus >= 400 {
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, &directive, turn.PublicModel,
+			"upstream_http", fmt.Sprintf("upstream_http_%d", metrics.UpstreamStatus),
+			metrics.UpstreamStatus, metrics.UpstreamStatus,
+			firstNonEmpty(metrics.ErrorType, "upstream_error"),
+			firstNonEmpty(metrics.ErrorCode, fmt.Sprintf("upstream_http_%d", metrics.UpstreamStatus)),
+			firstNonEmpty(metrics.ErrorMessage, http.StatusText(metrics.UpstreamStatus)),
+			metrics.ErrorBody, attemptsMade, attemptsMade > 1,
+		))
 	}
 
 	ack := settleHold(metrics)

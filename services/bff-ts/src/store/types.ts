@@ -29,6 +29,7 @@ import type { SystemLogStore } from "./system_logs_types.ts";
 import type { RegistrationConflict, RegistrationGuard } from "./auth_guards_store.ts";
 import type { DbBackupStore } from "./db_backups_types.ts";
 import type { UserLimitsStore } from "./user_limits_types.ts";
+import type { RequestErrorStore } from "./request_errors_types.ts";
 
 export type StoreErrorCode = "conflict" | "not_found" | "forbidden" | "bad_request";
 
@@ -129,6 +130,8 @@ export interface ControlStore {
   readonly dbBackups: DbBackupStore;
   /** Per-user caps, per-user group rates / RPM overrides and cross-owner key tooling (lane U1). */
   readonly userLimits: UserLimitsStore;
+  /** Request & upstream error center records (lane O1). */
+  readonly requestErrors: RequestErrorStore;
 
   init(): Promise<void>;
   close(): Promise<void>;

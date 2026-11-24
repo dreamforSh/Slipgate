@@ -483,6 +483,10 @@ func relayMultimodalResponse(
 	if resp.StatusCode >= 400 {
 		copyRetryHeaders(w.Header(), resp.Header)
 		errType, errCode, message := extractUpstreamError(raw, resp.Status)
+		metrics.ErrorType = errType
+		metrics.ErrorCode = errCode
+		metrics.ErrorMessage = message
+		metrics.ErrorBody = truncateUTF8(string(raw), requestErrorMaxBodyLen)
 		WriteProtocolError(w, turn.IngressCodec, resp.StatusCode, firstNonEmpty(errType, "upstream_error"),
 			firstNonEmpty(errCode, "upstream_http_"+strconv.Itoa(resp.StatusCode)), message)
 		return metrics, nil

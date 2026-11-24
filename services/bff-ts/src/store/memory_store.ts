@@ -42,6 +42,7 @@ import { MemoryPaymentsStore } from "./memory_payments.ts";
 import { MemorySystemLogStore } from "./memory_system_logs.ts";
 import { MemoryDbBackupStore } from "./db_backups_memory.ts";
 import { MemoryUserLimitsStore } from "./memory_user_limits.ts";
+import { MemoryRequestErrorStore } from "./memory_request_errors.ts";
 import type { OpsStore } from "./ops_types.ts";
 import type { PaymentsStore } from "./payments_types.ts";
 import {
@@ -152,6 +153,12 @@ export class MemoryControlStore implements ControlStore {
     apiKeys: this.apiKeys,
     usageLogs: this.usageLogs,
     ops: () => this.ops,
+  });
+
+  readonly requestErrors = new MemoryRequestErrorStore({
+    users: this.users,
+    accounts: this.accounts,
+    groups: this.groups,
   });
 
   readonly payments: PaymentsStore = new MemoryPaymentsStore(

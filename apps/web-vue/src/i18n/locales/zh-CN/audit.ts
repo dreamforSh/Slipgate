@@ -210,6 +210,8 @@ export default {
       tlsUpdate: "修改 TLS 指纹",
       tlsDelete: "删除 TLS 指纹",
       opsDeadLetterReplay: "重放结算死信",
+      opsRequestErrorResolve: "更新请求异常状态",
+      opsRequestErrorCleanup: "清理请求异常记录",
       systemUpdateSync: "同步系统更新",
     },
     errors: {
