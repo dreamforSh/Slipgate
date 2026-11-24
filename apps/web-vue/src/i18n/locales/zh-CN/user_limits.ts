@@ -122,6 +122,7 @@ export default {
         limits: "限额",
         rates: "分组倍率",
         quotas: "平台配额",
+        attributes: "自定义属性",
         keys: "API 密钥",
       },
     },

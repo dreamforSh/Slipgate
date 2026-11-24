@@ -122,6 +122,16 @@ export const AUDIT_ACTION_KEYS: Record<string, string> = {
   [`POST ${A}/affiliates/withdrawals/:id/review`]: "affiliateWithdrawalReview",
 
   [`POST ${A}/system/update/sync`]: "systemUpdateSync",
+
+  [`POST ${A}/user-attributes`]: "userAttrCreate",
+  [`PATCH ${A}/user-attributes/:id`]: "userAttrUpdate",
+  [`DELETE ${A}/user-attributes/:id`]: "userAttrDelete",
+  [`PUT ${A}/users/:userId/attributes`]: "userAttrSetValues",
+  [`POST ${A}/api-keys`]: "adminApiKeyCreate",
+  [`DELETE ${A}/api-keys/:id`]: "adminApiKeyRevoke",
+  [`POST ${A}/pages`]: "sitePageCreate",
+  [`PATCH ${A}/pages/:id`]: "sitePageUpdate",
+  [`DELETE ${A}/pages/:id`]: "sitePageDelete",
 };
 
 export function auditActionKey(method: string, route: string): string | null {

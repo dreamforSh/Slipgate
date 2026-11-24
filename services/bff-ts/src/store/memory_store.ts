@@ -49,6 +49,8 @@ import { MemoryPlatformQuotasStore } from "./memory_platform_quotas.ts";
 import { MemoryUsageRollupsStore } from "./memory_usage_rollups.ts";
 import { MemoryModerationStore } from "./memory_moderation.ts";
 import { MemoryPasskeyStore } from "./memory_passkeys.ts";
+import { MemorySitePagesStore } from "./memory_site_pages.ts";
+import { MemoryUserAttributesStore } from "./memory_user_attributes.ts";
 import type { OpsStore } from "./ops_types.ts";
 import type { PaymentsStore } from "./payments_types.ts";
 import {
@@ -189,6 +191,8 @@ export class MemoryControlStore implements ControlStore {
 
   readonly moderation = new MemoryModerationStore();
   readonly passkeys = new MemoryPasskeyStore();
+  readonly userAttributes = new MemoryUserAttributesStore({ hasUser: (id) => this.users.has(id) });
+  readonly sitePages = new MemorySitePagesStore();
 
   readonly payments: PaymentsStore = new MemoryPaymentsStore(
     {
@@ -1057,6 +1061,7 @@ export class MemoryControlStore implements ControlStore {
     for (const item of this.usageLogs) {
       if (filter?.userId && item.userId !== filter.userId) continue;
       if (filter?.accountId && item.accountId !== filter.accountId) continue;
+      if (filter?.groupIds && !filter.groupIds.includes(item.groupId)) continue;
       if (Date.parse(item.createdAtIso) < sinceMs) continue;
       out.push({ ...item });
       if (out.length >= limit) break;

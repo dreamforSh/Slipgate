@@ -2,6 +2,8 @@
 import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { RouterLink, useRoute } from "vue-router";
+import type { PublicSitePageNavItem } from "@slipgate/contracts";
+import { publicJson } from "../lib/api";
 import { useAuthStore } from "../stores/auth";
 import { usePortalStore } from "../stores/portal";
 import BrandMark from "./BrandMark.vue";
@@ -16,8 +18,19 @@ const auth = useAuthStore();
 const portal = usePortalStore();
 const route = useRoute();
 const menuOpen = ref(false);
+const navPages = ref<PublicSitePageNavItem[]>([]);
 
-onMounted(() => void portal.load());
+onMounted(async () => {
+  await portal.load();
+  if (!portal.settings?.backendModeEnabled) {
+    try {
+      const res = await publicJson<{ items: PublicSitePageNavItem[] }>("/api/v1/public/pages");
+      navPages.value = res.items;
+    } catch {
+      navPages.value = [];
+    }
+  }
+});
 
 interface Link {
   to?: string;
@@ -33,11 +46,12 @@ const links = computed<Link[]>(() => {
   if (s?.statusPageEnabled !== false) out.push({ to: "/status", label: t("publicNav.status"), icon: "activity" });
   if (s?.keyUsageLookupEnabled !== false) out.push({ to: "/key-usage", label: t("publicNav.keyUsage"), icon: "search" });
   if (s?.docUrl) out.push({ href: s.docUrl, label: t("publicNav.docs"), icon: "book-open" });
+  for (const p of navPages.value) out.push({ to: `/p/${p.slug}`, label: p.title, icon: "file" });
   for (const l of s?.customNavLinks ?? []) out.push({ href: l.url, label: l.label, icon: "external-link" });
   return out;
 });
 
-const consolePath = computed(() => (auth.isAdmin ? "/admin" : "/dashboard"));
+const consolePath = computed(() => (auth.isAdmin ? "/admin" : auth.isGroupManager ? "/admin/groups" : "/dashboard"));
 const year = new Date().getFullYear();
 </script>
 

@@ -68,6 +68,8 @@ export const useAuthStore = defineStore("auth", () => {
 
   const isAuthenticated = computed(() => Boolean(token.value && user.value));
   const isAdmin = computed(() => user.value?.role === "admin");
+  const isGroupManager = computed(() => user.value?.role === "group_manager");
+  const hasAdminAccess = computed(() => isAdmin.value || isGroupManager.value);
   const sessionTimes = computed<SessionTimes>(() =>
     token.value ? decodeSessionTimes(token.value) : { issuedAtIso: null, expiresAtIso: null },
   );
@@ -276,6 +278,8 @@ export const useAuthStore = defineStore("auth", () => {
     consumeSessionNotice,
     isAuthenticated,
     isAdmin,
+    isGroupManager,
+    hasAdminAccess,
     sessionTimes,
     setSession,
     adoptToken,

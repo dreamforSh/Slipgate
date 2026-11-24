@@ -16,6 +16,10 @@ export interface JwtClaims {
   jti: string;
   iat: number;
   exp: number;
+  /** Group IDs scoped to a group_manager account (populated on request authentication). */
+  managedGroupIds?: string[];
+  /** How this caller authenticated on admin routes (admin_api_key refuses step-up checks). */
+  authKind?: "jwt" | "admin_api_key";
 }
 
 /** Access token lifetime (the console signs in again after it; revocation is checked per request). */
@@ -199,7 +203,7 @@ export async function verifyJwt(token: string, secret: string): Promise<JwtClaim
     const claims = JSON.parse(decoder.decode(base64UrlToBytes(payloadSeg))) as JwtClaims;
     if (!claims || typeof claims !== "object") return null;
     if (typeof claims.sub !== "string" || !claims.sub || typeof claims.email !== "string" || !claims.email) return null;
-    if (claims.role !== "admin" && claims.role !== "user") return null;
+    if (claims.role !== "admin" && claims.role !== "group_manager" && claims.role !== "user") return null;
     if (!Number.isSafeInteger(claims.ver) || claims.ver < 0) return null;
     if (typeof claims.jti !== "string" || !JTI_RE.test(claims.jti)) return null;
     const nowSec = Math.floor(Date.now() / 1000);

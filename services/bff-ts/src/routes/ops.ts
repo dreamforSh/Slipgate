@@ -856,7 +856,23 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
   /* ---------------- Users ---------------- */
 
   app.get("/api/v1/admin/users", async (c) => {
-    const listed = await ops.listAdminUsers(query(c, AdminUserListQuerySchema));
+    const claims = c.get("authUser");
+    const q = query(c, AdminUserListQuerySchema);
+    let scope: { managedGroupIds?: string[] } | undefined;
+    if (claims.role === "group_manager") {
+      const allowed = claims.managedGroupIds ?? [];
+      if (q.groupId && !allowed.includes(q.groupId)) {
+        return c.json({ error: "forbidden", message: "Group is outside your managed scope" }, 403);
+      }
+      if (q.apiKeyGroupId && !allowed.includes(q.apiKeyGroupId)) {
+        return c.json({ error: "forbidden", message: "Group is outside your managed scope" }, 403);
+      }
+      if (q.role === "admin") {
+        return c.json({ error: "forbidden", message: "Administrator accounts are outside your scope" }, 403);
+      }
+      scope = { managedGroupIds: allowed };
+    }
+    const listed = await ops.listAdminUsers(q, scope);
     const result = { ...listed, items: await decorateAdminUsers(store, listed.items) };
     // `users` keeps older console builds working.
     return c.json({ ...result, users: result.items });
@@ -876,6 +892,7 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
       email: req.email,
       username: req.username,
       role: req.role,
+      managedGroupIds: req.managedGroupIds,
       notes: req.notes,
       allowedGroupIds: req.allowedGroupIds,
       passwordHash: await hashPassword(req.password),
@@ -907,7 +924,7 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
     const userId = c.req.param("userId");
     const req = await body(c, AdminUpdateUserRequestSchema);
     const self = c.get("authUser").sub;
-    if (userId === self && (req.role === "user" || req.status === "suspended")) {
+    if (userId === self && ((req.role !== undefined && req.role !== "admin") || req.status === "suspended")) {
       throw new StoreError("forbidden", "You cannot demote or suspend your own account");
     }
     const target = await ops.getAdminUser(userId);
@@ -1193,7 +1210,19 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
 
   /* ---------------- Usage ---------------- */
 
-  app.get("/api/v1/admin/usage/query", async (c) => c.json(await ops.queryUsage(query(c, UsageQuerySchema))));
+  app.get("/api/v1/admin/usage/query", async (c) => {
+    const claims = c.get("authUser");
+    const q = query(c, UsageQuerySchema);
+    let scope: { managedGroupIds?: string[] } | undefined;
+    if (claims.role === "group_manager") {
+      const allowed = claims.managedGroupIds ?? [];
+      if (q.groupId && !allowed.includes(q.groupId)) {
+        return c.json({ error: "forbidden", message: "Group is outside your managed scope" }, 403);
+      }
+      scope = { managedGroupIds: allowed };
+    }
+    return c.json(await ops.queryUsage(q, scope));
+  });
 
   app.get("/api/v1/admin/usage/export", async (c) => {
     const q = query(c, UsageQuerySchema);

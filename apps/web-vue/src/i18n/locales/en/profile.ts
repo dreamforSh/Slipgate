@@ -129,6 +129,9 @@ const en: typeof zh = {
       removeFailed: "Failed to remove passkey",
       loadFailed: "Failed to load passkeys",
     },
+    attributes: {
+      title: "Custom attributes",
+    },
   },
 };
 

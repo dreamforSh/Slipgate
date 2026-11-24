@@ -57,6 +57,7 @@ export interface UserAccessRecord {
 export interface UserAuthState {
   email: string;
   role: UserRole;
+  managedGroupIds?: string[];
   status: "active" | "suspended";
   /** Tokens carrying an older version are dead (bumped by password/role/status changes and sign-out-everywhere). */
   tokenVersion: number;
@@ -83,7 +84,8 @@ export const AUDIT_DELETE_BATCH = 5000;
 /** Fields of a new audit entry; id and timestamp are assigned by the store. */
 export type AuditLogInput = Omit<AuditLogItem, "id" | "createdAtIso">;
 
-export interface AdminUserCreateInput extends Omit<AdminCreateUserRequest, "password" | "initialBalanceUsd"> {
+export interface AdminUserCreateInput extends Omit<AdminCreateUserRequest, "password" | "initialBalanceUsd" | "managedGroupIds"> {
+  managedGroupIds?: string[];
   passwordHash: string;
   initialBalanceNano: bigint;
   avatarUrl?: string;
@@ -202,7 +204,7 @@ export interface OpsStore {
   revokeToken(jti: string, userId: string, expiresAtIso: string): Promise<void>;
 
   /* ---- Users ---- */
-  listAdminUsers(query: AdminUserListQuery): Promise<AdminUserListResponse>;
+  listAdminUsers(query: AdminUserListQuery, scope?: { managedGroupIds?: string[] }): Promise<AdminUserListResponse>;
   getAdminUser(userId: string): Promise<AdminUserItem | null>;
   createUser(input: AdminUserCreateInput): Promise<AdminUserItem>;
   /**
@@ -324,7 +326,7 @@ export interface OpsStore {
 
   /* ---- Usage browsing ---- */
   /** One page of rows; the COUNT/SUM summary (and exact total) only when `query.summary !== false`. */
-  queryUsage(query: UsageQuery): Promise<UsagePageResponse>;
+  queryUsage(query: UsageQuery, scope?: { managedGroupIds?: string[] }): Promise<UsagePageResponse>;
   exportUsage(query: UsageExportQuery): Promise<UsageRow[]>;
 
   /*

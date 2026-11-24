@@ -106,6 +106,7 @@ const en: typeof zh = {
     profile: "Profile",
     roles: {
       admin: "Administrator",
+      group_manager: "Group manager",
       user: "User",
     },
   },
@@ -132,6 +133,7 @@ const en: typeof zh = {
     models: "Models",
     status: "Status",
     keyUsage: "Key usage",
+    page: "Page",
     docs: "Docs",
     login: "Sign in",
     console: "Open console",

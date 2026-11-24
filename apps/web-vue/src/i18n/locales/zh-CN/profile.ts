@@ -127,5 +127,8 @@ export default {
       removeFailed: "移除失败",
       loadFailed: "加载通行密钥失败",
     },
+    attributes: {
+      title: "自定义属性",
+    },
   },
 };

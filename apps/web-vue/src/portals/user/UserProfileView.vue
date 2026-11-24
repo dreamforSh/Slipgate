@@ -9,6 +9,7 @@ import LinkedAccountsCard from "../../components/me/LinkedAccountsCard.vue";
 import SessionsCard from "../../components/me/SessionsCard.vue";
 import TotpCard from "../../components/me/TotpCard.vue";
 import PasskeysPanel from "../../components/profile/PasskeysPanel.vue";
+import UserAttributesPanel from "../../components/admin/users/UserAttributesPanel.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
 import UiBadge from "../../components/ui/UiBadge.vue";
 import UiCard from "../../components/ui/UiCard.vue";
@@ -69,6 +70,7 @@ watch(
 const nameChanged = computed(
   () => nameDraft.value.trim() !== (user.value?.username ?? "") || avatarDraft.value.trim() !== (user.value?.avatarUrl ?? ""),
 );
+const hasCustomAttributes = ref(false);
 const nameTooLong = computed(() => nameDraft.value.trim().length > 64);
 const namePreview = computed(() => nameDraft.value.trim() || emailLocal.value);
 
@@ -433,6 +435,17 @@ const stagger = (i: number) => ({ animationDelay: `${i * 70}ms`, animationFillMo
 
         <!-- WebAuthn Passkeys -->
         <PasskeysPanel class="animate-slide-up motion-reduce:animate-none" :style="stagger(4)" />
+
+        <!-- Custom user attributes (shown when the portal has enabled attributes) -->
+        <UiCard
+          v-show="hasCustomAttributes"
+          class="animate-slide-up motion-reduce:animate-none"
+          :style="stagger(5)"
+          icon="sliders"
+          :title="t('profile.attributes.title')"
+        >
+          <UserAttributesPanel @loaded="(n) => (hasCustomAttributes = n > 0)" />
+        </UiCard>
 
         <!-- Third-party sign-in identities (renders nothing when no provider is enabled) -->
         <LinkedAccountsCard class="animate-slide-up motion-reduce:animate-none" :style="stagger(5)" />

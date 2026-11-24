@@ -105,6 +105,7 @@ export default {
     profile: "个人资料",
     roles: {
       admin: "管理员",
+      group_manager: "分组管理员",
       user: "普通用户",
     },
   },
@@ -131,6 +132,7 @@ export default {
     models: "模型广场",
     status: "渠道状态",
     keyUsage: "用量查询",
+    page: "站点页面",
     docs: "文档",
     login: "登录",
     console: "进入控制台",

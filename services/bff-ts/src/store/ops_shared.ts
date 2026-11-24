@@ -50,7 +50,7 @@ export function subscriptionOverLimit(limits: SubscriptionLimits, usage: Subscri
 
 export function audienceMatches(audience: AnnouncementAudience, role: UserRole): boolean {
   if (audience === "all") return true;
-  return audience === "admins" ? role === "admin" : role === "user";
+  return audience === "admins" ? role === "admin" : role !== "admin";
 }
 
 /**

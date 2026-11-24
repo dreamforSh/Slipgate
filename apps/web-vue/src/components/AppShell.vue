@@ -102,6 +102,16 @@ const sections = computed<NavSection[]>(() => {
         ],
       },
     );
+  } else if (auth.isGroupManager) {
+    out.push({
+      title: t("nav.sections.admin"),
+      items: [
+        { to: "/admin/groups", label: t("nav.groups"), icon: "layers" },
+        { to: "/admin/accounts", label: t("nav.accounts"), icon: "users" },
+        { to: "/admin/users", label: t("nav.users"), icon: "user" },
+        { to: "/admin/usage", label: t("nav.adminUsage"), icon: "chart" },
+      ],
+    });
   }
   const mine: NavItem[] = [
     { to: "/dashboard", label: t("nav.myDashboard"), icon: "gauge" },
@@ -116,7 +126,7 @@ const sections = computed<NavSection[]>(() => {
   if (settings?.affiliateEnabled) mine.push({ to: "/affiliate", label: t("nav.affiliate"), icon: "share" });
   if (settings?.modelPlazaEnabled !== false) mine.push({ to: "/models", label: t("nav.models"), icon: "store" });
   if (settings?.statusPageEnabled !== false) mine.push({ to: "/status", label: t("nav.status"), icon: "radar" });
-  mine.push({ to: "/profile", label: t("nav.profile"), icon: "user" });
+    mine.push({ to: "/profile", label: t("nav.profile"), icon: "user" });
   out.push({ title: t("nav.sections.account"), items: mine });
 
   const links: NavItem[] = (settings?.customNavLinks ?? []).map((l, i) => ({
@@ -190,11 +200,17 @@ const pageTitle = computed(() =>
 
 const siteName = computed(() => portal.settings?.siteName || auth.setupStatus?.siteName || "Slipgate");
 const logoUrl = computed(() => portal.logoUrl);
-const homePath = computed(() => (auth.isAdmin ? "/admin" : "/dashboard"));
+const homePath = computed(() => (auth.isAdmin ? "/admin" : auth.isGroupManager ? "/admin/groups" : "/dashboard"));
 const email = computed(() => auth.user?.email ?? "");
 const displayName = computed(() => auth.user?.username || email.value);
 const initials = computed(() => (displayName.value || "?").slice(0, 1).toUpperCase());
-const roleLabel = computed(() => (auth.isAdmin ? t("shell.roles.admin") : t("shell.roles.user")));
+const roleLabel = computed(() =>
+  auth.isAdmin
+    ? t("shell.roles.admin")
+    : auth.isGroupManager
+      ? t("shell.roles.group_manager")
+      : t("shell.roles.user"),
+);
 const balance = computed(() => auth.wallet?.formattedAvailableUsd ?? null);
 
 /* ---------------- Sidebar: desktop rail collapse + mobile drawer ---------------- */
@@ -549,7 +565,7 @@ async function handleLogout() {
                     <UiIcon name="gauge" :size="15" />
                     {{ t("nav.myDashboard") }}
                   </RouterLink>
-                  <RouterLink v-if="auth.isAdmin" to="/admin" class="menu-item" role="menuitem">
+                  <RouterLink v-if="auth.hasAdminAccess" :to="auth.isAdmin ? '/admin' : '/admin/groups'" class="menu-item" role="menuitem">
                     <UiIcon name="dashboard" :size="15" />
                     {{ t("nav.sections.admin") }}
                   </RouterLink>

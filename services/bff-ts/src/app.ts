@@ -79,6 +79,9 @@ import { clientIp } from "./security/client_ip.ts";
 import { auditMiddleware, registerOpsRoutes } from "./routes/ops.ts";
 import { digestEmailCode, registerMailRoutes, type MailService } from "./routes/mail.ts";
 import { PasskeyStepUpRegistry, registerPasskeyRoutes } from "./routes/passkeys.ts";
+import { registerSitePageRoutes } from "./routes/site_pages.ts";
+import { registerUserAttributeRoutes } from "./routes/user_attributes.ts";
+import { applySignupDefaults } from "./signup_defaults.ts";
 import { registerPaymentRoutes } from "./routes/payments.ts";
 import { registerPricingRoutes, repriceSettlement, snapshotPriceRules, type PricingService } from "./routes/pricing.ts";
 import { CoalescingRunner, KeyedThrottle } from "./settlement_guards.ts";
@@ -870,6 +873,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (defaultBalance > 0n) {
       await store.creditWallet(created.id, defaultBalance, `signup:${created.id}`, "signup_default_balance");
     }
+    await applySignupDefaults(store, created.id, settings, syncDataPlaneBestEffort);
     await store.ops.touchLastLogin(created.id);
     const user = (await store.getUserById(created.id)) ?? created;
     // No data-plane push: a new user has no API keys yet, and creating one pushes the snapshot
@@ -1424,8 +1428,27 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   });
 
   app.get("/api/v1/admin/groups", async (c) => {
+    const claims = c.get("authUser");
     const groups = await store.listGroups(false);
+    if (claims.role === "group_manager") {
+      const allowed = new Set(claims.managedGroupIds ?? []);
+      return c.json({ groups: groups.filter((g) => allowed.has(g.id)) });
+    }
     return c.json({ groups });
+  });
+
+  app.get("/api/v1/admin/groups/:groupId", async (c) => {
+    const groupId = c.req.param("groupId");
+    const claims = c.get("authUser");
+    if (claims.role === "group_manager" && !(claims.managedGroupIds ?? []).includes(groupId)) {
+      return c.json({ error: "forbidden", message: "Group is outside your managed scope" }, 403);
+    }
+    const groups = await store.listGroups(false);
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) {
+      return c.json({ error: "not_found", message: "Group not found" }, 404);
+    }
+    return c.json({ group });
   });
 
   app.post("/api/v1/admin/groups", async (c) => {
@@ -1441,6 +1464,10 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
 
   app.patch("/api/v1/admin/groups/:groupId", async (c) => {
     const groupId = c.req.param("groupId");
+    const claims = c.get("authUser");
+    if (claims.role === "group_manager" && !(claims.managedGroupIds ?? []).includes(groupId)) {
+      return c.json({ error: "forbidden", message: "Group is outside your managed scope" }, 403);
+    }
     const raw = await readJsonBody(c.req.raw);
     const parsed = UpdateGroupRequestSchema.safeParse(raw);
     if (!parsed.success) {
@@ -1465,8 +1492,20 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   });
 
   app.get("/api/v1/admin/accounts", async (c) => {
+    const claims = c.get("authUser");
     const groupId = c.req.query("groupId");
     const executionMode = c.req.query("executionMode");
+    if (claims.role === "group_manager") {
+      const allowed = new Set(claims.managedGroupIds ?? []);
+      if (groupId && !allowed.has(groupId)) {
+        return c.json({ error: "forbidden", message: "Group is outside your managed scope" }, 403);
+      }
+      const accounts = await store.listAccounts({
+        groupId: groupId || undefined,
+        executionMode: executionMode || undefined,
+      });
+      return c.json({ accounts: accounts.filter((a) => allowed.has(a.groupId)) });
+    }
     const accounts = await store.listAccounts({
       groupId: groupId || undefined,
       executionMode: executionMode || undefined,
@@ -1916,11 +1955,13 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   });
 
   app.get("/api/v1/admin/usage", async (c) => {
+    const claims = c.get("authUser");
     const userId = c.req.query("userId");
     const limitRaw = Number.parseInt(c.req.query("limit") ?? "100", 10);
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 100;
     const items = await store.listUsageLogs({
       userId: userId || undefined,
+      groupIds: claims.role === "group_manager" ? (claims.managedGroupIds ?? []) : undefined,
       limit,
     });
     return c.json({ items });
@@ -2732,6 +2773,8 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     guards,
     stepUpRegistry: passkeyStepUpRegistry,
   });
+  registerUserAttributeRoutes(app, { store });
+  registerSitePageRoutes(app, { store, guards });
   registerAccountOAuthRoutes(app, { store, fetchImpl: options.oauthFetch });
   registerUserLimitRoutes(app, { store, sessions, syncDataPlane: syncDataPlaneBestEffort, internalToken });
   registerPlatformQuotaRoutes(app, { store, syncDataPlane: syncDataPlaneBestEffort });
@@ -2788,7 +2831,14 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   registerAnnouncementRoutes(app, store);
   if (!registry.list().some((p) => p.name === paymentWebhookPlugin.name)) registry.register(paymentWebhookPlugin);
   const plugins = registerPluginRoutes(app, store, registry, vaultSecret);
-  registerOAuthRoutes(app, { store, vaultSecret, jwtSecret, fetchImpl: options.oauthFetch, guards });
+  registerOAuthRoutes(app, {
+    store,
+    vaultSecret,
+    jwtSecret,
+    fetchImpl: options.oauthFetch,
+    guards,
+    syncDataPlane: syncDataPlaneBestEffort,
+  });
   registerBackupRoutes(app, store, async () => {
     pricing.invalidate();
     await plugins.reload();

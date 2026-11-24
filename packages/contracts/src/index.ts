@@ -32,6 +32,8 @@ export * from "./moderation.ts";
 export * from "./passkeys.ts";
 export * from "./platform_quotas.ts";
 export * from "./affiliate.ts";
+export * from "./user_attributes.ts";
+export * from "./site_pages.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 

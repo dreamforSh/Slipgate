@@ -118,6 +118,7 @@ const en: typeof zh = {
         limits: "Limits",
         rates: "Group rates",
         quotas: "Platform quotas",
+        attributes: "Attributes",
         keys: "API keys",
       },
     },

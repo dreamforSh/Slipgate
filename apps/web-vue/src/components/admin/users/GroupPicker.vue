@@ -8,6 +8,9 @@ import UiIcon from "../../ui/UiIcon.vue";
 const props = defineProps<{
   groups: GroupItem[];
   disabled?: boolean;
+  label?: string;
+  hint?: string;
+  emptyLabel?: string;
 }>();
 const model = defineModel<string[]>({ required: true });
 
@@ -27,7 +30,7 @@ function toggle(id: string) {
 <template>
   <div>
     <div class="mb-1.5 flex items-baseline justify-between gap-3">
-      <span class="label mb-0">{{ t("adminUsers.form.allowedGroups") }}</span>
+      <span class="label mb-0">{{ label ?? t("adminUsers.form.allowedGroups") }}</span>
       <span v-if="groups.length" class="text-2xs tabular-nums text-fg-subtle">
         {{ t("adminUsers.form.selectedGroups", { n: groups.filter((g) => selected.has(g.id)).length }) }}
       </span>
@@ -35,11 +38,11 @@ function toggle(id: string) {
     <div
       class="rounded-lg border border-line bg-surface-2/40 p-2"
       role="group"
-      :aria-label="t('adminUsers.form.allowedGroups')"
+      :aria-label="label ?? t('adminUsers.form.allowedGroups')"
     >
       <p v-if="groups.length === 0" class="flex items-center gap-2 px-1.5 py-1 text-xs text-fg-subtle">
         <UiIcon name="lock" :size="13" />
-        {{ t("adminUsers.form.noExclusiveGroups") }}
+        {{ emptyLabel ?? t("adminUsers.form.noExclusiveGroups") }}
       </p>
       <div v-else class="flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
         <button
@@ -64,6 +67,6 @@ function toggle(id: string) {
         </button>
       </div>
     </div>
-    <p class="hint">{{ t("adminUsers.form.allowedGroupsHint") }}</p>
+    <p class="hint">{{ hint ?? t("adminUsers.form.allowedGroupsHint") }}</p>
   </div>
 </template>

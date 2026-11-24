@@ -10,6 +10,8 @@ declare module "vue-router" {
     layout?: "auth" | "app" | "public";
     requiresAuth?: boolean;
     requiresAdmin?: boolean;
+    /** True on the bounded set of admin routes accessible to group_manager accounts. */
+    allowGroupManager?: boolean;
     /** Signed-out visitors whose URL carries a `token` query go here (query kept) instead of the login page. */
     guestRedirect?: string;
   }

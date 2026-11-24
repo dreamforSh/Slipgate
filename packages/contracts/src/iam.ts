@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { CaptchaProofSchema } from "./auth_guards.ts";
 
-export const UserRoleSchema = z.enum(["admin", "user"]);
+export const UserRoleSchema = z.enum(["admin", "group_manager", "user"]);
 export type UserRole = z.infer<typeof UserRoleSchema>;
 
 export const UserStatusSchema = z.enum(["active", "suspended"]);
@@ -57,6 +57,7 @@ export const UserProfileSchema = z.object({
   avatarUrl: z.string().max(512).optional(),
   emailVerified: z.boolean().optional(),
   role: UserRoleSchema,
+  managedGroupIds: z.array(z.string()).optional(),
   status: UserStatusSchema,
   totpEnabled: z.boolean(),
   createdAtIso: z.string(),

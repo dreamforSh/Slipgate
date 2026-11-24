@@ -477,6 +477,7 @@ interface AdminUserRow {
   avatar_url: string;
   email_verified: boolean;
   role: UserRole;
+  managed_group_ids: string[] | null;
   status: "active" | "suspended";
   totp_enabled: boolean;
   created_at: Date;
@@ -855,7 +856,7 @@ export class PostgresOpsStore implements OpsStore {
 
   private adminUserSelect(where: Fragment): Fragment {
     return this.sql`
-      SELECT u.id, u.email, u.username, u.avatar_url, u.email_verified, u.role, u.status, u.totp_enabled, u.created_at,
+      SELECT u.id, u.email, u.username, u.avatar_url, u.email_verified, u.role, u.managed_group_ids, u.status, u.totp_enabled, u.created_at,
              u.notes, u.allowed_group_ids, u.invite_code, u.referrer_id, r.email AS referrer_email,
              u.last_login_at,
              COALESCE(w.balance_nano_usd, 0)::text AS balance,
@@ -878,6 +879,7 @@ export class PostgresOpsStore implements OpsStore {
       avatarUrl: r.avatar_url ?? "",
       emailVerified: Boolean(r.email_verified),
       role: r.role,
+      managedGroupIds: Array.isArray(r.managed_group_ids) ? [...r.managed_group_ids] : [],
       status: r.status,
       totpEnabled: r.totp_enabled,
       createdAtIso: iso(r.created_at),
@@ -894,9 +896,28 @@ export class PostgresOpsStore implements OpsStore {
     };
   }
 
-  async listAdminUsers(query: AdminUserListQuery): Promise<AdminUserListResponse> {
+  async listAdminUsers(query: AdminUserListQuery, scope?: { managedGroupIds?: string[] }): Promise<AdminUserListResponse> {
     const sql = this.sql;
     const parts: Fragment[] = [];
+    let scopeCond: Fragment | null = null;
+    if (scope?.managedGroupIds !== undefined) {
+      if (scope.managedGroupIds.length === 0) {
+        return {
+          items: [],
+          total: 0,
+          stats: { total: 0, admins: 0, suspended: 0, newLast7d: 0, balanceNanoUsd: "0" },
+        };
+      }
+      const mgIds = scope.managedGroupIds;
+      scopeCond = sql`(
+        u.role <> 'admin' AND (
+          EXISTS (SELECT 1 FROM jsonb_array_elements_text(u.allowed_group_ids) g WHERE g = ANY(${mgIds}))
+          OR EXISTS (SELECT 1 FROM core.api_keys k WHERE k.user_id = u.id AND k.group_id = ANY(${mgIds}))
+          OR EXISTS (SELECT 1 FROM commerce.subscriptions s WHERE s.user_id = u.id AND s.group_id = ANY(${mgIds}))
+        )
+      )`;
+      parts.push(scopeCond);
+    }
     if (query.role) parts.push(sql`u.role = ${query.role}`);
     if (query.status) parts.push(sql`u.status = ${query.status}`);
     if (query.search) {
@@ -930,12 +951,13 @@ export class PostgresOpsStore implements OpsStore {
       sql<{ n: number }[]>`SELECT COUNT(*)::int AS n FROM commerce.users u WHERE ${where}`,
       sql<{ total: number; admins: number; suspended: number; new7d: number; balance: string }[]>`
         SELECT COUNT(*)::int AS total,
-               COUNT(*) FILTER (WHERE role = 'admin')::int AS admins,
-               COUNT(*) FILTER (WHERE status = 'suspended')::int AS suspended,
-               COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS new7d,
-               (SELECT COALESCE(SUM(w.balance_nano_usd), 0)::text
-                  FROM core.quota_wallets w JOIN commerce.users x ON x.id = w.user_id) AS balance
-          FROM commerce.users
+               COUNT(*) FILTER (WHERE u.role = 'admin')::int AS admins,
+               COUNT(*) FILTER (WHERE u.status = 'suspended')::int AS suspended,
+               COUNT(*) FILTER (WHERE u.created_at >= NOW() - INTERVAL '7 days')::int AS new7d,
+               COALESCE(SUM(w.balance_nano_usd), 0)::text AS balance
+          FROM commerce.users u
+          LEFT JOIN core.quota_wallets w ON w.user_id = u.id
+         WHERE ${scopeCond ?? sql`TRUE`}
       `,
     ]);
     const s = stats[0]!;
@@ -957,9 +979,9 @@ export class PostgresOpsStore implements OpsStore {
       await this.sql.begin(async (txRaw) => {
         const tx = txRaw as unknown as Sql;
         await tx`
-          INSERT INTO commerce.users (id, email, username, avatar_url, email_verified, password_hash, role, status, notes, allowed_group_ids)
+          INSERT INTO commerce.users (id, email, username, avatar_url, email_verified, password_hash, role, managed_group_ids, status, notes, allowed_group_ids)
           VALUES (${id}, ${input.email.toLowerCase()}, ${input.username}, ${input.avatarUrl ?? ""}, ${Boolean(input.emailVerified)},
-                  ${input.passwordHash}, ${input.role}, 'active', ${input.notes}, ${tx.json([...new Set(input.allowedGroupIds)])})
+                  ${input.passwordHash}, ${input.role}, ${[...new Set(input.managedGroupIds ?? [])]}, 'active', ${input.notes}, ${tx.json([...new Set(input.allowedGroupIds)])})
         `;
         await tx`
           INSERT INTO core.quota_wallets (user_id, balance_nano_usd, held_nano_usd)
@@ -1008,11 +1030,13 @@ export class PostgresOpsStore implements OpsStore {
           (input.status !== undefined && input.status !== cur.status) ||
           input.passwordHash !== undefined;
         const allowed = input.allowedGroupIds ? tx.json([...new Set(input.allowedGroupIds)]) : null;
+        const managed = input.managedGroupIds ? [...new Set(input.managedGroupIds)] : null;
         await tx`
           UPDATE commerce.users
              SET email = COALESCE(${input.email?.toLowerCase() ?? null}, email),
                  username = COALESCE(${input.username ?? null}, username),
                  role = COALESCE(${input.role ?? null}, role),
+                 managed_group_ids = COALESCE(${managed}::text[], managed_group_ids),
                  status = COALESCE(${input.status ?? null}, status),
                  notes = COALESCE(${input.notes ?? null}, notes),
                  allowed_group_ids = COALESCE(${allowed}::jsonb, allowed_group_ids),
@@ -1155,6 +1179,7 @@ export class PostgresOpsStore implements OpsStore {
         avatar_url: string;
         email_verified: boolean;
         role: UserRole;
+        managed_group_ids: string[] | null;
         status: "active" | "suspended";
         totp_enabled: boolean;
         created_at: Date;
@@ -1165,7 +1190,7 @@ export class PostgresOpsStore implements OpsStore {
              avatar_url = COALESCE(${avatarUrl ?? null}, avatar_url),
              updated_at = NOW()
        WHERE id = ${userId}
-      RETURNING id, email, username, avatar_url, email_verified, role, status, totp_enabled, created_at
+      RETURNING id, email, username, avatar_url, email_verified, role, managed_group_ids, status, totp_enabled, created_at
     `;
     const r = rows[0];
     if (!r) throw new StoreError("not_found", `User ${userId} not found`);
@@ -1176,6 +1201,7 @@ export class PostgresOpsStore implements OpsStore {
       avatarUrl: r.avatar_url ?? "",
       emailVerified: Boolean(r.email_verified),
       role: r.role,
+      managedGroupIds: Array.isArray(r.managed_group_ids) ? [...r.managed_group_ids] : [],
       status: r.status,
       totpEnabled: r.totp_enabled,
       createdAtIso: iso(r.created_at),
@@ -1198,6 +1224,7 @@ export class PostgresOpsStore implements OpsStore {
           avatar_url: string;
           email_verified: boolean;
           role: UserRole;
+          managed_group_ids: string[] | null;
           status: "active" | "suspended";
           totp_enabled: boolean;
           created_at: Date;
@@ -1208,7 +1235,7 @@ export class PostgresOpsStore implements OpsStore {
                email_verified = ${emailVerified},
                updated_at = NOW()
          WHERE id = ${userId}
-        RETURNING id, email, username, avatar_url, email_verified, role, status, totp_enabled, created_at
+        RETURNING id, email, username, avatar_url, email_verified, role, managed_group_ids, status, totp_enabled, created_at
       `;
       const r = rows[0]!;
       return {
@@ -1218,6 +1245,7 @@ export class PostgresOpsStore implements OpsStore {
         avatarUrl: r.avatar_url ?? "",
         emailVerified: Boolean(r.email_verified),
         role: r.role,
+        managedGroupIds: Array.isArray(r.managed_group_ids) ? [...r.managed_group_ids] : [],
         status: r.status,
         totpEnabled: r.totp_enabled,
         createdAtIso: iso(r.created_at),
@@ -1267,9 +1295,9 @@ export class PostgresOpsStore implements OpsStore {
 
   async getSessionState(userId: string, jti?: string): Promise<SessionState> {
     const rows = await this.sql<
-      { email: string; role: UserRole; status: "active" | "suspended"; token_version: number; revoked: boolean }[]
+      { email: string; role: UserRole; managed_group_ids: string[] | null; status: "active" | "suspended"; token_version: number; revoked: boolean }[]
     >`
-      SELECT u.email, u.role, u.status, u.token_version,
+      SELECT u.email, u.role, u.managed_group_ids, u.status, u.token_version,
              (${jti ?? null}::text IS NOT NULL
                AND EXISTS (SELECT 1 FROM commerce.revoked_tokens r WHERE r.jti = ${jti ?? null}::text)) AS revoked
         FROM commerce.users u
@@ -1278,7 +1306,13 @@ export class PostgresOpsStore implements OpsStore {
     const r = rows[0];
     if (!r) return { user: null, revoked: false };
     return {
-      user: { email: r.email, role: r.role, status: r.status, tokenVersion: Number(r.token_version) },
+      user: {
+        email: r.email,
+        role: r.role,
+        managedGroupIds: Array.isArray(r.managed_group_ids) ? [...r.managed_group_ids] : [],
+        status: r.status,
+        tokenVersion: Number(r.token_version),
+      },
       revoked: r.revoked === true,
     };
   }
@@ -2313,9 +2347,13 @@ export class PostgresOpsStore implements OpsStore {
 
   /* ---------------- Usage ---------------- */
 
-  private usageWhere(q: Omit<UsageQuery, "page" | "pageSize">): Fragment {
+  private usageWhere(q: Omit<UsageQuery, "page" | "pageSize">, scope?: { managedGroupIds?: string[] }): Fragment {
     const sql = this.sql;
     const parts: Fragment[] = [];
+    if (scope?.managedGroupIds !== undefined) {
+      if (scope.managedGroupIds.length === 0) parts.push(sql`FALSE`);
+      else parts.push(sql`l.group_id = ANY(${scope.managedGroupIds})`);
+    }
     if (q.userId) parts.push(sql`l.user_id = ${q.userId}`);
     if (q.apiKeyId) parts.push(sql`l.api_key_id = ${q.apiKeyId}`);
     if (q.groupId) parts.push(sql`l.group_id = ${q.groupId}`);
@@ -2378,8 +2416,8 @@ export class PostgresOpsStore implements OpsStore {
     };
   }
 
-  async queryUsage(query: UsageQuery): Promise<UsagePageResponse> {
-    const where = this.usageWhere(query);
+  async queryUsage(query: UsageQuery, scope?: { managedGroupIds?: string[] }): Promise<UsagePageResponse> {
+    const where = this.usageWhere(query, scope);
     const { offset, limit } = clampPage(query.page, query.pageSize);
     if (query.summary === false) {
       // Rows only: no COUNT/SUM over every matching row (the summary is unbounded in time).

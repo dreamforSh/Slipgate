@@ -7,13 +7,14 @@ import UiIcon from "../../ui/UiIcon.vue";
 import UiTabs from "../../ui/UiTabs.vue";
 import ReplaceGroupModal from "./ReplaceGroupModal.vue";
 import UserApiKeysPanel from "./UserApiKeysPanel.vue";
+import UserAttributesPanel from "./UserAttributesPanel.vue";
 import UserGroupRatesPanel from "./UserGroupRatesPanel.vue";
 import UserLimitsPanel from "./UserLimitsPanel.vue";
 import UserPlatformQuotasPanel from "./UserPlatformQuotasPanel.vue";
 import { STATUS_TONE, avatarTone, displayName, initial } from "./userDisplay";
 import { useLimitText } from "./limits";
 
-export type UserDetailTab = "limits" | "rates" | "quotas" | "keys";
+export type UserDetailTab = "limits" | "rates" | "quotas" | "keys" | "attributes";
 
 /** One user's caps and live status, per-group rates / RPM overrides and API keys. */
 const props = defineProps<{ user: AdminUserItem | null; groups: GroupItem[] }>();
@@ -37,6 +38,7 @@ const tabs = computed(() => [
   { key: "limits" as const, label: t("userLimits.drawer.tabs.limits"), icon: "gauge" as const },
   { key: "rates" as const, label: t("userLimits.drawer.tabs.rates"), icon: "percent" as const },
   { key: "quotas" as const, label: t("userLimits.drawer.tabs.quotas"), icon: "sliders" as const },
+  { key: "attributes" as const, label: t("userLimits.drawer.tabs.attributes"), icon: "user" as const },
   { key: "keys" as const, label: t("userLimits.drawer.tabs.keys"), icon: "key" as const, count: current.value?.apiKeyCount },
 ]);
 
@@ -88,7 +90,7 @@ function onReplaced(res: ReplaceUserGroupResponse) {
           <p class="truncate text-sm font-semibold text-fg">{{ displayName(current) }}</p>
           <p class="truncate text-xs text-fg-subtle">{{ current.email }}</p>
           <div class="mt-2 flex flex-wrap items-center gap-1.5">
-            <UiBadge :tone="current.role === 'admin' ? 'violet' : 'neutral'">{{ t(`adminUsers.roles.${current.role}`) }}</UiBadge>
+            <UiBadge :tone="current.role === 'admin' ? 'violet' : current.role === 'group_manager' ? 'info' : 'neutral'">{{ t(`adminUsers.roles.${current.role}`) }}</UiBadge>
             <UiBadge :tone="STATUS_TONE[current.status]" dot>{{ t(`adminUsers.statuses.${current.status}`) }}</UiBadge>
             <UiBadge tone="accent" mono :title="t('userLimits.fields.rpm')">
               <UiIcon name="gauge" :size="10" class="-ml-0.5 mr-0.5 inline" />{{ capText(current.effectiveRpmLimit ?? 0, "rpm") }}
@@ -118,6 +120,17 @@ function onReplaced(res: ReplaceUserGroupResponse) {
         </TransitionGroup>
       </div>
 
+      <div v-if="current.role === 'group_manager' && current.managedGroupIds?.length" class="mt-2 flex flex-wrap items-center gap-1.5 text-2xs">
+        <span class="text-fg-subtle">{{ t("adminUsers.form.managedGroups") }}:</span>
+        <span
+          v-for="gid in current.managedGroupIds"
+          :key="`mg-${gid}`"
+          class="inline-flex items-center gap-1 rounded-full bg-info/10 px-2 py-0.5 font-medium text-info ring-1 ring-inset ring-info/20"
+        >
+          <UiIcon name="layers" :size="9" />{{ groupNames.get(gid) ?? gid }}
+        </span>
+      </div>
+
       <UiTabs v-model="tab" :tabs="tabs" class="mt-5" />
 
       <div class="pt-5">
@@ -132,6 +145,7 @@ function onReplaced(res: ReplaceUserGroupResponse) {
             <UserLimitsPanel v-if="tab === 'limits'" :key="`l-${current.id}`" :user="current" :active="open && tab === 'limits'" @saved="onSaved" />
             <UserGroupRatesPanel v-else-if="tab === 'rates'" :key="`r-${current.id}`" :user="current" :active="open && tab === 'rates'" @saved="emit('changed')" />
             <UserPlatformQuotasPanel v-else-if="tab === 'quotas'" :key="`q-${current.id}`" :user="current" :active="open && tab === 'quotas'" @saved="emit('changed')" />
+            <UserAttributesPanel v-else-if="tab === 'attributes'" :key="`a-${current.id}`" :user-id="current.id" :active="open && tab === 'attributes'" />
             <UserApiKeysPanel
               v-else
               ref="keysPanel"

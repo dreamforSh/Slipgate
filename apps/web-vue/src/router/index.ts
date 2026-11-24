@@ -6,11 +6,11 @@ import { i18n } from "../i18n";
 import { useAuthStore } from "../stores/auth";
 import { usePortalStore } from "../stores/portal";
 
-const admin = (path: string, name: string, load: LazyPage, titleKey: string): RouteRecordRaw => ({
+const admin = (path: string, name: string, load: LazyPage, titleKey: string, allowGroupManager = false): RouteRecordRaw => ({
   path,
   name,
   component: load,
-  meta: { requiresAuth: true, requiresAdmin: true, titleKey },
+  meta: { requiresAuth: true, requiresAdmin: true, allowGroupManager, titleKey },
 });
 
 const member = (path: string, name: string, load: LazyPage, titleKey: string): RouteRecordRaw => ({
@@ -57,6 +57,12 @@ const router = createRouter({
       meta: { layout: "public", titleKey: "authGuards.legal.title" },
     },
     {
+      path: "/p/:slug",
+      name: "site-page",
+      component: () => import("../views/public/SitePageView.vue"),
+      meta: { layout: "public", titleKey: "publicNav.page" },
+    },
+    {
       path: "/setup",
       name: "setup-wizard",
       component: () => import("../views/SetupWizardView.vue"),
@@ -92,16 +98,16 @@ const router = createRouter({
     admin("/admin", "admin-dashboard", () => import("../portals/admin/AdminDashboardView.vue"), "nav.dashboard"),
     admin("/admin/ops", "admin-ops", () => import("../portals/admin/AdminOpsView.vue"), "nav.ops"),
     admin("/admin/risk", "admin-risk", () => import("../portals/admin/AdminRiskView.vue"), "nav.risk"),
-    admin("/admin/usage", "admin-usage", () => import("../portals/admin/AdminUsageView.vue"), "nav.adminUsage"),
-    admin("/admin/users", "admin-users", () => import("../portals/admin/AdminUsersView.vue"), "nav.users"),
-    admin("/admin/groups", "admin-groups", () => import("../portals/admin/AdminGroupsView.vue"), "nav.groups"),
+    admin("/admin/usage", "admin-usage", () => import("../portals/admin/AdminUsageView.vue"), "nav.adminUsage", true),
+    admin("/admin/users", "admin-users", () => import("../portals/admin/AdminUsersView.vue"), "nav.users", true),
+    admin("/admin/groups", "admin-groups", () => import("../portals/admin/AdminGroupsView.vue"), "nav.groups", true),
     admin(
       "/admin/subscriptions",
       "admin-subscriptions",
       () => import("../portals/admin/AdminSubscriptionsView.vue"),
       "nav.subscriptions",
     ),
-    admin("/admin/accounts", "admin-accounts", () => import("../portals/admin/AdminAccountsView.vue"), "nav.accounts"),
+    admin("/admin/accounts", "admin-accounts", () => import("../portals/admin/AdminAccountsView.vue"), "nav.accounts", true),
     { path: "/admin/proxy", redirect: "/admin/proxy/clash" },
     admin("/admin/proxy/clash", "admin-proxy-clash", () => import("../portals/admin/AdminClashPoolView.vue"), "nav.proxyClash"),
     admin("/admin/proxy/ips", "admin-proxy-ips", () => import("../portals/admin/AdminProxyIpsView.vue"), "nav.proxyIps"),
@@ -200,7 +206,7 @@ router.beforeEach(async (to) => {
   }
 
   if (to.path === "/setup") {
-    return auth.isAuthenticated ? (auth.isAdmin ? "/admin" : "/dashboard") : "/login";
+    return auth.isAuthenticated ? (auth.isAdmin ? "/admin" : auth.isGroupManager ? "/admin/groups" : "/dashboard") : "/login";
   }
 
   // Backend (admin-only) mode: anyone but an administrator only reaches sign-in and the few pages
@@ -215,7 +221,7 @@ router.beforeEach(async (to) => {
 
   // The landing page is for visitors; signed-in users go straight to their console.
   if (to.name === "home" && auth.isAuthenticated && !to.query.preview) {
-    return auth.isAdmin ? "/admin" : "/dashboard";
+    return auth.isAdmin ? "/admin" : auth.isGroupManager ? "/admin/groups" : "/dashboard";
   }
 
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
@@ -225,8 +231,8 @@ router.beforeEach(async (to) => {
     return { path: "/login", query: to.fullPath !== "/" ? { redirect: to.fullPath } : {} };
   }
 
-  if (to.meta.requiresAdmin && !auth.isAdmin) {
-    return "/dashboard";
+  if (to.meta.requiresAdmin && !auth.isAdmin && !(auth.isGroupManager && to.meta.allowGroupManager)) {
+    return auth.isGroupManager ? "/admin/groups" : "/dashboard";
   }
 
   return true;

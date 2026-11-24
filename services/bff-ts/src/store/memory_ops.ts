@@ -440,7 +440,13 @@ export class MemoryOpsStore implements OpsStore {
     const u = this.core.users.get(userId);
     if (!u) return { user: null, revoked: false };
     return {
-      user: { email: u.email, role: u.role, status: u.status, tokenVersion: this.tokenVersionOf(userId) },
+      user: {
+        email: u.email,
+        role: u.role,
+        managedGroupIds: [...(u.managedGroupIds ?? [])],
+        status: u.status,
+        tokenVersion: this.tokenVersionOf(userId),
+      },
       revoked: jti !== undefined && this.revokedTokens.has(jti),
     };
   }
@@ -507,6 +513,7 @@ export class MemoryOpsStore implements OpsStore {
     const { passwordHash: _, ...profile } = u;
     return {
       ...profile,
+      managedGroupIds: [...(u.managedGroupIds ?? [])],
       notes: m.notes,
       allowedGroupIds: [...m.allowedGroupIds],
       inviteCode: m.inviteCode,
@@ -520,8 +527,29 @@ export class MemoryOpsStore implements OpsStore {
     };
   }
 
-  async listAdminUsers(query: AdminUserListQuery): Promise<AdminUserListResponse> {
-    const all = Array.from(this.core.users.values()).map((u) => this.toAdminUser(u));
+  async listAdminUsers(query: AdminUserListQuery, scope?: { managedGroupIds?: string[] }): Promise<AdminUserListResponse> {
+    const managedSet = scope?.managedGroupIds ? new Set(scope.managedGroupIds) : null;
+    if (managedSet && managedSet.size === 0) {
+      return {
+        items: [],
+        total: 0,
+        stats: { total: 0, admins: 0, suspended: 0, newLast7d: 0, balanceNanoUsd: "0" },
+      };
+    }
+    const allRaw = Array.from(this.core.users.values()).map((u) => this.toAdminUser(u));
+    const all = managedSet
+      ? allRaw.filter((u) => {
+          if (u.role === "admin") return false;
+          if (u.allowedGroupIds.some((gid) => managedSet.has(gid))) return true;
+          for (const k of this.core.apiKeys.values()) {
+            if (k.userId === u.id && managedSet.has(k.groupId)) return true;
+          }
+          for (const s of this.subs.values()) {
+            if (s.userId === u.id && managedSet.has(s.groupId)) return true;
+          }
+          return false;
+        })
+      : allRaw;
     const q = query.search?.toLowerCase();
     const filtered = all.filter((u) => {
       if (query.role && u.role !== query.role) return false;
@@ -601,6 +629,7 @@ export class MemoryOpsStore implements OpsStore {
       emailVerified: Boolean(input.emailVerified),
       passwordHash: input.passwordHash,
       role: input.role,
+      managedGroupIds: [...new Set(input.managedGroupIds ?? [])],
       status: "active",
       totpEnabled: false,
       createdAtIso: new Date().toISOString(),
@@ -644,6 +673,7 @@ export class MemoryOpsStore implements OpsStore {
     if (endsSessions) this.bumpVersion(userId);
     if (input.username !== undefined) u.username = input.username;
     if (input.role !== undefined) u.role = input.role;
+    if (input.managedGroupIds !== undefined) u.managedGroupIds = [...new Set(input.managedGroupIds)];
     if (input.status !== undefined) u.status = input.status;
     if (input.passwordHash !== undefined) u.passwordHash = input.passwordHash;
     const m = this.metaOf(userId);
@@ -1661,7 +1691,12 @@ export class MemoryOpsStore implements OpsStore {
 
   /* ---------------- Usage ---------------- */
 
-  private matchUsage(log: UsageLogItem, q: Omit<UsageQuery, "page" | "pageSize">): boolean {
+  private matchUsage(
+    log: UsageLogItem,
+    q: Omit<UsageQuery, "page" | "pageSize">,
+    scope?: { managedGroupIds?: string[] },
+  ): boolean {
+    if (scope?.managedGroupIds && !scope.managedGroupIds.includes(log.groupId)) return false;
     if (q.userId && log.userId !== q.userId) return false;
     if (q.apiKeyId && log.apiKeyId !== q.apiKeyId) return false;
     if (q.groupId && log.groupId !== q.groupId) return false;
@@ -1685,8 +1720,8 @@ export class MemoryOpsStore implements OpsStore {
     };
   }
 
-  async queryUsage(query: UsageQuery): Promise<UsagePageResponse> {
-    const matched = this.core.usageLogs.filter((l) => this.matchUsage(l, query));
+  async queryUsage(query: UsageQuery, scope?: { managedGroupIds?: string[] }): Promise<UsagePageResponse> {
+    const matched = this.core.usageLogs.filter((l) => this.matchUsage(l, query, scope));
     const { offset, limit } = clampPage(query.page, query.pageSize);
     if (query.summary === false) {
       // Same contract as Postgres: no summary, and the total is only what this page proves.

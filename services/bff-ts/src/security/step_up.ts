@@ -1,7 +1,7 @@
 import type { Context } from "hono";
 import type { AdminStepUp, AuditStepUpError } from "@slipgate/contracts";
 import { WindowLimiter } from "../insights.ts";
-import type { SessionManager } from "../middleware/auth.ts";
+import type { AuthEnv, SessionManager } from "../middleware/auth.ts";
 import type { PasskeyStepUpRegistry } from "../routes/passkeys.ts";
 import type { ControlStore } from "../store/types.ts";
 import { clientIp } from "./client_ip.ts";
@@ -60,6 +60,9 @@ export class TotpStepUp {
 
   /** null when confirmed; otherwise the JSON refusal to return from the route. */
   async require(c: Context, userId: string, code: string | undefined): Promise<Response | null> {
+    if ((c as Context<AuthEnv>).get("authUser")?.authKind === "admin_api_key") {
+      return c.json({ error: "step_up_not_allowed", message: "Interactive sign-in required for two-factor confirmation" }, 403);
+    }
     const failure = await this.verify(userId, code);
     if (!failure) return null;
     if (failure.status === 429) c.header("Retry-After", String(STEP_UP_WINDOW_MS / 1000));
@@ -73,6 +76,9 @@ export class TotpStepUp {
    * sign-in is on. A stolen session token alone is not enough for any of them.
    */
   async confirmAdmin(c: Context, sessions: SessionManager, userId: string, confirm: AdminStepUp | undefined): Promise<Response | null> {
+    if ((c as Context<AuthEnv>).get("authUser")?.authKind === "admin_api_key") {
+      return c.json({ error: "step_up_not_allowed", message: "Interactive sign-in required for sensitive changes" }, 403);
+    }
     if (!confirm) return c.json({ error: "step_up_required", message: "Confirm this change with your password or passkey" }, 403);
     if (confirm.passkeyStepUpToken) {
       const registry = passkeyRegistries.get(this.store);

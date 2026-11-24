@@ -17,6 +17,7 @@ import { clientIp, safeRequestOrigin, trustsForwardedHeaders } from "../security
 import { decryptSecret, encryptSecret, hashPassword } from "../security/crypto.ts";
 import { ssrfSafeFetch } from "../security/ssrf.ts";
 import { StoreError, type ControlStore } from "../store/types.ts";
+import { applySignupDefaults } from "../signup_defaults.ts";
 import type { AuthGuards } from "../auth_guards.ts";
 
 /**
@@ -255,6 +256,7 @@ export interface OAuthRouteContext {
   fetchImpl?: typeof fetch;
   /** Captcha pass at sign-in start, sign-up email policy and backend mode (auth_guards.ts). */
   guards?: AuthGuards;
+  syncDataPlane?: () => Promise<void>;
 }
 
 export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) {
@@ -651,6 +653,7 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
         return c.redirect(`${base}/oauth/complete#${new URLSearchParams({ continue: continueToken }).toString()}`, 302);
       }
 
+      let createdNewUser = false;
       for (let attempt = 0; !userId; attempt++) {
         try {
           const created = await store.ops.createUser({
@@ -666,6 +669,7 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
             initialBalanceNano: BigInt(settings.defaultBalanceNanoUsd),
           });
           userId = created.id;
+          createdNewUser = true;
         } catch (err) {
           const conflict = err instanceof StoreError && err.code === "conflict";
           // A verified address taken meanwhile: lost a race with a registration of it.
@@ -680,9 +684,13 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
       } catch {
         // Another callback of the same identity won the race: drop this account (best effort, it
         // was never used) and sign in to the one that holds the identity.
+        createdNewUser = false;
         await store.ops.deleteUser(userId).catch(() => undefined);
         userId = await store.ops.findUserIdByIdentity(id.data, subject);
         if (!userId) return fail("signup_failed");
+      }
+      if (createdNewUser) {
+        await applySignupDefaults(store, userId, settings, ctx.syncDataPlane);
       }
     }
     const user = await store.getUserById(userId);
@@ -852,6 +860,7 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
       affCode: settings.affiliateEnabled ? req.affCode : undefined,
     });
     await store.ops.linkIdentity(created.id, consumed.provider, consumed.subject).catch(() => undefined);
+    await applySignupDefaults(store, created.id, settings, ctx.syncDataPlane);
     await store.ops.touchLastLogin(created.id);
     const finalUser = (await store.getUserById(created.id)) ?? created;
     const { token } = await issueAccessToken(store, jwtSecret, finalUser);

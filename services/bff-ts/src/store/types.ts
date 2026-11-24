@@ -36,6 +36,8 @@ import type { PlatformQuotasStore } from "./platform_quotas_types.ts";
 import type { UsageRollupsStore } from "./usage_rollups_types.ts";
 import type { ModerationStore } from "./moderation_types.ts";
 import type { PasskeyStore } from "./passkeys_types.ts";
+import type { SitePagesStore } from "./site_pages_types.ts";
+import type { UserAttributesStore } from "./user_attributes_types.ts";
 
 export type StoreErrorCode = "conflict" | "not_found" | "forbidden" | "bad_request";
 
@@ -100,6 +102,7 @@ export interface AccountSecretRecord {
 export interface UsageLogFilter {
   userId?: string;
   accountId?: string;
+  groupIds?: string[];
   limit?: number;
   sinceIso?: string;
 }
@@ -150,6 +153,10 @@ export interface ControlStore {
   readonly moderation: ModerationStore;
   /** WebAuthn passkeys (lane A2). */
   readonly passkeys: PasskeyStore;
+  /** User custom attribute definitions & values, plus admin API keys (lane A4). */
+  readonly userAttributes: UserAttributesStore;
+  /** Custom public Markdown site pages (lane S1). */
+  readonly sitePages: SitePagesStore;
 
   init(): Promise<void>;
   close(): Promise<void>;

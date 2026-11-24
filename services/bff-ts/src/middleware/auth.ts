@@ -5,6 +5,31 @@ import { signJwt, verifyJwt, verifyPasswordOrDummy, type JwtClaims } from "../se
 import type { SessionState } from "../store/ops_types.ts";
 import { StoreError, type ControlStore } from "../store/types.ts";
 
+async function sha256Hex(raw: string): Promise<string> {
+  const bytes = new TextEncoder().encode(raw);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function isGroupManagerAllowedRequest(method: string, path: string): boolean {
+  if (method === "GET") {
+    if (
+      path === "/api/v1/admin/groups" ||
+      path === "/api/v1/admin/accounts" ||
+      path === "/api/v1/admin/users" ||
+      path === "/api/v1/admin/usage" ||
+      path === "/api/v1/admin/usage/query"
+    ) {
+      return true;
+    }
+    return /^\/api\/v1\/admin\/groups\/[^/]+$/.test(path);
+  }
+  if (method === "PATCH") {
+    return /^\/api\/v1\/admin\/groups\/[^/]+$/.test(path);
+  }
+  return false;
+}
+
 export interface AuthEnv {
   Variables: {
     /** Verified token claims, with `role` and `email` replaced by the user's current values. */
@@ -109,7 +134,15 @@ export class SessionManager {
     // 401 (not 403) so the console drops the session, the same as an expired token.
     if (user.status !== "active") return reject("account_suspended", "Account is suspended");
     if (user.tokenVersion !== claims.ver) return reject("session_revoked", "This session has ended, sign in again");
-    return { claims: { ...claims, role: user.role, email: user.email } };
+    return {
+      claims: {
+        ...claims,
+        role: user.role,
+        email: user.email,
+        managedGroupIds: user.managedGroupIds ?? [],
+        authKind: "jwt",
+      },
+    };
   }
 
   /** Any signed-in, active user. */
@@ -127,9 +160,44 @@ export class SessionManager {
   /** A signed-in, active user whose current role (from the store) is admin. */
   requireAdmin(): MiddlewareHandler<AuthEnv> {
     return async (c, next) => {
-      const result = await this.authenticate(c.req.header("Authorization"));
+      const authHeader = c.req.header("Authorization");
+      const adminApiKey = c.req.header("X-Admin-Api-Key")?.trim();
+      if (!authHeader && adminApiKey) {
+        const keyRecord = await this.store.userAttributes.findActiveAdminApiKeyByHash(await sha256Hex(adminApiKey));
+        if (!keyRecord) {
+          return c.json({ error: "unauthorized", message: "Invalid or expired admin API key" }, 401);
+        }
+        const owner = await this.store.getUserById(keyRecord.userId);
+        if (!owner || owner.role !== "admin") {
+          return c.json({ error: "unauthorized", message: "Admin API key owner is not an administrator" }, 401);
+        }
+        if (owner.status !== "active") {
+          return c.json({ error: "account_suspended", message: "Account suspended" }, 403);
+        }
+        void this.store.userAttributes.touchAdminApiKeyLastUsed(keyRecord.id).catch(() => undefined);
+        const nowSec = Math.floor(Date.now() / 1000);
+        c.set("authUser", {
+          sub: owner.id,
+          email: owner.email,
+          role: "admin",
+          ver: 0,
+          jti: keyRecord.id,
+          iat: nowSec,
+          exp: nowSec + 300,
+          authKind: "admin_api_key",
+        });
+        await next();
+        return;
+      }
+
+      const result = await this.authenticate(authHeader);
       if ("rejection" in result) {
         return c.json({ error: result.rejection.error, message: result.rejection.message }, result.rejection.status);
+      }
+      if (result.claims.role === "group_manager" && isGroupManagerAllowedRequest(c.req.method, c.req.path)) {
+        c.set("authUser", result.claims);
+        await next();
+        return;
       }
       if (result.claims.role !== "admin") {
         return c.json({ error: "forbidden", message: "Administrator role required" }, 403);

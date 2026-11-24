@@ -66,6 +66,7 @@ export type AdminUserSort = z.infer<typeof AdminUserSortSchema>;
 export const AdminUserItemSchema = UserProfileSchema.extend({
   notes: z.string(),
   allowedGroupIds: z.array(z.string()),
+  managedGroupIds: z.array(z.string()).default([]),
   inviteCode: z.string(),
   referrerId: z.string().nullable(),
   referrerEmail: z.string().nullable(),
@@ -124,6 +125,7 @@ export const AdminCreateUserRequestSchema = z.object({
   role: UserRoleSchema.default("user"),
   notes: z.string().trim().max(1000).default(""),
   allowedGroupIds: z.array(z.string().min(1)).max(200).default([]),
+  managedGroupIds: z.array(z.string().min(1)).max(64).default([]),
   /** Opening balance; omitted means the portal's default new-user balance. */
   initialBalanceUsd: UsdAmountSchema.optional(),
   /** Request caps; omitted or null = the portal default, 0 = unlimited. */
@@ -141,6 +143,7 @@ export const AdminUpdateUserRequestSchema = z.object({
   status: UserStatusSchema.optional(),
   notes: z.string().trim().max(1000).optional(),
   allowedGroupIds: z.array(z.string().min(1)).max(200).optional(),
+  managedGroupIds: z.array(z.string().min(1)).max(64).optional(),
   /** Admin password reset; never echoed back. */
   password: z.string().min(8).max(128).optional(),
   /** Request caps; null = back to the portal default, 0 = unlimited. */
@@ -298,6 +301,10 @@ export const PortalSettingsSchema = z.object({
   registrationEmailSuffixAllowlist: RegistrationEmailSuffixListSchema,
   /** With an allowlist: an unlisted domain may still sign up while it has no account (one per domain). */
   registrationEmailDomainQuotaEnabled: z.boolean(),
+  /* Sign-up defaults (applied once when a new user self-registers) */
+  defaultSignupGroupIds: z.array(z.string().min(1).max(64)).max(32).default([]),
+  defaultSignupSubGroupId: z.string().trim().max(64).default(""),
+  defaultSignupSubDays: z.number().int().min(0).max(3650).default(0),
   /* Login agreement (terms / privacy documents, also served at /legal/:id) */
   loginAgreementEnabled: z.boolean(),
   loginAgreementMode: LoginAgreementModeSchema,
@@ -338,6 +345,9 @@ export const DEFAULT_PORTAL_SETTINGS: PortalSettings = {
   auditLogRetentionDays: AUDIT_LOG_RETENTION_DEFAULT_DAYS,
   registrationEmailSuffixAllowlist: [],
   registrationEmailDomainQuotaEnabled: false,
+  defaultSignupGroupIds: [],
+  defaultSignupSubGroupId: "",
+  defaultSignupSubDays: 0,
   loginAgreementEnabled: false,
   loginAgreementMode: "modal",
   loginAgreementUpdatedAt: "",

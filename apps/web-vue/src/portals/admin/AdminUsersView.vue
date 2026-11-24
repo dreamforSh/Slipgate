@@ -29,6 +29,7 @@ import ColumnPicker from "../../components/admin/users/ColumnPicker.vue";
 import GroupChips from "../../components/admin/users/GroupChips.vue";
 import ReplaceGroupModal from "../../components/admin/users/ReplaceGroupModal.vue";
 import UserDetailDrawer, { type UserDetailTab } from "../../components/admin/users/UserDetailDrawer.vue";
+import UserAttributeDefinitionsModal from "../../components/admin/users/UserAttributeDefinitionsModal.vue";
 import UserLiveCell from "../../components/admin/users/UserLiveCell.vue";
 import UserUsageCell from "../../components/admin/users/UserUsageCell.vue";
 import { useLimitText } from "../../components/admin/users/limits";
@@ -62,6 +63,8 @@ const notice = ref<string | null>(null);
 useFeedbackToasts(errorMessage, notice);
 
 const selfId = computed(() => auth.user?.id ?? null);
+const isAdmin = computed(() => auth.isAdmin);
+const attrDefsOpen = ref(false);
 
 /* ---------------- List state ---------------- */
 
@@ -279,7 +282,7 @@ async function loadLive(ids: string[]) {
 }
 
 function loadFigures(ids: string[]) {
-  if (ids.length === 0) return;
+  if (!isAdmin.value || ids.length === 0) return;
   if (show("usage")) void loadUsage(ids);
   if (show("live")) void loadLive(ids);
 }
@@ -550,7 +553,11 @@ onMounted(() => {
           <UiIcon name="refresh" :size="15" :spin="loading" />
           {{ t("common.refresh") }}
         </button>
-        <button type="button" class="btn btn-primary" @click="openCreate">
+        <button v-if="isAdmin" type="button" class="btn btn-secondary" @click="attrDefsOpen = true">
+          <UiIcon name="sliders" :size="15" />
+          {{ t("adminUsers.attributes.manage") }}
+        </button>
+        <button v-if="isAdmin" type="button" class="btn btn-primary" @click="openCreate">
           <UiIcon name="user-plus" :size="15" />
           {{ t("adminUsers.actions.create") }}
         </button>
@@ -623,7 +630,8 @@ onMounted(() => {
         </label>
         <select v-model="roleFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('adminUsers.table.role')">
           <option value="">{{ t("adminUsers.filters.allRoles") }}</option>
-          <option value="admin">{{ t("adminUsers.roles.admin") }}</option>
+          <option v-if="isAdmin" value="admin">{{ t("adminUsers.roles.admin") }}</option>
+          <option value="group_manager">{{ t("adminUsers.roles.group_manager") }}</option>
           <option value="user">{{ t("adminUsers.roles.user") }}</option>
         </select>
         <select
@@ -741,7 +749,7 @@ onMounted(() => {
         <table class="data-table">
           <thead>
             <tr>
-              <th class="w-10">
+              <th v-if="isAdmin" class="w-10">
                 <input
                   type="checkbox"
                   class="checkbox"
@@ -767,7 +775,7 @@ onMounted(() => {
               <th v-if="show('lastActive')">{{ t("userLimits.columns.keys.lastActive") }}</th>
               <th v-if="show('lastLogin')">{{ t("adminUsers.table.lastLogin") }}</th>
               <th v-if="show('created')">{{ t("adminUsers.table.created") }}</th>
-              <th class="sticky-end text-right">{{ t("common.actions") }}</th>
+              <th v-if="isAdmin" class="sticky-end text-right">{{ t("common.actions") }}</th>
             </tr>
           </thead>
           <tbody>
@@ -781,7 +789,7 @@ onMounted(() => {
               ]"
               :style="staggerStyle(i)"
             >
-              <td>
+              <td v-if="isAdmin">
                 <input
                   type="checkbox"
                   class="checkbox"
@@ -807,7 +815,7 @@ onMounted(() => {
                         type="button"
                         class="cursor-pointer truncate text-left font-medium text-fg transition-colors hover:text-accent"
                         :title="t('adminUsers.actions.edit')"
-                        @click="openEdit(u)"
+                        @click="isAdmin && openEdit(u)"
                       >
                         {{ displayName(u) }}
                       </button>
@@ -824,7 +832,7 @@ onMounted(() => {
               </td>
 
               <td v-if="show('role')">
-                <UiBadge :tone="u.role === 'admin' ? 'violet' : 'neutral'">
+                <UiBadge :tone="u.role === 'admin' ? 'violet' : u.role === 'group_manager' ? 'info' : 'neutral'">
                   <UiIcon v-if="u.role === 'admin'" name="crown" :size="10" class="-ml-0.5 mr-0.5 inline" />
                   {{ t(`adminUsers.roles.${u.role}`) }}
                 </UiBadge>
@@ -918,7 +926,7 @@ onMounted(() => {
                 {{ formatDateShort(u.createdAtIso) }}
               </td>
 
-              <td class="sticky-end whitespace-nowrap text-right">
+              <td v-if="isAdmin" class="sticky-end whitespace-nowrap text-right">
                 <div class="inline-flex items-center gap-0.5">
                   <button
                     type="button"
@@ -981,7 +989,8 @@ onMounted(() => {
       @rates="(u) => openDetail(u, 'rates')"
       @replace-group="openReplace"
     />
-    <UserFormModal v-model:open="formOpen" :user="editing" :groups="exclusiveGroups" :self-id="selfId" @saved="onSaved" />
+    <UserFormModal v-model:open="formOpen" :user="editing" :groups="exclusiveGroups" :managed-groups="allGroups" :self-id="selfId" @saved="onSaved" />
+    <UserAttributeDefinitionsModal v-model:open="attrDefsOpen" />
     <UserBalanceModal v-model:open="balanceOpen" :user="target" @adjusted="onAdjusted" />
     <UserLedgerDrawer v-model:open="ledgerOpen" :user="target" />
     <UserDetailDrawer v-model:open="detailOpen" v-model:tab="detailTab" :user="detailUser" :groups="allGroups" @changed="load" />

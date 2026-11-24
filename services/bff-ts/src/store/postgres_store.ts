@@ -62,6 +62,8 @@ import { PG_PLATFORM_QUOTAS_SCHEMA_SQL, PostgresPlatformQuotasStore } from "./po
 import { PG_USAGE_ROLLUPS_SCHEMA_SQL, PostgresUsageRollupsStore } from "./postgres_usage_rollups.ts";
 import { PG_MODERATION_SCHEMA_SQL, PostgresModerationStore } from "./postgres_moderation.ts";
 import { PG_PASSKEYS_SCHEMA_SQL, PostgresPasskeyStore } from "./postgres_passkeys.ts";
+import { PG_SITE_PAGES_SCHEMA_SQL, PostgresSitePagesStore } from "./postgres_site_pages.ts";
+import { PG_USER_ATTRIBUTES_SCHEMA_SQL, PostgresUserAttributesStore } from "./postgres_user_attributes.ts";
 import {
   PG_SETTLEMENT_SCHEMA_SQL,
   pruneSettlementIds,
@@ -150,6 +152,8 @@ export class PostgresControlStore implements ControlStore {
   readonly usageRollups: PostgresUsageRollupsStore;
   readonly moderation: PostgresModerationStore;
   readonly passkeys: PostgresPasskeyStore;
+  readonly userAttributes: PostgresUserAttributesStore;
+  readonly sitePages: PostgresSitePagesStore;
   private backgroundMaintenance: Promise<void> = Promise.resolve();
   /** Earliest time of the next opportunistic core.settlement_ids prune (off the settlement tx). */
   private settlementPruneAt = 0;
@@ -173,6 +177,8 @@ export class PostgresControlStore implements ControlStore {
     this.usageRollups = new PostgresUsageRollupsStore(this.sql);
     this.moderation = new PostgresModerationStore(this.sql);
     this.passkeys = new PostgresPasskeyStore(this.sql);
+    this.userAttributes = new PostgresUserAttributesStore(this.sql);
+    this.sitePages = new PostgresSitePagesStore(this.sql);
   }
 
   async init(): Promise<void> {
@@ -567,6 +573,8 @@ export class PostgresControlStore implements ControlStore {
     await this.sql.unsafe(PG_MODERATION_SCHEMA_SQL);
     await this.sql.unsafe(PG_PASSKEYS_SCHEMA_SQL);
     await this.sql.unsafe(PG_OAUTH_EXTRAS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_USER_ATTRIBUTES_SCHEMA_SQL);
+    await this.sql.unsafe(PG_SITE_PAGES_SCHEMA_SQL);
     // Index builds and the one-time spend backfill must not delay startup or block settlements.
     // So is the one-off pass of the current audit-log redaction over rows older builds stored.
     const auditScrub = await pendingAuditSecretScrub(this.sql);
@@ -753,7 +761,8 @@ export class PostgresControlStore implements ControlStore {
         email: string;
         username: string;
         password_hash: string | null;
-        role: "admin" | "user";
+        role: UserProfile["role"];
+        managed_group_ids: string[] | null;
         status: "active" | "suspended";
         totp_enabled: boolean;
         avatar_url: string;
@@ -762,7 +771,7 @@ export class PostgresControlStore implements ControlStore {
         token_version: number;
       }[]
     >`
-      SELECT id, email, username, password_hash, role, status, totp_enabled, avatar_url, email_verified, created_at, token_version
+      SELECT id, email, username, password_hash, role, managed_group_ids, status, totp_enabled, avatar_url, email_verified, created_at, token_version
       FROM commerce.users
       WHERE LOWER(email) = LOWER(${email})
       LIMIT 1
@@ -777,6 +786,7 @@ export class PostgresControlStore implements ControlStore {
       emailVerified: Boolean(row.email_verified),
       passwordHash: row.password_hash,
       role: row.role,
+      managedGroupIds: Array.isArray(row.managed_group_ids) ? row.managed_group_ids : [],
       status: row.status,
       totpEnabled: row.totp_enabled,
       createdAtIso: toIso(row.created_at),
@@ -790,7 +800,8 @@ export class PostgresControlStore implements ControlStore {
         id: string;
         email: string;
         username: string;
-        role: "admin" | "user";
+        role: UserProfile["role"];
+        managed_group_ids: string[] | null;
         status: "active" | "suspended";
         totp_enabled: boolean;
         avatar_url: string;
@@ -798,7 +809,7 @@ export class PostgresControlStore implements ControlStore {
         created_at: Date;
       }[]
     >`
-      SELECT id, email, username, role, status, totp_enabled, avatar_url, email_verified, created_at
+      SELECT id, email, username, role, managed_group_ids, status, totp_enabled, avatar_url, email_verified, created_at
       FROM commerce.users
       WHERE id = ${userId}
       LIMIT 1
@@ -812,6 +823,7 @@ export class PostgresControlStore implements ControlStore {
       avatarUrl: row.avatar_url ?? "",
       emailVerified: Boolean(row.email_verified),
       role: row.role,
+      managedGroupIds: Array.isArray(row.managed_group_ids) ? row.managed_group_ids : [],
       status: row.status,
       totpEnabled: row.totp_enabled,
       createdAtIso: toIso(row.created_at),
@@ -824,7 +836,8 @@ export class PostgresControlStore implements ControlStore {
         id: string;
         email: string;
         username: string;
-        role: "admin" | "user";
+        role: UserProfile["role"];
+        managed_group_ids: string[] | null;
         status: "active" | "suspended";
         totp_enabled: boolean;
         avatar_url: string;
@@ -832,7 +845,7 @@ export class PostgresControlStore implements ControlStore {
         created_at: Date;
       }[]
     >`
-      SELECT id, email, username, role, status, totp_enabled, avatar_url, email_verified, created_at
+      SELECT id, email, username, role, managed_group_ids, status, totp_enabled, avatar_url, email_verified, created_at
       FROM commerce.users
       ORDER BY created_at DESC
     `;
@@ -843,6 +856,7 @@ export class PostgresControlStore implements ControlStore {
       avatarUrl: row.avatar_url ?? "",
       emailVerified: Boolean(row.email_verified),
       role: row.role,
+      managedGroupIds: Array.isArray(row.managed_group_ids) ? row.managed_group_ids : [],
       status: row.status,
       totpEnabled: row.totp_enabled,
       createdAtIso: toIso(row.created_at),
@@ -2313,6 +2327,7 @@ export class PostgresControlStore implements ControlStore {
       FROM core.usage_logs
       WHERE (${filter?.userId ?? null}::text IS NULL OR user_id = ${filter?.userId ?? null})
         AND (${filter?.accountId ?? null}::text IS NULL OR account_id = ${filter?.accountId ?? null})
+        AND (${filter?.groupIds ?? null}::text[] IS NULL OR group_id = ANY(${filter?.groupIds ?? []}::text[]))
         AND (${since}::timestamptz IS NULL OR created_at >= ${since}::timestamptz)
       ORDER BY created_at DESC
       LIMIT ${limit}

@@ -29,6 +29,7 @@ import { generatePassword } from "./userDisplay";
 const props = defineProps<{
   user: AdminUserItem | null;
   groups: GroupItem[];
+  managedGroups?: GroupItem[];
   selfId: string | null;
 }>();
 const open = defineModel<boolean>("open", { required: true });
@@ -45,6 +46,7 @@ interface Form {
   status: UserStatus;
   notes: string;
   allowedGroupIds: string[];
+  managedGroupIds: string[];
   initialBalance: string;
   /** Own caps: null = portal default, 0 = unlimited. */
   rpmLimit: UserCap;
@@ -64,6 +66,7 @@ const isSelf = computed(() => props.user !== null && props.user.id === props.sel
 
 const roleOptions = computed<{ value: UserRole; label: string }[]>(() => [
   { value: "user", label: t("adminUsers.roles.user") },
+  { value: "group_manager", label: t("adminUsers.roles.group_manager") },
   { value: "admin", label: t("adminUsers.roles.admin") },
 ]);
 const statusOptions = computed<{ value: UserStatus; label: string }[]>(() => [
@@ -80,6 +83,7 @@ function blank(): Form {
     status: "active",
     notes: "",
     allowedGroupIds: [],
+    managedGroupIds: [],
     initialBalance: "",
     rpmLimit: null,
     concurrencyLimit: null,
@@ -102,6 +106,7 @@ watch(open, (isOpen) => {
           status: u.status,
           notes: u.notes,
           allowedGroupIds: [...u.allowedGroupIds],
+          managedGroupIds: [...(u.managedGroupIds ?? [])],
           rpmLimit: u.rpmLimit ?? null,
           concurrencyLimit: u.concurrencyLimit ?? null,
         }
@@ -140,6 +145,7 @@ function buildPatch(u: AdminUserItem): AdminUpdateUserRequest {
   if (!isSelf.value && form.role !== u.role) patch.role = form.role;
   if (!isSelf.value && form.status !== u.status) patch.status = form.status;
   if (!sameIds(form.allowedGroupIds, u.allowedGroupIds)) patch.allowedGroupIds = [...form.allowedGroupIds];
+  if (!sameIds(form.managedGroupIds, u.managedGroupIds ?? [])) patch.managedGroupIds = [...form.managedGroupIds];
   if (form.password) patch.password = form.password;
   if (!sameCap(form.rpmLimit, u.rpmLimit)) patch.rpmLimit = form.rpmLimit;
   if (!sameCap(form.concurrencyLimit, u.concurrencyLimit)) patch.concurrencyLimit = form.concurrencyLimit;
@@ -183,6 +189,7 @@ async function persist(confirm?: AdminStepUp) {
       role: form.role,
       notes: form.notes.trim(),
       allowedGroupIds: [...form.allowedGroupIds],
+      managedGroupIds: form.role === "group_manager" ? [...form.managedGroupIds] : [],
       ...(balance !== null ? { initialBalanceUsd: balance } : {}),
       ...(form.rpmLimit !== null ? { rpmLimit: form.rpmLimit } : {}),
       ...(form.concurrencyLimit !== null ? { concurrencyLimit: form.concurrencyLimit } : {}),
@@ -339,6 +346,16 @@ async function submit() {
       </p>
 
       <GroupPicker v-model="form.allowedGroupIds" :groups="groups" class="sm:col-span-2" />
+
+      <GroupPicker
+        v-if="form.role === 'group_manager'"
+        v-model="form.managedGroupIds"
+        :groups="managedGroups ?? groups"
+        :label="t('adminUsers.form.managedGroups')"
+        :hint="t('adminUsers.form.managedGroupsHint')"
+        :empty-label="t('adminUsers.form.noGroups')"
+        class="sm:col-span-2"
+      />
 
       <fieldset class="min-w-0 rounded-lg border border-line/80 bg-surface-2/30 p-3.5 sm:col-span-2">
         <legend class="sr-only">{{ t("userLimits.form.title") }}</legend>

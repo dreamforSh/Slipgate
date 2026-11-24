@@ -7,6 +7,7 @@ import {
   DEFAULT_EMAIL_CONFIG,
   type AffiliateCreditMode,
   type EmailConfig,
+  type GroupItem,
   type OAuthProviderConfig,
   type OAuthProviderId,
   type PortalSettings,
@@ -43,9 +44,12 @@ import SettingsSaveBar from "../../components/settings/SettingsSaveBar.vue";
 // Sign-in guards: captcha, sign-up email policy, backend mode, login agreement.
 import BackendModeCard from "../../components/settings/BackendModeCard.vue";
 import AuditRetentionSettingsRow from "../../components/admin/ops/AuditRetentionSettingsRow.vue";
+import AdminApiKeysPanel from "../../components/settings/AdminApiKeysPanel.vue";
 import CaptchaSettingsPanel from "../../components/settings/CaptchaSettingsPanel.vue";
 import LoginAgreementEditor from "../../components/settings/LoginAgreementEditor.vue";
 import RegistrationEmailPolicyCard from "../../components/settings/RegistrationEmailPolicyCard.vue";
+import SitePagesPanel from "../../components/settings/SitePagesPanel.vue";
+import GroupPicker from "../../components/admin/users/GroupPicker.vue";
 import { useAuthGuardSettings } from "../../components/settings/useAuthGuardSettings";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import MarkdownView from "../../components/ui/MarkdownView.vue";
@@ -92,6 +96,9 @@ interface SettingsForm {
   /** Caps for users without their own (0 = unlimited). */
   defaultUserRpm: number | string;
   defaultUserConcurrency: number | string;
+  defaultSignupGroupIds: string[];
+  defaultSignupSubGroupId: string;
+  defaultSignupSubDays: number | string;
   modelPlazaEnabled: boolean;
   statusPageEnabled: boolean;
   keyUsageLookupEnabled: boolean;
@@ -131,6 +138,9 @@ const TAB_FIELDS: Record<TabKey, FieldKey[]> = {
     "defaultApiKeyConcurrency",
     "defaultUserRpm",
     "defaultUserConcurrency",
+    "defaultSignupGroupIds",
+    "defaultSignupSubGroupId",
+    "defaultSignupSubDays",
   ],
   // SMTP settings live behind their own endpoint and are tracked separately (see "Email" below).
   email: [],
@@ -148,6 +158,7 @@ const NUMERIC: FieldKey[] = [
   "defaultApiKeyConcurrency",
   "defaultUserRpm",
   "defaultUserConcurrency",
+  "defaultSignupSubDays",
   "rebatePercent",
 ];
 const URL_RE = /^(https?:\/\/|\/(?!\/))/i;
@@ -195,6 +206,9 @@ function toForm(s: PortalSettings, prevRows: NavLinkRow[] = []): SettingsForm {
     defaultApiKeyConcurrency: s.defaultApiKeyConcurrency,
     defaultUserRpm: s.defaultUserRpm ?? 0,
     defaultUserConcurrency: s.defaultUserConcurrency ?? 0,
+    defaultSignupGroupIds: [...(s.defaultSignupGroupIds ?? [])],
+    defaultSignupSubGroupId: s.defaultSignupSubGroupId ?? "",
+    defaultSignupSubDays: s.defaultSignupSubDays ?? 0,
     modelPlazaEnabled: s.modelPlazaEnabled,
     statusPageEnabled: s.statusPageEnabled,
     keyUsageLookupEnabled: s.keyUsageLookupEnabled,
@@ -206,13 +220,18 @@ function toForm(s: PortalSettings, prevRows: NavLinkRow[] = []): SettingsForm {
 }
 
 function cloneForm(f: SettingsForm): SettingsForm {
-  return { ...f, customNavLinks: f.customNavLinks.map((r) => ({ ...r })) };
+  return {
+    ...f,
+    customNavLinks: f.customNavLinks.map((r) => ({ ...r })),
+    defaultSignupGroupIds: [...f.defaultSignupGroupIds],
+  };
 }
 
 /** Comparable representation of one field (formatting-insensitive for numbers and money). */
 function norm(f: SettingsForm, key: FieldKey): string {
   const v = f[key];
   if (key === "customNavLinks") return JSON.stringify(f.customNavLinks.map((r) => [r.label, r.url]));
+  if (key === "defaultSignupGroupIds") return JSON.stringify([...f.defaultSignupGroupIds].sort());
   if (key === "defaultBalanceUsd" || key === "affiliateMinWithdrawUsd") {
     return usdToNano(String(v)) ?? `raw:${v}`;
   }
@@ -247,6 +266,9 @@ function emptySettings(): PortalSettings {
     defaultApiKeyConcurrency: 5,
     defaultUserRpm: 0,
     defaultUserConcurrency: 0,
+    defaultSignupGroupIds: [],
+    defaultSignupSubGroupId: "",
+    defaultSignupSubDays: 0,
     modelPlazaEnabled: false,
     statusPageEnabled: false,
     keyUsageLookupEnabled: false,
@@ -451,6 +473,8 @@ const clientErrors = computed<Partial<Record<FieldKey, string>>>(() => {
   if (userRpm) e.defaultUserRpm = userRpm;
   const userConc = intError(f.defaultUserConcurrency, 0, 1_000_000);
   if (userConc) e.defaultUserConcurrency = userConc;
+  const subDaysErr = intError(f.defaultSignupSubDays, 0, 3650);
+  if (subDaysErr) e.defaultSignupSubDays = subDaysErr;
   if (f.rebatePercent === "") e.rebatePercent = t("settings.errors.required");
   else {
     const pct = Number(f.rebatePercent);
@@ -539,6 +563,8 @@ const logoPreview = computed(() => {
 });
 
 const origin = window.location.origin;
+const allGroups = ref<GroupItem[]>([]);
+const subscriptionGroups = computed(() => allGroups.value.filter((g) => g.enabled && g.subscriptionType === "subscription"));
 
 const rebateBps = computed(() => {
   const n = Number(form.value.rebatePercent);
@@ -562,6 +588,9 @@ async function load() {
   emailLoadError.value = null;
   oauthLoadError.value = null;
   void guards.loadCaptcha();
+  void apiJson<{ groups: GroupItem[] }>("/api/v1/admin/groups")
+    .then((res) => (allGroups.value = res.groups))
+    .catch(() => {});
   const [settingsRes, emailRes, oauthRes] = await Promise.allSettled([
     apiJson<PortalSettings>("/api/v1/admin/settings"),
     apiJson<EmailConfig>("/api/v1/admin/email/config"),
@@ -643,6 +672,9 @@ function buildPatch(): UpdatePortalSettingsRequest {
       case "defaultUserConcurrency":
         patch.defaultUserConcurrency = Number(f.defaultUserConcurrency);
         invalidatePortalCapDefaults();
+        break;
+      case "defaultSignupSubDays":
+        patch.defaultSignupSubDays = Number(f.defaultSignupSubDays);
         break;
       case "rebatePercent":
         patch.affiliateRebateBps = rebateBps.value;
@@ -1221,12 +1253,60 @@ const stagger = (i: number) => ({ animationDelay: `${Math.min(i, 5) * 60}ms`, an
             </div>
           </UiCard>
 
+          <UiCard
+            class="animate-slide-up motion-reduce:animate-none xl:col-span-2"
+            :style="stagger(2)"
+            icon="layers"
+            :title="t('settings.registration.signupDefaultsTitle')"
+          >
+            <div class="space-y-5">
+              <GroupPicker
+                v-model="form.defaultSignupGroupIds"
+                :groups="allGroups"
+                :label="t('settings.registration.defaultGroups')"
+                :hint="t('settings.registration.defaultGroupsHint')"
+                :empty-label="t('settings.registration.noGroups')"
+              />
+              <div class="grid gap-4 sm:grid-cols-2">
+                <SettingField
+                  input-id="set-signup-sub-group"
+                  :label="t('settings.registration.trialSubGroup')"
+                  :hint="t('settings.registration.trialSubGroupHint')"
+                  :dirty="isDirty('defaultSignupSubGroupId')"
+                >
+                  <select id="set-signup-sub-group" v-model="form.defaultSignupSubGroupId" class="select">
+                    <option value="">{{ t("settings.registration.trialSubNone") }}</option>
+                    <option v-for="g in subscriptionGroups" :key="g.id" :value="g.id">{{ g.name }}</option>
+                  </select>
+                </SettingField>
+                <SettingField
+                  input-id="set-signup-sub-days"
+                  :label="t('settings.registration.trialSubDays')"
+                  :hint="t('settings.registration.trialSubDaysHint')"
+                  :dirty="isDirty('defaultSignupSubDays')"
+                  :error="fieldError('defaultSignupSubDays')"
+                >
+                  <input
+                    id="set-signup-sub-days"
+                    v-model.number="form.defaultSignupSubDays"
+                    type="number"
+                    min="0"
+                    max="3650"
+                    step="1"
+                    class="input font-mono"
+                    :class="fieldError('defaultSignupSubDays') ? errorClass : ''"
+                  />
+                </SettingField>
+              </div>
+            </div>
+          </UiCard>
+
           <!-- Sign-up email domains (allowlist, per-domain quota) -->
           <RegistrationEmailPolicyCard
             v-model:allowlist="guards.portalForm.registrationEmailSuffixAllowlist"
             v-model:quota="guards.portalForm.registrationEmailDomainQuotaEnabled"
             class="animate-slide-up motion-reduce:animate-none xl:col-span-2"
-            :style="stagger(2)"
+            :style="stagger(3)"
             :dirty-keys="guards.portalDirty"
             :errors="guards.portalErrors"
           />
@@ -1252,6 +1332,7 @@ const stagger = (i: number) => ({ animationDelay: `${Math.min(i, 5) * 60}ms`, an
             :dirty="guards.portalDirty.includes('backendModeEnabled')"
           />
           <AuditRetentionSettingsRow class="animate-slide-up motion-reduce:animate-none" :style="stagger(4)" />
+          <AdminApiKeysPanel class="animate-slide-up motion-reduce:animate-none" :style="stagger(5)" />
         </div>
 
         <!-- ============ Login agreement & legal documents ============ -->
@@ -1443,6 +1524,8 @@ const stagger = (i: number) => ({ animationDelay: `${Math.min(i, 5) * 60}ms`, an
             <p class="mb-4 text-xs text-fg-subtle">{{ t("settings.nav.help") }}</p>
             <NavLinksEditor v-model="form.customNavLinks" :max="MAX_NAV_LINKS" :errors="navErrors" />
           </UiCard>
+
+          <SitePagesPanel class="animate-slide-up motion-reduce:animate-none" :style="stagger(3)" />
         </div>
 
         <!-- ============ Referral program ============ -->
