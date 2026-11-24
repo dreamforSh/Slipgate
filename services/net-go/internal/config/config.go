@@ -42,10 +42,11 @@ type Config struct {
 	VMDataDir             string
 	GuestdBin             string
 	DevUIURL              string
-	Mode                  string
-	DevSyncMode           string
-	DevSyncIntervalSec    int
-	UpdateRepo            string
+	Mode                   string
+	DevSyncMode            string
+	DevSyncIntervalSec     int
+	AutoRestartAfterUpdate bool
+	UpdateRepo             string
 	UpdateBranch          string
 	GitRepoDir            string
 	HotUpdateDir          string
@@ -130,10 +131,11 @@ func LoadFromEnv() Config {
 		ClashPortMax:          envInt("SLIPGATE_CLASH_PORT_MAX", 24999),
 		MaxAccountsPerExit:    envInt("SLIPGATE_MAX_ACCOUNTS_PER_EXIT_IP", 1),
 		DevUIURL:              strings.TrimSpace(os.Getenv("SLIPGATE_DEV_UI_URL")),
-		Mode:                  mode,
-		DevSyncMode:           syncMode,
-		DevSyncIntervalSec:    interval,
-		UpdateRepo:            envString("SLIPGATE_UPDATE_REPO", "dreamforSh/Slipgate"),
+		Mode:                   mode,
+		DevSyncMode:            syncMode,
+		DevSyncIntervalSec:     interval,
+		AutoRestartAfterUpdate: envBool("SLIPGATE_AUTO_RESTART_AFTER_UPDATE", true),
+		UpdateRepo:             envString("SLIPGATE_UPDATE_REPO", "dreamforSh/Slipgate"),
 		UpdateBranch:          envString("SLIPGATE_UPDATE_BRANCH", "main"),
 		GitRepoDir:            strings.TrimSpace(os.Getenv("SLIPGATE_GIT_REPO_DIR")),
 		HotUpdateDir:          envString("SLIPGATE_HOTUPDATE_DIR", defaultHotDir),

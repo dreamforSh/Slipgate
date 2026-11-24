@@ -29,11 +29,13 @@ const form = reactive<{
   channel: SystemUpdateChannel;
   autoSyncEnabled: boolean;
   intervalSeconds: number;
+  autoRestartAfterUpdate: boolean;
   strategy: DevSyncStrategy;
 }>({
   channel: "stable",
   autoSyncEnabled: false,
   intervalSeconds: 3600,
+  autoRestartAfterUpdate: true,
   strategy: "auto",
 });
 
@@ -44,6 +46,7 @@ watch(
     form.channel = next.channel;
     form.autoSyncEnabled = next.autoSyncEnabled;
     form.intervalSeconds = next.intervalSeconds > 0 ? next.intervalSeconds : 3600;
+    form.autoRestartAfterUpdate = next.autoRestartAfterUpdate ?? true;
     form.strategy = next.strategy;
   },
   { immediate: true },
@@ -70,6 +73,7 @@ function submit() {
     channel: form.channel,
     autoSyncEnabled: form.autoSyncEnabled,
     intervalSeconds: clamped,
+    autoRestartAfterUpdate: form.autoRestartAfterUpdate,
     strategy: form.strategy,
   });
 }
@@ -156,6 +160,15 @@ function submit() {
             </div>
           </div>
         </FormField>
+      </div>
+
+      <!-- Auto-restart after update toggle -->
+      <div class="flex items-center justify-between gap-4 rounded-xl border border-line bg-surface-2/40 p-4">
+        <div class="space-y-1">
+          <span class="text-xs font-semibold text-fg">{{ t("updates.policy.autoRestartLabel") }}</span>
+          <p class="text-xs leading-relaxed text-fg-muted">{{ t("updates.policy.autoRestartHint") }}</p>
+        </div>
+        <UiSwitch v-model="form.autoRestartAfterUpdate" :disabled="saving" />
       </div>
 
       <!-- Repository & credentials read-only diagnostics -->

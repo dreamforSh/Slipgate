@@ -54,7 +54,8 @@ watch(activeTab, (value) => {
 
 type PendingAction =
   | { kind: "apply"; channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; label?: string }
-  | { kind: "rollback"; releaseId?: string; label: string };
+  | { kind: "rollback"; releaseId?: string; label: string }
+  | { kind: "restart" };
 
 const stepUpOpen = ref(false);
 const pendingAction = ref<PendingAction | null>(null);
@@ -64,6 +65,9 @@ const stepUpTitle = computed(() => {
   if (!act) return t("updates.stepUp.applyTitle");
   if (act.kind === "rollback") {
     return t("updates.stepUp.rollbackTitle", { target: act.label });
+  }
+  if (act.kind === "restart") {
+    return t("updates.stepUp.restartTitle");
   }
   return t("updates.stepUp.applyTitle");
 });
@@ -83,14 +87,46 @@ async function handleCheck() {
   void store.loadReleases(true);
 }
 
+function handlePostMutationFeedback(
+  next: { version: string; bootId?: string; state: string; restartScheduled?: boolean },
+  beforeBootId: string,
+  defaultMsg: string,
+) {
+  if (store.restartTimedOut || next.state === "restarting" || next.restartScheduled) {
+    toast.warning(t("updates.toast.restartTimeout"));
+    return;
+  }
+  if (beforeBootId && next.bootId && next.bootId !== beforeBootId) {
+    toast.success(t("updates.toast.restarted", { version: next.version }));
+    window.setTimeout(() => window.location.reload(), 1000);
+    return;
+  }
+  toast.success(defaultMsg);
+}
+
 async function runApply(opts: { channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; confirm?: AdminStepUp }) {
+  const beforeBootId = store.status?.bootId ?? "";
   const next = await store.applyUpdate(opts);
-  toast.success(t("updates.toast.applied", { version: next.version }));
+  handlePostMutationFeedback(next, beforeBootId, t("updates.toast.applied", { version: next.version }));
 }
 
 async function runRollback(opts: { releaseId?: string; confirm?: AdminStepUp }) {
+  const beforeBootId = store.status?.bootId ?? "";
   const next = await store.rollback(opts);
-  toast.success(t("updates.toast.rolledBack", { version: next.version }));
+  handlePostMutationFeedback(next, beforeBootId, t("updates.toast.rolledBack", { version: next.version }));
+}
+
+async function runRestartEdge(opts: { confirm?: AdminStepUp } = {}) {
+  const beforeBootId = store.status?.bootId ?? "";
+  const next = await store.restartEdge(opts);
+  if (store.restartTimedOut || next.state === "restarting" || next.restartScheduled) {
+    toast.warning(t("updates.toast.restartTimeout"));
+    return;
+  }
+  if (!beforeBootId || !next.bootId || next.bootId !== beforeBootId) {
+    toast.success(t("updates.toast.restarted", { version: next.version }));
+    window.setTimeout(() => window.location.reload(), 1000);
+  }
 }
 
 function requestApply(opts: { channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; label?: string } = {}) {
@@ -133,6 +169,17 @@ function requestRestoreHistory(entry: SystemUpdateHistoryEntry) {
   stepUpOpen.value = true;
 }
 
+function requestRestartEdge() {
+  if (store.requiresStepUpForApply) {
+    pendingAction.value = { kind: "restart" };
+    stepUpOpen.value = true;
+    return;
+  }
+  void runRestartEdge().catch((err) => {
+    toast.error(errorText(err, t("common.requestFailed")));
+  });
+}
+
 async function executeStepUpAction(confirm: AdminStepUp) {
   const act = pendingAction.value;
   if (!act) return;
@@ -143,6 +190,8 @@ async function executeStepUpAction(confirm: AdminStepUp) {
       force: act.force,
       confirm,
     });
+  } else if (act.kind === "restart") {
+    await runRestartEdge({ confirm });
   } else {
     await runRollback({
       releaseId: act.releaseId,
@@ -195,11 +244,13 @@ onBeforeUnmount(() => {
       :checking="store.checking"
       :applying="store.applying"
       :rolling-back="store.rollingBack"
+      :restarting="store.restarting"
       :busy="store.isBusy"
       :error="store.error"
       @check="handleCheck"
       @apply="requestApply()"
       @rollback="requestRollbackLatest"
+      @restart="requestRestartEdge"
     />
 
     <div class="grid gap-6 lg:grid-cols-12">

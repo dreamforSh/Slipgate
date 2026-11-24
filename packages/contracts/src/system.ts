@@ -16,6 +16,7 @@ export const SystemUpdateStateSchema = z.enum([
   "downloading",
   "applying",
   "reloading_planes",
+  "restarting",
   "rolling_back",
   "error",
   "failed",
@@ -125,6 +126,9 @@ export const SystemUpdateStatusSchema = z.object({
   updateAvailable: z.boolean(),
   autoSyncEnabled: z.boolean(),
   intervalSeconds: z.number().int().nonnegative(),
+  autoRestartAfterUpdate: z.boolean().default(true),
+  restartScheduled: z.boolean().default(false),
+  bootId: z.string().default(""),
   state: SystemUpdateStateSchema,
   progress: SystemUpdateProgressSchema.nullable().default(null),
   reloadCount: z.number().int().nonnegative(),
@@ -157,6 +161,7 @@ export const UpdateSystemConfigRequestSchema = z.object({
   channel: SystemUpdateChannelSchema.optional(),
   autoSyncEnabled: z.boolean().optional(),
   intervalSeconds: z.number().int().min(30).max(86400).optional(),
+  autoRestartAfterUpdate: z.boolean().optional(),
   strategy: DevSyncStrategySchema.optional(),
 });
 export type UpdateSystemConfigRequest = z.infer<typeof UpdateSystemConfigRequestSchema>;
@@ -166,3 +171,8 @@ export const RollbackUpdateRequestSchema = z.object({
   confirm: AdminStepUpSchema.optional(),
 });
 export type RollbackUpdateRequest = z.infer<typeof RollbackUpdateRequestSchema>;
+
+export const RestartUpdateRequestSchema = z.object({
+  confirm: AdminStepUpSchema.optional(),
+});
+export type RestartUpdateRequest = z.infer<typeof RestartUpdateRequestSchema>;

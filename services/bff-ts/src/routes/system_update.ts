@@ -1,5 +1,6 @@
 import type { Context, Hono } from "hono";
 import {
+  RestartUpdateRequestSchema,
   RollbackUpdateRequestSchema,
   SystemReleasesResponseSchema,
   SystemUpdateStatusSchema,
@@ -24,6 +25,7 @@ interface StandalonePolicy {
   channel: SystemUpdateChannel;
   autoSyncEnabled: boolean;
   intervalSeconds: number;
+  autoRestartAfterUpdate: boolean;
   strategy: DevSyncStrategy;
 }
 
@@ -75,6 +77,7 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
     channel: initialStandalone.channel,
     autoSyncEnabled: initialStandalone.autoSyncEnabled,
     intervalSeconds: initialStandalone.intervalSeconds,
+    autoRestartAfterUpdate: initialStandalone.autoRestartAfterUpdate,
     strategy: initialStandalone.strategy,
   };
 
@@ -86,6 +89,7 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
       channel: standalonePolicy.channel,
       autoSyncEnabled: standalonePolicy.autoSyncEnabled,
       intervalSeconds: standalonePolicy.intervalSeconds,
+      autoRestartAfterUpdate: standalonePolicy.autoRestartAfterUpdate,
       strategy: standalonePolicy.strategy,
       resolvedStrategy: standalonePolicy.strategy === "git" ? "git" : "release",
       githubTokenConfigured: Boolean(process.env.SLIPGATE_GITHUB_TOKEN || process.env.GITHUB_TOKEN),
@@ -224,6 +228,9 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
       if (parsed.data.channel !== undefined) standalonePolicy.channel = parsed.data.channel;
       if (parsed.data.autoSyncEnabled !== undefined) standalonePolicy.autoSyncEnabled = parsed.data.autoSyncEnabled;
       if (parsed.data.intervalSeconds !== undefined) standalonePolicy.intervalSeconds = parsed.data.intervalSeconds;
+      if (parsed.data.autoRestartAfterUpdate !== undefined) {
+        standalonePolicy.autoRestartAfterUpdate = parsed.data.autoRestartAfterUpdate;
+      }
       if (parsed.data.strategy !== undefined) standalonePolicy.strategy = parsed.data.strategy;
       return c.json(currentStandaloneStatus());
     }
@@ -281,6 +288,64 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
         },
         body: JSON.stringify({ releaseId: parsed.data.releaseId }),
         signal: AbortSignal.timeout(60_000),
+      });
+      const payload = (await res.json()) as Record<string, unknown>;
+      if (!res.ok) {
+        return c.json(payload, forwardSupervisorErrorStatus(res.status));
+      }
+      return c.json(SystemUpdateStatusSchema.parse(payload));
+    } catch (err) {
+      return unreachableResponse(c, err);
+    }
+  });
+
+  app.post("/api/v1/admin/system/update/restart", async (c) => {
+    const bodyResult = await readJsonBody(c);
+    if (!bodyResult.ok) return bodyResult.response;
+
+    const parsed = RestartUpdateRequestSchema.safeParse(bodyResult.data);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    }
+
+    const sup = supervisorCredentials();
+    if (!sup) {
+      const claims = c.get("authUser");
+      const denied = await totpStepUp(store, vaultSecret).confirmAdmin(c, sessions, claims.sub, parsed.data.confirm);
+      if (denied) return denied;
+      return c.json(
+        {
+          error: "restart_unavailable_standalone",
+          message: "Service restart requires the unified Slipgate supervisor runtime",
+        },
+        409,
+      );
+    }
+
+    try {
+      const statusRes = await fetch(`${sup.url}/internal/supervisor/update`, {
+        headers: { "X-Slipgate-Internal-Token": sup.token },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!statusRes.ok) {
+        const payload = (await statusRes.json().catch(() => ({}))) as Record<string, unknown>;
+        return c.json(payload, forwardSupervisorErrorStatus(statusRes.status));
+      }
+      const statusJson = SystemUpdateStatusSchema.parse(await statusRes.json());
+      if (statusJson.mode !== "dev") {
+        const claims = c.get("authUser");
+        const denied = await totpStepUp(store, vaultSecret).confirmAdmin(c, sessions, claims.sub, parsed.data.confirm);
+        if (denied) return denied;
+      }
+
+      const res = await fetch(`${sup.url}/internal/supervisor/update/restart`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Slipgate-Internal-Token": sup.token,
+        },
+        body: JSON.stringify({}),
+        signal: AbortSignal.timeout(15_000),
       });
       const payload = (await res.json()) as Record<string, unknown>;
       if (!res.ok) {

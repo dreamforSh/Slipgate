@@ -247,6 +247,7 @@ const en: typeof zh = {
       systemUpdateSync: "Sync system update",
       systemUpdateConfig: "Update system update policy",
       systemUpdateRollback: "Roll back system version",
+      systemUpdateRestart: "Restart Slipgate service",
       userAttrCreate: "Create user attribute",
       userAttrUpdate: "Update user attribute",
       userAttrDelete: "Delete user attribute",

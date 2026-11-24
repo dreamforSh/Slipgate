@@ -15,16 +15,18 @@ import (
 )
 
 type persistedConfig struct {
-	Channel         string `json:"channel"`
-	AutoSyncEnabled bool   `json:"autoSyncEnabled"`
-	IntervalSeconds int    `json:"intervalSeconds"`
-	Strategy        string `json:"strategy"`
+	Channel                string `json:"channel"`
+	AutoSyncEnabled        bool   `json:"autoSyncEnabled"`
+	IntervalSeconds        int    `json:"intervalSeconds"`
+	AutoRestartAfterUpdate *bool  `json:"autoRestartAfterUpdate,omitempty"`
+	Strategy               string `json:"strategy"`
 }
 
 type baselineSnapshot struct {
 	Version    string `json:"version"`
 	Commit     string `json:"commit"`
 	Tag        string `json:"tag,omitempty"`
+	EdgeBin    string `json:"edgeBin,omitempty"`
 	CoreBin    string `json:"coreBin,omitempty"`
 	BFFBin     string `json:"bffBin,omitempty"`
 	WebUIDir   string `json:"webUiDir,omitempty"`
@@ -80,6 +82,9 @@ func (m *Manager) loadPersistedState() {
 				m.status.IntervalSeconds = pc.IntervalSeconds
 			}
 			m.status.AutoSyncEnabled = pc.AutoSyncEnabled
+			if pc.AutoRestartAfterUpdate != nil {
+				m.status.AutoRestartAfterUpdate = *pc.AutoRestartAfterUpdate
+			}
 		}
 	}
 
@@ -91,17 +96,59 @@ func (m *Manager) loadPersistedState() {
 			m.history = ph.Entries
 		}
 	}
+
+	if active, ok := LoadActiveRelease(m.cfg.HotUpdateDir); ok {
+		validBundle := bundleDirExists(active.BundleDir)
+		if validBundle || active.Version != "" || active.Commit != "" {
+			if strings.TrimSpace(active.Version) != "" {
+				m.status.Version = active.Version
+			}
+			if strings.TrimSpace(active.Commit) != "" {
+				m.status.ActiveCommit = active.Commit
+			}
+			if validBundle {
+				m.activeBundleDir = active.BundleDir
+			}
+			m.activeTag = active.Tag
+			if active.WebUIDir != "" {
+				if info, err := os.Stat(filepath.Join(active.WebUIDir, "index.html")); err == nil && !info.IsDir() {
+					m.activeWebUIDir = active.WebUIDir
+					m.status.WebUIOverridden = true
+				}
+			}
+			if active.GuestdBin != "" {
+				if info, err := os.Stat(active.GuestdBin); err == nil && !info.IsDir() {
+					m.guestdBin = active.GuestdBin
+					m.status.GuestdUpdated = true
+				}
+			}
+			if active.EdgeBin != "" {
+				samePath := SameExecutablePath(m.currentExePath(), active.EdgeBin)
+				sameBaseCommit := active.Commit != "" && commitsEqual(m.baseCommit, active.Commit)
+				if samePath || sameBaseCommit {
+					m.status.EdgeBinaryStaged = false
+					m.status.EdgeBinaryPath = nil
+				} else if info, err := os.Stat(active.EdgeBin); err == nil && !info.IsDir() {
+					p := active.EdgeBin
+					m.status.EdgeBinaryStaged = true
+					m.status.EdgeBinaryPath = &p
+				}
+			}
+		}
+	}
 }
 
 func (m *Manager) savePersistedConfigLocked() error {
 	if m.cfg.HotUpdateDir == "" {
 		return nil
 	}
+	autoRestart := m.status.AutoRestartAfterUpdate
 	payload := persistedConfig{
-		Channel:         m.status.Channel,
-		AutoSyncEnabled: m.status.AutoSyncEnabled,
-		IntervalSeconds: m.status.IntervalSeconds,
-		Strategy:        m.cfg.DevSyncMode,
+		Channel:                m.status.Channel,
+		AutoSyncEnabled:        m.status.AutoSyncEnabled,
+		IntervalSeconds:        m.status.IntervalSeconds,
+		AutoRestartAfterUpdate: &autoRestart,
+		Strategy:               m.cfg.DevSyncMode,
 	}
 	return writeJSONAtomic(filepath.Join(m.cfg.HotUpdateDir, "config.json"), payload)
 }
@@ -143,6 +190,7 @@ func (m *Manager) UpdateConfig(patch ConfigPatch) (StatusSnapshot, error) {
 	nextChannel := m.status.Channel
 	nextAutoSync := m.status.AutoSyncEnabled
 	nextInterval := m.status.IntervalSeconds
+	nextAutoRestart := m.status.AutoRestartAfterUpdate
 	nextStrategy := m.cfg.DevSyncMode
 
 	if patch.Channel != nil {
@@ -164,6 +212,9 @@ func (m *Manager) UpdateConfig(patch ConfigPatch) (StatusSnapshot, error) {
 		}
 		nextInterval = sec
 	}
+	if patch.AutoRestartAfterUpdate != nil {
+		nextAutoRestart = *patch.AutoRestartAfterUpdate
+	}
 	if patch.Strategy != nil {
 		st := strings.ToLower(strings.TrimSpace(*patch.Strategy))
 		if st != "auto" && st != "release" && st != "git" {
@@ -181,8 +232,10 @@ func (m *Manager) UpdateConfig(patch ConfigPatch) (StatusSnapshot, error) {
 	m.status.Channel = nextChannel
 	m.status.AutoSyncEnabled = nextAutoSync
 	m.status.IntervalSeconds = nextInterval
+	m.status.AutoRestartAfterUpdate = nextAutoRestart
 	m.cfg.DevSyncIntervalSec = nextInterval
 	m.cfg.DevSyncMode = nextStrategy
+	m.cfg.AutoRestartAfterUpdate = nextAutoRestart
 	m.status.Strategy = nextStrategy
 	m.status.ResolvedStrategy = resolveStrategy(nextStrategy, m.repoDir)
 	if channelChanged {
@@ -226,6 +279,11 @@ func (m *Manager) captureBaselineLocked() {
 		GuestdBin:  m.guestdBin,
 		CapturedAt: isoNow(),
 	}
+	if m.onEdgeRestart != nil {
+		if edgeBak, err := backupBaselineEdge(m.cfg.HotUpdateDir, m.currentExePath()); err == nil && edgeBak != "" {
+			snap.EdgeBin = edgeBak
+		}
+	}
 	if m.sup != nil {
 		if bin, ok := m.sup.ChildBinary("core"); ok {
 			snap.CoreBin = bin
@@ -247,16 +305,8 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 		prevSnap.PrevCoreBin, prevSnap.HasCore = m.sup.ChildBinary("core")
 		prevSnap.PrevBFFBin, prevSnap.HasBFF = m.sup.ChildBinary("bff")
 	}
+	autoRestartEnabled := m.status.AutoRestartAfterUpdate
 	m.mu.Unlock()
-
-	webDir := filepath.Join(req.BundleRoot, "webui")
-	webOverridden := false
-	if info, err := os.Stat(filepath.Join(webDir, "index.html")); err == nil && !info.IsDir() {
-		if m.onWebUIDir != nil {
-			m.onWebUIDir(webDir)
-		}
-		webOverridden = true
-	}
 
 	ext := exeExt()
 	coreBin := filepath.Join(req.BundleRoot, "slipgate-core"+ext)
@@ -266,10 +316,32 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 
 	edgeStaged := false
 	var edgeStagedPtr *string
+	var restartTarget string
 	if info, err := os.Stat(edgeBin); err == nil && !info.IsDir() {
-		edgeStaged = true
-		p := edgeBin
-		edgeStagedPtr = &p
+		_ = os.Chmod(edgeBin, 0o755)
+		if m.onEdgeRestart != nil || m.validateEdgeBin != nil {
+			stagedPath, valErr := prepareAndStageEdgeBinary(ctx, m.currentExePath(), edgeBin, m.validateEdgeBin)
+			if valErr != nil {
+				return false, valErr
+			}
+			edgeStaged = true
+			p := stagedPath
+			edgeStagedPtr = &p
+			restartTarget = stagedPath
+		} else {
+			edgeStaged = true
+			p := edgeBin
+			edgeStagedPtr = &p
+		}
+	}
+
+	webDir := filepath.Join(req.BundleRoot, "webui")
+	webOverridden := false
+	if info, err := os.Stat(filepath.Join(webDir, "index.html")); err == nil && !info.IsDir() {
+		if m.onWebUIDir != nil {
+			m.onWebUIDir(webDir)
+		}
+		webOverridden = true
 	}
 
 	guestdUpdated := false
@@ -289,17 +361,56 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 		}
 	}
 
+	activeCoreBin := prevSnap.PrevCoreBin
+	if info, err := os.Stat(coreBin); err == nil && !info.IsDir() {
+		_ = os.Chmod(coreBin, 0o755)
+		activeCoreBin = coreBin
+	}
+	activeBFFBin := prevSnap.PrevBFFBin
+	if info, err := os.Stat(bffBin); err == nil && !info.IsDir() {
+		_ = os.Chmod(bffBin, 0o755)
+		activeBFFBin = bffBin
+	}
+	activeWebDir := prevSnap.PrevWebUIDir
+	if webOverridden {
+		activeWebDir = webDir
+	} else if req.Action == "rollback" && req.BundleRoot == "" {
+		activeWebDir = ""
+	}
+	activeGuestd := m.guestdBin
+	if guestdUpdated {
+		activeGuestd = stagedGuestdPath
+	}
+
+	if err := saveActiveRelease(m.cfg.HotUpdateDir, &ActiveRelease{
+		Version:     req.NewVersion,
+		Commit:      req.NewCommit,
+		Tag:         req.Tag,
+		BaseVersion: m.baseVersion,
+		BaseCommit:  m.baseCommit,
+		BundleDir:   req.BundleRoot,
+		EdgeBin:     restartTarget,
+		CoreBin:     activeCoreBin,
+		BFFBin:      activeBFFBin,
+		GuestdBin:   activeGuestd,
+		WebUIDir:    activeWebDir,
+		UpdatedAt:   isoNow(),
+	}); err != nil {
+		return false, fmt.Errorf("persist active release: %w", err)
+	}
+
+	willAutoRestartEdge := m.onEdgeRestart != nil && autoRestartEnabled && restartTarget != ""
 	reloaded := false
-	if m.sup != nil {
+	if willAutoRestartEdge {
+		reloaded = true
+	} else if m.sup != nil {
 		updatedChild := false
-		if info, err := os.Stat(coreBin); err == nil && !info.IsDir() {
-			_ = os.Chmod(coreBin, 0o755)
+		if activeCoreBin != "" && activeCoreBin == coreBin {
 			if err := m.sup.UpdateChildBinary("core", coreBin); err == nil {
 				updatedChild = true
 			}
 		}
-		if info, err := os.Stat(bffBin); err == nil && !info.IsDir() {
-			_ = os.Chmod(bffBin, 0o755)
+		if activeBFFBin != "" && activeBFFBin == bffBin {
 			if err := m.sup.UpdateChildBinary("bff", bffBin); err == nil {
 				updatedChild = true
 			}
@@ -363,6 +474,11 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	if reloaded || webOverridden {
 		m.status.ReloadCount++
 	}
+	if willAutoRestartEdge {
+		m.status.RestartScheduled = true
+		m.status.State = StateRestarting
+		m.status.LastError = nil
+	}
 	m.activeBundleDir = req.BundleRoot
 	m.activeTag = req.Tag
 
@@ -370,6 +486,10 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	m.appendHistoryLocked(entry)
 	_ = m.savePersistedHistoryLocked()
 	m.mu.Unlock()
+
+	if willAutoRestartEdge {
+		m.triggerEdgeRestart(restartTarget, req.AsyncRestart)
+	}
 
 	return true, nil
 }
@@ -470,7 +590,11 @@ func (m *Manager) Rollback(ctx context.Context, releaseID string, asyncRestart b
 		return m.Status(), applyErr
 	}
 
-	m.setState(StateIdle, nil)
+	if m.isRestartScheduled() {
+		m.setState(StateRestarting, nil)
+	} else {
+		m.setState(StateIdle, nil)
+	}
 	return m.Status(), nil
 }
 
@@ -482,6 +606,34 @@ func (m *Manager) restoreBaseline(
 	fromCommit string,
 	channel string,
 ) error {
+	m.mu.RLock()
+	autoRestartEnabled := m.status.AutoRestartAfterUpdate
+	m.mu.RUnlock()
+
+	var (
+		edgeStaged    bool
+		edgeStagedPtr *string
+		restartTarget string
+	)
+	if base.EdgeBin != "" {
+		if info, err := os.Stat(base.EdgeBin); err == nil && !info.IsDir() {
+			if m.onEdgeRestart != nil || m.validateEdgeBin != nil {
+				stagedPath, valErr := prepareAndStageEdgeBinary(ctx, m.currentExePath(), base.EdgeBin, m.validateEdgeBin)
+				if valErr != nil {
+					return valErr
+				}
+				edgeStaged = true
+				p := stagedPath
+				edgeStagedPtr = &p
+				restartTarget = stagedPath
+			}
+		}
+	}
+
+	if err := ClearActiveRelease(m.cfg.HotUpdateDir); err != nil {
+		return fmt.Errorf("clear active release during baseline rollback: %w", err)
+	}
+
 	if m.onWebUIDir != nil {
 		m.onWebUIDir(base.WebUIDir)
 	}
@@ -489,8 +641,11 @@ func (m *Manager) restoreBaseline(
 		m.onGuestdBin(base.GuestdBin)
 	}
 
+	willAutoRestartEdge := m.onEdgeRestart != nil && autoRestartEnabled && restartTarget != ""
 	reloaded := false
-	if m.sup != nil {
+	if willAutoRestartEdge {
+		reloaded = true
+	} else if m.sup != nil {
 		updated := false
 		if base.CoreBin != "" {
 			if err := m.sup.UpdateChildBinary("core", base.CoreBin); err == nil {
@@ -532,8 +687,8 @@ func (m *Manager) restoreBaseline(
 	m.status.Version = base.Version
 	m.status.ActiveCommit = base.Commit
 	m.status.WebUIOverridden = base.WebUIDir != ""
-	m.status.EdgeBinaryStaged = false
-	m.status.EdgeBinaryPath = nil
+	m.status.EdgeBinaryStaged = edgeStaged
+	m.status.EdgeBinaryPath = edgeStagedPtr
 	m.status.GuestdUpdated = false
 	m.status.UpdateAvailable = false
 	m.status.LastUpdatedAtIso = &updatedAt
@@ -543,6 +698,11 @@ func (m *Manager) restoreBaseline(
 	m.activeTag = base.Tag
 	if reloaded {
 		m.status.ReloadCount++
+	}
+	if willAutoRestartEdge {
+		m.status.RestartScheduled = true
+		m.status.State = StateRestarting
+		m.status.LastError = nil
 	}
 	m.appendHistoryLocked(buildHistoryEntry(applyBundleRequest{
 		NewCommit:   base.Commit,
@@ -556,7 +716,57 @@ func (m *Manager) restoreBaseline(
 	}))
 	_ = m.savePersistedHistoryLocked()
 	m.mu.Unlock()
+
+	if willAutoRestartEdge {
+		m.triggerEdgeRestart(restartTarget, asyncRestart)
+	}
 	return nil
+}
+
+// TriggerRestart validates any staged edge binary (or the current executable) and schedules a
+// graceful edge drain and self-restart so updated or rolled-back edge binaries take effect immediately.
+func (m *Manager) TriggerRestart(ctx context.Context, async bool) (StatusSnapshot, error) {
+	if m.onEdgeRestart == nil {
+		return m.Status(), ErrRestartUnavailable
+	}
+	if !m.syncMu.TryLock() {
+		return m.Status(), ErrUpdateBusy
+	}
+	defer m.syncMu.Unlock()
+
+	m.mu.RLock()
+	staged := m.status.EdgeBinaryStaged
+	stagedPath := ""
+	if m.status.EdgeBinaryPath != nil {
+		stagedPath = strings.TrimSpace(*m.status.EdgeBinaryPath)
+	}
+	m.mu.RUnlock()
+
+	target := m.currentExePath()
+	if staged && stagedPath != "" {
+		if _, err := os.Stat(stagedPath); err != nil {
+			return m.Status(), fmt.Errorf("hotupdate: staged edge binary unavailable: %w", err)
+		}
+		target = stagedPath
+	}
+	if target == "" {
+		return m.Status(), ErrRestartUnavailable
+	}
+	if m.validateEdgeBin != nil {
+		if err := m.validateEdgeBin(ctx, target); err != nil {
+			return m.Status(), err
+		}
+	}
+
+	m.mu.Lock()
+	m.status.RestartScheduled = true
+	m.status.State = StateRestarting
+	m.status.LastError = nil
+	snap := m.snapshotLocked()
+	m.mu.Unlock()
+
+	m.triggerEdgeRestart(target, async)
+	return snap, nil
 }
 
 type rollbackTarget struct {

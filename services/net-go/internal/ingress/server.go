@@ -156,6 +156,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /internal/supervisor/update/sync", s.handleInternalUpdateSync)
 	mux.HandleFunc("PUT /internal/supervisor/update/config", s.handleInternalUpdateConfig)
 	mux.HandleFunc("POST /internal/supervisor/update/rollback", s.handleInternalUpdateRollback)
+	mux.HandleFunc("POST /internal/supervisor/update/restart", s.handleInternalUpdateRestart)
 	mux.HandleFunc("POST /internal/net/dataplane/sync", s.handleInternalDataPlaneSync)
 	s.registerClashInternalRoutes(mux)
 	s.registerVmInternalRoutes(mux)
@@ -442,6 +443,34 @@ func (s *Server) handleInternalUpdateRollback(w http.ResponseWriter, r *http.Req
 		if errors.Is(err, hotupdate.ErrRollbackUnavailable) || errors.Is(err, hotupdate.ErrUpdateBusy) {
 			code = http.StatusConflict
 			errCode = "rollback_unavailable"
+		}
+		writeJSON(w, code, map[string]any{
+			"error":   errCode,
+			"message": err.Error(),
+			"status":  status,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleInternalUpdateRestart(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.updater == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "hotupdate_unavailable",
+		})
+		return
+	}
+	status, err := s.updater.TriggerRestart(r.Context(), true)
+	if err != nil {
+		code := http.StatusBadGateway
+		errCode := "restart_failed"
+		if errors.Is(err, hotupdate.ErrRestartUnavailable) || errors.Is(err, hotupdate.ErrUpdateBusy) {
+			code = http.StatusConflict
+			errCode = "restart_unavailable"
 		}
 		writeJSON(w, code, map[string]any{
 			"error":   errCode,

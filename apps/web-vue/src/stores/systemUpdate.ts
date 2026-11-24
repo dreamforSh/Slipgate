@@ -8,13 +8,14 @@ import type {
   SystemUpdateStatus,
   UpdateSystemConfigRequest,
 } from "@slipgate/contracts";
-import { apiJson, errorText } from "../lib/api";
+import { ApiError, apiJson, errorText } from "../lib/api";
 
 const BUSY_STATES = new Set([
   "checking",
   "downloading",
   "applying",
   "reloading_planes",
+  "restarting",
   "rolling_back",
 ]);
 
@@ -32,6 +33,8 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
   const checking = ref(false);
   const applying = ref(false);
   const rollingBack = ref(false);
+  const restarting = ref(false);
+  const restartTimedOut = ref(false);
   const savingConfig = ref(false);
   const error = ref<string | null>(null);
 
@@ -43,6 +46,7 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
       checking.value ||
       applying.value ||
       rollingBack.value ||
+      restarting.value ||
       (status.value !== null && BUSY_STATES.has(status.value.state)),
   );
 
@@ -53,11 +57,11 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
 
   function syncPolling() {
     const active = status.value !== null && BUSY_STATES.has(status.value.state);
-    if (active && pollTimer === undefined) {
+    if (active && !restarting.value && pollTimer === undefined) {
       pollTimer = window.setInterval(() => {
         void loadStatus(true);
       }, 1500);
-    } else if (!active && !applying.value && !rollingBack.value && pollTimer !== undefined) {
+    } else if ((!active || restarting.value) && !applying.value && !rollingBack.value && pollTimer !== undefined) {
       window.clearInterval(pollTimer);
       pollTimer = undefined;
     }
@@ -135,12 +139,53 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
     }
   }
 
+  async function waitForRestartRecovery(prevBootId: string): Promise<SystemUpdateStatus | null> {
+    restarting.value = true;
+    restartTimedOut.value = false;
+    stopPolling();
+    error.value = null;
+
+    const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+    await sleep(1500);
+
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      try {
+        const next = await apiJson<SystemUpdateStatus>("/api/v1/admin/system/update");
+        if ((!prevBootId || next.bootId !== prevBootId) && next.state !== "restarting" && !next.restartScheduled) {
+          status.value = next;
+          restarting.value = false;
+          syncPolling();
+          void loadReleases(true);
+          return next;
+        }
+        status.value = next;
+      } catch (err) {
+        if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+          restarting.value = false;
+          error.value = err.message;
+          syncPolling();
+          throw err;
+        }
+        // Transient network reset / 502 / 503 while Slipgate drains and re-execs is expected.
+      }
+      await sleep(1500);
+    }
+
+    restarting.value = false;
+    restartTimedOut.value = true;
+    error.value = "Timed out waiting for Slipgate service reconnect; refresh manually to verify.";
+    syncPolling();
+    return null;
+  }
+
   async function applyUpdate(opts: {
     channel?: SystemUpdateChannel;
     targetTag?: string;
     force?: boolean;
     confirm?: AdminStepUp;
   }): Promise<SystemUpdateStatus> {
+    const prevBootId = status.value?.bootId ?? "";
     applying.value = true;
     error.value = null;
     // Start polling right away so download bytes & stage stepper update live while the request runs.
@@ -161,6 +206,11 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
         },
       });
       status.value = next;
+      if (next.restartScheduled || next.state === "restarting") {
+        applying.value = false;
+        const recovered = await waitForRestartRecovery(prevBootId);
+        return recovered ?? next;
+      }
       void loadReleases(true);
       return next;
     } catch (err) {
@@ -174,6 +224,7 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
   }
 
   async function rollback(opts: { releaseId?: string; confirm?: AdminStepUp }): Promise<SystemUpdateStatus> {
+    const prevBootId = status.value?.bootId ?? "";
     rollingBack.value = true;
     error.value = null;
     try {
@@ -185,6 +236,11 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
         },
       });
       status.value = next;
+      if (next.restartScheduled || next.state === "restarting") {
+        rollingBack.value = false;
+        const recovered = await waitForRestartRecovery(prevBootId);
+        return recovered ?? next;
+      }
       void loadReleases(true);
       return next;
     } catch (err) {
@@ -194,6 +250,33 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
     } finally {
       rollingBack.value = false;
       syncPolling();
+    }
+  }
+
+  async function restartEdge(opts: { confirm?: AdminStepUp } = {}): Promise<SystemUpdateStatus> {
+    const prevBootId = status.value?.bootId ?? "";
+    restarting.value = true;
+    restartTimedOut.value = false;
+    error.value = null;
+    try {
+      const next = await apiJson<SystemUpdateStatus>("/api/v1/admin/system/update/restart", {
+        method: "POST",
+        body: { confirm: opts.confirm },
+      });
+      status.value = next;
+      const recovered = await waitForRestartRecovery(prevBootId);
+      return recovered ?? next;
+    } catch (err) {
+      if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+        restarting.value = false;
+        error.value = errorText(err, "Failed to restart Slipgate service");
+        throw err;
+      }
+      const recovered = await waitForRestartRecovery(prevBootId);
+      if (recovered) {
+        return recovered;
+      }
+      throw err;
     }
   }
 
@@ -224,6 +307,8 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
     checking,
     applying,
     rollingBack,
+    restarting,
+    restartTimedOut,
     savingConfig,
     error,
     isBusy,
@@ -236,6 +321,8 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
     checkForUpdates,
     applyUpdate,
     rollback,
+    restartEdge,
+    waitForRestartRecovery,
     saveConfig,
     stopPolling,
   };

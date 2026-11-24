@@ -157,11 +157,19 @@ func TestInternalSupervisorUpdateAuthAndStatus(t *testing.T) {
 		t.Fatalf("NewServer failed: %v", err)
 	}
 	srv.WithCommit("c08e679")
+	restartCh := make(chan string, 1)
 	srv.WithHotUpdater(hotupdate.NewManager(hotupdate.Options{
 		Config:        cfg,
 		Version:       "0.1.0-test",
 		InitialCommit: "c08e679",
 		Logger:        log.New(io.Discard, "", 0),
+		RestartDelay:  10 * time.Millisecond,
+		ValidateEdgeBin: func(_ context.Context, _ string) error {
+			return nil
+		},
+		OnEdgeRestart: func(target string) {
+			restartCh <- target
+		},
 	}))
 	handler := srv.Handler()
 
@@ -195,6 +203,33 @@ func TestInternalSupervisorUpdateAuthAndStatus(t *testing.T) {
 	}
 	if snapshot.Mode != "dev" || snapshot.ActiveCommit != "c08e679" {
 		t.Fatalf("unexpected snapshot: %+v", snapshot)
+	}
+
+	// Restart endpoint enforces internal token and triggers OnEdgeRestart.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/supervisor/update/restart", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on restart without internal token, got %d", rec.Code)
+	}
+
+	reqRestart := httptest.NewRequest(http.MethodPost, "/internal/supervisor/update/restart", nil)
+	reqRestart.Header.Set("X-Slipgate-Internal-Token", cfg.InternalToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqRestart)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on restart with internal token, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var restartSnap hotupdate.StatusSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &restartSnap); err != nil {
+		t.Fatalf("decode restart snapshot: %v", err)
+	}
+	if restartSnap.State != hotupdate.StateRestarting || !restartSnap.RestartScheduled {
+		t.Fatalf("expected restarting snapshot, got %+v", restartSnap)
+	}
+	select {
+	case <-restartCh:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for OnEdgeRestart callback")
 	}
 }
 

@@ -36,6 +36,7 @@ func TestPublicListenerNeverServesInternalRoutes(t *testing.T) {
 	for _, p := range []string{
 		"/internal",
 		"/internal/supervisor/update",
+		"/internal/supervisor/update/restart",
 		"/internal/net/dataplane/settlements/dead-letter",
 		"/api/v1/internal/dataplane/snapshot",
 		"/api/v1/../v1/internal/dataplane/snapshot",

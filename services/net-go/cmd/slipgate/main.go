@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -73,6 +74,80 @@ func main() {
 			"Never expose this instance.", summary)
 	}
 
+	if active, ok := hotupdate.LoadActiveRelease(cfg.HotUpdateDir); ok {
+		baseMismatch := active.BaseCommit != "" &&
+			!hotupdate.CommitsEqual(active.BaseCommit, commit) &&
+			!hotupdate.CommitsEqual(active.Commit, commit)
+		if baseMismatch {
+			logger.Printf(
+				"[hotupdate] detected external upgrade (binary commit=%s, active base=%s target=%s); clearing active release",
+				commit,
+				active.BaseCommit,
+				active.Commit,
+			)
+			_ = hotupdate.ClearActiveRelease(cfg.HotUpdateDir)
+		} else {
+			if active.EdgeBin != "" {
+				if info, stErr := os.Stat(active.EdgeBin); stErr == nil && !info.IsDir() {
+					curExe := hotupdate.ResolvedCurrentExecutable()
+					if !hotupdate.SameExecutablePath(curExe, active.EdgeBin) && os.Getenv("SLIPGATE_REEXEC_GUARD") != active.EdgeBin {
+						logger.Printf("[hotupdate] handing off startup to active release edge binary %s", active.EdgeBin)
+						if execErr := execSelf(active.EdgeBin); execErr != nil {
+							logger.Printf("[hotupdate] startup handoff to %s failed (continuing with current binary): %v", active.EdgeBin, execErr)
+						} else {
+							return
+						}
+					}
+				}
+			}
+			if active.CoreBin != "" {
+				if info, stErr := os.Stat(active.CoreBin); stErr == nil && !info.IsDir() {
+					cfg.CoreBin = active.CoreBin
+				}
+			}
+			if active.BFFBin != "" {
+				if info, stErr := os.Stat(active.BFFBin); stErr == nil && !info.IsDir() {
+					cfg.BFFBin = active.BFFBin
+				}
+			}
+			if active.GuestdBin != "" {
+				if info, stErr := os.Stat(active.GuestdBin); stErr == nil && !info.IsDir() {
+					cfg.GuestdBin = active.GuestdBin
+				}
+			}
+			if active.WebUIDir != "" {
+				if info, stErr := os.Stat(filepath.Join(active.WebUIDir, "index.html")); stErr == nil && !info.IsDir() {
+					cfg.WebUIDir = active.WebUIDir
+				}
+			}
+		}
+	}
+	_ = os.Unsetenv("SLIPGATE_REEXEC_GUARD")
+
+	restartTarget, err := run(cfg, logFwd, logger)
+	if err != nil {
+		logger.Fatalf("%v", err)
+	}
+	if restartTarget != "" {
+		logger.Printf("[hotupdate] executing edge restart -> %s", restartTarget)
+		if execErr := execSelf(restartTarget); execErr != nil {
+			logger.Fatalf("[hotupdate] edge restart failed (%s): %v", restartTarget, execErr)
+		}
+	}
+}
+
+func withEnv(base []string, key, val string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(base)+1)
+	for _, entry := range base {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+	return append(out, prefix+val)
+}
+
+func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (string, error) {
 	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
@@ -88,7 +163,7 @@ func main() {
 		})
 		if openErr != nil {
 			if !cfg.AllowDegraded {
-				logger.Fatalf("failed to start embedded mihomo core: %v", openErr)
+				return "", fmt.Errorf("failed to start embedded mihomo core: %w", openErr)
 			}
 			logger.Printf("[clash] embedded mihomo degraded (continuing): %v", openErr)
 		} else {
@@ -105,7 +180,7 @@ func main() {
 	if cfg.DatabaseURL != "" {
 		pgStore, pgErr := clashpool.NewPostgresNetStore(cfg.DatabaseURL, cfg.VaultSecret)
 		if pgErr != nil {
-			logger.Fatalf("failed to initialize net postgres store: %v", pgErr)
+			return "", fmt.Errorf("failed to initialize net postgres store: %w", pgErr)
 		}
 		netStore = pgStore
 	} else {
@@ -127,7 +202,7 @@ func main() {
 	})
 	if err := clashCoord.Bootstrap(rootCtx); err != nil {
 		if !cfg.AllowDegraded {
-			logger.Fatalf("failed to bootstrap Clash/uTLS pool: %v", err)
+			return "", fmt.Errorf("failed to bootstrap Clash/uTLS pool: %w", err)
 		}
 		logger.Printf("[clash] bootstrap degraded (continuing): %v", err)
 	}
@@ -138,7 +213,7 @@ func main() {
 	if cfg.DatabaseURL != "" {
 		pgVmStore, pgErr := vmslot.NewPostgresVmStore(cfg.DatabaseURL, cfg.VaultSecret)
 		if pgErr != nil {
-			logger.Fatalf("failed to initialize vm postgres store: %v", pgErr)
+			return "", fmt.Errorf("failed to initialize vm postgres store: %w", pgErr)
 		}
 		vmStore = pgVmStore
 	} else {
@@ -156,7 +231,7 @@ func main() {
 	})
 	if err := vmCoord.Bootstrap(rootCtx); err != nil {
 		if !cfg.AllowDegraded {
-			logger.Fatalf("failed to bootstrap VM fleet coordinator: %v", err)
+			return "", fmt.Errorf("failed to bootstrap VM fleet coordinator: %w", err)
 		}
 		logger.Printf("[vmslot] bootstrap degraded (continuing): %v", err)
 	}
@@ -205,7 +280,7 @@ func main() {
 		childCtx, cancelChildren := context.WithCancel(context.Background())
 		defer cancelChildren()
 		if err := sup.StartAll(childCtx, specs); err != nil {
-			logger.Fatalf("failed to start supervised planes: %v", err)
+			return "", fmt.Errorf("failed to start supervised planes: %w", err)
 		}
 		defer func() {
 			if err := sup.Stop(10 * time.Second); err != nil {
@@ -244,7 +319,7 @@ func main() {
 
 	edge, err := ingress.NewServer(cfg, version, pool, sup)
 	if err != nil {
-		logger.Fatalf("failed to initialize edge ingress: %v", err)
+		return "", fmt.Errorf("failed to initialize edge ingress: %w", err)
 	}
 	edge.WithCommit(commit)
 	edge.WithClashCoordinator(clashCoord)
@@ -252,6 +327,10 @@ func main() {
 	edge.WithVmCoordinator(vmCoord)
 	edge.WithDataPlaneCoordinator(dpCoord)
 
+	var (
+		restartMu     sync.Mutex
+		restartTarget string
+	)
 	updater := hotupdate.NewManager(hotupdate.Options{
 		Config:        cfg,
 		Version:       version,
@@ -264,6 +343,13 @@ func main() {
 			if err := dpCoord.ResyncCore(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Printf("[dataplane] warning: post-hotupdate core snapshot resync failed: %v", err)
 			}
+		},
+		OnEdgeRestart: func(targetBinary string) {
+			restartMu.Lock()
+			restartTarget = targetBinary
+			restartMu.Unlock()
+			logger.Printf("[hotupdate] draining gateway to restart with %s", targetBinary)
+			stopSignals()
 		},
 	})
 	edge.WithHotUpdater(updater)
@@ -308,7 +394,7 @@ func main() {
 		}
 	case serveErr := <-errCh:
 		if serveErr != nil {
-			logger.Fatalf("[net] http server stopped unexpectedly: %v", serveErr)
+			return "", fmt.Errorf("[net] http server stopped unexpectedly: %w", serveErr)
 		}
 	}
 
@@ -318,4 +404,9 @@ func main() {
 	dpCoord.FlushSettlements(flushCtx)
 	dpCoord.FlushRequestErrors(flushCtx)
 	cancelFlush()
+
+	restartMu.Lock()
+	target := restartTarget
+	restartMu.Unlock()
+	return target, nil
 }

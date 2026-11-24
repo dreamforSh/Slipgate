@@ -662,3 +662,406 @@ func TestUpdateConfigPersistenceAndValidation(t *testing.T) {
 		t.Fatalf("expected ErrRollbackUnavailable when no updates applied, got %v", rbErr)
 	}
 }
+
+func TestAutoRestartAfterUpdateAndActiveReleasePersistence(t *testing.T) {
+	t.Parallel()
+
+	exePath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	exeBytes, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("read test executable: %v", err)
+	}
+
+	sup := supervisor.New(log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = sup.Stop(2 * time.Second)
+	}()
+
+	if err := sup.StartAll(ctx, []supervisor.ChildSpec{
+		{Name: "core", Binary: exePath, Args: []string{"-test.run=TestHelperProcess"}, Env: []string{"GO_WANT_HOTUPDATE_HELPER=1"}},
+		{Name: "bff", Binary: exePath, Args: []string{"-test.run=TestHelperProcess"}, Env: []string{"GO_WANT_HOTUPDATE_HELPER=1"}},
+	}); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+	beforeSnaps := sup.Snapshots()
+
+	ext := exeExt()
+	edgeExe := filepath.Join(t.TempDir(), "slipgate"+ext)
+	if err := os.WriteFile(edgeExe, []byte("v1-edge"), 0o755); err != nil {
+		t.Fatalf("write fake edge binary: %v", err)
+	}
+
+	assetName := PlatformAssetName("v0.2.0")
+	archiveBytes := buildMockArchive(t, assetName, map[string][]byte{
+		"slipgate-v0.2.0/webui/index.html":    []byte("<html>v020-auto-restart</html>"),
+		"slipgate-v0.2.0/slipgate-core" + ext: exeBytes,
+		"slipgate-v0.2.0/slipgate-bff" + ext:  exeBytes,
+		"slipgate-v0.2.0/slipgate" + ext:      []byte("v2-edge-binary"),
+	})
+	sum := sha256.Sum256(archiveBytes)
+	sumHex := hex.EncodeToString(sum[:])
+
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/dreamforSh/Slipgate/releases/latest":
+			_ = json.NewEncoder(w).Encode(githubRelease{
+				TagName:         "v0.2.0",
+				TargetCommitish: "deadbeef12345678",
+				Assets: []githubAsset{
+					{Name: "BUILD_META.json", BrowserDownloadURL: srvURL + "/dl/BUILD_META.json"},
+					{Name: "SHA256SUMS.txt", BrowserDownloadURL: srvURL + "/dl/SHA256SUMS.txt"},
+					{Name: assetName, BrowserDownloadURL: srvURL + "/dl/" + assetName},
+				},
+			})
+		case "/dl/BUILD_META.json":
+			_ = json.NewEncoder(w).Encode(buildMeta{Version: "0.2.0", Commit: "deadbeef12345678"})
+		case "/dl/SHA256SUMS.txt":
+			_, _ = fmt.Fprintf(w, "%s  %s\n", sumHex, assetName)
+		case "/dl/" + assetName:
+			_, _ = w.Write(archiveBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	hotDir := t.TempDir()
+	restartCh := make(chan string, 2)
+	validatedCh := make(chan string, 2)
+	mgr := NewManager(Options{
+		Config: config.Config{
+			Mode:                   "release",
+			DevSyncMode:            "release",
+			AutoRestartAfterUpdate: true,
+			UpdateRepo:             "dreamforSh/Slipgate",
+			UpdateBranch:           "main",
+			HotUpdateDir:           hotDir,
+		},
+		Version:            "0.1.0",
+		InitialCommit:      "111111110000",
+		Supervisor:         sup,
+		APIBaseURL:         srv.URL,
+		AllowCustomHost:    true,
+		Logger:             log.New(io.Discard, "", 0),
+		EdgeExecutablePath: edgeExe,
+		RestartDelay:       25 * time.Millisecond,
+		ValidateEdgeBin: func(_ context.Context, binPath string) error {
+			validatedCh <- binPath
+			raw, readErr := os.ReadFile(binPath)
+			if readErr != nil || string(raw) != "v2-edge-binary" {
+				return fmt.Errorf("unexpected candidate content: %q err=%v", string(raw), readErr)
+			}
+			return nil
+		},
+		OnEdgeRestart: func(targetBinary string) {
+			restartCh <- targetBinary
+		},
+	})
+
+	st, err := mgr.SyncWithOptions(context.Background(), SyncOptions{
+		AsyncRestart:      true,
+		AllowReleaseApply: true,
+	})
+	if err != nil {
+		t.Fatalf("SyncWithOptions failed: %v", err)
+	}
+	if st.State != StateRestarting || !st.RestartScheduled || st.BootID == "" {
+		t.Fatalf("expected StateRestarting + RestartScheduled=true + BootID, got %+v", st)
+	}
+	if !st.AutoRestartAfterUpdate {
+		t.Fatalf("expected AutoRestartAfterUpdate=true")
+	}
+
+	// Child planes must NOT be redundantly restarted when full edge restart is scheduled.
+	midSnaps := sup.Snapshots()
+	if midSnaps[0].PID != beforeSnaps[0].PID || midSnaps[1].PID != beforeSnaps[1].PID {
+		t.Fatalf("expected supervisor child PIDs to stay untouched before edge restart, before=%+v after=%+v", beforeSnaps, midSnaps)
+	}
+
+	select {
+	case <-validatedCh:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for ValidateEdgeBin")
+	}
+	select {
+	case gotTarget := <-restartCh:
+		if !SameExecutablePath(gotTarget, edgeExe) {
+			t.Fatalf("expected OnEdgeRestart target %s, got %s", edgeExe, gotTarget)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for OnEdgeRestart callback")
+	}
+
+	// Swapped executable on disk now contains v2 binary.
+	swappedRaw, err := os.ReadFile(edgeExe)
+	if err != nil || string(swappedRaw) != "v2-edge-binary" {
+		t.Fatalf("expected atomic swap onto %s, got %q err=%v", edgeExe, string(swappedRaw), err)
+	}
+
+	active, ok := LoadActiveRelease(hotDir)
+	if !ok || active.Version != "0.2.0" || !SameExecutablePath(active.EdgeBin, edgeExe) {
+		t.Fatalf("unexpected persisted active.json: ok=%v active=%+v", ok, active)
+	}
+
+	// Simulated restarted edge process loads active.json cleanly without pending edge restart.
+	rebooted := NewManager(Options{
+		Config: config.Config{
+			Mode:                   "release",
+			DevSyncMode:            "release",
+			AutoRestartAfterUpdate: true,
+			UpdateRepo:             "dreamforSh/Slipgate",
+			UpdateBranch:           "main",
+			HotUpdateDir:           hotDir,
+		},
+		Version:            "0.2.0",
+		InitialCommit:      "deadbeef12345678",
+		EdgeExecutablePath: edgeExe,
+		Logger:             log.New(io.Discard, "", 0),
+	}).Status()
+	if rebooted.BootID == "" || rebooted.BootID == st.BootID {
+		t.Fatalf("expected new unique BootID after restart, old=%q new=%q", st.BootID, rebooted.BootID)
+	}
+	if rebooted.Version != "0.2.0" || rebooted.EdgeBinaryStaged || !rebooted.CanRollback || rebooted.RestartScheduled {
+		t.Fatalf("unexpected rebooted status from active.json: %+v", rebooted)
+	}
+}
+
+func TestPreflightValidationFailureBlocksRestart(t *testing.T) {
+	t.Parallel()
+
+	ext := exeExt()
+	edgeExe := filepath.Join(t.TempDir(), "slipgate"+ext)
+	if err := os.WriteFile(edgeExe, []byte("v1-good"), 0o755); err != nil {
+		t.Fatalf("write baseline binary: %v", err)
+	}
+
+	assetName := PlatformAssetName("dev")
+	archiveBytes := buildMockArchive(t, assetName, map[string][]byte{
+		"slipgate-dev/webui/index.html": []byte("<html>bad-ui</html>"),
+		"slipgate-dev/slipgate" + ext:   []byte("corrupted-edge"),
+	})
+	sum := sha256.Sum256(archiveBytes)
+	sumHex := hex.EncodeToString(sum[:])
+
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/dreamforSh/Slipgate/releases/tags/dev-latest":
+			_ = json.NewEncoder(w).Encode(githubRelease{
+				TagName:         "dev-latest",
+				TargetCommitish: "badc0de12345",
+				Assets: []githubAsset{
+					{Name: "SHA256SUMS.txt", BrowserDownloadURL: srvURL + "/dl/SHA256SUMS.txt"},
+					{Name: assetName, BrowserDownloadURL: srvURL + "/dl/" + assetName},
+				},
+			})
+		case "/dl/SHA256SUMS.txt":
+			_, _ = fmt.Fprintf(w, "%s  %s\n", sumHex, assetName)
+		case "/dl/" + assetName:
+			_, _ = w.Write(archiveBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	hotDir := t.TempDir()
+	restartCh := make(chan string, 1)
+	mgr := NewManager(Options{
+		Config: config.Config{
+			Mode:                   "dev",
+			DevSyncMode:            "release",
+			AutoRestartAfterUpdate: true,
+			UpdateRepo:             "dreamforSh/Slipgate",
+			UpdateBranch:           "main",
+			HotUpdateDir:           hotDir,
+		},
+		Version:            "0.1.0",
+		InitialCommit:      "111111110000",
+		APIBaseURL:         srv.URL,
+		AllowCustomHost:    true,
+		Logger:             log.New(io.Discard, "", 0),
+		EdgeExecutablePath: edgeExe,
+		RestartDelay:       10 * time.Millisecond,
+		ValidateEdgeBin: func(_ context.Context, _ string) error {
+			return errors.New("corrupt binary failed --version")
+		},
+		OnEdgeRestart: func(target string) {
+			restartCh <- target
+		},
+	})
+
+	st, err := mgr.Sync(context.Background(), false, true)
+	if err == nil || !strings.Contains(err.Error(), "corrupt binary") {
+		t.Fatalf("expected preflight validation error, got err=%v status=%+v", err, st)
+	}
+	if st.RestartScheduled || st.State != StateError {
+		t.Fatalf("expected RestartScheduled=false and StateError, got %+v", st)
+	}
+	if _, hasActive := LoadActiveRelease(hotDir); hasActive {
+		t.Fatalf("active.json must not be persisted when preflight validation fails")
+	}
+	onDisk, _ := os.ReadFile(edgeExe)
+	if string(onDisk) != "v1-good" {
+		t.Fatalf("expected original edge binary to remain untouched, got %q", string(onDisk))
+	}
+	select {
+	case target := <-restartCh:
+		t.Fatalf("OnEdgeRestart must not fire after validation failure, got %s", target)
+	case <-time.After(60 * time.Millisecond):
+	}
+}
+
+func TestManualTriggerRestartAndAutoRestartConfigToggle(t *testing.T) {
+	t.Parallel()
+
+	exePath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	exeBytes, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("read test executable: %v", err)
+	}
+
+	sup := supervisor.New(log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = sup.Stop(2 * time.Second)
+	}()
+
+	if err := sup.StartAll(ctx, []supervisor.ChildSpec{
+		{Name: "core", Binary: exePath, Args: []string{"-test.run=TestHelperProcess"}, Env: []string{"GO_WANT_HOTUPDATE_HELPER=1"}},
+		{Name: "bff", Binary: exePath, Args: []string{"-test.run=TestHelperProcess"}, Env: []string{"GO_WANT_HOTUPDATE_HELPER=1"}},
+	}); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+	beforeSnaps := sup.Snapshots()
+
+	ext := exeExt()
+	edgeExe := filepath.Join(t.TempDir(), "slipgate"+ext)
+	if err := os.WriteFile(edgeExe, []byte("v1-edge"), 0o755); err != nil {
+		t.Fatalf("write fake edge binary: %v", err)
+	}
+
+	assetName := PlatformAssetName("dev")
+	archiveBytes := buildMockArchive(t, assetName, map[string][]byte{
+		"slipgate-dev/webui/index.html":    []byte("<html>manual-restart-ui</html>"),
+		"slipgate-dev/slipgate-core" + ext: exeBytes,
+		"slipgate-dev/slipgate-bff" + ext:  exeBytes,
+		"slipgate-dev/slipgate" + ext:      []byte("v2-manual-edge"),
+	})
+	sum := sha256.Sum256(archiveBytes)
+	sumHex := hex.EncodeToString(sum[:])
+
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/dreamforSh/Slipgate/releases/tags/dev-latest":
+			_ = json.NewEncoder(w).Encode(githubRelease{
+				TagName:         "dev-latest",
+				TargetCommitish: "cafebabe1234",
+				Assets: []githubAsset{
+					{Name: "SHA256SUMS.txt", BrowserDownloadURL: srvURL + "/dl/SHA256SUMS.txt"},
+					{Name: assetName, BrowserDownloadURL: srvURL + "/dl/" + assetName},
+				},
+			})
+		case "/dl/SHA256SUMS.txt":
+			_, _ = fmt.Fprintf(w, "%s  %s\n", sumHex, assetName)
+		case "/dl/" + assetName:
+			_, _ = w.Write(archiveBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	hotDir := t.TempDir()
+	restartCh := make(chan string, 2)
+	mgr := NewManager(Options{
+		Config: config.Config{
+			Mode:                   "dev",
+			DevSyncMode:            "release",
+			AutoRestartAfterUpdate: true,
+			UpdateRepo:             "dreamforSh/Slipgate",
+			UpdateBranch:           "main",
+			HotUpdateDir:           hotDir,
+		},
+		Version:            "0.1.0",
+		InitialCommit:      "111111110000",
+		Supervisor:         sup,
+		APIBaseURL:         srv.URL,
+		AllowCustomHost:    true,
+		Logger:             log.New(io.Discard, "", 0),
+		EdgeExecutablePath: edgeExe,
+		RestartDelay:       20 * time.Millisecond,
+		ValidateEdgeBin:    func(_ context.Context, _ string) error { return nil },
+		OnEdgeRestart:      func(target string) { restartCh <- target },
+	})
+
+	off := false
+	cfgSnap, err := mgr.UpdateConfig(ConfigPatch{AutoRestartAfterUpdate: &off})
+	if err != nil || cfgSnap.AutoRestartAfterUpdate {
+		t.Fatalf("expected AutoRestartAfterUpdate=false after UpdateConfig, got %+v err=%v", cfgSnap, err)
+	}
+
+	// Verify AutoRestartAfterUpdate=false persists across restarts.
+	reloaded := NewManager(Options{
+		Config: config.Config{
+			Mode:                   "dev",
+			DevSyncMode:            "release",
+			AutoRestartAfterUpdate: true,
+			UpdateRepo:             "dreamforSh/Slipgate",
+			UpdateBranch:           "main",
+			HotUpdateDir:           hotDir,
+		},
+		Logger: log.New(io.Discard, "", 0),
+	}).Status()
+	if reloaded.AutoRestartAfterUpdate {
+		t.Fatalf("expected persisted AutoRestartAfterUpdate=false in config.json")
+	}
+
+	st, err := mgr.Sync(context.Background(), false, false)
+	if err != nil {
+		t.Fatalf("Sync with autoRestartAfterUpdate=false failed: %v", err)
+	}
+	if st.State != StateIdle || st.RestartScheduled || !st.EdgeBinaryStaged {
+		t.Fatalf("expected StateIdle, RestartScheduled=false, EdgeBinaryStaged=true, got %+v", st)
+	}
+	afterSnaps := sup.Snapshots()
+	if afterSnaps[0].PID == beforeSnaps[0].PID || afterSnaps[1].PID == beforeSnaps[1].PID {
+		t.Fatalf("expected child planes to hot-restart when AutoRestartAfterUpdate=false")
+	}
+	select {
+	case target := <-restartCh:
+		t.Fatalf("OnEdgeRestart must not fire automatically when disabled, got %s", target)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Manual TriggerRestart executes OnEdgeRestart once.
+	rstSnap, err := mgr.TriggerRestart(context.Background(), true)
+	if err != nil {
+		t.Fatalf("TriggerRestart failed: %v", err)
+	}
+	if rstSnap.State != StateRestarting || !rstSnap.RestartScheduled {
+		t.Fatalf("expected StateRestarting + RestartScheduled=true after TriggerRestart, got %+v", rstSnap)
+	}
+	select {
+	case target := <-restartCh:
+		if !SameExecutablePath(target, edgeExe) {
+			t.Fatalf("expected TriggerRestart target %s, got %s", edgeExe, target)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for TriggerRestart callback")
+	}
+}

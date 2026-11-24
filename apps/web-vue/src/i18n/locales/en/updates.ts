@@ -29,6 +29,7 @@ const en: typeof zh = {
       downloading: "Downloading bundle",
       applying: "Extracting & staging",
       reloading_planes: "Reloading runtime planes",
+      restarting: "Restarting gateway",
       rolling_back: "Rolling back version",
       error: "Error",
       failed: "Failed",
@@ -53,11 +54,17 @@ const en: typeof zh = {
       edgeRestartTitle: "Updated edge binary staged (restart required)",
       edgeRestartDesc:
         "Core, BFF, and Web UI are already running the new release. Restart the slipgate service or container to load the staged edge binary at {path}:",
+      restartNow: "Restart service now",
+      restartingBtn: "Restarting…",
+      restartingTitle: "Draining connections & restarting Slipgate automatically…",
+      restartingDesc:
+        "The staged edge binary passed preflight checks. Slipgate is draining in-flight requests and handing off to the new process; this console will reload once it is back.",
       pipeline: {
         checking: "Check",
         downloading: "Download",
         applying: "Stage",
         reloading_planes: "Reload",
+        restarting: "Restart",
         done: "Done",
       },
       progressLabel: "{percent}% ({downloaded} / {total})",
@@ -138,6 +145,9 @@ const en: typeof zh = {
       autoSyncHintRelease:
         "In release mode, scheduled runs only check and surface availability; production planes are never restarted unprompted.",
       autoSyncHintDev: "In dev mode, new commits or rolling releases are downloaded and hot-reloaded automatically.",
+      autoRestartLabel: "Auto-restart gateway after update or rollback",
+      autoRestartHint:
+        "When enabled and a release includes an updated edge binary, Slipgate gracefully drains in-flight requests, re-execs the new binary, and automatically refreshes this console. Disable to reload child planes only and restart manually.",
       intervalLabel: "Check interval (seconds)",
       intervalUnit: "sec",
       presets: {
@@ -159,12 +169,16 @@ const en: typeof zh = {
     stepUp: {
       applyTitle: "Confirm system update",
       rollbackTitle: "Confirm rollback to {target}",
+      restartTitle: "Confirm Slipgate service restart",
     },
     toast: {
       checkedNew: "Update available: {version}",
       upToDate: "Already on the latest version",
       applied: "Updated and reloaded planes to {version}",
       rolledBack: "Rolled back to {version}",
+      restarting: "Service restart scheduled; waiting for reconnect…",
+      restarted: "Service restarted and online ({version})",
+      restartTimeout: "Timed out waiting for service reconnect; please refresh manually.",
     },
   },
 };

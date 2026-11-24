@@ -27,6 +27,7 @@ var (
 	ErrRollbackUnavailable   = errors.New("hotupdate: no previous release available for rollback")
 	ErrInvalidUpdateConfig   = errors.New("hotupdate: invalid update configuration")
 	ErrUpdateBusy            = errors.New("hotupdate: another update operation is already in progress")
+	ErrRestartUnavailable    = errors.New("hotupdate: automatic edge restart is not configured")
 )
 
 const (
@@ -35,6 +36,7 @@ const (
 	StateDownloading     = "downloading"
 	StateApplying        = "applying"
 	StateReloadingPlanes = "reloading_planes"
+	StateRestarting      = "restarting"
 	StateRollingBack     = "rolling_back"
 	StateError           = "error"
 )
@@ -55,17 +57,21 @@ const (
 
 // Options configures the repo-synced hot-update manager.
 type Options struct {
-	Config            config.Config
-	Version           string
-	InitialCommit     string
-	Supervisor        *supervisor.Supervisor
-	Logger            *log.Logger
-	APIBaseURL        string
-	AllowCustomHost   bool
-	OnWebUIDir        func(string)
-	GetWebUIDir       func() string
-	OnGuestdBin       func(string)
-	OnPlanesRestarted func(context.Context)
+	Config             config.Config
+	Version            string
+	InitialCommit      string
+	Supervisor         *supervisor.Supervisor
+	Logger             *log.Logger
+	APIBaseURL         string
+	AllowCustomHost    bool
+	OnWebUIDir         func(string)
+	GetWebUIDir        func() string
+	OnGuestdBin        func(string)
+	OnPlanesRestarted  func(context.Context)
+	OnEdgeRestart      func(targetBinary string)
+	ValidateEdgeBin    func(ctx context.Context, binPath string) error
+	RestartDelay       time.Duration
+	EdgeExecutablePath string
 }
 
 // Progress tracks real-time download or staging progress for active updates.
@@ -142,10 +148,11 @@ type ReleasesResult struct {
 
 // ConfigPatch holds runtime update policy changes sent via PUT /internal/supervisor/update/config.
 type ConfigPatch struct {
-	Channel         *string `json:"channel,omitempty"`
-	AutoSyncEnabled *bool   `json:"autoSyncEnabled,omitempty"`
-	IntervalSeconds *int    `json:"intervalSeconds,omitempty"`
-	Strategy        *string `json:"strategy,omitempty"`
+	Channel                *string `json:"channel,omitempty"`
+	AutoSyncEnabled        *bool   `json:"autoSyncEnabled,omitempty"`
+	IntervalSeconds        *int    `json:"intervalSeconds,omitempty"`
+	AutoRestartAfterUpdate *bool   `json:"autoRestartAfterUpdate,omitempty"`
+	Strategy               *string `json:"strategy,omitempty"`
 }
 
 // SyncOptions controls manual or scheduled check/apply behavior.
@@ -160,43 +167,46 @@ type SyncOptions struct {
 
 // StatusSnapshot matches packages/contracts/src/system.ts SystemUpdateStatusSchema.
 type StatusSnapshot struct {
-	Mode                  string               `json:"mode"`
-	Channel               string               `json:"channel"`
-	Standalone            bool                 `json:"standalone"`
-	Strategy              string               `json:"strategy"`
-	ResolvedStrategy      string               `json:"resolvedStrategy"`
-	Repo                  string               `json:"repo"`
-	Branch                string               `json:"branch"`
-	Version               string               `json:"version"`
-	ActiveCommit          string               `json:"activeCommit"`
-	RemoteCommit          *string              `json:"remoteCommit"`
-	RemoteVersion         *string              `json:"remoteVersion"`
-	RemoteTag             *string              `json:"remoteTag"`
-	ReleaseName           *string              `json:"releaseName"`
-	ReleaseNotes          *string              `json:"releaseNotes"`
-	ReleaseURL            *string              `json:"releaseUrl"`
-	PublishedAtIso        *string              `json:"publishedAtIso"`
-	AssetName             *string              `json:"assetName"`
-	AssetSizeBytes        *int64               `json:"assetSizeBytes"`
-	UpdateAvailable       bool                 `json:"updateAvailable"`
-	AutoSyncEnabled       bool                 `json:"autoSyncEnabled"`
-	IntervalSeconds       int                  `json:"intervalSeconds"`
-	State                 string               `json:"state"`
-	Progress              *Progress            `json:"progress"`
-	ReloadCount           int                  `json:"reloadCount"`
-	WebUIOverridden       bool                 `json:"webUiOverridden"`
-	EdgeBinaryStaged      bool                 `json:"edgeBinaryStaged"`
-	EdgeBinaryPath        *string              `json:"edgeBinaryPath"`
-	GuestdUpdated         bool                 `json:"guestdUpdated"`
-	GitHubTokenConfigured bool                 `json:"githubTokenConfigured"`
-	AllowReleaseApply     bool                 `json:"allowReleaseApply"`
-	CanRollback           bool                 `json:"canRollback"`
-	PreviousRelease       *PreviousReleaseInfo `json:"previousRelease"`
-	Components            []ComponentStatus    `json:"components"`
-	History               []HistoryEntry       `json:"history"`
-	LastCheckedAtIso      *string              `json:"lastCheckedAtIso"`
-	LastUpdatedAtIso      *string              `json:"lastUpdatedAtIso"`
-	LastError             *string              `json:"lastError"`
+	Mode                   string               `json:"mode"`
+	Channel                string               `json:"channel"`
+	Standalone             bool                 `json:"standalone"`
+	Strategy               string               `json:"strategy"`
+	ResolvedStrategy       string               `json:"resolvedStrategy"`
+	Repo                   string               `json:"repo"`
+	Branch                 string               `json:"branch"`
+	Version                string               `json:"version"`
+	ActiveCommit           string               `json:"activeCommit"`
+	RemoteCommit           *string              `json:"remoteCommit"`
+	RemoteVersion          *string              `json:"remoteVersion"`
+	RemoteTag              *string              `json:"remoteTag"`
+	ReleaseName            *string              `json:"releaseName"`
+	ReleaseNotes           *string              `json:"releaseNotes"`
+	ReleaseURL             *string              `json:"releaseUrl"`
+	PublishedAtIso         *string              `json:"publishedAtIso"`
+	AssetName              *string              `json:"assetName"`
+	AssetSizeBytes         *int64               `json:"assetSizeBytes"`
+	UpdateAvailable        bool                 `json:"updateAvailable"`
+	AutoSyncEnabled        bool                 `json:"autoSyncEnabled"`
+	IntervalSeconds        int                  `json:"intervalSeconds"`
+	AutoRestartAfterUpdate bool                 `json:"autoRestartAfterUpdate"`
+	RestartScheduled       bool                 `json:"restartScheduled"`
+	BootID                 string               `json:"bootId"`
+	State                  string               `json:"state"`
+	Progress               *Progress            `json:"progress"`
+	ReloadCount            int                  `json:"reloadCount"`
+	WebUIOverridden        bool                 `json:"webUiOverridden"`
+	EdgeBinaryStaged       bool                 `json:"edgeBinaryStaged"`
+	EdgeBinaryPath         *string              `json:"edgeBinaryPath"`
+	GuestdUpdated          bool                 `json:"guestdUpdated"`
+	GitHubTokenConfigured  bool                 `json:"githubTokenConfigured"`
+	AllowReleaseApply      bool                 `json:"allowReleaseApply"`
+	CanRollback            bool                 `json:"canRollback"`
+	PreviousRelease        *PreviousReleaseInfo `json:"previousRelease"`
+	Components             []ComponentStatus    `json:"components"`
+	History                []HistoryEntry       `json:"history"`
+	LastCheckedAtIso       *string              `json:"lastCheckedAtIso"`
+	LastUpdatedAtIso       *string              `json:"lastUpdatedAtIso"`
+	LastError              *string              `json:"lastError"`
 }
 
 // Manager polls or triggers repo-synced updates across stable and dev channels.
@@ -206,13 +216,22 @@ type Manager struct {
 	logger            *log.Logger
 	apiBaseURL        string
 	allowCustomHost   bool
+	baseVersion       string
+	baseCommit        string
+	edgeExePath       string
 	onWebUIDir        func(string)
 	getWebUIDir       func() string
 	onGuestdBin       func(string)
 	onPlanesRestarted func(context.Context)
+	onEdgeRestart     func(string)
+	validateEdgeBin   func(context.Context, string) error
+	restartDelay      time.Duration
 	httpClient        *http.Client
 	repoDir           string
 	configCh          chan struct{}
+
+	restartMu        sync.Mutex
+	restartTriggered bool
 
 	syncMu sync.Mutex
 	mu     sync.RWMutex
@@ -273,36 +292,50 @@ func NewManager(opts Options) *Manager {
 		intervalSec = 3600
 	}
 
+	validateFn := opts.ValidateEdgeBin
+	if validateFn == nil && opts.OnEdgeRestart != nil {
+		validateFn = validateEdgeBinary
+	}
+	bootID := fmt.Sprintf("boot-%d-%d", os.Getpid(), time.Now().UnixNano())
+
 	m := &Manager{
 		cfg:               opts.Config,
 		sup:               opts.Supervisor,
 		logger:            logger,
 		apiBaseURL:        apiBase,
 		allowCustomHost:   opts.AllowCustomHost,
+		baseVersion:       version,
+		baseCommit:        commit,
+		edgeExePath:       strings.TrimSpace(opts.EdgeExecutablePath),
 		onWebUIDir:        opts.OnWebUIDir,
 		getWebUIDir:       opts.GetWebUIDir,
 		onGuestdBin:       opts.OnGuestdBin,
 		onPlanesRestarted: opts.OnPlanesRestarted,
+		onEdgeRestart:     opts.OnEdgeRestart,
+		validateEdgeBin:   validateFn,
+		restartDelay:      opts.RestartDelay,
 		repoDir:           repoDir,
 		activeWebUIDir:    strings.TrimSpace(opts.Config.WebUIDir),
 		guestdBin:         strings.TrimSpace(opts.Config.GuestdBin),
 		configCh:          make(chan struct{}, 1),
 		status: StatusSnapshot{
-			Mode:                  opts.Config.Mode,
-			Channel:               defaultChannel,
-			Standalone:            false,
-			Strategy:              opts.Config.DevSyncMode,
-			ResolvedStrategy:      resolved,
-			Repo:                  opts.Config.UpdateRepo,
-			Branch:                opts.Config.UpdateBranch,
-			Version:               version,
-			ActiveCommit:          commit,
-			AutoSyncEnabled:       autoSync,
-			IntervalSeconds:       opts.Config.DevSyncIntervalSec,
-			State:                 StateIdle,
-			WebUIOverridden:       opts.Config.WebUIDir != "",
-			GitHubTokenConfigured: strings.TrimSpace(opts.Config.GitHubToken) != "",
-			AllowReleaseApply:     true,
+			Mode:                   opts.Config.Mode,
+			Channel:                defaultChannel,
+			Standalone:             false,
+			Strategy:               opts.Config.DevSyncMode,
+			ResolvedStrategy:       resolved,
+			Repo:                   opts.Config.UpdateRepo,
+			Branch:                 opts.Config.UpdateBranch,
+			Version:                version,
+			ActiveCommit:           commit,
+			AutoSyncEnabled:        autoSync,
+			IntervalSeconds:        opts.Config.DevSyncIntervalSec,
+			AutoRestartAfterUpdate: opts.Config.AutoRestartAfterUpdate,
+			BootID:                 bootID,
+			State:                  StateIdle,
+			WebUIOverridden:        opts.Config.WebUIDir != "",
+			GitHubTokenConfigured:  strings.TrimSpace(opts.Config.GitHubToken) != "",
+			AllowReleaseApply:      true,
 		},
 	}
 
@@ -465,8 +498,54 @@ func (m *Manager) SyncWithOptions(ctx context.Context, opts SyncOptions) (Status
 		return m.Status(), err
 	}
 
-	m.setState(StateIdle, nil)
+	if m.isRestartScheduled() {
+		m.setState(StateRestarting, nil)
+	} else {
+		m.setState(StateIdle, nil)
+	}
 	return m.Status(), nil
+}
+
+func (m *Manager) isRestartScheduled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.status.RestartScheduled
+}
+
+func (m *Manager) currentExePath() string {
+	if m.edgeExePath != "" {
+		return m.edgeExePath
+	}
+	return ResolvedCurrentExecutable()
+}
+
+func (m *Manager) triggerEdgeRestart(targetBinary string, async bool) {
+	if strings.TrimSpace(targetBinary) == "" {
+		return
+	}
+	m.restartMu.Lock()
+	if m.restartTriggered || m.onEdgeRestart == nil {
+		m.restartMu.Unlock()
+		return
+	}
+	m.restartTriggered = true
+	delay := m.restartDelay
+	cb := m.onEdgeRestart
+	m.restartMu.Unlock()
+
+	if delay <= 0 {
+		if async {
+			delay = 600 * time.Millisecond
+		} else {
+			delay = 150 * time.Millisecond
+		}
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		<-timer.C
+		cb(targetBinary)
+	}()
 }
 
 func (m *Manager) syncGit(ctx context.Context, checkOnly bool, asyncRestart bool, channel string) error {
@@ -553,6 +632,15 @@ func (m *Manager) syncGit(ctx context.Context, checkOnly bool, asyncRestart bool
 		zigOutCore := filepath.Join(stageDir, "bin", "slipgate-core"+ext)
 		if _, statErr := os.Stat(zigOutCore); statErr == nil {
 			_ = os.Rename(zigOutCore, filepath.Join(stageDir, "slipgate-core"+ext))
+		}
+	}
+
+	if _, err := exec.LookPath("go"); err == nil {
+		goDir := filepath.Join(m.repoDir, "services", "net-go")
+		edgeOut := filepath.Join(stageDir, "slipgate"+ext)
+		ldflags := fmt.Sprintf("-s -w -X main.version=%s -X main.commit=%s", curVersion, remoteCommit)
+		if _, err := runCmd(ctx, goDir, "go", "build", "-trimpath", "-ldflags", ldflags, "-o", edgeOut, "./cmd/slipgate"); err != nil {
+			return fmt.Errorf("rebuild slipgate: %w", err)
 		}
 	}
 

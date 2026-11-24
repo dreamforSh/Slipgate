@@ -132,7 +132,7 @@ fi
 tar -xzf "${TMP_DIR}/${ARCHIVE_NAME}" -C "$TMP_DIR"
 BUNDLE_DIR="${TMP_DIR}/slipgate-${ASSET_PREFIX}-linux-${ARCH}${MUSL_SUFFIX}"
 
-mkdir -p "$PREFIX" /etc/slipgate /var/lib/slipgate /var/run/slipgate/hotupdate
+mkdir -p "$PREFIX" /etc/slipgate /var/lib/slipgate/hotupdate /var/run/slipgate
 cp -R "${BUNDLE_DIR}/." "${PREFIX}/"
 chmod 0755 "${PREFIX}/slipgate" "${PREFIX}/slipgate-core" "${PREFIX}/slipgate-guestd" "${PREFIX}/slipgate-bff"
 ln -sf "${PREFIX}/slipgate" /usr/local/bin/slipgate
@@ -203,7 +203,7 @@ fi
 if [[ "$USE_SYSTEMD" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
   SERVICE_USER_LINES=""
   if id -u slipgate >/dev/null 2>&1; then
-    SERVICE_USER_LINES=$'User=slipgate\nGroup=slipgate\nRuntimeDirectory=slipgate slipgate/hotupdate\nStateDirectory=slipgate\nNoNewPrivileges=true'
+    SERVICE_USER_LINES=$'User=slipgate\nGroup=slipgate\nRuntimeDirectory=slipgate\nStateDirectory=slipgate\nNoNewPrivileges=true'
   fi
   cat > /etc/systemd/system/slipgate.service <<EOF
 [Unit]
@@ -218,7 +218,7 @@ WorkingDirectory=${PREFIX}
 EnvironmentFile=/etc/slipgate/slipgate.env
 Environment=SLIPGATE_CORE_BIN=${PREFIX}/slipgate-core
 Environment=SLIPGATE_BFF_BIN=${PREFIX}/slipgate-bff
-Environment=SLIPGATE_HOTUPDATE_DIR=/var/run/slipgate/hotupdate
+Environment=SLIPGATE_HOTUPDATE_DIR=/var/lib/slipgate/hotupdate
 # Undelivered settlements are money owed: keep them under StateDirectory, which (unlike the
 # RuntimeDirectory above) survives a service restart and a reboot.
 Environment=SLIPGATE_SETTLEMENT_SPOOL_DIR=/var/lib/slipgate/settlement-spool

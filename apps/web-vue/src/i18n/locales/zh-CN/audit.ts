@@ -241,6 +241,7 @@ export default {
       systemUpdateSync: "同步系统更新",
       systemUpdateConfig: "修改更新策略",
       systemUpdateRollback: "回滚系统版本",
+      systemUpdateRestart: "重启系统服务",
       userAttrCreate: "创建用户属性",
       userAttrUpdate: "修改用户属性",
       userAttrDelete: "删除用户属性",

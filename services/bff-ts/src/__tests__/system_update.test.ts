@@ -52,13 +52,25 @@ describe("admin system update routes", () => {
       const cfgRes = await app.request("/api/v1/admin/system/update/config", {
         method: "PUT",
         headers,
-        body: JSON.stringify({ channel: "dev", autoSyncEnabled: true, intervalSeconds: 300, strategy: "release" }),
+        body: JSON.stringify({
+          channel: "dev",
+          autoSyncEnabled: true,
+          intervalSeconds: 300,
+          autoRestartAfterUpdate: false,
+          strategy: "release",
+        }),
       });
       expect(cfgRes.status).toBe(200);
-      const cfgBody = (await cfgRes.json()) as { channel: string; autoSyncEnabled: boolean; intervalSeconds: number };
+      const cfgBody = (await cfgRes.json()) as {
+        channel: string;
+        autoSyncEnabled: boolean;
+        intervalSeconds: number;
+        autoRestartAfterUpdate: boolean;
+      };
       expect(cfgBody.channel).toBe("dev");
       expect(cfgBody.autoSyncEnabled).toBe(true);
       expect(cfgBody.intervalSeconds).toBe(300);
+      expect(cfgBody.autoRestartAfterUpdate).toBe(false);
 
       // Rollback without step-up confirmation is rejected (403)
       const rbNoStepUp = await app.request("/api/v1/admin/system/update/rollback", {
@@ -75,6 +87,21 @@ describe("admin system update routes", () => {
         body: JSON.stringify({ confirm: { password: "AdminPassword123!" } }),
       });
       expect(rbStandalone.status).toBe(409);
+
+      // Restart without step-up confirmation is rejected (403), with step-up returns 409 in standalone mode
+      const rstNoStepUp = await app.request("/api/v1/admin/system/update/restart", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({}),
+      });
+      expect(rstNoStepUp.status).toBe(403);
+
+      const rstStandalone = await app.request("/api/v1/admin/system/update/restart", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ confirm: { password: "AdminPassword123!" } }),
+      });
+      expect(rstStandalone.status).toBe(409);
     } finally {
       if (prevUrl !== undefined) process.env.SLIPGATE_NET_INTERNAL_URL = prevUrl;
       else delete process.env.SLIPGATE_NET_INTERNAL_URL;
@@ -83,10 +110,12 @@ describe("admin system update routes", () => {
     }
   });
 
-  it("enforces admin step-up on release apply/rollback and strips credentials before proxying to supervisor", async () => {
+  it("enforces admin step-up on release apply/rollback/restart and strips credentials before proxying to supervisor", async () => {
     const receivedSyncPayloads: Array<Record<string, unknown>> = [];
     const receivedRollbackPayloads: Array<Record<string, unknown>> = [];
+    const receivedRestartPayloads: Array<Record<string, unknown>> = [];
     let currentChannel = "stable";
+    let autoRestartAfterUpdate = true;
 
     const mockSupervisor = createServer((req, res) => {
       if (req.headers["x-slipgate-internal-token"] !== "test-internal-token") {
@@ -117,6 +146,9 @@ describe("admin system update routes", () => {
           updateAvailable: true,
           autoSyncEnabled: true,
           intervalSeconds: 3600,
+          autoRestartAfterUpdate,
+          restartScheduled: false,
+          bootId: "boot-1",
           state: "idle",
           reloadCount: 1,
           webUiOverridden: true,
@@ -161,12 +193,27 @@ describe("admin system update routes", () => {
         }
         if (req.method === "PUT" && req.url === "/internal/supervisor/update/config") {
           if (typeof jsonBody.channel === "string") currentChannel = jsonBody.channel;
-          res.end(JSON.stringify({ ...baseStatus, channel: currentChannel }));
+          if (typeof jsonBody.autoRestartAfterUpdate === "boolean") {
+            autoRestartAfterUpdate = jsonBody.autoRestartAfterUpdate;
+          }
+          res.end(JSON.stringify({ ...baseStatus, channel: currentChannel, autoRestartAfterUpdate }));
           return;
         }
         if (req.method === "POST" && req.url === "/internal/supervisor/update/rollback") {
           receivedRollbackPayloads.push(jsonBody);
           res.end(JSON.stringify({ ...baseStatus, version: "0.1.0", canRollback: false }));
+          return;
+        }
+        if (req.method === "POST" && req.url === "/internal/supervisor/update/restart") {
+          receivedRestartPayloads.push(jsonBody);
+          res.end(
+            JSON.stringify({
+              ...baseStatus,
+              state: "restarting",
+              restartScheduled: true,
+              bootId: "boot-2",
+            }),
+          );
           return;
         }
         res.statusCode = 404;
@@ -224,7 +271,7 @@ describe("admin system update routes", () => {
       expect(receivedSyncPayloads[1]?.targetTag).toBe("v0.3.0");
       expect("confirm" in (receivedSyncPayloads[1] ?? {})).toBe(false);
 
-      // Releases catalog & config update work via supervisor
+      // Releases catalog & config update work via supervisor (including autoRestartAfterUpdate)
       const relRes = await app.request("/api/v1/admin/system/update/releases?refresh=1", { headers });
       expect(relRes.status).toBe(200);
       expect(((await relRes.json()) as { releases: Array<{ tag: string }> }).releases[0]?.tag).toBe("v0.3.0");
@@ -232,10 +279,12 @@ describe("admin system update routes", () => {
       const cfgRes = await app.request("/api/v1/admin/system/update/config", {
         method: "PUT",
         headers,
-        body: JSON.stringify({ channel: "dev" }),
+        body: JSON.stringify({ channel: "dev", autoRestartAfterUpdate: false }),
       });
       expect(cfgRes.status).toBe(200);
-      expect(((await cfgRes.json()) as { channel: string }).channel).toBe("dev");
+      const cfgPayload = (await cfgRes.json()) as { channel: string; autoRestartAfterUpdate: boolean };
+      expect(cfgPayload.channel).toBe("dev");
+      expect(cfgPayload.autoRestartAfterUpdate).toBe(false);
 
       // Rollback enforces step-up & forwards releaseId
       const blockedRollback = await app.request("/api/v1/admin/system/update/rollback", {
@@ -256,6 +305,31 @@ describe("admin system update routes", () => {
       expect(okRollback.status).toBe(200);
       expect(receivedRollbackPayloads[0]?.releaseId).toBe("rel-1");
       expect("confirm" in (receivedRollbackPayloads[0] ?? {})).toBe(false);
+
+      // Restart enforces step-up in release mode, strips confirm, and returns restarting state
+      const blockedRestart = await app.request("/api/v1/admin/system/update/restart", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({}),
+      });
+      expect(blockedRestart.status).toBe(403);
+
+      const okRestart = await app.request("/api/v1/admin/system/update/restart", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ confirm: { password: "AdminPassword123!" } }),
+      });
+      expect(okRestart.status).toBe(200);
+      const restartBody = (await okRestart.json()) as {
+        state: string;
+        restartScheduled: boolean;
+        bootId: string;
+      };
+      expect(restartBody.state).toBe("restarting");
+      expect(restartBody.restartScheduled).toBe(true);
+      expect(restartBody.bootId).toBe("boot-2");
+      expect(receivedRestartPayloads.length).toBe(1);
+      expect("confirm" in (receivedRestartPayloads[0] ?? {})).toBe(false);
     } finally {
       await new Promise<void>((resolve) => mockSupervisor.close(() => resolve()));
       if (prevUrl !== undefined) process.env.SLIPGATE_NET_INTERNAL_URL = prevUrl;

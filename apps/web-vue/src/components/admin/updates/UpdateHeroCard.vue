@@ -13,6 +13,7 @@ const props = defineProps<{
   checking: boolean;
   applying: boolean;
   rollingBack: boolean;
+  restarting?: boolean;
   busy: boolean;
   error: string | null;
 }>();
@@ -21,11 +22,12 @@ const emit = defineEmits<{
   (e: "check"): void;
   (e: "apply"): void;
   (e: "rollback"): void;
+  (e: "restart"): void;
 }>();
 
 const { t } = useI18n();
 
-const PIPELINE_STEPS = ["checking", "downloading", "applying", "reloading_planes", "done"] as const;
+const PIPELINE_STEPS = ["checking", "downloading", "applying", "reloading_planes", "restarting", "done"] as const;
 
 const activeStepIndex = computed(() => {
   const s = props.status?.state;
@@ -36,7 +38,7 @@ const activeStepIndex = computed(() => {
 });
 
 const showPipeline = computed(
-  () => props.busy || (props.status?.progress !== null && props.status?.progress !== undefined),
+  () => props.busy || Boolean(props.restarting) || (props.status?.progress !== null && props.status?.progress !== undefined),
 );
 
 const progressPercent = computed(() => Math.round(props.status?.progress?.percent ?? 0));
@@ -57,7 +59,7 @@ const systemdRestartCmd = "systemctl restart slipgate";
 const stateTone = computed(() => {
   const s = props.status?.state;
   if (s === "error" || s === "failed") return "danger" as const;
-  if (props.busy) return "accent" as const;
+  if (props.restarting || s === "restarting" || props.busy) return "accent" as const;
   if (props.status?.edgeBinaryStaged) return "warning" as const;
   if (props.status?.updateAvailable) return "accent" as const;
   return "success" as const;
@@ -191,7 +193,7 @@ const stateTone = computed(() => {
 
       <!-- Live pipeline stepper + progress bar -->
       <div v-if="showPipeline" class="mt-5 rounded-xl border border-line bg-surface-2/60 p-4 space-y-3">
-        <div class="grid grid-cols-5 gap-2">
+        <div class="grid grid-cols-3 gap-2 sm:grid-cols-6">
           <div
             v-for="(step, idx) in PIPELINE_STEPS"
             :key="step"
@@ -230,14 +232,36 @@ const stateTone = computed(() => {
         </div>
       </div>
 
+      <!-- Live automatic restart notice banner -->
+      <UiAlert v-if="restarting || status?.restartScheduled || status?.state === 'restarting'" tone="info" class="mt-4">
+        <div class="flex items-start gap-2.5">
+          <UiIcon name="loader" :size="16" spin class="mt-0.5 text-accent" />
+          <div class="space-y-1">
+            <p class="font-semibold text-fg">{{ t("updates.hero.restartingTitle") }}</p>
+            <p class="text-xs leading-relaxed text-fg-muted">{{ t("updates.hero.restartingDesc") }}</p>
+          </div>
+        </div>
+      </UiAlert>
+
       <!-- Edge binary restart notice banner -->
-      <UiAlert v-if="status?.edgeBinaryStaged" tone="warning" class="mt-4">
-        <div class="space-y-2">
+      <UiAlert v-else-if="status?.edgeBinaryStaged" tone="warning" class="mt-4">
+        <div class="space-y-2.5">
           <p class="font-semibold text-fg">{{ t("updates.hero.edgeRestartTitle") }}</p>
           <p class="text-xs leading-relaxed text-fg-muted">
             {{ t("updates.hero.edgeRestartDesc", { path: status.edgeBinaryPath ?? "staged/slipgate" }) }}
           </p>
-          <div class="flex flex-wrap gap-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              v-if="!status?.standalone"
+              type="button"
+              class="btn btn-primary btn-sm"
+              :disabled="busy || restarting"
+              @click="emit('restart')"
+            >
+              <UiIcon :name="restarting ? 'loader' : 'refresh'" :size="14" :spin="Boolean(restarting)" />
+              {{ restarting ? t("updates.hero.restartingBtn") : t("updates.hero.restartNow") }}
+              <UiIcon v-if="status?.mode !== 'dev' && !restarting" name="shield" :size="12" class="opacity-80" />
+            </button>
             <div class="inline-flex items-center gap-1 rounded-lg border border-line bg-surface px-2.5 py-1 font-mono text-xs text-fg">
               <span>{{ dockerRestartCmd }}</span>
               <CopyButton :text="dockerRestartCmd" />
