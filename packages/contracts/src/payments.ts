@@ -561,6 +561,7 @@ export const AffiliateRebateItemSchema = z.object({
   inviteeEmail: z.string(),
   orderId: z.string(),
   amountNanoUsd: z.string(),
+  creditedTo: z.enum(["wallet", "commission_pool"]).optional(),
   createdAtIso: z.string(),
 });
 export type AffiliateRebateItem = z.infer<typeof AffiliateRebateItemSchema>;

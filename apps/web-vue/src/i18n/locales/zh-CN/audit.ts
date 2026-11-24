@@ -227,6 +227,8 @@ export default {
       channelMonitorUpdate: "修改渠道探测监控",
       channelMonitorDelete: "删除渠道探测监控",
       channelMonitorRun: "手动执行渠道探测",
+      affiliateRateUpdate: "设置用户专属返利比例",
+      affiliateWithdrawalReview: "审核返利提现申请",
       systemUpdateSync: "同步系统更新",
     },
     errors: {

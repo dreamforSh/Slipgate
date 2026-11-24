@@ -107,6 +107,9 @@ export const AUDIT_ACTION_KEYS: Record<string, string> = {
   [`DELETE ${A}/channel-monitors/:id`]: "channelMonitorDelete",
   [`POST ${A}/channel-monitors/:id/run`]: "channelMonitorRun",
 
+  [`PUT ${A}/affiliates/rates/:userId`]: "affiliateRateUpdate",
+  [`POST ${A}/affiliates/withdrawals/:id/review`]: "affiliateWithdrawalReview",
+
   [`POST ${A}/system/update/sync`]: "systemUpdateSync",
 };
 

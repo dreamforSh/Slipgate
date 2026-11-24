@@ -3,6 +3,7 @@ import type { z } from "zod";
 import {
   AdminOrderActionRequestSchema,
   AdminRefundRequestSchema,
+  AffiliateWithdrawalStatusSchema,
   CreateOrderRequestSchema,
   DEFAULT_PAYMENT_CONFIG,
   fiatToMinor,
@@ -10,6 +11,8 @@ import {
   PAID_ORDER_STATUSES,
   parseUsdToNano,
   ResolveOrderRequestSchema,
+  ReviewAffiliateWithdrawalRequestSchema,
+  SetAffiliateRateRequestSchema,
   UpdatePaymentConfigRequestSchema,
   UpsertPaymentPlanRequestSchema,
   UserRefundRequestSchema,
@@ -242,6 +245,46 @@ export function registerPaymentRoutes(app: App, ctx: PaymentRouteContext): Payme
 
   app.get("/api/v1/admin/affiliates/rebates", async (c) => {
     return c.json({ items: await payments.listRebates(c.req.query("userId") || null, 200) });
+  });
+
+  app.get("/api/v1/admin/affiliates/accounts", async (c) => {
+    const settings = await store.ops.getSettings();
+    const search = c.req.query("search")?.trim() || undefined;
+    return c.json({ items: await payments.listAffiliateAccounts(settings.affiliateRebateBps, search) });
+  });
+
+  app.put("/api/v1/admin/affiliates/rates/:userId", async (c) => {
+    const req = await body(c, SetAffiliateRateRequestSchema);
+    const settings = await store.ops.getSettings();
+    const item = await payments.setAffiliateCustomRate(
+      c.req.param("userId"),
+      req.customRebateBps,
+      settings.affiliateRebateBps,
+    );
+    return c.json({ item });
+  });
+
+  app.get("/api/v1/admin/affiliates/withdrawals", async (c) => {
+    const statusRaw = c.req.query("status");
+    let status: z.infer<typeof AffiliateWithdrawalStatusSchema> | undefined;
+    if (statusRaw) {
+      const parsed = AffiliateWithdrawalStatusSchema.safeParse(statusRaw);
+      if (!parsed.success) bad(parsed.error.issues);
+      status = parsed.data;
+    }
+    const userId = c.req.query("userId")?.trim() || undefined;
+    return c.json({ items: await payments.listAffiliateWithdrawals({ userId, status, limit: 200 }) });
+  });
+
+  app.post("/api/v1/admin/affiliates/withdrawals/:id/review", async (c) => {
+    const req = await body(c, ReviewAffiliateWithdrawalRequestSchema);
+    const item = await payments.reviewAffiliateWithdrawal(
+      c.req.param("id"),
+      req.action,
+      c.get("authUser").sub,
+      req.reviewNote,
+    );
+    return c.json({ item });
   });
 
   /* ---------------- Purchase (signed-in users) ---------------- */

@@ -363,6 +363,7 @@ export class PaymentService {
     const result = await this.deps.store.payments.fulfillOrder(orderId, tradeNo, {
       enabled: settings.affiliateEnabled,
       bps: settings.affiliateRebateBps,
+      creditMode: settings.affiliateCreditMode,
     });
     if (result.delivered) await this.deps.syncDataPlane();
     if (result.order.deliveryError) {

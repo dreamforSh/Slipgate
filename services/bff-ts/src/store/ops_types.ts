@@ -18,6 +18,7 @@ import type {
   PromoCodeCheckResponse,
   PromoCodeItem,
   PromoCodeUsageItem,
+  RedeemCodeClaimItem,
   RedeemCodeItem,
   RedeemCodeListQuery,
   RedeemCodeListResponse,
@@ -245,6 +246,7 @@ export interface OpsStore {
   /** Atomically consumes the code and credits balance or grants/extends the subscription. */
   redeemCode(userId: string, code: string): Promise<RedeemResult>;
   listUserRedeemHistory(userId: string, limit: number): Promise<RedeemCodeItem[]>;
+  listRedeemCodeClaims(code: string): Promise<RedeemCodeClaimItem[]>;
 
   /* ---- Promo codes ---- */
   listPromoCodes(): Promise<PromoCodeItem[]>;

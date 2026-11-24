@@ -241,6 +241,9 @@ export const CustomNavLinkSchema = z.object({
 });
 export type CustomNavLink = z.infer<typeof CustomNavLinkSchema>;
 
+export const AffiliateCreditModeSchema = z.enum(["wallet", "commission_pool"]);
+export type AffiliateCreditMode = z.infer<typeof AffiliateCreditModeSchema>;
+
 export const PortalSettingsSchema = z.object({
   /* Branding */
   siteName: z.string().trim().min(1).max(64),
@@ -274,6 +277,10 @@ export const PortalSettingsSchema = z.object({
   affiliateEnabled: z.boolean(),
   /** Rebate on the invitee's paid top-ups, in basis points (1000 = 10%). */
   affiliateRebateBps: z.number().int().min(0).max(5000),
+  /** Where top-up rebates go: main API wallet or dedicated withdrawable commission pool. */
+  affiliateCreditMode: z.enum(["wallet", "commission_pool"]).default("wallet"),
+  /** Minimum payout withdrawal amount in USD when credit mode uses commission_pool. */
+  affiliateMinWithdrawUsd: UsdAmountSchema.default("10"),
   /* Maintenance */
   /** Audit-log rows older than this many days are swept daily; 0 keeps them forever. */
   auditLogRetentionDays: AuditLogRetentionDaysSchema,
@@ -317,6 +324,8 @@ export const DEFAULT_PORTAL_SETTINGS: PortalSettings = {
   keyUsageLookupEnabled: true,
   affiliateEnabled: false,
   affiliateRebateBps: 1000,
+  affiliateCreditMode: "wallet",
+  affiliateMinWithdrawUsd: "10",
   auditLogRetentionDays: AUDIT_LOG_RETENTION_DEFAULT_DAYS,
   registrationEmailSuffixAllowlist: [],
   registrationEmailDomainQuotaEnabled: false,
@@ -509,6 +518,10 @@ export const RedeemCodeItemSchema = z.object({
   redeemedAtIso: z.string().nullable(),
   expiresAtIso: z.string().nullable(),
   createdAtIso: z.string(),
+  maxUses: z.number().int().min(1).default(1),
+  usedCount: z.number().int().nonnegative().default(0),
+  perUserLimit: z.number().int().min(1).default(1),
+  batchPerUserLimit: z.number().int().nonnegative().default(0),
 });
 export type RedeemCodeItem = z.infer<typeof RedeemCodeItemSchema>;
 
@@ -549,6 +562,9 @@ export const GenerateRedeemCodesRequestSchema = z
       .default(""),
     expiresAtIso: z.string().datetime({ offset: true }).nullable().optional(),
     notes: z.string().trim().max(200).default(""),
+    maxUses: z.number().int().min(1).max(100_000).default(1),
+    perUserLimit: z.number().int().min(1).max(1000).default(1),
+    batchPerUserLimit: z.number().int().min(0).max(1000).default(0),
   })
   .superRefine((v, ctx) => {
     if (v.kind === "balance" && !v.amountUsd) {
@@ -573,6 +589,20 @@ export const UpdateRedeemCodesRequestSchema = z.object({
   notes: z.string().trim().max(200).optional(),
 });
 export type UpdateRedeemCodesRequest = z.infer<typeof UpdateRedeemCodesRequestSchema>;
+
+export const RedeemCodeClaimItemSchema = z.object({
+  id: z.string(),
+  code: z.string(),
+  batchId: z.string(),
+  userId: z.string(),
+  userEmail: z.string(),
+  kind: RedeemCodeKindSchema,
+  amountNanoUsd: NanoUsdStringSchema,
+  groupId: z.string().nullable(),
+  validityDays: z.number().int().nullable(),
+  redeemedAtIso: z.string(),
+});
+export type RedeemCodeClaimItem = z.infer<typeof RedeemCodeClaimItemSchema>;
 
 export const RedeemRequestSchema = z.object({
   code: z.string().trim().min(4).max(64),

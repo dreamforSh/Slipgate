@@ -1,6 +1,9 @@
 import {
   PAID_ORDER_STATUSES,
+  type AffiliateAccountItem,
   type AffiliateRebateItem,
+  type AffiliateWithdrawalItem,
+  type AffiliateWithdrawalStatus,
   type OrderListQuery,
   type PaymentCheckout,
   type PaymentCurrency,
@@ -71,8 +74,34 @@ interface RebateRecord {
   inviteeId: string;
   orderId: string;
   amountNano: bigint;
+  creditedTo: "wallet" | "commission_pool";
   /** `reversed` once the order was refunded in full and the rebate taken back. */
   status: "settled" | "reversed";
+  createdAtIso: string;
+}
+
+interface AffiliateAccountRecord {
+  userId: string;
+  customRebateBps: number | null;
+  balanceNano: bigint;
+  totalEarnedNano: bigint;
+  totalTransferredNano: bigint;
+  totalWithdrawnNano: bigint;
+  updatedAtIso: string;
+}
+
+interface AffiliateWithdrawalRecord {
+  id: string;
+  userId: string;
+  kind: AffiliateWithdrawalItem["kind"];
+  amountNano: bigint;
+  status: AffiliateWithdrawalStatus;
+  payoutMethod: string;
+  payoutAccount: string;
+  notes: string;
+  reviewNote: string;
+  reviewedBy: string | null;
+  reviewedAtIso: string | null;
   createdAtIso: string;
 }
 
@@ -107,8 +136,12 @@ export class MemoryPaymentsStore implements PaymentsStore {
   private readonly plans = new Map<string, PlanRecord>();
   private readonly orders = new Map<string, OrderRecord>();
   private readonly rebates: RebateRecord[] = [];
+  private readonly affiliateAccounts = new Map<string, AffiliateAccountRecord>();
+  private readonly affiliateWithdrawals: AffiliateWithdrawalRecord[] = [];
   /** Per-order tail of the fulfil/refund chain (the Postgres store's row lock). */
   private readonly orderLocks = new Map<string, Promise<void>>();
+  /** Per-user affiliate pool lock matching Postgres FOR UPDATE row locking. */
+  private readonly affiliateLocks = new Map<string, Promise<void>>();
 
   constructor(
     private readonly core: Pick<MemoryCoreState, "users" | "wallets" | "idempotencyKeys" | "ledger" | "groups">,
@@ -403,21 +436,45 @@ export class MemoryPaymentsStore implements PaymentsStore {
       o.paidAtIso = new Date().toISOString();
       if (providerTradeNo) o.providerTradeNo = providerTradeNo;
 
-      if (rebate.enabled && rebate.bps > 0 && o.kind === "recharge" && o.creditNano > 0n) {
+      if (rebate.enabled && o.kind === "recharge" && o.creditNano > 0n) {
         const referrerId = (await this.ops.getAdminUser(o.userId))?.referrerId;
         if (referrerId && this.core.users.has(referrerId)) {
-          const amount = (o.creditNano * BigInt(rebate.bps)) / 10_000n;
-          if (amount > 0n && applyMemoryWalletDelta(this.core, referrerId, amount, `rebate:${o.id}`, "credit", `rebate:${o.id}`)) {
-            this.rebates.unshift({
-              id: `cms_${crypto.randomUUID()}`,
-              beneficiaryId: referrerId,
-              inviteeId: o.userId,
-              orderId: o.id,
-              amountNano: amount,
-              status: "settled",
-              createdAtIso: new Date().toISOString(),
-            });
-          }
+          await this.withAffiliateLock(referrerId, async () => {
+            const acc = this.ensureAffiliateRecord(referrerId);
+            const effectiveBps = acc.customRebateBps ?? rebate.bps;
+            const amount = effectiveBps > 0 ? (o.creditNano * BigInt(effectiveBps)) / 10_000n : 0n;
+            if (amount <= 0n) return;
+            const creditMode = rebate.creditMode === "commission_pool" ? "commission_pool" : "wallet";
+            if (creditMode === "commission_pool") {
+              if (this.rebates.some((r) => r.orderId === o.id)) return;
+              acc.balanceNano += amount;
+              acc.totalEarnedNano += amount;
+              acc.updatedAtIso = new Date().toISOString();
+              this.rebates.unshift({
+                id: `cms_${crypto.randomUUID()}`,
+                beneficiaryId: referrerId,
+                inviteeId: o.userId,
+                orderId: o.id,
+                amountNano: amount,
+                creditedTo: "commission_pool",
+                status: "settled",
+                createdAtIso: new Date().toISOString(),
+              });
+            } else if (applyMemoryWalletDelta(this.core, referrerId, amount, `rebate:${o.id}`, "credit", `rebate:${o.id}`)) {
+              acc.totalEarnedNano += amount;
+              acc.updatedAtIso = new Date().toISOString();
+              this.rebates.unshift({
+                id: `cms_${crypto.randomUUID()}`,
+                beneficiaryId: referrerId,
+                inviteeId: o.userId,
+                orderId: o.id,
+                amountNano: amount,
+                creditedTo: "wallet",
+                status: "settled",
+                createdAtIso: new Date().toISOString(),
+              });
+            }
+          });
         }
       }
       return { order: this.toOrder(o), fulfilled: true, delivered };
@@ -583,14 +640,36 @@ export class MemoryPaymentsStore implements PaymentsStore {
       if (rebate) {
         const back = proportion(rebate.amountNano, part, remainingBeforePart);
         if (back > 0n) {
-          applyMemoryWalletDelta(
-            this.core,
-            rebate.beneficiaryId,
-            -back,
-            `rebate-refund:${o.id}${ledgerSuffix}`,
-            "adjust",
-            `rebate-refund:${o.id}${ledgerSuffix}`,
-          );
+          if (rebate.creditedTo === "commission_pool") {
+            await this.withAffiliateLock(rebate.beneficiaryId, async () => {
+              const acc = this.ensureAffiliateRecord(rebate.beneficiaryId);
+              const fromPool = acc.balanceNano > back ? back : acc.balanceNano;
+              if (fromPool > 0n) {
+                acc.balanceNano -= fromPool;
+                acc.updatedAtIso = new Date().toISOString();
+              }
+              const remainder = back - fromPool;
+              if (remainder > 0n) {
+                applyMemoryWalletDelta(
+                  this.core,
+                  rebate.beneficiaryId,
+                  -remainder,
+                  `rebate-refund:${o.id}${ledgerSuffix}`,
+                  "adjust",
+                  `rebate-refund:${o.id}${ledgerSuffix}`,
+                );
+              }
+            });
+          } else {
+            applyMemoryWalletDelta(
+              this.core,
+              rebate.beneficiaryId,
+              -back,
+              `rebate-refund:${o.id}${ledgerSuffix}`,
+              "adjust",
+              `rebate-refund:${o.id}${ledgerSuffix}`,
+            );
+          }
         }
         if (back >= rebate.amountNano) rebate.status = "reversed";
         else rebate.amountNano -= back;
@@ -746,11 +825,264 @@ export class MemoryPaymentsStore implements PaymentsStore {
         inviteeEmail: this.core.users.get(r.inviteeId)?.email ?? "",
         orderId: r.orderId,
         amountNanoUsd: r.amountNano.toString(),
+        creditedTo: r.creditedTo,
         createdAtIso: r.createdAtIso,
       }));
   }
 
   async rebateTotal(beneficiaryId: string) {
     return this.rebates.filter((r) => r.status === "settled" && r.beneficiaryId === beneficiaryId).reduce((s, r) => s + r.amountNano, 0n);
+  }
+
+  /* ---------------- Affiliate accounts, rates & withdrawals (Lane C3) ---------------- */
+
+  private async withAffiliateLock<T>(userId: string, fn: () => Promise<T> | T): Promise<T> {
+    const prev = this.affiliateLocks.get(userId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const tail = prev.then(() => gate);
+    this.affiliateLocks.set(userId, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.affiliateLocks.get(userId) === tail) this.affiliateLocks.delete(userId);
+    }
+  }
+
+  private ensureAffiliateRecord(userId: string): AffiliateAccountRecord {
+    let rec = this.affiliateAccounts.get(userId);
+    if (!rec) {
+      rec = {
+        userId,
+        customRebateBps: null,
+        balanceNano: 0n,
+        totalEarnedNano: 0n,
+        totalTransferredNano: 0n,
+        totalWithdrawnNano: 0n,
+        updatedAtIso: this.core.users.get(userId)?.createdAtIso ?? new Date().toISOString(),
+      };
+      this.affiliateAccounts.set(userId, rec);
+    }
+    return rec;
+  }
+
+  private toAffiliateAccountItem(userId: string, username: string, inviteeCount: number, defaultBps: number): AffiliateAccountItem {
+    const u = this.core.users.get(userId);
+    const rec = this.affiliateAccounts.get(userId);
+    const legacy = this.rebates
+      .filter((r) => r.beneficiaryId === userId && r.status !== "reversed")
+      .reduce((s, r) => s + r.amountNano, 0n);
+    const totalEarned = rec ? (rec.totalEarnedNano > legacy ? rec.totalEarnedNano : legacy) : legacy;
+    const customRebateBps = rec?.customRebateBps ?? null;
+    return {
+      userId,
+      email: u?.email ?? "",
+      username,
+      customRebateBps,
+      effectiveRebateBps: customRebateBps ?? defaultBps,
+      balanceNanoUsd: (rec?.balanceNano ?? 0n).toString(),
+      totalEarnedNanoUsd: totalEarned.toString(),
+      totalTransferredNanoUsd: (rec?.totalTransferredNano ?? 0n).toString(),
+      totalWithdrawnNanoUsd: (rec?.totalWithdrawnNano ?? 0n).toString(),
+      inviteeCount,
+      updatedAtIso: rec?.updatedAtIso ?? u?.createdAtIso ?? new Date(0).toISOString(),
+    };
+  }
+
+  private toWithdrawalItem(w: AffiliateWithdrawalRecord): AffiliateWithdrawalItem {
+    return {
+      id: w.id,
+      userId: w.userId,
+      userEmail: this.core.users.get(w.userId)?.email ?? "",
+      kind: w.kind,
+      amountNanoUsd: w.amountNano.toString(),
+      status: w.status,
+      payoutMethod: w.payoutMethod,
+      payoutAccount: w.payoutAccount,
+      notes: w.notes,
+      reviewNote: w.reviewNote,
+      reviewedBy: w.reviewedBy,
+      reviewedAtIso: w.reviewedAtIso,
+      createdAtIso: w.createdAtIso,
+    };
+  }
+
+  async getAffiliateAccount(userId: string, defaultBps: number): Promise<AffiliateAccountItem> {
+    const adminUser = await this.ops.getAdminUser(userId);
+    if (!adminUser) throw new StoreError("not_found", `User ${userId} not found`);
+    const invitees = await this.ops.listInvitees(userId);
+    return this.toAffiliateAccountItem(userId, adminUser.username, invitees.length, defaultBps);
+  }
+
+  async listAffiliateAccounts(defaultBps: number, search?: string): Promise<AffiliateAccountItem[]> {
+    const q = search?.trim().toLowerCase() ?? "";
+    const out: { item: AffiliateAccountItem; bal: bigint; earned: bigint; createdAtIso: string }[] = [];
+    for (const [id, u] of this.core.users) {
+      const adminUser = await this.ops.getAdminUser(id);
+      if (!adminUser) continue;
+      if (
+        q &&
+        !u.email.toLowerCase().includes(q) &&
+        !adminUser.username.toLowerCase().includes(q) &&
+        !id.toLowerCase().includes(q)
+      ) {
+        continue;
+      }
+      const invitees = await this.ops.listInvitees(id);
+      const item = this.toAffiliateAccountItem(id, adminUser.username, invitees.length, defaultBps);
+      out.push({
+        item,
+        bal: BigInt(item.balanceNanoUsd),
+        earned: BigInt(item.totalEarnedNanoUsd),
+        createdAtIso: u.createdAtIso,
+      });
+    }
+    out.sort((a, b) => {
+      if (b.bal !== a.bal) return b.bal > a.bal ? 1 : -1;
+      if (b.earned !== a.earned) return b.earned > a.earned ? 1 : -1;
+      return b.createdAtIso.localeCompare(a.createdAtIso);
+    });
+    return out.slice(0, 200).map((r) => r.item);
+  }
+
+  async setAffiliateCustomRate(
+    userId: string,
+    customRebateBps: number | null,
+    defaultBps: number,
+  ): Promise<AffiliateAccountItem> {
+    if (!this.core.users.has(userId)) throw new StoreError("not_found", `User ${userId} not found`);
+    return this.withAffiliateLock(userId, async () => {
+      const rec = this.ensureAffiliateRecord(userId);
+      rec.customRebateBps = customRebateBps;
+      rec.updatedAtIso = new Date().toISOString();
+      return this.getAffiliateAccount(userId, defaultBps);
+    });
+  }
+
+  async transferAffiliateToWallet(
+    userId: string,
+    amountNano: bigint,
+  ): Promise<{ withdrawal: AffiliateWithdrawalItem; affiliateBalanceNanoUsd: string; walletBalanceNanoUsd: string }> {
+    if (amountNano <= 0n) throw new StoreError("bad_request", "Transfer amount must be positive");
+    if (!this.core.users.has(userId)) throw new StoreError("not_found", `User ${userId} not found`);
+    return this.withAffiliateLock(userId, () => {
+      const rec = this.affiliateAccounts.get(userId);
+      if (!rec || rec.balanceNano < amountNano) {
+        throw new StoreError("bad_request", "Insufficient commission balance");
+      }
+      const now = new Date().toISOString();
+      rec.balanceNano -= amountNano;
+      rec.totalTransferredNano += amountNano;
+      rec.updatedAtIso = now;
+      const id = `affw_${crypto.randomUUID()}`;
+      applyMemoryWalletDelta(this.core, userId, amountNano, `aff-transfer:${id}`, "credit", `aff-transfer:${id}`);
+      const w: AffiliateWithdrawalRecord = {
+        id,
+        userId,
+        kind: "wallet_transfer",
+        amountNano,
+        status: "paid",
+        payoutMethod: "wallet",
+        payoutAccount: "",
+        notes: "",
+        reviewNote: "",
+        reviewedBy: null,
+        reviewedAtIso: now,
+        createdAtIso: now,
+      };
+      this.affiliateWithdrawals.unshift(w);
+      return {
+        withdrawal: this.toWithdrawalItem(w),
+        affiliateBalanceNanoUsd: rec.balanceNano.toString(),
+        walletBalanceNanoUsd: (this.core.wallets.get(userId)?.balanceNano ?? 0n).toString(),
+      };
+    });
+  }
+
+  async requestAffiliateWithdrawal(
+    userId: string,
+    amountNano: bigint,
+    payoutMethod: string,
+    payoutAccount: string,
+    notes: string,
+  ): Promise<AffiliateWithdrawalItem> {
+    if (amountNano <= 0n) throw new StoreError("bad_request", "Withdrawal amount must be positive");
+    if (!this.core.users.has(userId)) throw new StoreError("not_found", `User ${userId} not found`);
+    return this.withAffiliateLock(userId, () => {
+      const rec = this.affiliateAccounts.get(userId);
+      if (!rec || rec.balanceNano < amountNano) {
+        throw new StoreError("bad_request", "Insufficient commission balance");
+      }
+      const now = new Date().toISOString();
+      rec.balanceNano -= amountNano;
+      rec.updatedAtIso = now;
+      const w: AffiliateWithdrawalRecord = {
+        id: `affw_${crypto.randomUUID()}`,
+        userId,
+        kind: "payout",
+        amountNano,
+        status: "pending",
+        payoutMethod,
+        payoutAccount,
+        notes,
+        reviewNote: "",
+        reviewedBy: null,
+        reviewedAtIso: null,
+        createdAtIso: now,
+      };
+      this.affiliateWithdrawals.unshift(w);
+      return this.toWithdrawalItem(w);
+    });
+  }
+
+  async listAffiliateWithdrawals(filter: {
+    userId?: string;
+    status?: AffiliateWithdrawalStatus;
+    limit?: number;
+  }): Promise<AffiliateWithdrawalItem[]> {
+    const limit = Math.max(1, Math.min(500, filter.limit ?? 200));
+    return this.affiliateWithdrawals
+      .filter((w) => (!filter.userId || w.userId === filter.userId) && (!filter.status || w.status === filter.status))
+      .slice(0, limit)
+      .map((w) => this.toWithdrawalItem(w));
+  }
+
+  async reviewAffiliateWithdrawal(
+    id: string,
+    action: "approve" | "mark_paid" | "reject",
+    reviewerId: string,
+    reviewNote: string,
+  ): Promise<AffiliateWithdrawalItem> {
+    const w = this.affiliateWithdrawals.find((x) => x.id === id);
+    if (!w) throw new StoreError("not_found", "Withdrawal request not found");
+    if (w.kind !== "payout") throw new StoreError("bad_request", "Wallet transfers cannot be reviewed");
+    return this.withAffiliateLock(w.userId, () => {
+      if (action === "approve") {
+        if (w.status !== "pending") throw new StoreError("conflict", `Withdrawal is already ${w.status}`);
+        w.status = "approved";
+      } else if (action === "mark_paid") {
+        if (w.status !== "pending" && w.status !== "approved") {
+          throw new StoreError("conflict", `Withdrawal is already ${w.status}`);
+        }
+        w.status = "paid";
+        const rec = this.ensureAffiliateRecord(w.userId);
+        rec.totalWithdrawnNano += w.amountNano;
+        rec.updatedAtIso = new Date().toISOString();
+      } else {
+        if (w.status !== "pending" && w.status !== "approved") {
+          throw new StoreError("conflict", `Withdrawal is already ${w.status}`);
+        }
+        w.status = "rejected";
+        const rec = this.ensureAffiliateRecord(w.userId);
+        rec.balanceNano += w.amountNano;
+        rec.updatedAtIso = new Date().toISOString();
+      }
+      w.reviewNote = reviewNote;
+      w.reviewedBy = reviewerId;
+      w.reviewedAtIso = new Date().toISOString();
+      return this.toWithdrawalItem(w);
+    });
   }
 }

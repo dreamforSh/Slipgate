@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import type {
+  RedeemCodeClaimItem,
   RedeemCodeItem,
   RedeemCodeKind,
   RedeemCodeListResponse,
@@ -283,6 +284,32 @@ function valueText(item: RedeemCodeItem): string {
   return t("redeem.value.invitation");
 }
 
+/* ---------------- Claims drawer/modal ---------------- */
+
+const claimsOpen = ref(false);
+const claimsCode = ref("");
+const claimsLoading = ref(false);
+const claimsItems = ref<RedeemCodeClaimItem[]>([]);
+
+async function openClaims(item: RedeemCodeItem) {
+  claimsCode.value = item.code;
+  claimsItems.value = [];
+  claimsOpen.value = true;
+  claimsLoading.value = true;
+  try {
+    claimsItems.value = (
+      await apiJson<{ items: RedeemCodeClaimItem[] }>(
+        `/api/v1/admin/redeem-codes/${encodeURIComponent(item.code)}/claims`,
+        { fallbackError: t("redeem.admin.claims.loadFailed") },
+      )
+    ).items;
+  } catch (err) {
+    fail(err, t("redeem.admin.claims.loadFailed"));
+  } finally {
+    claimsLoading.value = false;
+  }
+}
+
 onMounted(() => void load());
 </script>
 
@@ -453,6 +480,7 @@ onMounted(() => void load());
               <th>{{ t("redeem.admin.table.code") }}</th>
               <th>{{ t("redeem.admin.table.kind") }}</th>
               <th>{{ t("redeem.admin.table.value") }}</th>
+              <th>{{ t("redeem.admin.table.usage") }}</th>
               <th>{{ t("redeem.admin.table.status") }}</th>
               <th>{{ t("redeem.admin.table.batch") }}</th>
               <th>{{ t("redeem.admin.table.notes") }}</th>
@@ -496,6 +524,26 @@ onMounted(() => void load());
                 >
                   {{ valueText(c) }}
                 </span>
+              </td>
+              <td class="whitespace-nowrap">
+                <div class="flex flex-col gap-0.5">
+                  <button
+                    v-if="c.usedCount > 0 || c.redeemedAtIso"
+                    type="button"
+                    class="inline-flex w-fit items-center gap-1 rounded px-1.5 py-0.5 font-mono text-xs text-accent transition-colors hover:bg-accent/10"
+                    :title="t('redeem.admin.table.viewClaims')"
+                    @click="openClaims(c)"
+                  >
+                    <UiIcon name="list" :size="12" />
+                    {{ c.usedCount }} / {{ c.maxUses }}
+                  </button>
+                  <span v-else class="font-mono text-xs text-fg-subtle">{{ c.usedCount }} / {{ c.maxUses }}</span>
+                  <span v-if="c.perUserLimit > 1 || c.batchPerUserLimit > 0" class="text-2xs text-fg-subtle">
+                    {{ c.perUserLimit > 1 ? t("redeem.admin.table.perUserShort", { n: c.perUserLimit }) : "" }}
+                    {{ c.perUserLimit > 1 && c.batchPerUserLimit > 0 ? " · " : "" }}
+                    {{ c.batchPerUserLimit > 0 ? t("redeem.admin.table.batchLimitShort", { n: c.batchPerUserLimit }) : "" }}
+                  </span>
+                </div>
               </td>
               <td>
                 <UiBadge :tone="statusTone[c.status]" dot>{{ t(`redeem.statuses.${c.status}`) }}</UiBadge>
@@ -615,6 +663,39 @@ onMounted(() => void load());
           <UiIcon v-if="bulkBusy" name="loader" :size="15" spin />
           {{ t("redeem.admin.bulk.apply") }}
         </button>
+      </template>
+    </UiModal>
+
+    <UiModal v-model:open="claimsOpen" width="lg" :title="t('redeem.admin.claims.title', { code: claimsCode })">
+      <template #icon>
+        <span class="icon-chip icon-chip-accent h-8 w-8"><UiIcon name="list" :size="15" /></span>
+      </template>
+      <ListSkeleton v-if="claimsLoading" />
+      <EmptyState v-else-if="claimsItems.length === 0" compact icon="ticket" :title="t('redeem.admin.claims.empty')" />
+      <div v-else class="table-wrap max-h-96 overflow-y-auto">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>{{ t("redeem.admin.claims.user") }}</th>
+              <th>{{ t("redeem.admin.claims.value") }}</th>
+              <th class="text-right">{{ t("redeem.admin.claims.time") }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="cl in claimsItems" :key="cl.id">
+              <td class="font-mono text-xs text-fg">{{ cl.userEmail || cl.userId }}</td>
+              <td class="text-xs text-fg-muted">
+                {{ cl.kind === "balance" ? formatUsd(cl.amountNanoUsd) : cl.kind }}
+              </td>
+              <td class="whitespace-nowrap text-right text-xs text-fg-subtle">
+                {{ formatDateTime(cl.redeemedAtIso) }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <template #footer>
+        <button type="button" class="btn btn-secondary" @click="claimsOpen = false">{{ t("common.close") }}</button>
       </template>
     </UiModal>
   </div>

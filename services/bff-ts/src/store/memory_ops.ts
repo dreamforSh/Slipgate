@@ -20,6 +20,7 @@ import {
   type PromoCodeCheckResponse,
   type PromoCodeItem,
   type PromoCodeUsageItem,
+  type RedeemCodeClaimItem,
   type RedeemCodeItem,
   type RedeemCodeKind,
   type RedeemCodeListQuery,
@@ -196,6 +197,22 @@ interface RedeemRecord {
   redeemedAtIso: string | null;
   expiresAtIso: string | null;
   createdAtIso: string;
+  maxUses: number;
+  usedCount: number;
+  perUserLimit: number;
+  batchPerUserLimit: number;
+}
+
+interface RedeemClaimRecord {
+  id: string;
+  code: string;
+  batchId: string;
+  userId: string;
+  kind: RedeemCodeKind;
+  amountNano: bigint;
+  groupId: string | null;
+  validityDays: number | null;
+  redeemedAtIso: string;
 }
 
 interface PromoRecord {
@@ -238,6 +255,7 @@ export class MemoryOpsStore implements OpsStore {
   private readonly redeem = new Map<string, RedeemRecord>();
   private readonly promos = new Map<string, PromoRecord>();
   private readonly promoUsages: { promoId: string; userId: string; bonusNano: bigint; usedAtIso: string }[] = [];
+  private readonly redeemClaims: RedeemClaimRecord[] = [];
   private readonly announcements = new Map<string, AnnouncementRecord>();
   private readonly reads = new Map<string, string>(); // `${annId}\u0000${userId}` -> readAtIso
   private readonly audit: AuditLogItem[] = [];
@@ -622,6 +640,7 @@ export class MemoryOpsStore implements OpsStore {
     for (const [id, s] of this.subs) if (s.userId === userId) this.subs.delete(id);
     for (const m of this.meta.values()) if (m.referrerId === userId) m.referrerId = null;
     for (let i = this.identities.length - 1; i >= 0; i--) if (this.identities[i]!.userId === userId) this.identities.splice(i, 1);
+    for (let i = this.redeemClaims.length - 1; i >= 0; i--) if (this.redeemClaims[i]!.userId === userId) this.redeemClaims.splice(i, 1);
   }
 
   async setUsersStatus(userIds: string[], status: "active" | "suspended"): Promise<number> {
@@ -745,27 +764,53 @@ export class MemoryOpsStore implements OpsStore {
 
   async isInvitationCodeUsable(code: string): Promise<boolean> {
     const rec = this.redeem.get(normalizeRedeemCode(code));
-    return Boolean(rec && rec.kind === "invitation" && effectiveRedeemStatus(rec.status, rec.expiresAtIso) === "unused");
+    return Boolean(
+      rec &&
+        rec.kind === "invitation" &&
+        effectiveRedeemStatus(rec.status, rec.expiresAtIso) === "unused" &&
+        rec.usedCount < rec.maxUses,
+    );
   }
 
   async registerWithInvitation<T extends { id: string }>(code: string, register: () => Promise<T>): Promise<T | null> {
     const rec = this.redeem.get(normalizeRedeemCode(code));
-    // Check and claim with no await in between: one concurrent registration wins the code.
-    if (!rec || rec.kind !== "invitation" || effectiveRedeemStatus(rec.status, rec.expiresAtIso) !== "unused") return null;
-    rec.status = "used";
-    rec.redeemedBy = null;
-    rec.redeemedAtIso = new Date().toISOString();
+    // Check and claim with no await in between: one concurrent registration wins the slot.
+    if (
+      !rec ||
+      rec.kind !== "invitation" ||
+      effectiveRedeemStatus(rec.status, rec.expiresAtIso) !== "unused" ||
+      rec.usedCount >= rec.maxUses
+    ) {
+      return null;
+    }
+    const prevRedeemedAt = rec.redeemedAtIso;
+    const prevStatus = rec.status;
+    rec.usedCount += 1;
+    if (rec.usedCount >= rec.maxUses) rec.status = "used";
+    if (rec.maxUses === 1) rec.redeemedBy = null;
+    const nowIso = new Date().toISOString();
+    rec.redeemedAtIso = nowIso;
     let created: T;
     try {
       created = await register();
     } catch (err) {
-      if (rec.status === "used" && rec.redeemedBy === null) {
-        rec.status = "unused";
-        rec.redeemedAtIso = null;
-      }
+      rec.usedCount = Math.max(0, rec.usedCount - 1);
+      rec.status = rec.usedCount < rec.maxUses ? "unused" : prevStatus;
+      if (rec.maxUses === 1) rec.redeemedAtIso = prevRedeemedAt;
       throw err;
     }
     rec.redeemedBy = created.id;
+    this.redeemClaims.unshift({
+      id: `rdc_${crypto.randomUUID()}`,
+      code: rec.code,
+      batchId: rec.batchId,
+      userId: created.id,
+      kind: "invitation",
+      amountNano: 0n,
+      groupId: null,
+      validityDays: null,
+      redeemedAtIso: nowIso,
+    });
     return created;
   }
 
@@ -814,6 +859,10 @@ export class MemoryOpsStore implements OpsStore {
       redeemedAtIso: r.redeemedAtIso,
       expiresAtIso: r.expiresAtIso,
       createdAtIso: r.createdAtIso,
+      maxUses: r.maxUses,
+      usedCount: r.usedCount,
+      perUserLimit: r.perUserLimit,
+      batchPerUserLimit: r.batchPerUserLimit,
     };
   }
 
@@ -826,6 +875,9 @@ export class MemoryOpsStore implements OpsStore {
     if (req.kind === "subscription") this.requireSubscriptionGroup(req.groupId ?? "");
     const batchId = `b_${randomCode(10).toLowerCase()}`;
     const now = new Date().toISOString();
+    const maxUses = req.maxUses ?? 1;
+    const perUserLimit = Math.min(req.perUserLimit ?? 1, maxUses);
+    const batchPerUserLimit = req.batchPerUserLimit ?? 0;
     const out: RedeemCodeItem[] = [];
     for (const code of codes) {
       if (this.redeem.has(code)) throw new StoreError("conflict", "Generated a duplicate code, retry");
@@ -842,6 +894,10 @@ export class MemoryOpsStore implements OpsStore {
         redeemedAtIso: null,
         expiresAtIso: req.expiresAtIso ?? null,
         createdAtIso: now,
+        maxUses,
+        usedCount: 0,
+        perUserLimit,
+        batchPerUserLimit,
       };
       this.redeem.set(code, rec);
       out.push(this.toRedeemItem(rec));
@@ -873,9 +929,9 @@ export class MemoryOpsStore implements OpsStore {
         used: count("used"),
         disabled: count("disabled"),
         expired: count("expired"),
-        redeemedNanoUsd: all
-          .filter((r) => r.status === "used" && r.kind === "balance")
-          .reduce((sum, r) => sum + BigInt(r.amountNanoUsd), 0n)
+        redeemedNanoUsd: Array.from(this.redeem.values())
+          .filter((r) => r.kind === "balance")
+          .reduce((sum, r) => sum + r.amountNano * BigInt(Math.max(r.usedCount, r.status === "used" ? 1 : 0)), 0n)
           .toString(),
       },
     };
@@ -920,21 +976,48 @@ export class MemoryOpsStore implements OpsStore {
     if (!rec || rec.status === "disabled" || rec.kind === "invitation") {
       throw new StoreError("not_found", "Invalid redeem code");
     }
-    if (rec.status === "used") throw new StoreError("conflict", "This code has already been used");
+    if (rec.status === "used" || rec.usedCount >= rec.maxUses) {
+      throw new StoreError("conflict", "This code has already been used");
+    }
     if (effectiveRedeemStatus(rec.status, rec.expiresAtIso) === "expired") {
       throw new StoreError("bad_request", "This code has expired");
     }
+    const priorCodeClaims = this.redeemClaims.filter((c) => c.code === code && c.userId === userId).length;
+    if (priorCodeClaims >= rec.perUserLimit) {
+      throw new StoreError("conflict", "You have already reached the redemption limit for this code");
+    }
+    if (rec.batchPerUserLimit > 0 && rec.batchId) {
+      const priorBatchClaims = this.redeemClaims.filter((c) => c.batchId === rec.batchId && c.userId === userId).length;
+      if (priorBatchClaims >= rec.batchPerUserLimit) {
+        throw new StoreError("conflict", "You have already reached the redemption limit for this batch");
+      }
+    }
+    const claimId = `rdc_${crypto.randomUUID()}`;
+    const idempotencyKey = rec.maxUses === 1 ? `redeem:${code}` : `redeem:${code}:${claimId}`;
     let subscriptionExpiresAtIso: string | null = null;
-    // No await from the status check to `status = "used"`: one concurrent redeem wins the code.
+    // No await from the checks to recording the claim + incrementing usedCount.
     if (rec.kind === "subscription") {
-      const sub = this.grantSubscription(userId, rec.groupId ?? "", rec.validityDays ?? 30, "", `redeem:${code}`, Date.now());
+      const sub = this.grantSubscription(userId, rec.groupId ?? "", rec.validityDays ?? 30, "", idempotencyKey, Date.now());
       subscriptionExpiresAtIso = sub.expiresAtIso;
     } else if (rec.amountNano > 0n) {
-      applyMemoryWalletDelta(this.core, userId, rec.amountNano, `redeem:${code}`, "credit", `redeem:${code}`);
+      applyMemoryWalletDelta(this.core, userId, rec.amountNano, idempotencyKey, "credit", idempotencyKey);
     }
-    rec.status = "used";
+    const nowIso = new Date().toISOString();
+    this.redeemClaims.unshift({
+      id: claimId,
+      code,
+      batchId: rec.batchId,
+      userId,
+      kind: rec.kind,
+      amountNano: rec.amountNano,
+      groupId: rec.groupId,
+      validityDays: rec.validityDays,
+      redeemedAtIso: nowIso,
+    });
+    rec.usedCount += 1;
+    rec.status = rec.usedCount >= rec.maxUses ? "used" : "unused";
     rec.redeemedBy = userId;
-    rec.redeemedAtIso = new Date().toISOString();
+    rec.redeemedAtIso = nowIso;
     return {
       code,
       kind: rec.kind,
@@ -946,11 +1029,70 @@ export class MemoryOpsStore implements OpsStore {
   }
 
   async listUserRedeemHistory(userId: string, limit: number): Promise<RedeemCodeItem[]> {
-    return Array.from(this.redeem.values())
-      .filter((r) => r.redeemedBy === userId)
-      .sort((a, b) => cmp(b.redeemedAtIso ?? "", a.redeemedAtIso ?? ""))
-      .slice(0, limit)
-      .map((r) => this.toRedeemItem(r));
+    const out: RedeemCodeItem[] = [];
+    const seenCodes = new Set<string>();
+    for (const cl of this.redeemClaims) {
+      if (cl.userId !== userId) continue;
+      const rec = this.redeem.get(cl.code);
+      if (!rec) continue;
+      seenCodes.add(cl.code);
+      const email = this.core.users.get(userId)?.email ?? null;
+      out.push({
+        ...this.toRedeemItem(rec),
+        amountNanoUsd: cl.amountNano.toString(),
+        groupId: cl.groupId,
+        groupName: cl.groupId ? (this.core.groups.get(cl.groupId)?.name ?? null) : null,
+        validityDays: cl.validityDays,
+        redeemedBy: userId,
+        redeemedByEmail: email,
+        redeemedAtIso: cl.redeemedAtIso,
+      });
+      if (out.length >= limit) break;
+    }
+    if (out.length < limit) {
+      for (const rec of this.redeem.values()) {
+        if (rec.redeemedBy === userId && !seenCodes.has(rec.code)) {
+          out.push(this.toRedeemItem(rec));
+          if (out.length >= limit) break;
+        }
+      }
+    }
+    return out.sort((a, b) => cmp(b.redeemedAtIso ?? "", a.redeemedAtIso ?? "")).slice(0, limit);
+  }
+
+  async listRedeemCodeClaims(rawCode: string): Promise<RedeemCodeClaimItem[]> {
+    const code = normalizeRedeemCode(rawCode);
+    const rec = this.redeem.get(code);
+    if (!rec) throw new StoreError("not_found", "Redeem code not found");
+    const claims = this.redeemClaims.filter((c) => c.code === code);
+    if (claims.length === 0 && rec.redeemedBy) {
+      return [
+        {
+          id: `legacy_${rec.code}`,
+          code: rec.code,
+          batchId: rec.batchId,
+          userId: rec.redeemedBy,
+          userEmail: this.core.users.get(rec.redeemedBy)?.email ?? "",
+          kind: rec.kind,
+          amountNanoUsd: rec.amountNano.toString(),
+          groupId: rec.groupId,
+          validityDays: rec.validityDays,
+          redeemedAtIso: rec.redeemedAtIso ?? new Date(0).toISOString(),
+        },
+      ];
+    }
+    return claims.slice(0, 500).map((cl) => ({
+      id: cl.id,
+      code: cl.code,
+      batchId: cl.batchId,
+      userId: cl.userId,
+      userEmail: this.core.users.get(cl.userId)?.email ?? "",
+      kind: cl.kind,
+      amountNanoUsd: cl.amountNano.toString(),
+      groupId: cl.groupId,
+      validityDays: cl.validityDays,
+      redeemedAtIso: cl.redeemedAtIso,
+    }));
   }
 
   /* ---------------- Promo codes ---------------- */

@@ -7,6 +7,8 @@ import {
   AdminTotpResetRequestSchema,
   AdminUpdateUserRequestSchema,
   AdminUserListQuerySchema,
+  AffiliateTransferRequestSchema,
+  AffiliateWithdrawRequestSchema,
   AssignSubscriptionRequestSchema,
   AuditClearRequestSchema,
   AuditClearResponseSchema,
@@ -659,20 +661,68 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
       ...u,
       email: u.email.replace(/^(.).*?(@.*)$/, "$1***$2"),
     }));
-    const [rebateTotal, rebates] = await Promise.all([store.payments.rebateTotal(userId), store.payments.listRebates(userId, 50)]);
+    const [rebateTotal, rebates, account, withdrawals] = await Promise.all([
+      store.payments.rebateTotal(userId),
+      store.payments.listRebates(userId, 50),
+      store.payments.getAffiliateAccount(userId, settings.affiliateRebateBps),
+      store.payments.listAffiliateWithdrawals({ userId, limit: 50 }),
+    ]);
     return c.json({
       enabled: settings.affiliateEnabled,
-      rebateBps: settings.affiliateRebateBps,
+      creditMode: settings.affiliateCreditMode,
+      minWithdrawUsd: settings.affiliateMinWithdrawUsd,
+      rebateBps: account.effectiveRebateBps,
+      globalRebateBps: settings.affiliateRebateBps,
+      customRebateBps: account.customRebateBps,
       inviteCode,
       inviteCount: mine.length,
       invitees: mine,
       rebateTotalNanoUsd: rebateTotal.toString(),
+      commissionBalanceNanoUsd: account.balanceNanoUsd,
+      totalEarnedNanoUsd: account.totalEarnedNanoUsd,
+      totalTransferredNanoUsd: account.totalTransferredNanoUsd,
+      totalWithdrawnNanoUsd: account.totalWithdrawnNanoUsd,
+      withdrawals,
       rebates: rebates.map((r) => ({
         amountNanoUsd: r.amountNanoUsd,
         inviteeEmail: r.inviteeEmail.replace(/^(.).*?(@.*)$/, "$1***$2"),
+        creditedTo: r.creditedTo ?? "wallet",
         createdAtIso: r.createdAtIso,
       })),
     });
+  });
+
+  app.post("/api/v1/user/affiliate/transfer", async (c) => {
+    const userId = c.get("authUser").sub;
+    const settings = await ops.getSettings();
+    if (!settings.affiliateEnabled) throw new StoreError("forbidden", "Referral program is disabled");
+    const req = await body(c, AffiliateTransferRequestSchema);
+    const amountNano = usd(req.amountUsd);
+    if (amountNano <= 0n) throw new StoreError("bad_request", "Transfer amount must be greater than zero");
+    const result = await store.payments.transferAffiliateToWallet(userId, amountNano);
+    await syncDataPlane();
+    return c.json(result);
+  });
+
+  app.post("/api/v1/user/affiliate/withdraw", async (c) => {
+    const userId = c.get("authUser").sub;
+    const settings = await ops.getSettings();
+    if (!settings.affiliateEnabled) throw new StoreError("forbidden", "Referral program is disabled");
+    const req = await body(c, AffiliateWithdrawRequestSchema);
+    const amountNano = usd(req.amountUsd);
+    if (amountNano <= 0n) throw new StoreError("bad_request", "Withdrawal amount must be greater than zero");
+    const minNano = parseUsdToNano(settings.affiliateMinWithdrawUsd);
+    if (amountNano < minNano) {
+      throw new StoreError("bad_request", `Minimum withdrawal amount is $${settings.affiliateMinWithdrawUsd}`);
+    }
+    const item = await store.payments.requestAffiliateWithdrawal(
+      userId,
+      amountNano,
+      req.payoutMethod,
+      req.payoutAccount,
+      req.notes,
+    );
+    return c.json({ item }, 201);
   });
 
   /* ======================================================================================== */
@@ -872,6 +922,10 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
     return c.json({ changed: await ops.updateRedeemCodes(req) });
   });
 
+  app.get("/api/v1/admin/redeem-codes/:code/claims", async (c) => {
+    return c.json({ items: await ops.listRedeemCodeClaims(c.req.param("code")) });
+  });
+
   app.get("/api/v1/admin/redeem-codes/export", async (c) => {
     const q = query(c, RedeemCodeListQuerySchema);
     const rows = [];
@@ -881,7 +935,24 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
       if (res.items.length < 200) break;
     }
     const csv = toCsv(
-      ["code", "kind", "amount_usd", "group", "validity_days", "status", "batch", "notes", "redeemed_by", "redeemed_at", "expires_at", "created_at"],
+      [
+        "code",
+        "kind",
+        "amount_usd",
+        "group",
+        "validity_days",
+        "status",
+        "used_count",
+        "max_uses",
+        "per_user_limit",
+        "batch_per_user_limit",
+        "batch",
+        "notes",
+        "redeemed_by",
+        "redeemed_at",
+        "expires_at",
+        "created_at",
+      ],
       rows.map((r) => [
         r.code,
         r.kind,
@@ -889,6 +960,10 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
         r.groupName ?? "",
         r.validityDays ?? "",
         r.status,
+        r.usedCount,
+        r.maxUses,
+        r.perUserLimit,
+        r.batchPerUserLimit,
         r.batchId,
         r.notes,
         r.redeemedByEmail ?? "",

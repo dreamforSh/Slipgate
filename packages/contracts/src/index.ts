@@ -28,6 +28,7 @@ export * from "./request_errors.ts";
 export * from "./alerts.ts";
 export * from "./channel_monitors.ts";
 export * from "./platform_quotas.ts";
+export * from "./affiliate.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 

@@ -19,6 +19,7 @@ import {
   type PromoCodeCheckResponse,
   type PromoCodeItem,
   type PromoCodeUsageItem,
+  type RedeemCodeClaimItem,
   type RedeemCodeItem,
   type RedeemCodeListQuery,
   type RedeemCodeListResponse,
@@ -108,10 +109,33 @@ export const PG_OPS_SCHEMA_SQL = `
       ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'unused',
       ADD COLUMN IF NOT EXISTS batch_id TEXT NOT NULL DEFAULT '',
       ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '',
-      ADD COLUMN IF NOT EXISTS created_by TEXT;
+      ADD COLUMN IF NOT EXISTS created_by TEXT,
+      ADD COLUMN IF NOT EXISTS max_uses INTEGER NOT NULL DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS used_count INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS per_user_limit INTEGER NOT NULL DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS batch_per_user_limit INTEGER NOT NULL DEFAULT 0;
   UPDATE commerce.redeem_codes SET status = 'used' WHERE redeemed_by IS NOT NULL AND status = 'unused';
+  UPDATE commerce.redeem_codes SET used_count = 1 WHERE status = 'used' AND used_count = 0;
   CREATE INDEX IF NOT EXISTS idx_commerce_redeem_codes_created ON commerce.redeem_codes (created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_commerce_redeem_codes_redeemed_by ON commerce.redeem_codes (redeemed_by, redeemed_at DESC);
+
+  CREATE TABLE IF NOT EXISTS commerce.redeem_code_claims (
+      id TEXT PRIMARY KEY,
+      code TEXT NOT NULL REFERENCES commerce.redeem_codes(code) ON DELETE CASCADE,
+      batch_id TEXT NOT NULL DEFAULT '',
+      user_id TEXT NOT NULL REFERENCES commerce.users(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      amount_nano_usd NUMERIC(39, 0) NOT NULL DEFAULT 0,
+      group_id TEXT,
+      validity_days INTEGER,
+      redeemed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_commerce_redeem_claims_code_user
+      ON commerce.redeem_code_claims (code, user_id);
+  CREATE INDEX IF NOT EXISTS idx_commerce_redeem_claims_batch_user
+      ON commerce.redeem_code_claims (batch_id, user_id);
+  CREATE INDEX IF NOT EXISTS idx_commerce_redeem_claims_user
+      ON commerce.redeem_code_claims (user_id, redeemed_at DESC);
 
   CREATE TABLE IF NOT EXISTS commerce.promo_codes (
       id TEXT PRIMARY KEY,
@@ -452,6 +476,10 @@ interface RedeemRow {
   redeemed_at: Date | null;
   expires_at: Date | null;
   created_at: Date;
+  max_uses: number;
+  used_count: number;
+  per_user_limit: number;
+  batch_per_user_limit: number;
 }
 
 interface PromoRow {
@@ -1142,6 +1170,7 @@ export class PostgresOpsStore implements OpsStore {
     const rows = await this.sql`
       SELECT 1 FROM commerce.redeem_codes
        WHERE code = ${normalizeRedeemCode(code)} AND kind = 'invitation' AND status = 'unused'
+         AND used_count < max_uses
          AND (expires_at IS NULL OR expires_at > NOW())
     `;
     return rows.length > 0;
@@ -1149,15 +1178,16 @@ export class PostgresOpsStore implements OpsStore {
 
   async registerWithInvitation<T extends { id: string }>(code: string, register: () => Promise<T>): Promise<T | null> {
     const normalized = normalizeRedeemCode(code);
-    // The conditional UPDATE is the claim: concurrent registrations with one code queue on its
-    // row lock and re-check `status = 'unused'`, so exactly one of them gets a row back. Until the
-    // user exists the claim has no redeemer; a crash in that gap leaves the code spent (fail-closed).
-    const claimed = await this.sql<{ claimed_at: Date }[]>`
+    // Atomic UPDATE claims one invitation slot under row lock; rolls back if `register()` fails.
+    const claimed = await this.sql<{ claimed_at: Date; max_uses: number }[]>`
       UPDATE commerce.redeem_codes
-         SET status = 'used', redeemed_by = NULL, redeemed_at = date_trunc('milliseconds', clock_timestamp())
-       WHERE code = ${normalized} AND kind = 'invitation' AND status = 'unused'
+         SET used_count = used_count + 1,
+             status = CASE WHEN used_count + 1 >= max_uses THEN 'used' ELSE status END,
+             redeemed_by = CASE WHEN max_uses = 1 THEN NULL ELSE redeemed_by END,
+             redeemed_at = date_trunc('milliseconds', clock_timestamp())
+       WHERE code = ${normalized} AND kind = 'invitation' AND status = 'unused' AND used_count < max_uses
          AND (expires_at IS NULL OR expires_at > NOW())
-      RETURNING redeemed_at AS claimed_at
+      RETURNING redeemed_at AS claimed_at, max_uses
     `;
     const claim = claimed[0];
     if (!claim) return null;
@@ -1166,15 +1196,31 @@ export class PostgresOpsStore implements OpsStore {
       created = await register();
     } catch (err) {
       await this.sql`
-        UPDATE commerce.redeem_codes SET status = 'unused', redeemed_at = NULL
-         WHERE code = ${normalized} AND status = 'used' AND redeemed_by IS NULL AND redeemed_at = ${claim.claimed_at}
+        UPDATE commerce.redeem_codes
+           SET used_count = GREATEST(0, used_count - 1),
+               status = 'unused',
+               redeemed_at = CASE WHEN max_uses = 1 THEN NULL ELSE redeemed_at END
+         WHERE code = ${normalized} AND used_count > 0
       `.catch(() => {});
       throw err;
     }
+    if (claim.max_uses === 1) {
+      await this.sql`
+        UPDATE commerce.redeem_codes SET redeemed_by = ${created.id}
+         WHERE code = ${normalized} AND redeemed_by IS NULL AND redeemed_at = ${claim.claimed_at}
+      `;
+    } else {
+      await this.sql`
+        UPDATE commerce.redeem_codes SET redeemed_by = ${created.id}
+         WHERE code = ${normalized}
+      `;
+    }
     await this.sql`
-      UPDATE commerce.redeem_codes SET redeemed_by = ${created.id}
-       WHERE code = ${normalized} AND redeemed_by IS NULL AND redeemed_at = ${claim.claimed_at}
-    `;
+      INSERT INTO commerce.redeem_code_claims (id, code, batch_id, user_id, kind, amount_nano_usd, redeemed_at)
+      SELECT ${`rdc_${crypto.randomUUID()}`}, code, batch_id, ${created.id}, 'invitation', 0, NOW()
+        FROM commerce.redeem_codes
+       WHERE code = ${normalized}
+    `.catch(() => {});
     return created;
   }
 
@@ -1215,7 +1261,7 @@ export class PostgresOpsStore implements OpsStore {
     return this.sql`
       SELECT c.code, c.kind, c.amount_nano_usd::text, c.group_id, g.name AS group_name, c.validity_days,
              c.status, c.batch_id, c.notes, c.redeemed_by, u.email AS redeemed_by_email, c.redeemed_at,
-             c.expires_at, c.created_at
+             c.expires_at, c.created_at, c.max_uses, c.used_count, c.per_user_limit, c.batch_per_user_limit
         FROM commerce.redeem_codes c
         LEFT JOIN core.groups g ON g.id = c.group_id
         LEFT JOIN commerce.users u ON u.id = c.redeemed_by
@@ -1240,6 +1286,10 @@ export class PostgresOpsStore implements OpsStore {
       redeemedAtIso: isoOrNull(r.redeemed_at),
       expiresAtIso,
       createdAtIso: iso(r.created_at),
+      maxUses: r.max_uses ?? 1,
+      usedCount: r.used_count ?? 0,
+      perUserLimit: r.per_user_limit ?? 1,
+      batchPerUserLimit: r.batch_per_user_limit ?? 0,
     };
   }
 
@@ -1257,6 +1307,9 @@ export class PostgresOpsStore implements OpsStore {
       if (g[0].subscription_type !== "subscription") throw new StoreError("bad_request", "That group is not subscription-billed");
     }
     const batchId = `b_${randomCode(10).toLowerCase()}`;
+    const maxUses = req.maxUses ?? 1;
+    const perUserLimit = Math.min(req.perUserLimit ?? 1, maxUses);
+    const batchPerUserLimit = req.batchPerUserLimit ?? 0;
     const rows = codes.map((code) => ({
       code,
       kind: req.kind,
@@ -1268,6 +1321,10 @@ export class PostgresOpsStore implements OpsStore {
       notes: req.notes,
       created_by: createdBy,
       expires_at: req.expiresAtIso ? new Date(req.expiresAtIso) : null,
+      max_uses: maxUses,
+      used_count: 0,
+      per_user_limit: perUserLimit,
+      batch_per_user_limit: batchPerUserLimit,
     }));
     try {
       await this.sql`
@@ -1283,6 +1340,10 @@ export class PostgresOpsStore implements OpsStore {
           "notes",
           "created_by",
           "expires_at",
+          "max_uses",
+          "used_count",
+          "per_user_limit",
+          "batch_per_user_limit",
         )}
       `;
     } catch (err) {
@@ -1326,7 +1387,7 @@ export class PostgresOpsStore implements OpsStore {
                COUNT(*) FILTER (WHERE status = 'used')::int AS used,
                COUNT(*) FILTER (WHERE status = 'disabled')::int AS disabled,
                COUNT(*) FILTER (WHERE status = 'unused' AND expires_at IS NOT NULL AND expires_at <= NOW())::int AS expired,
-               COALESCE(SUM(amount_nano_usd) FILTER (WHERE status = 'used' AND kind = 'balance'), 0)::text AS redeemed
+               COALESCE(SUM(amount_nano_usd * GREATEST(used_count, CASE WHEN status = 'used' THEN 1 ELSE 0 END)) FILTER (WHERE kind = 'balance'), 0)::text AS redeemed
           FROM commerce.redeem_codes
       `,
     ]);
@@ -1369,29 +1430,68 @@ export class PostgresOpsStore implements OpsStore {
     const code = normalizeRedeemCode(rawCode);
     return this.sql.begin(async (txRaw) => {
       const tx = txRaw as unknown as Sql;
-      const rows = await tx<
-        { kind: RedeemCodeItem["kind"]; amount: string; group_id: string | null; validity_days: number | null; status: string; expires_at: Date | null; group_name: string | null }[]
-      >`
-        SELECT c.kind, c.amount_nano_usd::text AS amount, c.group_id, c.validity_days, c.status, c.expires_at, g.name AS group_name
+      const rows = await tx<{
+        kind: RedeemCodeItem["kind"];
+        amount: string;
+        group_id: string | null;
+        validity_days: number | null;
+        status: "unused" | "used" | "disabled";
+        batch_id: string;
+        expires_at: Date | null;
+        max_uses: number;
+        used_count: number;
+        per_user_limit: number;
+        batch_per_user_limit: number;
+        group_name: string | null;
+      }[]>`
+        SELECT c.kind, c.amount_nano_usd::text AS amount, c.group_id, c.validity_days, c.status, c.batch_id,
+               c.expires_at, c.max_uses, c.used_count, c.per_user_limit, c.batch_per_user_limit, g.name AS group_name
           FROM commerce.redeem_codes c LEFT JOIN core.groups g ON g.id = c.group_id
          WHERE c.code = ${code}
          FOR UPDATE OF c
       `;
       const r = rows[0];
       if (!r || r.status === "disabled" || r.kind === "invitation") throw new StoreError("not_found", "Invalid redeem code");
-      if (r.status === "used") throw new StoreError("conflict", "This code has already been used");
+      if (r.status === "used" || r.used_count >= r.max_uses) throw new StoreError("conflict", "This code has already been used");
       if (r.expires_at && r.expires_at.getTime() <= Date.now()) throw new StoreError("bad_request", "This code has expired");
+
+      const codeClaims = await tx<{ n: number }[]>`
+        SELECT COUNT(*)::int AS n FROM commerce.redeem_code_claims WHERE code = ${code} AND user_id = ${userId}
+      `;
+      if ((codeClaims[0]?.n ?? 0) >= r.per_user_limit) {
+        throw new StoreError("conflict", "You have already reached the redemption limit for this code");
+      }
+      if (r.batch_per_user_limit > 0 && r.batch_id) {
+        await tx`SELECT pg_advisory_xact_lock(74210061, hashtext(${`${r.batch_id}:${userId}`}))`;
+        const batchClaims = await tx<{ n: number }[]>`
+          SELECT COUNT(*)::int AS n FROM commerce.redeem_code_claims WHERE batch_id = ${r.batch_id} AND user_id = ${userId}
+        `;
+        if ((batchClaims[0]?.n ?? 0) >= r.batch_per_user_limit) {
+          throw new StoreError("conflict", "You have already reached the redemption limit for this batch");
+        }
+      }
+
+      const claimId = `rdc_${crypto.randomUUID()}`;
+      const idempotencyKey = r.max_uses === 1 ? `redeem:${code}` : `redeem:${code}:${claimId}`;
       let subscriptionExpiresAtIso: string | null = null;
       if (r.kind === "subscription") {
-        const subId = await pgAssignSubscriptionTx(tx, userId, r.group_id ?? "", r.validity_days ?? 30, "", `redeem:${code}`);
+        const subId = await pgAssignSubscriptionTx(tx, userId, r.group_id ?? "", r.validity_days ?? 30, "", idempotencyKey);
         const exp = await tx<{ expires_at: Date }[]>`SELECT expires_at FROM commerce.subscriptions WHERE id = ${subId}`;
         subscriptionExpiresAtIso = isoOrNull(exp[0]?.expires_at);
       } else {
         const amount = BigInt(r.amount);
-        if (amount > 0n) await pgApplyWalletDelta(tx, userId, amount, `redeem:${code}`, "credit", `redeem:${code}`);
+        if (amount > 0n) await pgApplyWalletDelta(tx, userId, amount, idempotencyKey, "credit", idempotencyKey);
       }
       await tx`
-        UPDATE commerce.redeem_codes SET status = 'used', redeemed_by = ${userId}, redeemed_at = NOW() WHERE code = ${code}
+        INSERT INTO commerce.redeem_code_claims (id, code, batch_id, user_id, kind, amount_nano_usd, group_id, validity_days)
+        VALUES (${claimId}, ${code}, ${r.batch_id}, ${userId}, ${r.kind}, ${r.amount}::numeric, ${r.group_id}, ${r.validity_days})
+      `;
+      const nextUsed = r.used_count + 1;
+      const nextStatus = nextUsed >= r.max_uses ? "used" : "unused";
+      await tx`
+        UPDATE commerce.redeem_codes
+           SET used_count = ${nextUsed}, status = ${nextStatus}, redeemed_by = ${userId}, redeemed_at = NOW()
+         WHERE code = ${code}
       `;
       return {
         code,
@@ -1405,10 +1505,102 @@ export class PostgresOpsStore implements OpsStore {
   }
 
   async listUserRedeemHistory(userId: string, limit: number): Promise<RedeemCodeItem[]> {
-    const rows = await this.sql<RedeemRow[]>`
-      ${this.redeemSelect(this.sql`c.redeemed_by = ${userId}`)} ORDER BY c.redeemed_at DESC LIMIT ${Math.max(1, Math.min(200, limit))}
+    const capped = Math.max(1, Math.min(200, limit));
+    const claimRows = await this.sql<RedeemRow[]>`
+      SELECT c.code, c.kind, cl.amount_nano_usd::text, cl.group_id, g.name AS group_name, cl.validity_days,
+             c.status, c.batch_id, c.notes, cl.user_id AS redeemed_by, u.email AS redeemed_by_email,
+             cl.redeemed_at, c.expires_at, c.created_at, c.max_uses, c.used_count,
+             c.per_user_limit, c.batch_per_user_limit
+        FROM commerce.redeem_code_claims cl
+        JOIN commerce.redeem_codes c ON c.code = cl.code
+        LEFT JOIN core.groups g ON g.id = cl.group_id
+        LEFT JOIN commerce.users u ON u.id = cl.user_id
+       WHERE cl.user_id = ${userId}
+      UNION ALL
+      SELECT c.code, c.kind, c.amount_nano_usd::text, c.group_id, g.name AS group_name, c.validity_days,
+             c.status, c.batch_id, c.notes, c.redeemed_by, u.email AS redeemed_by_email,
+             c.redeemed_at, c.expires_at, c.created_at, c.max_uses, c.used_count,
+             c.per_user_limit, c.batch_per_user_limit
+        FROM commerce.redeem_codes c
+        LEFT JOIN core.groups g ON g.id = c.group_id
+        LEFT JOIN commerce.users u ON u.id = c.redeemed_by
+       WHERE c.redeemed_by = ${userId}
+         AND NOT EXISTS (SELECT 1 FROM commerce.redeem_code_claims cl2 WHERE cl2.code = c.code AND cl2.user_id = ${userId})
+       ORDER BY redeemed_at DESC NULLS LAST
+       LIMIT ${capped}
     `;
-    return rows.map((r) => this.toRedeemItem(r));
+    return claimRows.map((r) => this.toRedeemItem(r));
+  }
+
+  async listRedeemCodeClaims(rawCode: string): Promise<RedeemCodeClaimItem[]> {
+    const code = normalizeRedeemCode(rawCode);
+    const parent = await this.sql<{
+      code: string;
+      kind: RedeemCodeItem["kind"];
+      amount_nano_usd: string;
+      group_id: string | null;
+      validity_days: number | null;
+      batch_id: string;
+      redeemed_by: string | null;
+      redeemed_by_email: string | null;
+      redeemed_at: Date | null;
+    }[]>`
+      SELECT c.code, c.kind, c.amount_nano_usd::text, c.group_id, c.validity_days, c.batch_id,
+             c.redeemed_by, u.email AS redeemed_by_email, c.redeemed_at
+        FROM commerce.redeem_codes c
+        LEFT JOIN commerce.users u ON u.id = c.redeemed_by
+       WHERE c.code = ${code}
+    `;
+    const p = parent[0];
+    if (!p) throw new StoreError("not_found", "Redeem code not found");
+    const rows = await this.sql<{
+      id: string;
+      code: string;
+      batch_id: string;
+      user_id: string;
+      user_email: string | null;
+      kind: RedeemCodeItem["kind"];
+      amount_nano_usd: string;
+      group_id: string | null;
+      validity_days: number | null;
+      redeemed_at: Date;
+    }[]>`
+      SELECT cl.id, cl.code, cl.batch_id, cl.user_id, u.email AS user_email, cl.kind,
+             cl.amount_nano_usd::text, cl.group_id, cl.validity_days, cl.redeemed_at
+        FROM commerce.redeem_code_claims cl
+        LEFT JOIN commerce.users u ON u.id = cl.user_id
+       WHERE cl.code = ${code}
+       ORDER BY cl.redeemed_at DESC
+       LIMIT 500
+    `;
+    if (rows.length === 0 && p.redeemed_by) {
+      return [
+        {
+          id: `legacy_${p.code}`,
+          code: p.code,
+          batchId: p.batch_id,
+          userId: p.redeemed_by,
+          userEmail: p.redeemed_by_email ?? "",
+          kind: p.kind,
+          amountNanoUsd: p.amount_nano_usd,
+          groupId: p.group_id,
+          validityDays: p.validity_days,
+          redeemedAtIso: isoOrNull(p.redeemed_at) ?? new Date(0).toISOString(),
+        },
+      ];
+    }
+    return rows.map((r) => ({
+      id: r.id,
+      code: r.code,
+      batchId: r.batch_id,
+      userId: r.user_id,
+      userEmail: r.user_email ?? "",
+      kind: r.kind,
+      amountNanoUsd: r.amount_nano_usd,
+      groupId: r.group_id,
+      validityDays: r.validity_days,
+      redeemedAtIso: iso(r.redeemed_at),
+    }));
   }
 
   /* ---------------- Promo codes ---------------- */

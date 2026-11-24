@@ -233,6 +233,8 @@ const en: typeof zh = {
       channelMonitorUpdate: "Update channel monitor",
       channelMonitorDelete: "Delete channel monitor",
       channelMonitorRun: "Run channel monitor probe",
+      affiliateRateUpdate: "Set custom affiliate rebate rate",
+      affiliateWithdrawalReview: "Review affiliate withdrawal",
       systemUpdateSync: "Sync system update",
     },
     errors: {

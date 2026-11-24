@@ -5,6 +5,7 @@ import { onBeforeRouteLeave, useRoute, useRouter } from "vue-router";
 import {
   configuredPublicBaseUrl,
   DEFAULT_EMAIL_CONFIG,
+  type AffiliateCreditMode,
   type EmailConfig,
   type OAuthProviderConfig,
   type OAuthProviderId,
@@ -97,6 +98,8 @@ interface SettingsForm {
   affiliateEnabled: boolean;
   /** Percent shown to the admin; the API stores basis points. */
   rebatePercent: number | string;
+  affiliateCreditMode: AffiliateCreditMode;
+  affiliateMinWithdrawUsd: string;
 }
 type FieldKey = keyof SettingsForm;
 
@@ -137,7 +140,7 @@ const TAB_FIELDS: Record<TabKey, FieldKey[]> = {
   security: [],
   agreement: [],
   public: ["modelPlazaEnabled", "statusPageEnabled", "keyUsageLookupEnabled", "homeContent", "customNavLinks"],
-  referral: ["affiliateEnabled", "rebatePercent"],
+  referral: ["affiliateEnabled", "rebatePercent", "affiliateCreditMode", "affiliateMinWithdrawUsd"],
 };
 const FIELDS = TABS.flatMap((tab) => TAB_FIELDS[tab]);
 const NUMERIC: FieldKey[] = [
@@ -197,6 +200,8 @@ function toForm(s: PortalSettings, prevRows: NavLinkRow[] = []): SettingsForm {
     keyUsageLookupEnabled: s.keyUsageLookupEnabled,
     affiliateEnabled: s.affiliateEnabled,
     rebatePercent: s.affiliateRebateBps / 100,
+    affiliateCreditMode: s.affiliateCreditMode ?? "wallet",
+    affiliateMinWithdrawUsd: s.affiliateMinWithdrawUsd ?? "10",
   };
 }
 
@@ -208,7 +213,9 @@ function cloneForm(f: SettingsForm): SettingsForm {
 function norm(f: SettingsForm, key: FieldKey): string {
   const v = f[key];
   if (key === "customNavLinks") return JSON.stringify(f.customNavLinks.map((r) => [r.label, r.url]));
-  if (key === "defaultBalanceUsd") return usdToNano(f.defaultBalanceUsd) ?? `raw:${f.defaultBalanceUsd}`;
+  if (key === "defaultBalanceUsd" || key === "affiliateMinWithdrawUsd") {
+    return usdToNano(String(v)) ?? `raw:${v}`;
+  }
   if (NUMERIC.includes(key)) return v === "" ? "" : String(Number(v));
   return String(v);
 }
@@ -245,6 +252,8 @@ function emptySettings(): PortalSettings {
     keyUsageLookupEnabled: false,
     affiliateEnabled: false,
     affiliateRebateBps: 0,
+    affiliateCreditMode: "wallet",
+    affiliateMinWithdrawUsd: "10",
     auditLogRetentionDays: 0,
     registrationEmailSuffixAllowlist: [],
     registrationEmailDomainQuotaEnabled: false,
@@ -447,6 +456,8 @@ const clientErrors = computed<Partial<Record<FieldKey, string>>>(() => {
     const pct = Number(f.rebatePercent);
     if (!Number.isFinite(pct) || pct < 0 || pct > 50) e.rebatePercent = t("settings.errors.range", { min: 0, max: 50 });
   }
+  if (!f.affiliateMinWithdrawUsd.trim()) e.affiliateMinWithdrawUsd = t("settings.errors.required");
+  else if (usdToNano(f.affiliateMinWithdrawUsd) === null) e.affiliateMinWithdrawUsd = t("settings.errors.usd");
   if (navErrors.value.some((r) => r.label || r.url)) e.customNavLinks = t("settings.errors.navLinks");
   return e;
 });
@@ -635,6 +646,9 @@ function buildPatch(): UpdatePortalSettingsRequest {
         break;
       case "rebatePercent":
         patch.affiliateRebateBps = rebateBps.value;
+        break;
+      case "affiliateMinWithdrawUsd":
+        patch.affiliateMinWithdrawUsd = f.affiliateMinWithdrawUsd.trim().replace(/^\$/, "");
         break;
       default:
         Object.assign(patch, { [k]: f[k] });
@@ -1448,7 +1462,7 @@ const stagger = (i: number) => ({ animationDelay: `${Math.min(i, 5) * 60}ms`, an
                 :description="t('settings.referral.enabledHelp')"
                 :dirty="isDirty('affiliateEnabled')"
               />
-              <div class="pt-4 transition-opacity" :class="form.affiliateEnabled ? '' : 'opacity-60'">
+              <div class="space-y-4 pt-4 transition-opacity" :class="form.affiliateEnabled ? '' : 'opacity-60'">
                 <SettingField
                   input-id="set-rebate"
                   :label="t('settings.referral.rate')"
@@ -1482,6 +1496,38 @@ const stagger = (i: number) => ({ animationDelay: `${Math.min(i, 5) * 60}ms`, an
                     </div>
                   </div>
                 </SettingField>
+
+                <SettingField
+                  input-id="set-aff-credit-mode"
+                  :label="t('settings.referral.creditMode')"
+                  :hint="t('settings.referral.creditModeHint')"
+                  :dirty="isDirty('affiliateCreditMode')"
+                >
+                  <select id="set-aff-credit-mode" v-model="form.affiliateCreditMode" class="input">
+                    <option value="wallet">{{ t("settings.referral.creditModeOptions.wallet") }}</option>
+                    <option value="commission_pool">{{ t("settings.referral.creditModeOptions.commission_pool") }}</option>
+                  </select>
+                </SettingField>
+
+                <SettingField
+                  input-id="set-aff-min-withdraw"
+                  :label="t('settings.referral.minWithdrawUsd')"
+                  :hint="t('settings.referral.minWithdrawUsdHint')"
+                  :dirty="isDirty('affiliateMinWithdrawUsd')"
+                  :error="fieldError('affiliateMinWithdrawUsd')"
+                >
+                  <div class="relative w-44">
+                    <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm text-fg-subtle">$</span>
+                    <input
+                      id="set-aff-min-withdraw"
+                      v-model="form.affiliateMinWithdrawUsd"
+                      type="text"
+                      inputmode="decimal"
+                      class="input pl-7 font-mono"
+                      :class="fieldError('affiliateMinWithdrawUsd') ? errorClass : ''"
+                    />
+                  </div>
+                </SettingField>
               </div>
             </div>
           </UiCard>
@@ -1510,7 +1556,13 @@ const stagger = (i: number) => ({ animationDelay: `${Math.min(i, 5) * 60}ms`, an
               </div>
             </div>
             <p class="mt-3 text-xs leading-relaxed text-fg-subtle">
-              {{ form.affiliateEnabled ? t("settings.referral.noteOn") : t("settings.referral.noteOff") }}
+              {{
+                !form.affiliateEnabled
+                  ? t("settings.referral.noteOff")
+                  : form.affiliateCreditMode === "commission_pool"
+                    ? t("settings.referral.notePool")
+                    : t("settings.referral.noteOn")
+              }}
             </p>
           </UiCard>
         </div>

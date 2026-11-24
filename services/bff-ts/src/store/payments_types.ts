@@ -1,5 +1,8 @@
 import type {
+  AffiliateAccountItem,
   AffiliateRebateItem,
+  AffiliateWithdrawalItem,
+  AffiliateWithdrawalStatus,
   OrderListQuery,
   PaymentCheckout,
   PaymentCurrency,
@@ -77,6 +80,8 @@ export interface RebatePolicy {
   enabled: boolean;
   /** Basis points of the credited balance paid to the payer's referrer. */
   bps: number;
+  /** Where top-up rebates are credited: user's main API wallet or dedicated commission pool. */
+  creditMode?: "wallet" | "commission_pool";
 }
 
 export interface FulfillResult {
@@ -189,4 +194,31 @@ export interface PaymentsStore {
   dashboard(days: number, currency: PaymentCurrency): Promise<PaymentDashboard>;
   listRebates(beneficiaryId: string | null, limit: number): Promise<AffiliateRebateItem[]>;
   rebateTotal(beneficiaryId: string): Promise<bigint>;
+
+  /* ---- Affiliate accounts, custom rates, wallet transfers & withdrawals (Lane C3) ---- */
+  getAffiliateAccount(userId: string, defaultBps: number): Promise<AffiliateAccountItem>;
+  listAffiliateAccounts(defaultBps: number, search?: string): Promise<AffiliateAccountItem[]>;
+  setAffiliateCustomRate(userId: string, customRebateBps: number | null, defaultBps: number): Promise<AffiliateAccountItem>;
+  transferAffiliateToWallet(
+    userId: string,
+    amountNano: bigint,
+  ): Promise<{ withdrawal: AffiliateWithdrawalItem; affiliateBalanceNanoUsd: string; walletBalanceNanoUsd: string }>;
+  requestAffiliateWithdrawal(
+    userId: string,
+    amountNano: bigint,
+    payoutMethod: string,
+    payoutAccount: string,
+    notes: string,
+  ): Promise<AffiliateWithdrawalItem>;
+  listAffiliateWithdrawals(filter: {
+    userId?: string;
+    status?: AffiliateWithdrawalStatus;
+    limit?: number;
+  }): Promise<AffiliateWithdrawalItem[]>;
+  reviewAffiliateWithdrawal(
+    id: string,
+    action: "approve" | "mark_paid" | "reject",
+    reviewerId: string,
+    reviewNote: string,
+  ): Promise<AffiliateWithdrawalItem>;
 }

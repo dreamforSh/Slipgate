@@ -1,18 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { RouterLink } from "vue-router";
+import { parseUsdToNano, type AffiliateWithdrawalItem } from "@slipgate/contracts";
 import CopyButton from "../../components/ui/CopyButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
+import FormField from "../../components/ui/FormField.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
 import StatCard from "../../components/ui/StatCard.vue";
 import UiAlert from "../../components/ui/UiAlert.vue";
+import UiBadge from "../../components/ui/UiBadge.vue";
 import UiCard from "../../components/ui/UiCard.vue";
 import UiIcon, { type IconName } from "../../components/ui/UiIcon.vue";
+import UiModal from "../../components/ui/UiModal.vue";
 import UiPagination from "../../components/ui/UiPagination.vue";
 import { useNow } from "../../composables/useNow";
 import { apiJson, errorText } from "../../lib/api";
-import { formatDateShort, formatDateTime, formatRelative, formatUsd } from "../../lib/format";
+import { formatDateShort, formatDateTime, formatRelative, formatUsd, type Tone } from "../../lib/format";
 import { useToastStore } from "../../stores/toast";
 
 interface Invitee {
@@ -25,16 +29,26 @@ interface RebateEntry {
   amountNanoUsd: string;
   /** Masked by the BFF. */
   inviteeEmail: string;
+  creditedTo?: "wallet" | "commission_pool";
   createdAtIso: string;
 }
 
 interface AffiliateInfo {
   enabled: boolean;
+  creditMode?: "wallet" | "commission_pool";
+  minWithdrawUsd?: string;
   rebateBps: number;
+  globalRebateBps?: number;
+  customRebateBps?: number | null;
   inviteCode: string;
   inviteCount: number;
   invitees: Invitee[];
   rebateTotalNanoUsd?: string;
+  commissionBalanceNanoUsd?: string;
+  totalEarnedNanoUsd?: string;
+  totalTransferredNanoUsd?: string;
+  totalWithdrawnNanoUsd?: string;
+  withdrawals?: AffiliateWithdrawalItem[];
   rebates?: RebateEntry[];
 }
 
@@ -63,6 +77,16 @@ onMounted(load);
 /* ---------------- Derived ---------------- */
 
 const ratePercent = computed(() => `${Number(((info.value?.rebateBps ?? 0) / 100).toFixed(2))}%`);
+const hasCustomRate = computed(
+  () => info.value?.customRebateBps !== null && info.value?.customRebateBps !== undefined,
+);
+const poolNano = computed(() => BigInt(info.value?.commissionBalanceNanoUsd ?? "0"));
+const showPoolSection = computed(
+  () =>
+    info.value?.creditMode === "commission_pool" ||
+    poolNano.value > 0n ||
+    (info.value?.withdrawals?.length ?? 0) > 0,
+);
 const inviteLink = computed(() =>
   info.value ? `${window.location.origin}/register?aff=${encodeURIComponent(info.value.inviteCode)}` : "",
 );
@@ -89,6 +113,134 @@ const steps = computed<{ icon: IconName; title: string; body: string }[]>(() => 
   { icon: "user-plus", title: t("affiliate.steps.join.title"), body: t("affiliate.steps.join.body") },
   { icon: "gift", title: t("affiliate.steps.earn.title"), body: t("affiliate.steps.earn.body", { rate: ratePercent.value }) },
 ]);
+
+/* ---------------- Commission pool modals ---------------- */
+
+const transferOpen = ref(false);
+const transferAmountUsd = ref("");
+const transferAttempted = ref(false);
+const transferBusy = ref(false);
+
+function nanoToInput(nano: bigint): string {
+  const whole = nano / 1_000_000_000n;
+  const frac = (nano % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : whole.toString();
+}
+
+function parseAmount(raw: string): bigint | null {
+  try {
+    const v = parseUsdToNano(raw);
+    return v > 0n ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function openTransfer() {
+  transferAmountUsd.value = poolNano.value > 0n ? nanoToInput(poolNano.value) : "";
+  transferAttempted.value = false;
+  transferOpen.value = true;
+}
+
+const transferError = computed(() => {
+  if (!transferAttempted.value) return undefined;
+  const n = parseAmount(transferAmountUsd.value);
+  if (!n) return t("affiliate.pool.errors.amount");
+  if (n > poolNano.value) return t("affiliate.pool.errors.exceeds");
+  return undefined;
+});
+
+async function submitTransfer() {
+  transferAttempted.value = true;
+  const n = parseAmount(transferAmountUsd.value);
+  if (!n || n > poolNano.value) return;
+  transferBusy.value = true;
+  try {
+    await apiJson("/api/v1/user/affiliate/transfer", {
+      method: "POST",
+      body: { amountUsd: transferAmountUsd.value.trim().replace(/^\$/, "") },
+    });
+    toast.success(t("affiliate.pool.transferSuccess"));
+    transferOpen.value = false;
+    await load();
+  } catch (err) {
+    toast.error(errorText(err, t("affiliate.loadFailed")));
+  } finally {
+    transferBusy.value = false;
+  }
+}
+
+const withdrawOpen = ref(false);
+const withdrawAttempted = ref(false);
+const withdrawBusy = ref(false);
+const withdrawForm = reactive({
+  amountUsd: "",
+  payoutMethod: "alipay",
+  payoutAccount: "",
+  notes: "",
+});
+
+function openWithdraw() {
+  withdrawForm.amountUsd = poolNano.value > 0n ? nanoToInput(poolNano.value) : "";
+  withdrawForm.payoutMethod = "alipay";
+  withdrawForm.payoutAccount = "";
+  withdrawForm.notes = "";
+  withdrawAttempted.value = false;
+  withdrawOpen.value = true;
+}
+
+const minWithdrawNano = computed(() => {
+  try {
+    return parseUsdToNano(info.value?.minWithdrawUsd ?? "10");
+  } catch {
+    return 10_000_000_000n;
+  }
+});
+
+const withdrawErrors = computed(() => {
+  if (!withdrawAttempted.value) return {} as Record<string, string | undefined>;
+  const e: Record<string, string | undefined> = {};
+  const n = parseAmount(withdrawForm.amountUsd);
+  if (!n) e.amount = t("affiliate.pool.errors.amount");
+  else if (n > poolNano.value) e.amount = t("affiliate.pool.errors.exceeds");
+  else if (n < minWithdrawNano.value) {
+    e.amount = t("affiliate.pool.errors.belowMin", { min: info.value?.minWithdrawUsd ?? "10" });
+  }
+  if (!withdrawForm.payoutAccount.trim()) e.account = t("affiliate.pool.errors.account");
+  return e;
+});
+
+async function submitWithdraw() {
+  withdrawAttempted.value = true;
+  const n = parseAmount(withdrawForm.amountUsd);
+  if (!n || n > poolNano.value || n < minWithdrawNano.value || !withdrawForm.payoutAccount.trim()) return;
+  withdrawBusy.value = true;
+  try {
+    await apiJson("/api/v1/user/affiliate/withdraw", {
+      method: "POST",
+      body: {
+        amountUsd: withdrawForm.amountUsd.trim().replace(/^\$/, ""),
+        payoutMethod: withdrawForm.payoutMethod,
+        payoutAccount: withdrawForm.payoutAccount.trim(),
+        notes: withdrawForm.notes.trim(),
+      },
+    });
+    toast.success(t("affiliate.pool.withdrawSuccess"));
+    withdrawOpen.value = false;
+    await load();
+  } catch (err) {
+    toast.error(errorText(err, t("affiliate.loadFailed")));
+  } finally {
+    withdrawBusy.value = false;
+  }
+}
+
+const withdrawalStatusTone: Record<AffiliateWithdrawalItem["status"], Tone> = {
+  pending: "warning",
+  approved: "info",
+  paid: "success",
+  rejected: "danger",
+};
 
 /* ---------------- Invitees table (client-side paging) ---------------- */
 
@@ -172,9 +324,12 @@ const enter = "animate-slide-up motion-reduce:animate-none";
         <div class="pointer-events-none absolute inset-0 bg-grid [mask-image:linear-gradient(to_bottom,black,transparent)]" />
         <div class="relative grid gap-6 p-5 sm:p-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)] lg:items-center">
           <div class="min-w-0">
-            <span class="icon-chip icon-chip-accent h-10 w-10 rounded-xl">
-              <UiIcon name="gift" :size="19" />
-            </span>
+            <div class="flex items-center gap-2">
+              <span class="icon-chip icon-chip-accent h-10 w-10 rounded-xl">
+                <UiIcon name="gift" :size="19" />
+              </span>
+              <UiBadge v-if="hasCustomRate" tone="accent">{{ t("affiliate.stats.customBadge") }}</UiBadge>
+            </div>
             <h2 class="mt-4 text-xl font-bold tracking-tight text-fg">
               {{ t("affiliate.hero.title", { rate: ratePercent }) }}
             </h2>
@@ -215,13 +370,55 @@ const enter = "animate-slide-up motion-reduce:animate-none";
         </div>
       </section>
 
+      <!-- Commission Pool Wallet (shown in commission_pool mode or when pool/withdrawals exist) -->
+      <UiCard
+        v-if="showPoolSection"
+        :class="enter"
+        :style="stagger(1)"
+        icon="wallet"
+        :title="t('affiliate.pool.title')"
+      >
+        <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p class="text-xs text-fg-subtle">{{ t("affiliate.stats.poolBalance") }}</p>
+            <p class="mt-0.5 font-mono text-2xl font-bold tabular-nums text-fg">
+              {{ formatUsd(info.commissionBalanceNanoUsd ?? "0") }}
+            </p>
+            <div class="mt-1 flex flex-wrap gap-3 text-xs text-fg-subtle">
+              <span>{{ t("affiliate.stats.transferredOut", { amount: formatUsd(info.totalTransferredNanoUsd ?? "0") }) }}</span>
+              <span>{{ t("affiliate.stats.withdrawnOut", { amount: formatUsd(info.totalWithdrawnNanoUsd ?? "0") }) }}</span>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button
+              type="button"
+              class="btn btn-primary"
+              :disabled="poolNano <= 0n"
+              @click="openTransfer"
+            >
+              <UiIcon name="arrow-right" :size="14" />
+              {{ t("affiliate.pool.transfer") }}
+            </button>
+            <button
+              type="button"
+              class="btn btn-secondary"
+              :disabled="poolNano < minWithdrawNano"
+              @click="openWithdraw"
+            >
+              <UiIcon name="wallet" :size="14" />
+              {{ t("affiliate.pool.withdraw") }}
+            </button>
+          </div>
+        </div>
+      </UiCard>
+
       <!-- Stats -->
       <div class="grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 sm:gap-4 lg:grid-cols-4">
         <StatCard
           :class="enter"
           :style="stagger(1)"
           :label="t('affiliate.stats.earned')"
-          :value="formatUsd(info.rebateTotalNanoUsd ?? '0')"
+          :value="formatUsd(info.totalEarnedNanoUsd ?? info.rebateTotalNanoUsd ?? '0')"
           icon="wallet"
           tone="violet"
           :hint="t('affiliate.stats.earnedHint')"
@@ -233,7 +430,7 @@ const enter = "animate-slide-up motion-reduce:animate-none";
           :value="ratePercent"
           icon="percent"
           tone="accent"
-          :hint="t('affiliate.stats.rateHint')"
+          :hint="hasCustomRate ? t('affiliate.stats.customBadge') : t('affiliate.stats.rateHint')"
         />
         <StatCard
           :class="enter"
@@ -281,6 +478,43 @@ const enter = "animate-slide-up motion-reduce:animate-none";
         </ol>
       </UiCard>
 
+      <!-- Transfers & Withdrawals -->
+      <UiCard v-if="showPoolSection" :class="enter" :style="stagger(6)" icon="list" :title="t('affiliate.pool.historyTitle')" flush>
+        <EmptyState v-if="!(info.withdrawals?.length)" compact icon="wallet" :title="t('affiliate.pool.historyEmpty')" />
+        <div v-else class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>{{ t("payments.admin.rebates.withdrawals.kind") }}</th>
+                <th>{{ t("payments.admin.rebates.withdrawals.amount") }}</th>
+                <th>{{ t("payments.admin.rebates.withdrawals.target") }}</th>
+                <th>{{ t("payments.admin.rebates.withdrawals.status") }}</th>
+                <th>{{ t("payments.admin.rebates.withdrawals.reviewNote") }}</th>
+                <th class="text-right">{{ t("payments.admin.rebates.withdrawals.time") }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="w in info.withdrawals" :key="w.id">
+                <td class="whitespace-nowrap text-xs">{{ t(`affiliate.pool.kinds.${w.kind}`) }}</td>
+                <td class="whitespace-nowrap font-mono text-xs font-semibold tabular-nums text-fg">
+                  {{ formatUsd(w.amountNanoUsd) }}
+                </td>
+                <td class="max-w-[14rem] truncate text-xs text-fg-muted">
+                  {{ w.kind === "payout" ? `${w.payoutMethod}: ${w.payoutAccount}` : "API Wallet" }}
+                </td>
+                <td>
+                  <UiBadge :tone="withdrawalStatusTone[w.status]" dot>{{ t(`affiliate.pool.statuses.${w.status}`) }}</UiBadge>
+                </td>
+                <td class="max-w-[14rem] truncate text-xs text-fg-subtle">{{ w.reviewNote || "—" }}</td>
+                <td class="whitespace-nowrap text-right text-xs text-fg-subtle" :title="formatDateTime(w.createdAtIso)">
+                  {{ formatRelative(w.createdAtIso, now) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </UiCard>
+
       <!-- Rebates -->
       <UiCard :class="enter" :style="stagger(6)" icon="gift" :title="t('affiliate.rebates.title')" flush>
         <template #actions>
@@ -307,6 +541,9 @@ const enter = "animate-slide-up motion-reduce:animate-none";
                   {{ formatDateShort(r.createdAtIso) }} · {{ formatRelative(r.createdAtIso, now) }}
                 </p>
               </div>
+              <UiBadge v-if="r.creditedTo" :tone="r.creditedTo === 'commission_pool' ? 'accent' : 'neutral'">
+                {{ r.creditedTo === "commission_pool" ? t("affiliate.rebates.creditedPool") : t("affiliate.rebates.creditedWallet") }}
+              </UiBadge>
               <span class="shrink-0 font-mono text-sm font-semibold tabular-nums text-success">+{{ formatUsd(r.amountNanoUsd) }}</span>
             </li>
           </ul>
@@ -360,5 +597,113 @@ const enter = "animate-slide-up motion-reduce:animate-none";
         </template>
       </UiCard>
     </template>
+
+    <!-- Transfer to API wallet modal -->
+    <UiModal
+      v-model:open="transferOpen"
+      width="md"
+      :title="t('affiliate.pool.transferTitle')"
+      :persistent="transferBusy"
+    >
+      <template #icon>
+        <span class="icon-chip icon-chip-accent h-8 w-8"><UiIcon name="arrow-right" :size="15" /></span>
+      </template>
+      <form id="aff-transfer-form" class="space-y-4" @submit.prevent="submitTransfer">
+        <p class="text-xs leading-relaxed text-fg-muted">{{ t("affiliate.pool.transferBody") }}</p>
+        <FormField :label="t('affiliate.pool.amount')" required>
+          <div class="flex gap-2">
+            <input
+              v-model="transferAmountUsd"
+              type="text"
+              inputmode="decimal"
+              class="input flex-1 font-mono"
+              :class="transferError ? '!border-danger' : ''"
+            />
+            <button type="button" class="btn btn-secondary shrink-0" @click="transferAmountUsd = nanoToInput(poolNano)">
+              {{ t("affiliate.pool.useAll") }}
+            </button>
+          </div>
+          <p class="mt-1 text-xs" :class="transferError ? 'text-danger' : 'text-fg-subtle'">
+            {{ transferError ?? t("affiliate.pool.available", { amount: formatUsd(poolNano.toString()) }) }}
+          </p>
+        </FormField>
+      </form>
+      <template #footer>
+        <button type="button" class="btn btn-secondary" :disabled="transferBusy" @click="transferOpen = false">
+          {{ t("common.cancel") }}
+        </button>
+        <button type="submit" form="aff-transfer-form" class="btn btn-primary" :disabled="transferBusy">
+          <UiIcon v-if="transferBusy" name="loader" :size="15" spin />
+          {{ transferBusy ? t("affiliate.pool.submitting") : t("affiliate.pool.transfer") }}
+        </button>
+      </template>
+    </UiModal>
+
+    <!-- Payout withdrawal modal -->
+    <UiModal
+      v-model:open="withdrawOpen"
+      width="md"
+      :title="t('affiliate.pool.withdrawTitle')"
+      :persistent="withdrawBusy"
+    >
+      <template #icon>
+        <span class="icon-chip icon-chip-accent h-8 w-8"><UiIcon name="wallet" :size="15" /></span>
+      </template>
+      <form id="aff-withdraw-form" class="space-y-4" @submit.prevent="submitWithdraw">
+        <p class="text-xs leading-relaxed text-fg-muted">
+          {{ t("affiliate.pool.withdrawBody", { min: info?.minWithdrawUsd ?? "10" }) }}
+        </p>
+        <FormField :label="t('affiliate.pool.amount')" required>
+          <input
+            v-model="withdrawForm.amountUsd"
+            type="text"
+            inputmode="decimal"
+            class="input font-mono"
+            :class="withdrawErrors.amount ? '!border-danger' : ''"
+          />
+          <p class="mt-1 text-xs" :class="withdrawErrors.amount ? 'text-danger' : 'text-fg-subtle'">
+            {{ withdrawErrors.amount ?? t("affiliate.pool.available", { amount: formatUsd(poolNano.toString()) }) }}
+          </p>
+        </FormField>
+        <FormField :label="t('affiliate.pool.method')" required>
+          <select v-model="withdrawForm.payoutMethod" class="input">
+            <option value="alipay">{{ t("affiliate.pool.methods.alipay") }}</option>
+            <option value="wxpay">{{ t("affiliate.pool.methods.wxpay") }}</option>
+            <option value="bank">{{ t("affiliate.pool.methods.bank") }}</option>
+            <option value="usdt">{{ t("affiliate.pool.methods.usdt") }}</option>
+            <option value="other">{{ t("affiliate.pool.methods.other") }}</option>
+          </select>
+        </FormField>
+        <FormField :label="t('affiliate.pool.account')" required>
+          <input
+            v-model="withdrawForm.payoutAccount"
+            type="text"
+            maxlength="200"
+            class="input"
+            :class="withdrawErrors.account ? '!border-danger' : ''"
+            :placeholder="t('affiliate.pool.accountPlaceholder')"
+          />
+          <p v-if="withdrawErrors.account" class="mt-1 text-xs text-danger">{{ withdrawErrors.account }}</p>
+        </FormField>
+        <FormField :label="t('affiliate.pool.notes')">
+          <input
+            v-model="withdrawForm.notes"
+            type="text"
+            maxlength="300"
+            class="input"
+            :placeholder="t('affiliate.pool.notesPlaceholder')"
+          />
+        </FormField>
+      </form>
+      <template #footer>
+        <button type="button" class="btn btn-secondary" :disabled="withdrawBusy" @click="withdrawOpen = false">
+          {{ t("common.cancel") }}
+        </button>
+        <button type="submit" form="aff-withdraw-form" class="btn btn-primary" :disabled="withdrawBusy">
+          <UiIcon v-if="withdrawBusy" name="loader" :size="15" spin />
+          {{ withdrawBusy ? t("affiliate.pool.submitting") : t("affiliate.pool.withdraw") }}
+        </button>
+      </template>
+    </UiModal>
   </div>
 </template>

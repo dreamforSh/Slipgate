@@ -34,6 +34,9 @@ interface GenerateForm {
   groupId: string;
   validityDays: number;
   count: number;
+  maxUses: number;
+  perUserLimit: number;
+  batchPerUserLimit: number;
   prefix: string;
   expiryPreset: ExpiryPreset;
   expiryCustom: string;
@@ -47,6 +50,9 @@ function blank(): GenerateForm {
     groupId: "",
     validityDays: 30,
     count: 10,
+    maxUses: 1,
+    perUserLimit: 1,
+    batchPerUserLimit: 0,
     prefix: "",
     expiryPreset: "never",
     expiryCustom: "",
@@ -114,7 +120,9 @@ function onPrefix(ev: Event) {
 /* ---------------- Validation ---------------- */
 
 const errors = computed(() => {
-  const e: Partial<Record<"amount" | "group" | "days" | "count" | "prefix" | "expiry", string>> = {};
+  const e: Partial<
+    Record<"amount" | "group" | "days" | "count" | "maxUses" | "perUserLimit" | "batchPerUserLimit" | "prefix" | "expiry", string>
+  > = {};
   if (form.kind === "balance" && !normalizeUsdInput(form.amountUsd)) e.amount = t("redeem.admin.generate.errors.amount");
   if (form.kind === "subscription") {
     if (!form.groupId) e.group = t("redeem.admin.generate.errors.group");
@@ -123,6 +131,15 @@ const errors = computed(() => {
     }
   }
   if (!Number.isInteger(form.count) || form.count < 1 || form.count > 500) e.count = t("redeem.admin.generate.errors.count");
+  if (!Number.isInteger(form.maxUses) || form.maxUses < 1 || form.maxUses > 100_000) {
+    e.maxUses = t("redeem.admin.generate.errors.maxUses");
+  }
+  if (!Number.isInteger(form.perUserLimit) || form.perUserLimit < 1 || form.perUserLimit > 1000) {
+    e.perUserLimit = t("redeem.admin.generate.errors.perUserLimit");
+  }
+  if (!Number.isInteger(form.batchPerUserLimit) || form.batchPerUserLimit < 0 || form.batchPerUserLimit > 1000) {
+    e.batchPerUserLimit = t("redeem.admin.generate.errors.batchPerUserLimit");
+  }
   if (!/^[A-Z0-9]{0,8}$/.test(form.prefix)) e.prefix = t("redeem.admin.generate.errors.prefix");
   if (form.expiryPreset === "custom" && resolveExpiry("custom", form.expiryCustom) === undefined) {
     e.expiry = t("redeem.admin.generate.errors.expiry");
@@ -141,6 +158,9 @@ async function submit() {
   const body: GenerateRedeemCodesRequest = {
     kind: form.kind,
     count: form.count,
+    maxUses: form.maxUses,
+    perUserLimit: form.perUserLimit,
+    batchPerUserLimit: form.batchPerUserLimit,
     prefix: form.prefix,
     notes: form.notes.trim(),
     expiresAtIso,
@@ -292,6 +312,51 @@ async function submit() {
           {{ shown.prefix ?? t("redeem.admin.generate.prefixHint") }}
         </p>
       </FormField>
+
+      <div class="grid gap-3 sm:col-span-2 sm:grid-cols-3">
+        <FormField :label="t('redeem.admin.generate.maxUses')">
+          <input
+            v-model.number="form.maxUses"
+            type="number"
+            min="1"
+            max="100000"
+            step="1"
+            class="input font-mono"
+            :class="shown.maxUses ? '!border-danger' : ''"
+          />
+          <p class="mt-1 text-2xs" :class="shown.maxUses ? 'text-danger' : 'text-fg-subtle'">
+            {{ shown.maxUses ?? t("redeem.admin.generate.maxUsesHint") }}
+          </p>
+        </FormField>
+        <FormField :label="t('redeem.admin.generate.perUserLimit')">
+          <input
+            v-model.number="form.perUserLimit"
+            type="number"
+            min="1"
+            max="1000"
+            step="1"
+            class="input font-mono"
+            :class="shown.perUserLimit ? '!border-danger' : ''"
+          />
+          <p class="mt-1 text-2xs" :class="shown.perUserLimit ? 'text-danger' : 'text-fg-subtle'">
+            {{ shown.perUserLimit ?? t("redeem.admin.generate.perUserLimitHint") }}
+          </p>
+        </FormField>
+        <FormField :label="t('redeem.admin.generate.batchPerUserLimit')">
+          <input
+            v-model.number="form.batchPerUserLimit"
+            type="number"
+            min="0"
+            max="1000"
+            step="1"
+            class="input font-mono"
+            :class="shown.batchPerUserLimit ? '!border-danger' : ''"
+          />
+          <p class="mt-1 text-2xs" :class="shown.batchPerUserLimit ? 'text-danger' : 'text-fg-subtle'">
+            {{ shown.batchPerUserLimit ?? t("redeem.admin.generate.batchPerUserLimitHint") }}
+          </p>
+        </FormField>
+      </div>
 
       <div class="sm:col-span-2">
         <ExpiryPresetField
