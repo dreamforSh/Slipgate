@@ -52,6 +52,7 @@ import { PG_USER_LIMITS_SCHEMA_SQL, PostgresUserLimitsStore } from "./postgres_u
 import { PG_REQUEST_ERRORS_SCHEMA_SQL, PostgresRequestErrorStore } from "./postgres_request_errors.ts";
 import { PG_ALERTS_SCHEMA_SQL, PostgresAlertStore } from "./postgres_alerts.ts";
 import { PG_CHANNEL_MONITORS_SCHEMA_SQL, PostgresChannelMonitorStore } from "./postgres_channel_monitors.ts";
+import { PG_PLATFORM_QUOTAS_SCHEMA_SQL, PostgresPlatformQuotasStore } from "./postgres_platform_quotas.ts";
 import {
   PG_SETTLEMENT_SCHEMA_SQL,
   pruneSettlementIds,
@@ -136,6 +137,7 @@ export class PostgresControlStore implements ControlStore {
   readonly requestErrors: PostgresRequestErrorStore;
   readonly alerts: PostgresAlertStore;
   readonly channelMonitors: PostgresChannelMonitorStore;
+  readonly platformQuotas: PostgresPlatformQuotasStore;
   private backgroundMaintenance: Promise<void> = Promise.resolve();
   /** Earliest time of the next opportunistic core.settlement_ids prune (off the settlement tx). */
   private settlementPruneAt = 0;
@@ -155,6 +157,7 @@ export class PostgresControlStore implements ControlStore {
     this.requestErrors = new PostgresRequestErrorStore(this.sql);
     this.alerts = new PostgresAlertStore(this.sql);
     this.channelMonitors = new PostgresChannelMonitorStore(this.sql);
+    this.platformQuotas = new PostgresPlatformQuotasStore(this.sql);
   }
 
   async init(): Promise<void> {
@@ -544,6 +547,7 @@ export class PostgresControlStore implements ControlStore {
     await this.sql.unsafe(PG_REQUEST_ERRORS_SCHEMA_SQL);
     await this.sql.unsafe(PG_ALERTS_SCHEMA_SQL);
     await this.sql.unsafe(PG_CHANNEL_MONITORS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_PLATFORM_QUOTAS_SCHEMA_SQL);
     // Index builds and the one-time spend backfill must not delay startup or block settlements.
     // So is the one-off pass of the current audit-log redaction over rows older builds stored.
     const auditScrub = await pendingAuditSecretScrub(this.sql);

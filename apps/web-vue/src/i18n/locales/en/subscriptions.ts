@@ -26,6 +26,7 @@ const en: typeof zh = {
       revoked: "Revoked",
     },
     windows: {
+      all: "All windows",
       daily: "Day",
       weekly: "Week",
       monthly: "Month",
@@ -78,6 +79,13 @@ const en: typeof zh = {
       preview: "New expiry",
       invalid: "Enter a non-zero whole number of days (-3650 to 3650)",
       submit: "Apply",
+    },
+    resetModal: {
+      title: "Reset subscription usage",
+      titleBulk: "Reset subscription usage ({n} subscriptions)",
+      window: "Window to reset",
+      hint: "Reset a single rolling window (day, week, or month) independently, or reset all windows together.",
+      submit: "Reset usage",
     },
     assign: {
       title: "Assign subscription",

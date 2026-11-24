@@ -117,13 +117,19 @@ export function clampKeysToUserLimits(keys: DataPlaneSyncApiKey[], limits: DataP
   });
 }
 
-/** Adds `userLimits` (and the clamped key limits) to an exported snapshot. */
+/** Adds `userLimits` (and the clamped key limits + blocked platforms) to an exported snapshot. */
 export async function withUserLimits(store: ControlStore, snapshot: DataPlaneSyncSnapshot): Promise<DataPlaneSyncSnapshot> {
-  const settings = await store.ops.getSettings();
-  const limits = await store.userLimits.exportUserLimits({
-    rpm: settings.defaultUserRpm,
-    concurrency: settings.defaultUserConcurrency,
-  });
+  const [settings, blockedPlatforms] = await Promise.all([
+    store.ops.getSettings(),
+    store.platformQuotas.listBlockedUserPlatforms(),
+  ]);
+  const limits = {
+    ...(await store.userLimits.exportUserLimits({
+      rpm: settings.defaultUserRpm,
+      concurrency: settings.defaultUserConcurrency,
+    })),
+    blockedPlatforms,
+  };
   return { ...snapshot, apiKeys: clampKeysToUserLimits(snapshot.apiKeys, limits), userLimits: limits };
 }
 

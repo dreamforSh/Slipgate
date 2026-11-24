@@ -100,6 +100,7 @@ import { registerAccountOAuthRoutes } from "./routes/account_oauth.ts";
 import { AuthGuards, BACKEND_MODE_REFUSAL, conflictRefusal, refusalResponse, registerAuthGuardRoutes } from "./auth_guards.ts";
 import { RegistrationGuardError } from "./store/auth_guards_store.ts";
 import { registerUserLimitRoutes, repriceForUser, UserRateCache, withApiKeyDefaults, withUserLimits } from "./routes/user_limits.ts";
+import { registerPlatformQuotaRoutes } from "./routes/platform_quotas.ts";
 import {
   credentialFingerprint,
   decryptSecret,
@@ -593,18 +594,22 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     };
   };
   const loadLimitedKeyIds = async () => new Set(await store.listLimitedKeyIds());
+  const loadPlatformQuotaUserIds = async () => new Set(await store.platformQuotas.listCappedUserIds());
   let groupMeta = cached(30_000, loadGroupMeta);
   let limitedKeyIds = cached(30_000, loadLimitedKeyIds);
+  let platformQuotaUserIds = cached(30_000, loadPlatformQuotaUserIds);
   /** Per-user custom group rates the settlement path bills at (lane U1). */
   const userRates = new UserRateCache(store);
   function refreshSettlementCaches() {
     groupMeta = cached(30_000, loadGroupMeta);
     limitedKeyIds = cached(30_000, loadLimitedKeyIds);
+    platformQuotaUserIds = cached(30_000, loadPlatformQuotaUserIds);
     userRates.invalidate();
   }
-  /** Per-key / per-subscription cap checks after a charged settlement: at most one per second each, with a trailing run. */
+  /** Per-key / per-subscription / per-platform cap checks after a charged settlement: at most one per second each. */
   const keyCapChecks = new KeyedThrottle(1000);
   const subscriptionCapChecks = new KeyedThrottle(1000);
+  const platformQuotaCapChecks = new KeyedThrottle(1000);
 
   /** Debounces sync requests from the settlement path (e.g. settlements crossing a cap) into one push. */
   let syncTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1132,6 +1137,13 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
         if ((await groupMeta()).subscriptionGroupIds.has(item.groupId)) {
           await subscriptionCapChecks.request(`${item.userId}\u0000${item.groupId}`, async () => {
             if (await store.ops.isSubscriptionOverLimit(item.userId, item.groupId)) scheduleDataPlaneSync();
+          });
+        }
+        if ((await platformQuotaUserIds()).has(item.userId)) {
+          await platformQuotaCapChecks.request(`${item.userId}\u0000${item.platform}`, async () => {
+            if (await store.platformQuotas.isUserPlatformOverLimit(item.userId, item.platform)) {
+              scheduleDataPlaneSync();
+            }
           });
         }
       } catch {
@@ -2662,6 +2674,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   });
   registerAccountOAuthRoutes(app, { store, fetchImpl: options.oauthFetch });
   registerUserLimitRoutes(app, { store, sessions, syncDataPlane: syncDataPlaneBestEffort, internalToken });
+  registerPlatformQuotaRoutes(app, { store, syncDataPlane: syncDataPlaneBestEffort });
   mail = registerMailRoutes(app, { store, vaultSecret, sessions, deliver: options.mailDelivery, guards });
   // Price rules travel in the data-plane snapshot, so an edit is pushed like any other change.
   pricing = registerPricingRoutes(app, store, () => void syncDataPlaneBestEffort());

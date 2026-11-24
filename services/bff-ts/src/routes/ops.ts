@@ -1006,7 +1006,7 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
     const failed: { id: string; message: string }[] = [];
     for (const id of new Set(req.ids)) {
       try {
-        items.push(await ops.updateSubscription(id, req.action, req.days ?? 0, req.notes));
+        items.push(await ops.updateSubscription(id, req.action, req.days ?? 0, req.notes, req.window));
       } catch (err) {
         failed.push({ id, message: err instanceof Error ? err.message : String(err) });
       }
@@ -1017,7 +1017,7 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
 
   app.patch("/api/v1/admin/subscriptions/:id", async (c) => {
     const req = await body(c, UpdateSubscriptionRequestSchema);
-    const item = await ops.updateSubscription(c.req.param("id"), req.action, req.days ?? 0, req.notes);
+    const item = await ops.updateSubscription(c.req.param("id"), req.action, req.days ?? 0, req.notes, req.window);
     await syncDataPlane();
     return c.json({ item });
   });

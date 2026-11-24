@@ -25,6 +25,7 @@ export default {
       revoked: "已撤销",
     },
     windows: {
+      all: "全部窗口",
       daily: "日",
       weekly: "周",
       monthly: "月",
@@ -77,6 +78,13 @@ export default {
       preview: "调整后到期",
       invalid: "请输入非 0 的整数天数（-3650 到 3650）",
       submit: "确认调整",
+    },
+    resetModal: {
+      title: "重置订阅用量",
+      titleBulk: "批量重置订阅用量（{n} 条）",
+      window: "重置窗口",
+      hint: "选择只清零单一滚动窗口（日/周/月），或清零全部窗口。",
+      submit: "确认重置",
     },
     assign: {
       title: "分配订阅",

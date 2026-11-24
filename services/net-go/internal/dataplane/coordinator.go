@@ -277,6 +277,7 @@ type Coordinator struct {
 
 	mu                 sync.RWMutex
 	keyByHash          map[string]edgeKeyMeta
+	groupPlatforms     map[string]string
 	keyIPAllowlists    map[string][]string
 	keyIPDenylists     map[string][]string
 	accountAuthKinds   map[string]string
@@ -331,6 +332,7 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		logger:                logger,
 		accessLogEnabled: opts.AccessLogEnabled,
 		keyByHash:        make(map[string]edgeKeyMeta),
+		groupPlatforms:   make(map[string]string),
 		keyIPAllowlists:  make(map[string][]string),
 		keyIPDenylists:   make(map[string][]string),
 		accountAuthKinds: make(map[string]string),
@@ -466,8 +468,10 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		BalanceNanoUSD string `json:"balanceNanoUsd"`
 	}
 
+	nextGroupPlatforms := make(map[string]string, len(snap.Groups))
 	coreGroups := make([]coreGroup, 0, len(snap.Groups))
 	for _, g := range snap.Groups {
+		nextGroupPlatforms[g.ID] = g.Platform
 		mult := g.RateMultiplier
 		if mult <= 0 {
 			mult = 1.0
@@ -546,10 +550,11 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 		normHash := strings.ToLower(strings.TrimSpace(k.KeyHashHex))
 		if normHash != "" {
 			nextKeyByHash[normHash] = edgeKeyMeta{
-				ID:      k.ID,
-				UserID:  k.UserID,
-				GroupID: k.GroupID,
-				Enabled: enabled,
+				ID:       k.ID,
+				UserID:   k.UserID,
+				GroupID:  k.GroupID,
+				Platform: nextGroupPlatforms[k.GroupID],
+				Enabled:  enabled,
 			}
 		}
 		coreKeys = append(coreKeys, coreAPIKey{
@@ -643,6 +648,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 
 	c.mu.Lock()
 	c.keyByHash = nextKeyByHash
+	c.groupPlatforms = nextGroupPlatforms
 	c.keyIPAllowlists = nextIPAllowlists
 	c.keyIPDenylists = nextIPDenylists
 	c.accountAuthKinds = nextAuthKinds
@@ -997,7 +1003,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !isModelsReq {
-			if rej := c.userLimits.precheck(km.UserID, km.GroupID); rej != nil {
+			if rej := c.userLimits.precheck(km.UserID, km.GroupID, km.Platform); rej != nil {
 				setRetryAfter(w.Header(), rej.retryAfterMs)
 				rep := buildDirectiveErrorReport(
 					r, requestID, startedAt, nil, turn.PublicModel,
@@ -2150,10 +2156,18 @@ func normalizeBanDuration(d string) string {
 }
 
 type edgeKeyMeta struct {
-	ID      string
-	UserID  string
-	GroupID string
-	Enabled bool
+	ID       string
+	UserID   string
+	GroupID  string
+	Platform string
+	Enabled  bool
+}
+
+func (c *Coordinator) groupPlatform(groupID string) string {
+	c.mu.RLock()
+	p := c.groupPlatforms[groupID]
+	c.mu.RUnlock()
+	return p
 }
 
 // upfrontKeyRejection is slipgate-core's 401 message for a key it is certain to refuse: a missing

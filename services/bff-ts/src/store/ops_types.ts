@@ -288,7 +288,13 @@ export interface OpsStore {
   listSubscriptions(query: UserSubscriptionListQuery): Promise<{ items: UserSubscriptionItem[]; total: number }>;
   listUserSubscriptions(userId: string): Promise<UserSubscriptionItem[]>;
   assignSubscription(userId: string, groupId: string, validityDays: number, notes: string, source: string): Promise<UserSubscriptionItem>;
-  updateSubscription(id: string, action: SubscriptionAction, days: number, notes?: string): Promise<UserSubscriptionItem>;
+  updateSubscription(
+    id: string,
+    action: SubscriptionAction,
+    days: number,
+    notes?: string,
+    resetWindow?: import("@slipgate/contracts").SubscriptionResetWindow,
+  ): Promise<UserSubscriptionItem>;
   deleteSubscription(id: string): Promise<void>;
   subscriptionEntitlements(): Promise<SubscriptionEntitlement[]>;
   /** True when this (user, group) subscription just reached a cap (cheap single-pair check). */

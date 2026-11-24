@@ -24,6 +24,13 @@ import (
 // slipgate-core's per-key buckets stay in force underneath (the BFF also clamps each key's own
 // limits to the caps that cover it).
 
+// SyncBlockedPlatformInput matches DataPlaneBlockedPlatformSchema (Lane U2).
+type SyncBlockedPlatformInput struct {
+	UserID   string `json:"userId"`
+	Platform string `json:"platform"`
+	Window   string `json:"window"`
+}
+
 // SyncUserLimitsInput matches DataPlaneSyncUserLimitsSchema.
 type SyncUserLimitsInput struct {
 	DefaultRPMLimit         uint32                       `json:"defaultRpmLimit"`
@@ -31,6 +38,7 @@ type SyncUserLimitsInput struct {
 	Users                   []SyncUserCapInput           `json:"users"`
 	Groups                  []SyncGroupCapInput          `json:"groups"`
 	Overrides               []SyncUserGroupOverrideInput `json:"overrides"`
+	BlockedPlatforms        []SyncBlockedPlatformInput   `json:"blockedPlatforms,omitempty"`
 }
 
 // SyncUserCapInput is one user's own caps; nil inherits the default, 0 = unlimited.
@@ -66,6 +74,8 @@ type userLimitPolicy struct {
 	groups   map[string]userCaps
 	// rpmOverrides holds only non-null overrides (0 = exempt from the group cap).
 	rpmOverrides map[string]uint32
+	// blockedPlatforms maps pairKey(userID, platform) -> tripped window ("daily"|"weekly"|"monthly").
+	blockedPlatforms map[string]string
 }
 
 // capsFor resolves the caps covering one (user, group); 0 = none.
@@ -86,7 +96,7 @@ func (p *userLimitPolicy) capsFor(userID, groupID string) (user userCaps, group 
 
 // limited reports whether any cap could apply to some user.
 func (p *userLimitPolicy) limited() bool {
-	return p != nil && (p.defaults.rpm > 0 || p.defaults.concurrency > 0 || len(p.users) > 0 || len(p.groups) > 0 || len(p.rpmOverrides) > 0)
+	return p != nil && (p.defaults.rpm > 0 || p.defaults.concurrency > 0 || len(p.users) > 0 || len(p.groups) > 0 || len(p.rpmOverrides) > 0 || len(p.blockedPlatforms) > 0)
 }
 
 func pairKey(userID, groupID string) string {
@@ -98,10 +108,11 @@ func buildUserLimitPolicy(in *SyncUserLimitsInput) *userLimitPolicy {
 		return nil
 	}
 	p := &userLimitPolicy{
-		defaults:     userCaps{rpm: in.DefaultRPMLimit, concurrency: in.DefaultConcurrencyLimit},
-		users:        make(map[string]userCaps, len(in.Users)),
-		groups:       make(map[string]userCaps, len(in.Groups)),
-		rpmOverrides: make(map[string]uint32, len(in.Overrides)),
+		defaults:         userCaps{rpm: in.DefaultRPMLimit, concurrency: in.DefaultConcurrencyLimit},
+		users:            make(map[string]userCaps, len(in.Users)),
+		groups:           make(map[string]userCaps, len(in.Groups)),
+		rpmOverrides:     make(map[string]uint32, len(in.Overrides)),
+		blockedPlatforms: make(map[string]string, len(in.BlockedPlatforms)),
 	}
 	for _, u := range in.Users {
 		id := strings.TrimSpace(u.UserID)
@@ -129,6 +140,18 @@ func buildUserLimitPolicy(in *SyncUserLimitsInput) *userLimitPolicy {
 			continue
 		}
 		p.rpmOverrides[pairKey(o.UserID, o.GroupID)] = *o.RPMOverride
+	}
+	for _, bp := range in.BlockedPlatforms {
+		uid := strings.TrimSpace(bp.UserID)
+		plat := strings.ToLower(strings.TrimSpace(bp.Platform))
+		win := strings.TrimSpace(bp.Window)
+		if uid == "" || plat == "" {
+			continue
+		}
+		if win == "" {
+			win = "daily"
+		}
+		p.blockedPlatforms[pairKey(uid, plat)] = win
 	}
 	return p
 }
@@ -230,11 +253,41 @@ func counterFor(m map[string]*limitCounter, key string, minute, nowMs int64, tra
 	return c
 }
 
-// precheck inspects whether (userID, groupID) has already hit an RPM or concurrency cap without
+// checkPlatformQuota reports whether (userID, platform) has tripped a spend cap (Lane U2).
+func (g *userLimitGate) checkPlatformQuota(userID, platform string) *userLimitRejection {
+	if userID == "" || platform == "" {
+		return nil
+	}
+	plat := strings.ToLower(strings.TrimSpace(platform))
+	if plat == "" {
+		return nil
+	}
+	g.mu.Lock()
+	policy := g.policy
+	g.mu.Unlock()
+	if policy == nil || len(policy.blockedPlatforms) == 0 {
+		return nil
+	}
+	if win, ok := policy.blockedPlatforms[pairKey(userID, plat)]; ok {
+		return &userLimitRejection{
+			status:       http.StatusTooManyRequests,
+			errType:      "rate_limit_error",
+			code:         "platform_quota_exceeded",
+			message:      "user platform " + win + " spend quota exceeded",
+			retryAfterMs: 60_000,
+		}
+	}
+	return nil
+}
+
+// precheck inspects whether (userID, groupID) has already hit an RPM, concurrency, or platform quota cap without
 // mutating counters. Used before slipgate-core IPC so a throttled user does not burn key RPM.
-func (g *userLimitGate) precheck(userID, groupID string) *userLimitRejection {
+func (g *userLimitGate) precheck(userID, groupID, groupPlatform string) *userLimitRejection {
 	if userID == "" {
 		return nil
+	}
+	if rej := g.checkPlatformQuota(userID, groupPlatform); rej != nil {
+		return rej
 	}
 	nowMs := g.clock().UnixMilli()
 	minute := nowMs / 60_000
@@ -436,6 +489,20 @@ func (c *Coordinator) admitUserLimits(
 	d *coreDispatchDirective,
 	settle func(RelayMetrics) coreSettleAck,
 ) (release func(), admitted bool) {
+	if rej := c.userLimits.checkPlatformQuota(d.UserID, d.Provider); rej != nil {
+		settle(RelayMetrics{UpstreamStatus: rej.status})
+		setRetryAfter(w.Header(), rej.retryAfterMs)
+		WriteProtocolError(w, codec, rej.status, rej.errType, rej.code, rej.message)
+		return func() {}, false
+	}
+	if grpPlat := c.groupPlatform(d.GroupID); grpPlat != "" && !strings.EqualFold(grpPlat, d.Provider) {
+		if rej := c.userLimits.checkPlatformQuota(d.UserID, grpPlat); rej != nil {
+			settle(RelayMetrics{UpstreamStatus: rej.status})
+			setRetryAfter(w.Header(), rej.retryAfterMs)
+			WriteProtocolError(w, codec, rej.status, rej.errType, rej.code, rej.message)
+			return func() {}, false
+		}
+	}
 	release, rej := c.userLimits.admit(d.UserID, d.GroupID)
 	if rej == nil {
 		return release, true

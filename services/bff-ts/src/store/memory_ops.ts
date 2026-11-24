@@ -220,6 +220,9 @@ interface SubscriptionRecord {
   startsAtIso: string;
   expiresAtIso: string;
   usageResetAtIso: string | null;
+  dailyResetAtIso: string | null;
+  weeklyResetAtIso: string | null;
+  monthlyResetAtIso: string | null;
   createdAtIso: string;
 }
 
@@ -1270,10 +1273,13 @@ export class MemoryOpsStore implements OpsStore {
 
   private usageOf(s: SubscriptionRecord, nowMs = Date.now()): SubscriptionUsage {
     const floor = s.usageResetAtIso ? Date.parse(s.usageResetAtIso) : Number.NEGATIVE_INFINITY;
+    const dailyReset = s.dailyResetAtIso ? Date.parse(s.dailyResetAtIso) : Number.NEGATIVE_INFINITY;
+    const weeklyReset = s.weeklyResetAtIso ? Date.parse(s.weeklyResetAtIso) : Number.NEGATIVE_INFINITY;
+    const monthlyReset = s.monthlyResetAtIso ? Date.parse(s.monthlyResetAtIso) : Number.NEGATIVE_INFINITY;
     const since = {
-      daily: Math.max(floor, nowMs - SUBSCRIPTION_WINDOWS_MS.daily),
-      weekly: Math.max(floor, nowMs - SUBSCRIPTION_WINDOWS_MS.weekly),
-      monthly: Math.max(floor, nowMs - SUBSCRIPTION_WINDOWS_MS.monthly),
+      daily: nowMs - SUBSCRIPTION_WINDOWS_MS.daily,
+      weekly: nowMs - SUBSCRIPTION_WINDOWS_MS.weekly,
+      monthly: nowMs - SUBSCRIPTION_WINDOWS_MS.monthly,
     };
     let d = 0n;
     let w = 0n;
@@ -1284,9 +1290,9 @@ export class MemoryOpsStore implements OpsStore {
       // Spend at the reset instant itself belongs to the old window.
       if (t < since.monthly || t <= floor) continue;
       const cost = BigInt(log.costNanoUsd);
-      m += cost;
-      if (t >= since.weekly) w += cost;
-      if (t >= since.daily) d += cost;
+      if (t > monthlyReset) m += cost;
+      if (t >= since.weekly && t > weeklyReset) w += cost;
+      if (t >= since.daily && t > dailyReset) d += cost;
     }
     return { dailyNanoUsd: d.toString(), weeklyNanoUsd: w.toString(), monthlyNanoUsd: m.toString() };
   }
@@ -1306,6 +1312,9 @@ export class MemoryOpsStore implements OpsStore {
       startsAtIso: s.startsAtIso,
       expiresAtIso: s.expiresAtIso,
       usageResetAtIso: s.usageResetAtIso,
+      dailyResetAtIso: s.dailyResetAtIso,
+      weeklyResetAtIso: s.weeklyResetAtIso,
+      monthlyResetAtIso: s.monthlyResetAtIso,
       createdAtIso: s.createdAtIso,
       limits,
       usage,
@@ -1378,13 +1387,22 @@ export class MemoryOpsStore implements OpsStore {
       startsAtIso: new Date(now).toISOString(),
       expiresAtIso: new Date(now + addMs).toISOString(),
       usageResetAtIso: null,
+      dailyResetAtIso: null,
+      weeklyResetAtIso: null,
+      monthlyResetAtIso: null,
       createdAtIso: new Date(now).toISOString(),
     };
     this.subs.set(rec.id, rec);
     return rec;
   }
 
-  async updateSubscription(id: string, action: SubscriptionAction, days: number, notes?: string): Promise<UserSubscriptionItem> {
+  async updateSubscription(
+    id: string,
+    action: SubscriptionAction,
+    days: number,
+    notes?: string,
+    resetWindow: "all" | "daily" | "weekly" | "monthly" = "all",
+  ): Promise<UserSubscriptionItem> {
     const s = this.subs.get(id);
     if (!s) throw new StoreError("not_found", "Subscription not found");
     const now = Date.now();
@@ -1406,9 +1424,22 @@ export class MemoryOpsStore implements OpsStore {
       case "reactivate":
         s.status = "active";
         break;
-      case "reset_usage":
-        s.usageResetAtIso = new Date(now).toISOString();
+      case "reset_usage": {
+        const at = new Date(now).toISOString();
+        if (resetWindow === "all") {
+          s.usageResetAtIso = at;
+          s.dailyResetAtIso = at;
+          s.weeklyResetAtIso = at;
+          s.monthlyResetAtIso = at;
+        } else if (resetWindow === "daily") {
+          s.dailyResetAtIso = at;
+        } else if (resetWindow === "weekly") {
+          s.weeklyResetAtIso = at;
+        } else if (resetWindow === "monthly") {
+          s.monthlyResetAtIso = at;
+        }
         break;
+      }
     }
     if (notes !== undefined) s.notes = notes;
     return this.toSubItem(s, now);

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ApiKeyItemSchema, UpdateApiKeyRequestSchema } from "./apikeys.ts";
+import { DataPlaneBlockedPlatformSchema } from "./platform_quotas.ts";
 import { GroupPlatformSchema } from "./pool.ts";
 
 /**
@@ -364,6 +365,8 @@ export const DataPlaneSyncUserLimitsSchema = z.object({
       rateMultiplier: z.number().positive().nullable(),
     }),
   ),
+  /** Per-user platform spend quota breaches enforced at the edge (Lane U2). */
+  blockedPlatforms: z.array(DataPlaneBlockedPlatformSchema).optional(),
 });
 export type DataPlaneSyncUserLimits = z.infer<typeof DataPlaneSyncUserLimitsSchema>;
 

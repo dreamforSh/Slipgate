@@ -45,6 +45,7 @@ import { MemoryUserLimitsStore } from "./memory_user_limits.ts";
 import { MemoryRequestErrorStore } from "./memory_request_errors.ts";
 import { MemoryAlertStore } from "./memory_alerts.ts";
 import { MemoryChannelMonitorStore } from "./memory_channel_monitors.ts";
+import { MemoryPlatformQuotasStore } from "./memory_platform_quotas.ts";
 import type { OpsStore } from "./ops_types.ts";
 import type { PaymentsStore } from "./payments_types.ts";
 import {
@@ -168,6 +169,11 @@ export class MemoryControlStore implements ControlStore {
   readonly channelMonitors = new MemoryChannelMonitorStore({
     accounts: this.accounts,
     groups: this.groups,
+  });
+
+  readonly platformQuotas = new MemoryPlatformQuotasStore({
+    users: this.users,
+    usageLogs: this.usageLogs,
   });
 
   readonly payments: PaymentsStore = new MemoryPaymentsStore(

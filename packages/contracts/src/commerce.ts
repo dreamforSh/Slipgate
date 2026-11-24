@@ -784,6 +784,10 @@ export const UserSubscriptionItemSchema = z.object({
   expiresAtIso: z.string(),
   /** Spend before this instant no longer counts against the caps (admin quota reset). */
   usageResetAtIso: z.string().nullable(),
+  /** Independent per-window reset timestamps (Lane U2). */
+  dailyResetAtIso: z.string().nullable().default(null),
+  weeklyResetAtIso: z.string().nullable().default(null),
+  monthlyResetAtIso: z.string().nullable().default(null),
   createdAtIso: z.string(),
   limits: SubscriptionLimitsSchema,
   usage: SubscriptionUsageSchema,
@@ -814,10 +818,15 @@ export type AssignSubscriptionRequest = z.infer<typeof AssignSubscriptionRequest
 export const SubscriptionActionSchema = z.enum(["extend", "revoke", "reactivate", "reset_usage"]);
 export type SubscriptionAction = z.infer<typeof SubscriptionActionSchema>;
 
+export const SubscriptionResetWindowSchema = z.enum(["all", "daily", "weekly", "monthly"]);
+export type SubscriptionResetWindow = z.infer<typeof SubscriptionResetWindowSchema>;
+
 export const UpdateSubscriptionRequestSchema = z.object({
   action: SubscriptionActionSchema,
   /** extend: positive lengthens, negative shortens (an expired one restarts from now). */
   days: z.number().int().min(-3650).max(3650).optional(),
+  /** reset_usage: all (default) or a single rolling window (daily / weekly / monthly). */
+  window: SubscriptionResetWindowSchema.optional(),
   notes: z.string().trim().max(200).optional(),
 });
 

@@ -6,6 +6,7 @@ import type {
   BulkSubscriptionActionRequest,
   GroupItem,
   SubscriptionAction,
+  SubscriptionResetWindow,
   UpdateSubscriptionRequest,
   UserSubscriptionItem,
   UserSubscriptionStatus,
@@ -13,10 +14,12 @@ import type {
 import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
+import SegmentedControl from "../../components/ui/SegmentedControl.vue";
 import UiAlert from "../../components/ui/UiAlert.vue";
 import UiBadge from "../../components/ui/UiBadge.vue";
 import UiCard from "../../components/ui/UiCard.vue";
 import UiIcon from "../../components/ui/UiIcon.vue";
+import UiModal from "../../components/ui/UiModal.vue";
 import UiPagination from "../../components/ui/UiPagination.vue";
 import SubscriptionAssignModal from "../../components/admin/subscriptions/SubscriptionAssignModal.vue";
 import SubscriptionExtendModal from "../../components/admin/subscriptions/SubscriptionExtendModal.vue";
@@ -158,12 +161,21 @@ const ACTION_NOTICE: Record<SubscriptionAction, string> = {
   reactivate: "subscriptions.notice.reactivated",
 };
 
-async function runAction(sub: UserSubscriptionItem, action: SubscriptionAction, days?: number): Promise<boolean> {
+async function runAction(
+  sub: UserSubscriptionItem,
+  action: SubscriptionAction,
+  days?: number,
+  resetWindow?: SubscriptionResetWindow,
+): Promise<boolean> {
   errorMessage.value = null;
   notice.value = null;
   setBusy(sub.id, true);
   try {
-    const body: UpdateSubscriptionRequest = { action, ...(days !== undefined ? { days } : {}) };
+    const body: UpdateSubscriptionRequest = {
+      action,
+      ...(days !== undefined ? { days } : {}),
+      ...(resetWindow !== undefined ? { window: resetWindow } : {}),
+    };
     await apiJson(`/api/v1/admin/subscriptions/${encodeURIComponent(sub.id)}`, {
       method: "PATCH",
       body,
@@ -203,7 +215,11 @@ async function deleteSub(sub: UserSubscriptionItem) {
 const bulkBusy = ref(false);
 const bulkFailures = ref<{ id: string; label: string; message: string }[]>([]);
 
-async function runBulk(action: SubscriptionAction, days?: number): Promise<boolean> {
+async function runBulk(
+  action: SubscriptionAction,
+  days?: number,
+  resetWindow?: SubscriptionResetWindow,
+): Promise<boolean> {
   const targets = selectedItems.value;
   if (targets.length === 0 || bulkBusy.value) return false;
   const labels = new Map(targets.map((s) => [s.id, `${s.userEmail} · ${s.groupName}`]));
@@ -212,7 +228,12 @@ async function runBulk(action: SubscriptionAction, days?: number): Promise<boole
   bulkFailures.value = [];
   bulkBusy.value = true;
   try {
-    const body: BulkSubscriptionActionRequest = { action, ids: targets.map((s) => s.id), ...(days !== undefined ? { days } : {}) };
+    const body: BulkSubscriptionActionRequest = {
+      action,
+      ids: targets.map((s) => s.id),
+      ...(days !== undefined ? { days } : {}),
+      ...(resetWindow !== undefined ? { window: resetWindow } : {}),
+    };
     const res = await apiJson<{ items: UserSubscriptionItem[]; failed: { id: string; message: string }[] }>(
       "/api/v1/admin/subscriptions/bulk",
       { method: "POST", body, fallbackError: t("subscriptions.errors.bulk") },
@@ -259,6 +280,41 @@ async function confirmExtend(days: number) {
       ? await runAction(extendTargets.value[0], "extend", days)
       : false;
   if (ok) extendOpen.value = false;
+}
+
+const resetOpen = ref(false);
+const resetTargets = ref<UserSubscriptionItem[]>([]);
+const resetBulk = ref(false);
+const resetWindow = ref<SubscriptionResetWindow>("all");
+const resetWindowOptions = computed(() =>
+  (["all", "daily", "weekly", "monthly"] as const).map((value) => ({
+    value,
+    label: t(`subscriptions.windows.${value}`),
+  })),
+);
+const resetBusy = computed(() =>
+  resetBulk.value ? bulkBusy.value : resetTargets.value.some((s) => busyIds.value.has(s.id)),
+);
+function openReset(sub: UserSubscriptionItem) {
+  resetTargets.value = [sub];
+  resetBulk.value = false;
+  resetWindow.value = "all";
+  resetOpen.value = true;
+}
+function openBulkReset() {
+  resetTargets.value = [...selectedItems.value];
+  resetBulk.value = true;
+  resetWindow.value = "all";
+  resetOpen.value = true;
+}
+async function confirmReset() {
+  const win = resetWindow.value;
+  const ok = resetBulk.value
+    ? await runBulk("reset_usage", undefined, win)
+    : resetTargets.value[0]
+      ? await runAction(resetTargets.value[0], "reset_usage", undefined, win)
+      : false;
+  if (ok) resetOpen.value = false;
 }
 
 function onAssigned(created: UserSubscriptionItem[]) {
@@ -364,7 +420,7 @@ onMounted(() => {
               <UiIcon name="calendar" :size="13" />
               {{ t("subscriptions.bulk.extend") }}
             </button>
-            <button type="button" class="btn btn-secondary btn-sm" :disabled="bulkBusy" @click="runBulk('reset_usage')">
+            <button type="button" class="btn btn-secondary btn-sm" :disabled="bulkBusy" @click="openBulkReset">
               <UiIcon name="rotate-ccw" :size="13" />
               {{ t("subscriptions.bulk.resetUsage") }}
             </button>
@@ -558,14 +614,16 @@ onMounted(() => {
                   >
                     <UiIcon name="calendar" :size="13" />
                   </button>
-                  <ConfirmButton
-                    icon-only
-                    icon="rotate-ccw"
-                    :label="t('subscriptions.actions.resetUsage')"
-                    :confirm-label="t('subscriptions.actions.confirmReset')"
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon btn-xs"
                     :disabled="busyIds.has(s.id)"
-                    @confirm="runAction(s, 'reset_usage')"
-                  />
+                    :title="t('subscriptions.actions.resetUsage')"
+                    :aria-label="t('subscriptions.actions.labelFor', { action: t('subscriptions.actions.resetUsage'), name: s.userEmail })"
+                    @click="openReset(s)"
+                  >
+                    <UiIcon name="rotate-ccw" :size="13" />
+                  </button>
                   <button
                     v-if="s.status === 'revoked'"
                     type="button"
@@ -615,6 +673,38 @@ onMounted(() => {
       :busy="extendBusy"
       @confirm="confirmExtend"
     />
+    <UiModal
+      v-model:open="resetOpen"
+      width="sm"
+      :persistent="resetBusy"
+      :title="resetTargets.length === 1 ? t('subscriptions.resetModal.title') : t('subscriptions.resetModal.titleBulk', { n: resetTargets.length })"
+    >
+      <template #icon>
+        <span class="icon-chip icon-chip-warning h-8 w-8">
+          <UiIcon name="rotate-ccw" :size="15" />
+        </span>
+      </template>
+      <div class="space-y-3">
+        <div v-if="resetTargets.length === 1" class="rounded-lg border border-line bg-surface-2/40 px-3.5 py-2.5 text-xs">
+          <p class="truncate font-medium text-fg">{{ resetTargets[0]!.userEmail }}</p>
+          <p class="mt-0.5 truncate text-fg-subtle">{{ resetTargets[0]!.groupName }}</p>
+        </div>
+        <div>
+          <p class="label">{{ t("subscriptions.resetModal.window") }}</p>
+          <SegmentedControl v-model="resetWindow" :options="resetWindowOptions" size="sm" block />
+          <p class="hint mt-1.5">{{ t("subscriptions.resetModal.hint") }}</p>
+        </div>
+      </div>
+      <template #footer>
+        <button type="button" class="btn btn-secondary" :disabled="resetBusy" @click="resetOpen = false">
+          {{ t("common.cancel") }}
+        </button>
+        <button type="button" class="btn btn-primary" :disabled="resetBusy" @click="confirmReset">
+          <UiIcon v-if="resetBusy" name="loader" :size="15" spin />
+          {{ t("subscriptions.resetModal.submit") }}
+        </button>
+      </template>
+    </UiModal>
   </div>
 </template>
 

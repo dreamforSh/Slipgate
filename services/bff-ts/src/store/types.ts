@@ -32,6 +32,7 @@ import type { UserLimitsStore } from "./user_limits_types.ts";
 import type { RequestErrorStore } from "./request_errors_types.ts";
 import type { AlertStore } from "./alerts_types.ts";
 import type { ChannelMonitorStore } from "./channel_monitors_types.ts";
+import type { PlatformQuotasStore } from "./platform_quotas_types.ts";
 
 export type StoreErrorCode = "conflict" | "not_found" | "forbidden" | "bad_request";
 
@@ -138,6 +139,8 @@ export interface ControlStore {
   readonly alerts: AlertStore;
   /** Active synthetic channel monitors and probe history (lane O3). */
   readonly channelMonitors: ChannelMonitorStore;
+  /** Per-user per-platform spend quotas (lane U2). */
+  readonly platformQuotas: PlatformQuotasStore;
 
   init(): Promise<void>;
   close(): Promise<void>;

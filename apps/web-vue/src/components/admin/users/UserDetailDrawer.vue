@@ -9,10 +9,11 @@ import ReplaceGroupModal from "./ReplaceGroupModal.vue";
 import UserApiKeysPanel from "./UserApiKeysPanel.vue";
 import UserGroupRatesPanel from "./UserGroupRatesPanel.vue";
 import UserLimitsPanel from "./UserLimitsPanel.vue";
+import UserPlatformQuotasPanel from "./UserPlatformQuotasPanel.vue";
 import { STATUS_TONE, avatarTone, displayName, initial } from "./userDisplay";
 import { useLimitText } from "./limits";
 
-export type UserDetailTab = "limits" | "rates" | "keys";
+export type UserDetailTab = "limits" | "rates" | "quotas" | "keys";
 
 /** One user's caps and live status, per-group rates / RPM overrides and API keys. */
 const props = defineProps<{ user: AdminUserItem | null; groups: GroupItem[] }>();
@@ -35,6 +36,7 @@ watch(
 const tabs = computed(() => [
   { key: "limits" as const, label: t("userLimits.drawer.tabs.limits"), icon: "gauge" as const },
   { key: "rates" as const, label: t("userLimits.drawer.tabs.rates"), icon: "percent" as const },
+  { key: "quotas" as const, label: t("userLimits.drawer.tabs.quotas"), icon: "sliders" as const },
   { key: "keys" as const, label: t("userLimits.drawer.tabs.keys"), icon: "key" as const, count: current.value?.apiKeyCount },
 ]);
 
@@ -126,9 +128,10 @@ function onReplaced(res: ReplaceUserGroupResponse) {
           enter-from-class="translate-y-1 opacity-0"
           leave-to-class="opacity-0"
         >
-          <KeepAlive :max="3">
+          <KeepAlive :max="4">
             <UserLimitsPanel v-if="tab === 'limits'" :key="`l-${current.id}`" :user="current" :active="open && tab === 'limits'" @saved="onSaved" />
             <UserGroupRatesPanel v-else-if="tab === 'rates'" :key="`r-${current.id}`" :user="current" :active="open && tab === 'rates'" @saved="emit('changed')" />
+            <UserPlatformQuotasPanel v-else-if="tab === 'quotas'" :key="`q-${current.id}`" :user="current" :active="open && tab === 'quotas'" @saved="emit('changed')" />
             <UserApiKeysPanel
               v-else
               ref="keysPanel"

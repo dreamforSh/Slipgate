@@ -178,6 +178,9 @@ export const PG_OPS_SCHEMA_SQL = `
       ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'admin',
       ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '',
       ADD COLUMN IF NOT EXISTS usage_reset_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS daily_reset_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS weekly_reset_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS monthly_reset_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
   CREATE INDEX IF NOT EXISTS idx_commerce_subscriptions_user_group ON commerce.subscriptions (user_id, group_id, status);
   CREATE INDEX IF NOT EXISTS idx_commerce_subscriptions_created ON commerce.subscriptions (created_at DESC);
@@ -494,6 +497,9 @@ interface SubscriptionRow {
   starts_at: Date;
   expires_at: Date;
   usage_reset_at: Date | null;
+  daily_reset_at: Date | null;
+  weekly_reset_at: Date | null;
+  monthly_reset_at: Date | null;
   created_at: Date;
   daily_limit: string | null;
   weekly_limit: string | null;
@@ -899,6 +905,7 @@ export class PostgresOpsStore implements OpsStore {
         throw new StoreError("conflict", "This user has earned referral rebates; suspend the account instead");
       }
       await tx`DELETE FROM core.api_keys WHERE user_id = ${userId}`;
+      await tx`DELETE FROM core.user_platform_quotas WHERE user_id = ${userId}`;
       await tx`DELETE FROM core.ledger_entries WHERE user_id = ${userId}`;
       await tx`DELETE FROM core.quota_wallets WHERE user_id = ${userId}`;
       await tx`DELETE FROM commerce.revoked_tokens WHERE user_id = ${userId}`;
@@ -1717,7 +1724,8 @@ export class PostgresOpsStore implements OpsStore {
   private subscriptionSelect(where: Fragment): Fragment {
     return this.sql`
       SELECT s.id, s.user_id, u.email AS user_email, s.group_id, g.name AS group_name, s.status, s.source, s.notes,
-             s.starts_at, s.expires_at, s.usage_reset_at, s.created_at,
+             s.starts_at, s.expires_at, s.usage_reset_at, s.daily_reset_at, s.weekly_reset_at, s.monthly_reset_at,
+             s.created_at,
              g.daily_limit_nano_usd::text AS daily_limit, g.weekly_limit_nano_usd::text AS weekly_limit,
              g.monthly_limit_nano_usd::text AS monthly_limit,
              COALESCE(x.d, 0)::text AS daily_used, COALESCE(x.w, 0)::text AS weekly_used, COALESCE(x.m, 0)::text AS monthly_used
@@ -1725,9 +1733,20 @@ export class PostgresOpsStore implements OpsStore {
         LEFT JOIN commerce.users u ON u.id = s.user_id
         LEFT JOIN core.groups g ON g.id = s.group_id
         LEFT JOIN LATERAL (
-          SELECT SUM(l.cost_nano_usd) FILTER (WHERE l.created_at >= GREATEST(NOW() - INTERVAL '1 day', COALESCE(s.usage_reset_at, '-infinity'::timestamptz))) AS d,
-                 SUM(l.cost_nano_usd) FILTER (WHERE l.created_at >= GREATEST(NOW() - INTERVAL '7 days', COALESCE(s.usage_reset_at, '-infinity'::timestamptz))) AS w,
-                 SUM(l.cost_nano_usd) AS m
+          SELECT SUM(l.cost_nano_usd) FILTER (
+                   WHERE l.created_at >= NOW() - INTERVAL '1 day'
+                     AND (s.usage_reset_at IS NULL OR l.created_at > s.usage_reset_at)
+                     AND (s.daily_reset_at IS NULL OR l.created_at > s.daily_reset_at)
+                 ) AS d,
+                 SUM(l.cost_nano_usd) FILTER (
+                   WHERE l.created_at >= NOW() - INTERVAL '7 days'
+                     AND (s.usage_reset_at IS NULL OR l.created_at > s.usage_reset_at)
+                     AND (s.weekly_reset_at IS NULL OR l.created_at > s.weekly_reset_at)
+                 ) AS w,
+                 SUM(l.cost_nano_usd) FILTER (
+                   WHERE (s.usage_reset_at IS NULL OR l.created_at > s.usage_reset_at)
+                     AND (s.monthly_reset_at IS NULL OR l.created_at > s.monthly_reset_at)
+                 ) AS m
             FROM core.usage_logs l
            WHERE l.user_id = s.user_id AND l.group_id = s.group_id
              AND l.created_at >= GREATEST(NOW() - INTERVAL '30 days', COALESCE(s.usage_reset_at, '-infinity'::timestamptz))
@@ -1757,6 +1776,9 @@ export class PostgresOpsStore implements OpsStore {
       startsAtIso: iso(r.starts_at),
       expiresAtIso,
       usageResetAtIso: isoOrNull(r.usage_reset_at),
+      dailyResetAtIso: isoOrNull(r.daily_reset_at),
+      weeklyResetAtIso: isoOrNull(r.weekly_reset_at),
+      monthlyResetAtIso: isoOrNull(r.monthly_reset_at),
       createdAtIso: iso(r.created_at),
       limits,
       usage,
@@ -1809,7 +1831,13 @@ export class PostgresOpsStore implements OpsStore {
     return this.loadSub(id);
   }
 
-  async updateSubscription(id: string, action: SubscriptionAction, days: number, notes?: string): Promise<UserSubscriptionItem> {
+  async updateSubscription(
+    id: string,
+    action: SubscriptionAction,
+    days: number,
+    notes?: string,
+    resetWindow: "all" | "daily" | "weekly" | "monthly" = "all",
+  ): Promise<UserSubscriptionItem> {
     await this.sql.begin(async (txRaw) => {
       const tx = txRaw as unknown as Sql;
       const rows = await tx<{ starts_at: Date; expires_at: Date }[]>`
@@ -1839,7 +1867,20 @@ export class PostgresOpsStore implements OpsStore {
           await tx`UPDATE commerce.subscriptions SET status = 'active', updated_at = NOW() WHERE id = ${id}`;
           break;
         case "reset_usage":
-          await tx`UPDATE commerce.subscriptions SET usage_reset_at = NOW(), updated_at = NOW() WHERE id = ${id}`;
+          if (resetWindow === "all") {
+            await tx`
+              UPDATE commerce.subscriptions
+                 SET usage_reset_at = NOW(), daily_reset_at = NOW(), weekly_reset_at = NOW(),
+                     monthly_reset_at = NOW(), updated_at = NOW()
+               WHERE id = ${id}
+            `;
+          } else if (resetWindow === "daily") {
+            await tx`UPDATE commerce.subscriptions SET daily_reset_at = NOW(), updated_at = NOW() WHERE id = ${id}`;
+          } else if (resetWindow === "weekly") {
+            await tx`UPDATE commerce.subscriptions SET weekly_reset_at = NOW(), updated_at = NOW() WHERE id = ${id}`;
+          } else if (resetWindow === "monthly") {
+            await tx`UPDATE commerce.subscriptions SET monthly_reset_at = NOW(), updated_at = NOW() WHERE id = ${id}`;
+          }
           break;
       }
       if (notes !== undefined) await tx`UPDATE commerce.subscriptions SET notes = ${notes} WHERE id = ${id}`;
@@ -1862,13 +1903,24 @@ export class PostgresOpsStore implements OpsStore {
           FROM commerce.subscriptions s
           JOIN core.groups g ON g.id = s.group_id
           LEFT JOIN LATERAL (
-            SELECT SUM(l.cost_nano_usd) FILTER (WHERE l.created_at >= GREATEST(NOW() - INTERVAL '1 day', COALESCE(s.usage_reset_at, '-infinity'::timestamptz))) AS d,
-                   SUM(l.cost_nano_usd) FILTER (WHERE l.created_at >= GREATEST(NOW() - INTERVAL '7 days', COALESCE(s.usage_reset_at, '-infinity'::timestamptz))) AS w,
-                   SUM(l.cost_nano_usd) AS m
+            SELECT SUM(l.cost_nano_usd) FILTER (
+                     WHERE l.created_at >= NOW() - INTERVAL '1 day'
+                       AND (s.usage_reset_at IS NULL OR l.created_at > s.usage_reset_at)
+                       AND (s.daily_reset_at IS NULL OR l.created_at > s.daily_reset_at)
+                   ) AS d,
+                   SUM(l.cost_nano_usd) FILTER (
+                     WHERE l.created_at >= NOW() - INTERVAL '7 days'
+                       AND (s.usage_reset_at IS NULL OR l.created_at > s.usage_reset_at)
+                       AND (s.weekly_reset_at IS NULL OR l.created_at > s.weekly_reset_at)
+                   ) AS w,
+                   SUM(l.cost_nano_usd) FILTER (
+                     WHERE (s.usage_reset_at IS NULL OR l.created_at > s.usage_reset_at)
+                       AND (s.monthly_reset_at IS NULL OR l.created_at > s.monthly_reset_at)
+                   ) AS m
               FROM core.usage_logs l
              WHERE l.user_id = s.user_id AND l.group_id = s.group_id
                AND l.created_at >= GREATEST(NOW() - INTERVAL '30 days', COALESCE(s.usage_reset_at, '-infinity'::timestamptz))
-             AND (s.usage_reset_at IS NULL OR l.created_at > s.usage_reset_at)
+               AND (s.usage_reset_at IS NULL OR l.created_at > s.usage_reset_at)
                -- Inside the lateral this is a one-time filter: an uncapped group never scans usage
                -- (as an ON condition alone it would be checked only after the scan).
                AND (g.daily_limit_nano_usd > 0 OR g.weekly_limit_nano_usd > 0 OR g.monthly_limit_nano_usd > 0)
