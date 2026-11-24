@@ -85,6 +85,8 @@ import { AccountAutoTester, registerAutoTestRoutes } from "./autotest.ts";
 import { mountAuditRetention } from "./audit_retention.ts";
 import { logRouteError, mountSystemLogging, registerSystemLogRoutes } from "./routes/system_logs.ts";
 import { registerRequestErrorRoutes } from "./routes/request_errors.ts";
+import { AlertService } from "./alerts/service.ts";
+import { registerAlertRoutes } from "./routes/alerts.ts";
 import { registerAnnouncementRoutes } from "./routes/announcements.ts";
 import { paymentWebhookPlugin } from "./plugins/payment_webhook.ts";
 import { registerPluginRoutes } from "./routes/plugins.ts";
@@ -516,7 +518,11 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   /** Captcha, sign-up email policy, backend (admin-only) mode and legal documents (auth_guards.ts). */
   const guards = new AuthGuards({ store, vaultSecret, sessions, fetchImpl: options.captchaFetch });
   // Assigned when the mail routes register (after the admin guard); read lazily by handlers.
-  let mail: MailService = { ready: async () => false };
+  let mail: MailService = {
+    ready: async () => false,
+    deliver: async () => {},
+    siteName: async () => "Slipgate",
+  };
   let pricing: PricingService = { rules: async () => [], invalidate: () => undefined };
 
   function verifyInternalHeader(c: Context): boolean {
@@ -2662,6 +2668,24 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   mountAuditRetention(app, store, options.startSchedulers === true, vaultSecret);
   registerSystemLogRoutes(app, store, systemLogs, { verifyInternal: verifyInternalHeader });
   registerRequestErrorRoutes(app, store, { verifyInternal: verifyInternalHeader });
+  const alertService = new AlertService({
+    store,
+    mail: () => mail,
+    deadLetterCount: async () => {
+      try {
+        const forwarded = await forwardNetInternal("/internal/net/dataplane/settlements/dead-letter", {
+          timeoutMs: 5_000,
+        });
+        if (!forwarded.configured || forwarded.status !== 200) return 0;
+        const n = Number(forwarded.payload.count ?? 0);
+        return Number.isFinite(n) && n >= 0 ? n : 0;
+      } catch {
+        return 0;
+      }
+    },
+  });
+  registerAlertRoutes(app, store, alertService);
+  if (options.startSchedulers) alertService.start();
   registerAnnouncementRoutes(app, store);
   if (!registry.list().some((p) => p.name === paymentWebhookPlugin.name)) registry.register(paymentWebhookPlugin);
   const plugins = registerPluginRoutes(app, store, registry, vaultSecret);

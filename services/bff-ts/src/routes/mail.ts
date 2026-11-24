@@ -270,9 +270,17 @@ export function registerMailRoutes(app: Hono<AuthEnv>, ctx: MailRouteContext): M
     return c.json({ reset: true });
   });
 
-  return { ready };
+  return {
+    ready,
+    deliver: async (msg: MailMessage): Promise<void> => {
+      await deliver(msg);
+    },
+    siteName,
+  };
 }
 
 export interface MailService {
   ready(): Promise<boolean>;
+  deliver(msg: MailMessage): Promise<void>;
+  siteName(): Promise<string>;
 }

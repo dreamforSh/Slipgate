@@ -1,6 +1,7 @@
 import { PluginRegistry } from "@slipgate/plugin-sdk";
 import { createBffApp, MAX_REQUEST_BODY_BYTES } from "./app.ts";
 import { stopAuditRetentionSweepers } from "./audit_retention.ts";
+import { stopAlertServices } from "./alerts/service.ts";
 import { installCrashLogging } from "./logging/crash.ts";
 import { installConsoleCapture } from "./logging/logger.ts";
 import { stopSystemLogServices } from "./logging/service.ts";
@@ -81,6 +82,7 @@ console.log(`slipgate-bff ${VERSION} listening on http://${server.hostname}:${se
 const shutdown = async () => {
   server.stop(true);
   stopAuditRetentionSweepers();
+  stopAlertServices();
   // Writes the entries still queued before the pool closes.
   await stopSystemLogServices().catch(() => undefined);
   await store.close();

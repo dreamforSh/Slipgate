@@ -91,6 +91,14 @@ export const AUDIT_ACTION_KEYS: Record<string, string> = {
   [`POST ${A}/ops/settlement-dead-letters/replay`]: "opsDeadLetterReplay",
   [`POST ${A}/ops/request-errors/:id/resolve`]: "opsRequestErrorResolve",
   [`POST ${A}/ops/request-errors/cleanup`]: "opsRequestErrorCleanup",
+  [`POST ${A}/ops/alerts/rules`]: "opsAlertRuleCreate",
+  [`PATCH ${A}/ops/alerts/rules/:id`]: "opsAlertRuleUpdate",
+  [`DELETE ${A}/ops/alerts/rules/:id`]: "opsAlertRuleDelete",
+  [`POST ${A}/ops/alerts/evaluate`]: "opsAlertEvaluate",
+  [`POST ${A}/ops/alerts/events/:id/ack`]: "opsAlertEventAck",
+  [`POST ${A}/ops/alerts/events/:id/resolve`]: "opsAlertEventResolve",
+  [`POST ${A}/ops/alerts/silences`]: "opsAlertSilenceCreate",
+  [`DELETE ${A}/ops/alerts/silences/:id`]: "opsAlertSilenceDelete",
 
   [`POST ${A}/system/update/sync`]: "systemUpdateSync",
 };

@@ -30,6 +30,7 @@ import type { RegistrationConflict, RegistrationGuard } from "./auth_guards_stor
 import type { DbBackupStore } from "./db_backups_types.ts";
 import type { UserLimitsStore } from "./user_limits_types.ts";
 import type { RequestErrorStore } from "./request_errors_types.ts";
+import type { AlertStore } from "./alerts_types.ts";
 
 export type StoreErrorCode = "conflict" | "not_found" | "forbidden" | "bad_request";
 
@@ -132,6 +133,8 @@ export interface ControlStore {
   readonly userLimits: UserLimitsStore;
   /** Request & upstream error center records (lane O1). */
   readonly requestErrors: RequestErrorStore;
+  /** Alert rules, events, and silences (lane O2). */
+  readonly alerts: AlertStore;
 
   init(): Promise<void>;
   close(): Promise<void>;

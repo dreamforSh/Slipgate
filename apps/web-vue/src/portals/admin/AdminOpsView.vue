@@ -6,6 +6,7 @@ import type { OpsOverview, OpsRange } from "@slipgate/contracts";
 import OpsAccountsTable from "../../components/admin/ops-monitor/OpsAccountsTable.vue";
 import OpsDeadLettersCard from "../../components/admin/ops-monitor/OpsDeadLettersCard.vue";
 import OpsErrorCenterPanel from "../../components/admin/ops-monitor/OpsErrorCenterPanel.vue";
+import OpsAlertsPanel from "../../components/admin/ops-monitor/OpsAlertsPanel.vue";
 import OpsFleetCard from "../../components/admin/ops-monitor/OpsFleetCard.vue";
 import OpsModelsTable from "../../components/admin/ops-monitor/OpsModelsTable.vue";
 import OpsRecentErrors from "../../components/admin/ops-monitor/OpsRecentErrors.vue";
@@ -30,10 +31,13 @@ const router = useRouter();
 const toast = useToastStore();
 const now = useNow(15_000);
 
-type OpsTab = "overview" | "errors";
-const tab = ref<OpsTab>(route.query.tab === "errors" ? "errors" : "overview");
+type OpsTab = "overview" | "errors" | "alerts";
+const initialTab = route.query.tab === "errors" ? "errors" : route.query.tab === "alerts" ? "alerts" : "overview";
+const tab = ref<OpsTab>(initialTab);
 const errorsVisited = ref(tab.value === "errors");
+const alertsVisited = ref(tab.value === "alerts");
 const openErrorCount = ref(0);
+const firingAlertCount = ref(0);
 const errorRefreshToken = ref(0);
 
 const tabs = computed(() => [
@@ -44,13 +48,20 @@ const tabs = computed(() => [
     icon: "alert" as const,
     ...(openErrorCount.value > 0 ? { count: openErrorCount.value } : {}),
   },
+  {
+    key: "alerts" as OpsTab,
+    label: t("security.ops.tabs.alerts"),
+    icon: "bell" as const,
+    ...(firingAlertCount.value > 0 ? { count: firingAlertCount.value } : {}),
+  },
 ]);
 
 watch(tab, (value) => {
   if (value === "errors") errorsVisited.value = true;
+  if (value === "alerts") alertsVisited.value = true;
   const query = { ...route.query };
-  if (value === "errors") query.tab = "errors";
-  else delete query.tab;
+  if (value === "overview") delete query.tab;
+  else query.tab = value;
   void router.replace({ query });
 });
 
@@ -369,6 +380,14 @@ const stats = computed<Stat[]>(() => {
       :now="now"
       :refresh-token="errorRefreshToken"
       @open-count="openErrorCount = $event"
+    />
+
+    <OpsAlertsPanel
+      v-if="alertsVisited"
+      v-show="tab === 'alerts'"
+      :now="now"
+      :refresh-token="errorRefreshToken"
+      @firing-count="firingAlertCount = $event"
     />
   </div>
 </template>
