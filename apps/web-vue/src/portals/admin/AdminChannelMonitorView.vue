@@ -1,13 +1,17 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { UpstreamAccount } from "@slipgate/contracts";
+import { useRoute, useRouter } from "vue-router";
+import type { ChannelMonitor, ChannelMonitorStatus, UpstreamAccount } from "@slipgate/contracts";
 import AccountTestModal from "../../components/admin/AccountTestModal.vue";
 import PlatformTypeBadge from "../../components/admin/accounts/PlatformTypeBadge.vue";
+import MonitorFormModal from "../../components/admin/channel-monitor/MonitorFormModal.vue";
+import MonitorHistoryDrawer from "../../components/admin/channel-monitor/MonitorHistoryDrawer.vue";
 import ListSkeleton from "../../components/admin/ops/ListSkeleton.vue";
 import { STAGGER_CLASS, stagger } from "../../components/admin/ops/opsUtil";
 import AutoTestScheduleCard from "../../components/admin/tools/AutoTestScheduleCard.vue";
 import { formatInterval, type AutoTestConfig } from "../../components/admin/tools/toolsTypes";
+import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
 import SegmentedControl from "../../components/ui/SegmentedControl.vue";
@@ -16,6 +20,8 @@ import UiAlert from "../../components/ui/UiAlert.vue";
 import UiBadge from "../../components/ui/UiBadge.vue";
 import UiCard from "../../components/ui/UiCard.vue";
 import UiIcon from "../../components/ui/UiIcon.vue";
+import UiSwitch from "../../components/ui/UiSwitch.vue";
+import UiTabs from "../../components/ui/UiTabs.vue";
 import { apiJson, errorText } from "../../lib/api";
 import {
   accountStatusLabel,
@@ -26,8 +32,21 @@ import {
   healthTone,
   type Tone,
 } from "../../lib/format";
+import { useToastStore } from "../../stores/toast";
 
 const { t } = useI18n();
+const route = useRoute();
+const router = useRouter();
+const toast = useToastStore();
+
+type MonitorTab = "monitors" | "accounts";
+const tab = ref<MonitorTab>(route.query.tab === "accounts" ? "accounts" : "monitors");
+watch(tab, (value) => {
+  const query = { ...route.query };
+  if (value === "monitors") delete query.tab;
+  else query.tab = value;
+  void router.replace({ query });
+});
 
 /* ---------------- Clock ---------------- */
 
@@ -187,8 +206,120 @@ async function onTested() {
   flashTimer = window.setTimeout(() => (flashId.value = null), 1800);
 }
 
+/* ---------------- Active Synthetic Monitors ---------------- */
+
+const monitors = ref<ChannelMonitor[]>([]);
+const monitorsLoading = ref(false);
+const probingId = ref<string | null>(null);
+const formOpen = ref(false);
+const editingMonitor = ref<ChannelMonitor | null>(null);
+const historyOpen = ref(false);
+const historyMonitor = ref<ChannelMonitor | null>(null);
+
+const monitorStats = computed(() => {
+  let up = 0;
+  let degraded = 0;
+  let down = 0;
+  for (const m of monitors.value) {
+    if (m.lastStatus === "up") up++;
+    else if (m.lastStatus === "degraded") degraded++;
+    else if (m.lastStatus === "down") down++;
+  }
+  return { total: monitors.value.length, up, degraded, down };
+});
+
+const monitorTabs = computed(() => [
+  { key: "monitors" as MonitorTab, label: t("adminTools.monitor.tabs.monitors"), icon: "radar" as const, count: monitors.value.length },
+  { key: "accounts" as MonitorTab, label: t("adminTools.monitor.tabs.accounts"), icon: "server" as const, count: accounts.value.length },
+]);
+
+function monitorStatusTone(s: ChannelMonitorStatus): Tone {
+  switch (s) {
+    case "up":
+      return "success";
+    case "degraded":
+      return "warning";
+    case "down":
+      return "danger";
+    default:
+      return "neutral";
+  }
+}
+
+function sparkColor(s: "up" | "degraded" | "down"): string {
+  if (s === "up") return "bg-success/80";
+  if (s === "degraded") return "bg-warning/85";
+  return "bg-danger/85";
+}
+
+async function loadMonitors() {
+  monitorsLoading.value = true;
+  try {
+    const res = await apiJson<{ items: ChannelMonitor[] }>("/api/v1/admin/channel-monitors");
+    monitors.value = res.items;
+    if (historyMonitor.value) {
+      const updated = res.items.find((m) => m.id === historyMonitor.value!.id);
+      if (updated) historyMonitor.value = updated;
+    }
+  } catch (err) {
+    toast.error(errorText(err, t("adminTools.monitor.errors.loadAccounts")));
+  } finally {
+    monitorsLoading.value = false;
+  }
+}
+
+function openCreateMonitor() {
+  editingMonitor.value = null;
+  formOpen.value = true;
+}
+
+function openEditMonitor(m: ChannelMonitor) {
+  editingMonitor.value = m;
+  formOpen.value = true;
+}
+
+function openMonitorHistory(m: ChannelMonitor) {
+  historyMonitor.value = m;
+  historyOpen.value = true;
+}
+
+async function probeMonitorNow(m: ChannelMonitor) {
+  probingId.value = m.id;
+  try {
+    await apiJson(`/api/v1/admin/channel-monitors/${encodeURIComponent(m.id)}/run`, { method: "POST" });
+    await loadMonitors();
+  } catch (err) {
+    toast.error(errorText(err, t("adminTools.monitor.errors.run")));
+  } finally {
+    probingId.value = null;
+  }
+}
+
+async function toggleMonitorFlag(m: ChannelMonitor, field: "enabled" | "isPublic", value: boolean) {
+  try {
+    await apiJson(`/api/v1/admin/channel-monitors/${encodeURIComponent(m.id)}`, {
+      method: "PATCH",
+      body: { [field]: value },
+    });
+    m[field] = value;
+  } catch (err) {
+    toast.error(errorText(err, t("adminTools.monitor.errors.saveSchedule")));
+  }
+}
+
+async function deleteMonitor(id: string) {
+  try {
+    await apiJson(`/api/v1/admin/channel-monitors/${encodeURIComponent(id)}`, { method: "DELETE" });
+    toast.success(t("adminTools.monitor.synthetic.deletedToast"));
+    await loadMonitors();
+  } catch (err) {
+    toast.error(errorText(err, t("adminTools.monitor.errors.saveSchedule")));
+  }
+}
+
 onMounted(() => {
   void load();
+  void loadMonitors();
   clock = window.setInterval(() => (now.value = Date.now()), 30_000);
 });
 
@@ -202,13 +333,185 @@ onBeforeUnmount(() => {
   <div class="space-y-6">
     <PageHeader :title="t('nav.channelMonitor')">
       <template #actions>
-        <button type="button" class="btn btn-secondary" :disabled="loading" @click="load()">
-          <UiIcon name="refresh" :size="15" :spin="loading" />
+        <button
+          v-if="tab === 'monitors'"
+          type="button"
+          class="btn btn-primary"
+          @click="openCreateMonitor"
+        >
+          <UiIcon name="plus" :size="15" />
+          {{ t("adminTools.monitor.synthetic.add") }}
+        </button>
+        <button type="button" class="btn btn-secondary" :disabled="loading || monitorsLoading" @click="load(); loadMonitors()">
+          <UiIcon name="refresh" :size="15" :spin="loading || monitorsLoading" />
           <span class="hidden sm:inline">{{ t("common.refresh") }}</span>
         </button>
       </template>
     </PageHeader>
 
+    <UiTabs v-model="tab" :tabs="monitorTabs" />
+
+    <!-- Synthetic Active Monitors Tab -->
+    <div v-show="tab === 'monitors'" class="space-y-6">
+      <div class="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4">
+        <StatCard
+          :label="t('adminTools.monitor.synthetic.stats.total')"
+          :value="formatNumber(monitorStats.total)"
+          icon="radar"
+          tone="accent"
+        />
+        <StatCard
+          :label="t('adminTools.monitor.synthetic.stats.up')"
+          :value="formatNumber(monitorStats.up)"
+          icon="check-circle"
+          tone="success"
+        />
+        <StatCard
+          :label="t('adminTools.monitor.synthetic.stats.degraded')"
+          :value="formatNumber(monitorStats.degraded)"
+          icon="alert"
+          :tone="monitorStats.degraded ? 'warning' : 'neutral'"
+        />
+        <StatCard
+          :label="t('adminTools.monitor.synthetic.stats.down')"
+          :value="formatNumber(monitorStats.down)"
+          icon="x-circle"
+          :tone="monitorStats.down ? 'danger' : 'neutral'"
+        />
+      </div>
+
+      <UiCard icon="radar" :title="t('adminTools.monitor.synthetic.title')" flush>
+        <EmptyState
+          v-if="!monitorsLoading && monitors.length === 0"
+          icon="radar"
+          :title="t('adminTools.monitor.synthetic.empty')"
+        >
+          <button type="button" class="btn btn-primary btn-sm" @click="openCreateMonitor">
+            <UiIcon name="plus" :size="14" />
+            {{ t("adminTools.monitor.synthetic.add") }}
+          </button>
+        </EmptyState>
+
+        <div v-else class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>{{ t("adminTools.monitor.synthetic.cols.monitor") }}</th>
+                <th>{{ t("adminTools.monitor.synthetic.cols.account") }}</th>
+                <th>{{ t("adminTools.monitor.synthetic.cols.status") }}</th>
+                <th>{{ t("adminTools.monitor.synthetic.cols.history24h") }}</th>
+                <th class="text-right">{{ t("adminTools.monitor.health.table.latency") }}</th>
+                <th>{{ t("adminTools.monitor.synthetic.cols.enabled") }}</th>
+                <th>{{ t("adminTools.monitor.synthetic.cols.isPublic") }}</th>
+                <th class="text-right">{{ t("adminTools.monitor.health.table.actions") }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="m in monitors" :key="m.id">
+                <td class="min-w-[12rem] max-w-[16rem]">
+                  <p class="truncate text-sm font-medium text-fg" :title="m.name">{{ m.name }}</p>
+                  <p class="truncate text-2xs text-fg-subtle" :title="m.description">
+                    {{ m.model || "auto" }} · {{ m.intervalSeconds }}s
+                  </p>
+                </td>
+                <td class="max-w-[11rem]">
+                  <p class="truncate text-xs text-fg" :title="m.accountName || m.accountId">
+                    {{ m.accountName || m.accountId }}
+                  </p>
+                  <p v-if="m.platform" class="truncate text-2xs text-fg-subtle">{{ m.platform }}</p>
+                </td>
+                <td class="whitespace-nowrap">
+                  <UiBadge :tone="monitorStatusTone(m.lastStatus)" dot :pulse="m.lastStatus === 'up'">
+                    {{ t(`adminTools.monitor.synthetic.statuses.${m.lastStatus}`) }}
+                  </UiBadge>
+                  <p v-if="m.lastCheckedAtIso" class="mt-0.5 text-2xs text-fg-subtle" :title="formatDateTime(m.lastCheckedAtIso)">
+                    {{ formatRelative(m.lastCheckedAtIso, now) }}
+                  </p>
+                </td>
+                <td>
+                  <div class="flex items-center gap-2">
+                    <div class="flex h-4 items-end gap-0.5">
+                      <span
+                        v-for="(pt, idx) in m.recentRuns"
+                        :key="idx"
+                        class="h-3.5 w-1.5 rounded-sm"
+                        :class="sparkColor(pt.status)"
+                        :title="`${pt.status} · ${pt.latencyMs}ms · ${formatDateTime(pt.checkedAtIso)}`"
+                      />
+                      <span v-if="m.recentRuns.length === 0" class="text-2xs text-fg-subtle">—</span>
+                    </div>
+                    <span v-if="m.uptime24hPct !== null" class="font-mono text-2xs text-fg-muted">
+                      {{ m.uptime24hPct }}%
+                    </span>
+                  </div>
+                </td>
+                <td class="whitespace-nowrap text-right font-mono text-xs tabular-nums">
+                  <span v-if="m.lastCheckedAtIso" :class="latencyClass(m.lastLatencyMs)">
+                    {{ formatDurationMs(m.lastLatencyMs) }}
+                  </span>
+                  <span v-else class="text-fg-subtle">—</span>
+                </td>
+                <td>
+                  <UiSwitch
+                    :model-value="m.enabled"
+                    hide-label
+                    :label="m.name"
+                    @update:model-value="toggleMonitorFlag(m, 'enabled', $event)"
+                  />
+                </td>
+                <td>
+                  <UiSwitch
+                    :model-value="m.isPublic"
+                    hide-label
+                    :label="`${m.name} public`"
+                    tone="accent"
+                    @update:model-value="toggleMonitorFlag(m, 'isPublic', $event)"
+                  />
+                </td>
+                <td class="whitespace-nowrap text-right">
+                  <div class="inline-flex items-center gap-1">
+                    <button
+                      type="button"
+                      class="btn btn-secondary btn-xs"
+                      :disabled="probingId === m.id"
+                      @click="probeMonitorNow(m)"
+                    >
+                      <UiIcon name="play" :size="12" :spin="probingId === m.id" />
+                      {{ t("adminTools.monitor.synthetic.probeNow") }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-xs"
+                      :title="t('adminTools.monitor.synthetic.historyTitle')"
+                      @click="openMonitorHistory(m)"
+                    >
+                      <UiIcon name="clock" :size="13" />
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-xs"
+                      @click="openEditMonitor(m)"
+                    >
+                      <UiIcon name="pencil" :size="13" />
+                    </button>
+                    <ConfirmButton
+                      size="xs"
+                      icon="trash"
+                      icon-only
+                      :confirm-label="t('common.confirm')"
+                      @confirm="deleteMonitor(m.id)"
+                    />
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </UiCard>
+    </div>
+
+    <!-- Account Auto-Test & Health Tab -->
+    <div v-show="tab === 'accounts'" class="space-y-6">
     <AutoTestScheduleCard :now="now" @config="onConfig" @progress="load(true)" @finished="load(true)" />
 
     <div class="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4">
@@ -392,6 +695,10 @@ onBeforeUnmount(() => {
       </div>
     </UiCard>
 
+    </div>
+
     <AccountTestModal v-model:open="testOpen" :account="testAccount" @tested="onTested" />
+    <MonitorFormModal v-model:open="formOpen" :monitor="editingMonitor" :accounts="accounts" @saved="loadMonitors" />
+    <MonitorHistoryDrawer v-model:open="historyOpen" :monitor="historyMonitor" :now="now" @probed="loadMonitors" />
   </div>
 </template>

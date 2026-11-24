@@ -87,6 +87,9 @@ import { logRouteError, mountSystemLogging, registerSystemLogRoutes } from "./ro
 import { registerRequestErrorRoutes } from "./routes/request_errors.ts";
 import { AlertService } from "./alerts/service.ts";
 import { registerAlertRoutes } from "./routes/alerts.ts";
+import { ChannelMonitorService } from "./channel_monitors/service.ts";
+import { registerChannelMonitorRoutes } from "./routes/channel_monitors.ts";
+import type { ChannelMonitorProbeFn } from "./store/channel_monitors_types.ts";
 import { registerAnnouncementRoutes } from "./routes/announcements.ts";
 import { paymentWebhookPlugin } from "./plugins/payment_webhook.ts";
 import { registerPluginRoutes } from "./routes/plugins.ts";
@@ -125,6 +128,8 @@ export interface BffAppOptions {
   startSchedulers?: boolean;
   /** Test hook: replaces SMTP delivery for verification/reset mail. */
   mailDelivery?: (cfg: import("./mail/smtp.ts").SmtpConfig, msg: import("./mail/smtp.ts").MailMessage) => Promise<unknown>;
+  /** Test hook: replaces synthetic channel monitor probe execution. */
+  probeMonitor?: ChannelMonitorProbeFn;
   /** Test hooks for full database backups (dump runner, object storage, part size, clock). */
   dbBackup?: DbBackupAppOptions;
 }
@@ -2665,6 +2670,17 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return url && internalToken ? { url, token: internalToken } : null;
   });
   registerAutoTestRoutes(app, autoTester);
+  const channelMonitorService = new ChannelMonitorService({
+    store,
+    probeTarget: () => {
+      const url = process.env.SLIPGATE_NET_INTERNAL_URL;
+      return url && internalToken ? { url, token: internalToken } : null;
+    },
+    syncDataPlane: syncDataPlaneBestEffort,
+    probeMonitor: options.probeMonitor,
+  });
+  registerChannelMonitorRoutes(app, store, channelMonitorService);
+  if (options.startSchedulers) channelMonitorService.start();
   mountAuditRetention(app, store, options.startSchedulers === true, vaultSecret);
   registerSystemLogRoutes(app, store, systemLogs, { verifyInternal: verifyInternalHeader });
   registerRequestErrorRoutes(app, store, { verifyInternal: verifyInternalHeader });

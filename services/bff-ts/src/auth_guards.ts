@@ -623,6 +623,7 @@ export function registerAuthGuardRoutes(app: Hono<AuthEnv>, guards: AuthGuards):
   const publicGuard = guards.backendModePublicGuard();
   app.use("/api/v1/public/models", publicGuard);
   app.use("/api/v1/public/status", publicGuard);
+  app.use("/api/v1/public/channel-monitors/status", publicGuard);
   app.use("/api/v1/public/home", publicGuard);
   app.use("/api/v1/public/promo/*", publicGuard);
 

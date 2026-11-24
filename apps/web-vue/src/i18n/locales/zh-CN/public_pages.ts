@@ -169,6 +169,19 @@ export default {
         bad: "< 50%",
         none: "无流量",
       },
+      probes: {
+        title: "主动探测监控",
+        subtitle: "定时合成请求探测各上游通路真实连通性与响应延迟。",
+        count: "{n} 项监控",
+        uptime: "24h 可用率",
+        noRuns: "等待首次探测",
+        statuses: {
+          unknown: "待探测",
+          up: "正常",
+          degraded: "高延迟",
+          down: "异常",
+        },
+      },
     },
     keyUsage: {
       eyebrow: "自助查询",

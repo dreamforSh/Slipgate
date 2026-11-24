@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import type { ChannelHealth, ChannelStatusResponse } from "@slipgate/contracts";
+import type {
+  ChannelHealth,
+  ChannelStatusResponse,
+  PublicChannelMonitorItem,
+  PublicChannelMonitorsStatusResponse,
+} from "@slipgate/contracts";
 import PublicLayout from "../../components/PublicLayout.vue";
 import ChannelStatusCard from "../../components/public/ChannelStatusCard.vue";
 import PublicDisabled from "../../components/public/PublicDisabled.vue";
@@ -12,10 +17,11 @@ import { vReveal } from "../../components/public/reveal";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import PlatformIcon from "../../components/ui/PlatformIcon.vue";
 import UiAlert from "../../components/ui/UiAlert.vue";
+import UiBadge from "../../components/ui/UiBadge.vue";
 import UiIcon from "../../components/ui/UiIcon.vue";
 import { useNow } from "../../composables/useNow";
 import { ApiError, errorText, publicJson } from "../../lib/api";
-import type { Tone } from "../../lib/format";
+import { formatDurationMs, formatRelative, type Tone } from "../../lib/format";
 
 const REFRESH_SECONDS = 60;
 
@@ -23,6 +29,7 @@ const { t, locale } = useI18n();
 const now = useNow(30_000);
 
 const data = ref<ChannelStatusResponse | null>(null);
+const probeMonitors = ref<PublicChannelMonitorItem[]>([]);
 const loading = ref(false);
 const disabled = ref(false);
 const error = ref<string | null>(null);
@@ -31,11 +38,30 @@ const hidden = ref(typeof document !== "undefined" && document.visibilityState =
 let lastLoadedAt = 0;
 let timer: number | undefined;
 
+function monitorBadgeTone(s: PublicChannelMonitorItem["lastStatus"]): Tone {
+  if (s === "up") return "success";
+  if (s === "degraded") return "warning";
+  if (s === "down") return "danger";
+  return "neutral";
+}
+
+function runBarClass(s: "up" | "degraded" | "down"): string {
+  if (s === "up") return "bg-success/80";
+  if (s === "degraded") return "bg-warning/85";
+  return "bg-danger/85";
+}
+
 async function load() {
   if (loading.value) return;
   loading.value = true;
   try {
-    data.value = await publicJson<ChannelStatusResponse>("/api/v1/public/status");
+    const [statusRes, monitorsRes] = await Promise.allSettled([
+      publicJson<ChannelStatusResponse>("/api/v1/public/status"),
+      publicJson<PublicChannelMonitorsStatusResponse>("/api/v1/public/channel-monitors/status"),
+    ]);
+    if (statusRes.status === "rejected") throw statusRes.reason;
+    data.value = statusRes.value;
+    probeMonitors.value = monitorsRes.status === "fulfilled" ? monitorsRes.value.items : [];
     disabled.value = false;
     error.value = null;
     lastLoadedAt = Date.now();
@@ -278,6 +304,67 @@ const ringOffset = computed(() => RING_C * (1 - countdown.value / REFRESH_SECOND
             </div>
           </template>
         </template>
+
+        <section v-if="probeMonitors.length > 0" class="space-y-4 pt-2">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 class="text-base font-semibold text-fg">{{ t("public.status.probes.title") }}</h2>
+              <p class="text-xs text-fg-subtle">{{ t("public.status.probes.subtitle") }}</p>
+            </div>
+            <span class="text-xs font-medium text-fg-muted">
+              {{ t("public.status.probes.count", { n: probeMonitors.length }) }}
+            </span>
+          </div>
+
+          <div class="grid gap-4 lg:grid-cols-2">
+            <article
+              v-for="m in probeMonitors"
+              :key="m.id"
+              class="card flex min-w-0 flex-col gap-3.5 p-5"
+            >
+              <header class="flex items-start justify-between gap-3">
+                <div class="flex min-w-0 items-center gap-3">
+                  <span class="icon-chip h-9 w-9 rounded-xl bg-surface-2">
+                    <PlatformIcon :platform="m.platform" :size="17" />
+                  </span>
+                  <div class="min-w-0">
+                    <h3 class="truncate text-sm font-semibold text-fg" :title="m.name">{{ m.name }}</h3>
+                    <p class="truncate font-mono text-2xs text-fg-subtle">
+                      {{ m.model || providerLabel(m.platform) }}
+                      <template v-if="m.lastCheckedAtIso"> · {{ formatRelative(m.lastCheckedAtIso, now) }}</template>
+                    </p>
+                  </div>
+                </div>
+                <UiBadge :tone="monitorBadgeTone(m.lastStatus)" dot :pulse="m.lastStatus === 'up'">
+                  {{ t(`public.status.probes.statuses.${m.lastStatus}`) }}
+                </UiBadge>
+              </header>
+
+              <div class="flex items-center gap-1">
+                <span
+                  v-for="(pt, idx) in m.recentRuns"
+                  :key="idx"
+                  class="h-5 flex-1 rounded-sm"
+                  :class="runBarClass(pt.status)"
+                  :title="`${pt.status} (${pt.latencyMs}ms)`"
+                />
+                <span v-if="m.recentRuns.length === 0" class="text-xs text-fg-subtle">
+                  {{ t("public.status.probes.noRuns") }}
+                </span>
+              </div>
+
+              <div class="flex items-center justify-between text-xs text-fg-subtle">
+                <span>
+                  {{ t("public.status.probes.uptime") }}:
+                  <strong class="font-mono text-fg">{{ m.uptime24hPct !== null ? `${m.uptime24hPct}%` : "—" }}</strong>
+                </span>
+                <span class="font-mono tabular-nums text-fg-muted">
+                  {{ m.lastCheckedAtIso ? formatDurationMs(m.lastLatencyMs) : "—" }}
+                </span>
+              </div>
+            </article>
+          </div>
+        </section>
       </div>
     </template>
   </PublicLayout>

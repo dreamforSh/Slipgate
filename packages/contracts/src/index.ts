@@ -26,6 +26,7 @@ export * from "./account_oauth.ts";
 export * from "./step_up.ts";
 export * from "./request_errors.ts";
 export * from "./alerts.ts";
+export * from "./channel_monitors.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 

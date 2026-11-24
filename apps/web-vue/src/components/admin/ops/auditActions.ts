@@ -99,6 +99,10 @@ export const AUDIT_ACTION_KEYS: Record<string, string> = {
   [`POST ${A}/ops/alerts/events/:id/resolve`]: "opsAlertEventResolve",
   [`POST ${A}/ops/alerts/silences`]: "opsAlertSilenceCreate",
   [`DELETE ${A}/ops/alerts/silences/:id`]: "opsAlertSilenceDelete",
+  [`POST ${A}/channel-monitors`]: "channelMonitorCreate",
+  [`PATCH ${A}/channel-monitors/:id`]: "channelMonitorUpdate",
+  [`DELETE ${A}/channel-monitors/:id`]: "channelMonitorDelete",
+  [`POST ${A}/channel-monitors/:id/run`]: "channelMonitorRun",
 
   [`POST ${A}/system/update/sync`]: "systemUpdateSync",
 };

@@ -171,6 +171,19 @@ const en: typeof zh = {
         bad: "< 50%",
         none: "No traffic",
       },
+      probes: {
+        title: "Active probe monitors",
+        subtitle: "Scheduled synthetic probes checking live upstream reachability and latency.",
+        count: "{n} monitors",
+        uptime: "24h uptime",
+        noRuns: "Awaiting first probe",
+        statuses: {
+          unknown: "Pending",
+          up: "Up",
+          degraded: "Degraded",
+          down: "Down",
+        },
+      },
     },
     keyUsage: {
       eyebrow: "Self-service",

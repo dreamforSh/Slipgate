@@ -226,6 +226,10 @@ const en: typeof zh = {
       opsAlertEventResolve: "Resolve alert event",
       opsAlertSilenceCreate: "Create alert silence",
       opsAlertSilenceDelete: "Delete alert silence",
+      channelMonitorCreate: "Create channel monitor",
+      channelMonitorUpdate: "Update channel monitor",
+      channelMonitorDelete: "Delete channel monitor",
+      channelMonitorRun: "Run channel monitor probe",
       systemUpdateSync: "Sync system update",
     },
     errors: {

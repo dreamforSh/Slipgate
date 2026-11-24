@@ -31,6 +31,7 @@ import type { DbBackupStore } from "./db_backups_types.ts";
 import type { UserLimitsStore } from "./user_limits_types.ts";
 import type { RequestErrorStore } from "./request_errors_types.ts";
 import type { AlertStore } from "./alerts_types.ts";
+import type { ChannelMonitorStore } from "./channel_monitors_types.ts";
 
 export type StoreErrorCode = "conflict" | "not_found" | "forbidden" | "bad_request";
 
@@ -135,6 +136,8 @@ export interface ControlStore {
   readonly requestErrors: RequestErrorStore;
   /** Alert rules, events, and silences (lane O2). */
   readonly alerts: AlertStore;
+  /** Active synthetic channel monitors and probe history (lane O3). */
+  readonly channelMonitors: ChannelMonitorStore;
 
   init(): Promise<void>;
   close(): Promise<void>;

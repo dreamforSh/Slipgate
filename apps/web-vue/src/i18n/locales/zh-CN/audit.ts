@@ -220,6 +220,10 @@ export default {
       opsAlertEventResolve: "解决告警事件",
       opsAlertSilenceCreate: "创建告警静默",
       opsAlertSilenceDelete: "删除告警静默",
+      channelMonitorCreate: "创建渠道探测监控",
+      channelMonitorUpdate: "修改渠道探测监控",
+      channelMonitorDelete: "删除渠道探测监控",
+      channelMonitorRun: "手动执行渠道探测",
       systemUpdateSync: "同步系统更新",
     },
     errors: {
