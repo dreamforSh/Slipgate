@@ -394,3 +394,271 @@ func TestPrivateRepoReleaseAssetSyncViaAPIURL(t *testing.T) {
 		t.Fatalf("unexpected private sync status: %+v webDir=%q", st, webDir)
 	}
 }
+
+func TestCompareSemver(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		a    string
+		b    string
+		want int
+	}{
+		{"0.1.0", "0.2.0", -1},
+		{"v0.1.0", "0.2.0", -1},
+		{"0.2.0-dev", "0.2.0", -1},
+		{"v1.10.0", "v1.2.0", 1},
+		{"dev", "v0.1.0", -1},
+		{"0.2.0", "v0.2.0", 0},
+	}
+	for _, tc := range cases {
+		if got := compareSemver(tc.a, tc.b); got != tc.want {
+			t.Errorf("compareSemver(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestStableChannelApplyCatalogHistoryAndRollback(t *testing.T) {
+	t.Parallel()
+
+	exePath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	exeBytes, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("read test executable: %v", err)
+	}
+
+	sup := supervisor.New(log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = sup.Stop(2 * time.Second)
+	}()
+
+	if err := sup.StartAll(ctx, []supervisor.ChildSpec{
+		{Name: "core", Binary: exePath, Args: []string{"-test.run=TestHelperProcess"}, Env: []string{"GO_WANT_HOTUPDATE_HELPER=1"}},
+		{Name: "bff", Binary: exePath, Args: []string{"-test.run=TestHelperProcess"}, Env: []string{"GO_WANT_HOTUPDATE_HELPER=1"}},
+	}); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+
+	makeBundle := func(tag, version, commit, uiMarker string) (string, []byte, string) {
+		asset := PlatformAssetName(tag)
+		bytes := buildMockArchive(t, asset, map[string][]byte{
+			"slipgate-" + tag + "/webui/index.html":        []byte("<html>" + uiMarker + "</html>"),
+			"slipgate-" + tag + "/slipgate-core" + ext:     exeBytes,
+			"slipgate-" + tag + "/slipgate-bff" + ext:      exeBytes,
+			"slipgate-" + tag + "/slipgate-guestd" + ext:   []byte("guestd-" + version),
+			"slipgate-" + tag + "/slipgate" + ext:          []byte("edge-" + version),
+		})
+		sum := sha256.Sum256(bytes)
+		return asset, bytes, hex.EncodeToString(sum[:])
+	}
+
+	asset02, bytes02, sum02 := makeBundle("v0.2.0", "0.2.0", "22222222aaaa", "v020-ui")
+	asset03, bytes03, sum03 := makeBundle("v0.3.0", "0.3.0", "33333333bbbb", "v030-ui")
+
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rel02 := githubRelease{
+			TagName:         "v0.2.0",
+			Name:            "Slipgate v0.2.0",
+			Body:            "## What's New\n- Dual channel updates",
+			PublishedAt:     "2026-11-24T01:00:00Z",
+			HTMLURL:         srvURL + "/releases/tag/v0.2.0",
+			TargetCommitish: "22222222aaaa",
+			Assets: []githubAsset{
+				{Name: "BUILD_META.json", BrowserDownloadURL: srvURL + "/dl/v0.2.0/BUILD_META.json", Size: 64},
+				{Name: "SHA256SUMS.txt", BrowserDownloadURL: srvURL + "/dl/v0.2.0/SHA256SUMS.txt", Size: 128},
+				{Name: asset02, BrowserDownloadURL: srvURL + "/dl/v0.2.0/" + asset02, Size: int64(len(bytes02))},
+			},
+		}
+		rel03 := githubRelease{
+			TagName:         "v0.3.0",
+			Name:            "Slipgate v0.3.0",
+			Body:            "## Hotfix\n- Faster streaming",
+			PublishedAt:     "2026-11-24T02:00:00Z",
+			HTMLURL:         srvURL + "/releases/tag/v0.3.0",
+			TargetCommitish: "33333333bbbb",
+			Assets: []githubAsset{
+				{Name: "BUILD_META.json", BrowserDownloadURL: srvURL + "/dl/v0.3.0/BUILD_META.json", Size: 64},
+				{Name: "SHA256SUMS.txt", BrowserDownloadURL: srvURL + "/dl/v0.3.0/SHA256SUMS.txt", Size: 128},
+				{Name: asset03, BrowserDownloadURL: srvURL + "/dl/v0.3.0/" + asset03, Size: int64(len(bytes03))},
+			},
+		}
+
+		switch r.URL.Path {
+		case "/repos/dreamforSh/Slipgate/releases/latest":
+			_ = json.NewEncoder(w).Encode(rel02)
+		case "/repos/dreamforSh/Slipgate/releases/tags/v0.2.0":
+			_ = json.NewEncoder(w).Encode(rel02)
+		case "/repos/dreamforSh/Slipgate/releases/tags/v0.3.0":
+			_ = json.NewEncoder(w).Encode(rel03)
+		case "/repos/dreamforSh/Slipgate/releases":
+			_ = json.NewEncoder(w).Encode([]githubRelease{rel03, rel02})
+		case "/dl/v0.2.0/BUILD_META.json":
+			_ = json.NewEncoder(w).Encode(buildMeta{Version: "0.2.0", Commit: "22222222aaaa"})
+		case "/dl/v0.2.0/SHA256SUMS.txt":
+			_, _ = fmt.Fprintf(w, "%s  %s\n", sum02, asset02)
+		case "/dl/v0.2.0/" + asset02:
+			_, _ = w.Write(bytes02)
+		case "/dl/v0.3.0/BUILD_META.json":
+			_ = json.NewEncoder(w).Encode(buildMeta{Version: "0.3.0", Commit: "33333333bbbb"})
+		case "/dl/v0.3.0/SHA256SUMS.txt":
+			_, _ = fmt.Fprintf(w, "%s  %s\n", sum03, asset03)
+		case "/dl/v0.3.0/" + asset03:
+			_, _ = w.Write(bytes03)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	hotDir := t.TempDir()
+	var webDir, guestdDir string
+	mgr := NewManager(Options{
+		Config: config.Config{
+			Mode:         "release",
+			DevSyncMode:  "release",
+			UpdateRepo:   "dreamforSh/Slipgate",
+			UpdateBranch: "main",
+			HotUpdateDir: hotDir,
+		},
+		Version:         "0.1.0",
+		InitialCommit:   "111111110000",
+		Supervisor:      sup,
+		APIBaseURL:      srv.URL,
+		AllowCustomHost: true,
+		Logger:          log.New(io.Discard, "", 0),
+		OnWebUIDir:      func(dir string) { webDir = dir },
+		GetWebUIDir:     func() string { return webDir },
+		OnGuestdBin:     func(path string) { guestdDir = path },
+	})
+
+	// 1. Check only against stable /releases/latest
+	chk, err := mgr.Sync(context.Background(), true, false)
+	if err != nil {
+		t.Fatalf("stable checkOnly failed: %v", err)
+	}
+	if !chk.UpdateAvailable || chk.RemoteVersion == nil || *chk.RemoteVersion != "0.2.0" || chk.ReleaseNotes == nil {
+		t.Fatalf("unexpected stable check status: %+v", chk)
+	}
+
+	// 2. Approved apply (release mode with AllowReleaseApply=true)
+	st02, err := mgr.SyncWithOptions(context.Background(), SyncOptions{AllowReleaseApply: true})
+	if err != nil {
+		t.Fatalf("SyncWithOptions v0.2.0 failed: %v", err)
+	}
+	if st02.Version != "0.2.0" || !st02.GuestdUpdated || guestdDir == "" || !st02.CanRollback || st02.PreviousRelease == nil || st02.PreviousRelease.Version != "0.1.0" {
+		t.Fatalf("unexpected status after v0.2.0 apply: %+v", st02)
+	}
+
+	// 3. ListReleases marks v0.2.0 current & caches results
+	catalog, err := mgr.ListReleases(context.Background(), false)
+	if err != nil {
+		t.Fatalf("ListReleases failed: %v", err)
+	}
+	if len(catalog.Releases) != 2 || !catalog.Releases[1].Current || !catalog.Releases[0].Installable {
+		t.Fatalf("unexpected release catalog: %+v", catalog)
+	}
+
+	// 4. Target specific release tag v0.3.0
+	st03, err := mgr.SyncWithOptions(context.Background(), SyncOptions{
+		TargetTag:         "v0.3.0",
+		AllowReleaseApply: true,
+	})
+	if err != nil {
+		t.Fatalf("SyncWithOptions v0.3.0 failed: %v", err)
+	}
+	if st03.Version != "0.3.0" || st03.PreviousRelease == nil || st03.PreviousRelease.Version != "0.2.0" {
+		t.Fatalf("unexpected status after v0.3.0 apply: %+v", st03)
+	}
+
+	// 5. Rollback to previous release (v0.2.0), then baseline (0.1.0)
+	rb02, err := mgr.Rollback(context.Background(), "", false)
+	if err != nil {
+		t.Fatalf("Rollback to v0.2.0 failed: %v", err)
+	}
+	if rb02.Version != "0.2.0" || len(rb02.History) < 3 || rb02.History[0].Action != "rollback" {
+		t.Fatalf("unexpected status after rollback to v0.2.0: %+v", rb02)
+	}
+
+	rbBase, err := mgr.Rollback(context.Background(), "baseline", false)
+	if err != nil {
+		t.Fatalf("Rollback to baseline failed: %v", err)
+	}
+	if rbBase.Version != "0.1.0" || webDir != "" {
+		t.Fatalf("unexpected status after baseline rollback: %+v webDir=%q", rbBase, webDir)
+	}
+}
+
+func TestUpdateConfigPersistenceAndValidation(t *testing.T) {
+	t.Parallel()
+
+	hotDir := t.TempDir()
+	mgr := NewManager(Options{
+		Config: config.Config{
+			Mode:         "release",
+			DevSyncMode:  "auto",
+			UpdateRepo:   "dreamforSh/Slipgate",
+			UpdateBranch: "main",
+			HotUpdateDir: hotDir,
+		},
+		Version: "0.1.0",
+		Logger:  log.New(io.Discard, "", 0),
+	})
+
+	badCh := "nightly"
+	if _, err := mgr.UpdateConfig(ConfigPatch{Channel: &badCh}); !errors.Is(err, ErrInvalidUpdateConfig) {
+		t.Fatalf("expected ErrInvalidUpdateConfig for channel=%q, got %v", badCh, err)
+	}
+
+	badInt := 10
+	if _, err := mgr.UpdateConfig(ConfigPatch{IntervalSeconds: &badInt}); !errors.Is(err, ErrInvalidUpdateConfig) {
+		t.Fatalf("expected ErrInvalidUpdateConfig for interval=10, got %v", err)
+	}
+
+	ch := ChannelDev
+	auto := true
+	interval := 180
+	strat := "release"
+	st, err := mgr.UpdateConfig(ConfigPatch{
+		Channel:         &ch,
+		AutoSyncEnabled: &auto,
+		IntervalSeconds: &interval,
+		Strategy:        &strat,
+	})
+	if err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+	if st.Channel != ChannelDev || !st.AutoSyncEnabled || st.IntervalSeconds != 180 || st.Strategy != "release" {
+		t.Fatalf("unexpected updated config snapshot: %+v", st)
+	}
+
+	// Fresh Manager loads persisted config.json cleanly
+	reloaded := NewManager(Options{
+		Config: config.Config{
+			Mode:         "release",
+			DevSyncMode:  "auto",
+			UpdateRepo:   "dreamforSh/Slipgate",
+			UpdateBranch: "main",
+			HotUpdateDir: hotDir,
+		},
+		Version: "0.1.0",
+		Logger:  log.New(io.Discard, "", 0),
+	}).Status()
+	if reloaded.Channel != ChannelDev || !reloaded.AutoSyncEnabled || reloaded.IntervalSeconds != 180 || reloaded.Strategy != "release" {
+		t.Fatalf("reloaded config mismatch: %+v", reloaded)
+	}
+
+	if _, rbErr := mgr.Rollback(context.Background(), "", false); !errors.Is(rbErr, ErrRollbackUnavailable) {
+		t.Fatalf("expected ErrRollbackUnavailable when no updates applied, got %v", rbErr)
+	}
+}

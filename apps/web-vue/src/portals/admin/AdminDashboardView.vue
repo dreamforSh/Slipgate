@@ -10,7 +10,6 @@ import type {
   RiskBanEvent,
   RoutePreviewResponse,
   StoredCompositeRoute,
-  SystemUpdateStatus,
   UsageLogItem,
   VmSlotSummary,
 } from "@slipgate/contracts";
@@ -45,8 +44,10 @@ import {
   slotStateLabel,
 } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import { useSystemUpdateStore } from "../../stores/systemUpdate";
 
 const auth = useAuthStore();
+const systemUpdate = useSystemUpdateStore();
 const { t, locale } = useI18n();
 
 interface ReadinessState {
@@ -63,9 +64,6 @@ const clashRuntime = ref<ClashRuntimeStatus | null>(null);
 const vmSlots = ref<VmSlotSummary[]>([]);
 const riskEvents = ref<RiskBanEvent[]>([]);
 const readiness = ref<ReadinessState | null>(null);
-const updateStatus = ref<SystemUpdateStatus | null>(null);
-const updateBusy = ref(false);
-const updateError = ref<string | null>(null);
 const routeGroupId = ref("grp_default");
 const routePublicModel = ref("");
 const routeMatchType = ref<"exact" | "prefix">("exact");
@@ -78,7 +76,7 @@ const previewError = ref<string | null>(null);
 const loading = ref(false);
 const routeFormOpen = ref(false);
 
-useFeedbackToasts(updateError);
+useFeedbackToasts(computed(() => systemUpdate.error));
 
 /* ---------------- Usage statistics ---------------- */
 
@@ -262,7 +260,7 @@ const groupNameById = computed(() => new Map(groups.value.map((g) => [g.id, g.na
 async function loadOverview() {
   loading.value = true;
   try {
-    const [grpRes, routeRes, usageRes, clashRes, vmRes, riskRes, readyRes, updRes] = await Promise.all([
+    const [grpRes, routeRes, usageRes, clashRes, vmRes, riskRes, readyRes] = await Promise.all([
       auth.apiFetch("/api/v1/admin/groups"),
       auth.apiFetch("/api/v1/admin/routes"),
       auth.apiFetch("/api/v1/admin/usage?limit=15"),
@@ -270,7 +268,7 @@ async function loadOverview() {
       auth.apiFetch("/api/v1/admin/vms/slots"),
       auth.apiFetch("/api/v1/admin/risk/events"),
       fetch("/readyz"),
-      auth.apiFetch("/api/v1/admin/system/update"),
+      systemUpdate.loadStatus(true),
     ]);
     if (grpRes.ok) {
       const grpData = (await grpRes.json()) as { groups: GroupItem[] };
@@ -306,9 +304,6 @@ async function loadOverview() {
     if (readyRes.ok || readyRes.status === 503) {
       readiness.value = (await readyRes.json()) as ReadinessState;
     }
-    if (updRes.ok) {
-      updateStatus.value = (await updRes.json()) as SystemUpdateStatus;
-    }
   } catch {
     // Allow standalone preview when backend is offline.
   } finally {
@@ -316,38 +311,8 @@ async function loadOverview() {
   }
 }
 
-async function triggerRepoSync(checkOnly: boolean) {
-  updateBusy.value = true;
-  updateError.value = null;
-  try {
-    const res = await auth.apiFetch("/api/v1/admin/system/update/sync", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ checkOnly }),
-    });
-    const data = (await res.json()) as SystemUpdateStatus & {
-      error?: string;
-      message?: string;
-      status?: SystemUpdateStatus;
-    };
-    if (!res.ok) {
-      if (data.status) {
-        updateStatus.value = data.status;
-      }
-      updateError.value = data.message ?? data.error ?? t("dashboard.update.failed");
-      return;
-    }
-    updateStatus.value = data;
-    if (!checkOnly) {
-      window.setTimeout(() => {
-        void loadOverview();
-      }, 1200);
-    }
-  } catch (err) {
-    updateError.value = err instanceof Error ? err.message : t("dashboard.update.syncFailed");
-  } finally {
-    updateBusy.value = false;
-  }
+async function checkSystemUpdates() {
+  await systemUpdate.checkForUpdates();
 }
 
 async function handleCreateRoute() {
@@ -945,53 +910,70 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
       </div>
     </UiCard>
 
-    <!-- Hot update -->
+    <!-- System update summary -->
     <UiCard icon="branch" :title="t('dashboard.update.title')">
       <template #actions>
-        <UiBadge :tone="updateStatus?.mode === 'dev' ? 'success' : 'neutral'" dot>
-          {{ updateStatus?.mode === "dev" ? t("dashboard.update.devChannel") : t("dashboard.update.stable") }}
+        <UiBadge :tone="systemUpdate.status?.channel === 'dev' ? 'warning' : 'neutral'" dot>
+          {{
+            systemUpdate.status?.channel === "dev"
+              ? t("updates.channels.shortDev")
+              : t("dashboard.update.stable")
+          }}
         </UiBadge>
-        <UiBadge v-if="updateStatus?.updateAvailable" tone="accent">{{ t("dashboard.update.available") }}</UiBadge>
-        <button type="button" class="btn btn-secondary btn-sm" :disabled="updateBusy" @click="triggerRepoSync(true)">
-          <UiIcon name="search" :size="14" />
+        <UiBadge v-if="systemUpdate.needsEdgeRestart" tone="warning" dot>
+          {{ t("dashboard.update.edgeRestartNeeded") }}
+        </UiBadge>
+        <UiBadge v-else-if="systemUpdate.updateAvailable" tone="accent" dot>
+          {{ t("dashboard.update.available") }}
+        </UiBadge>
+        <UiBadge v-else tone="success" dot>
+          {{ t("dashboard.update.upToDate") }}
+        </UiBadge>
+        <button type="button" class="btn btn-secondary btn-sm" :disabled="systemUpdate.isBusy" @click="checkSystemUpdates">
+          <UiIcon :name="systemUpdate.checking ? 'loader' : 'refresh'" :size="14" :spin="systemUpdate.checking" />
           {{ t("dashboard.update.check") }}
         </button>
-        <button type="button" class="btn btn-primary btn-sm" :disabled="updateBusy" @click="triggerRepoSync(false)">
-          <UiIcon :name="updateBusy ? 'loader' : 'download'" :size="14" :spin="updateBusy" />
-          {{ t("dashboard.update.now") }}
-        </button>
+        <RouterLink to="/admin/updates" class="btn btn-primary btn-sm">
+          <UiIcon name="download" :size="14" />
+          {{ t("dashboard.update.manage") }}
+        </RouterLink>
       </template>
-      <dl class="kv grid-cols-2 sm:grid-cols-3 lg:grid-cols-6">
-        <div>
-          <dt>{{ t("dashboard.update.repo") }}</dt>
-          <dd :title="updateStatus?.repo">{{ updateStatus?.repo ?? "dreamforSh/Slipgate" }}</dd>
+
+      <div class="flex flex-wrap items-center justify-between gap-4 text-xs text-fg-muted">
+        <div class="flex flex-wrap items-center gap-x-5 gap-y-2">
+          <span class="inline-flex items-center gap-1.5">
+            <span class="text-fg-subtle">{{ t("dashboard.update.branchVersion") }}:</span>
+            <code class="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-fg">
+              {{ systemUpdate.status?.version ?? "0.1.0" }}
+            </code>
+            <span class="font-mono text-2xs text-fg-subtle">
+              ({{ shortHash(systemUpdate.status?.activeCommit ?? "dev", 8) }})
+            </span>
+          </span>
+
+          <span v-if="systemUpdate.updateAvailable && (systemUpdate.status?.remoteVersion || systemUpdate.status?.remoteCommit)" class="font-medium text-accent">
+            {{
+              t("dashboard.update.remoteHint", {
+                version: systemUpdate.status?.remoteVersion ?? shortHash(systemUpdate.status?.remoteCommit, 8),
+              })
+            }}
+          </span>
+
+          <span class="inline-flex items-center gap-1.5">
+            <span class="text-fg-subtle">{{ t("dashboard.update.console") }}:</span>
+            <span>
+              {{ systemUpdate.status?.webUiOverridden ? t("dashboard.update.consoleLive") : t("dashboard.update.consoleBuiltin") }}
+            </span>
+          </span>
         </div>
-        <div>
-          <dt>{{ t("dashboard.update.branchVersion") }}</dt>
-          <dd>{{ updateStatus?.branch ?? "main" }} · {{ updateStatus?.version ?? "0.1.0" }}</dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.commit") }}</dt>
-          <dd>
-            {{ shortHash(updateStatus?.activeCommit ?? "dev") }}
-            <span v-if="updateStatus?.remoteCommit" class="text-accent">→ {{ shortHash(updateStatus.remoteCommit) }}</span>
-          </dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.strategyState") }}</dt>
-          <dd>{{ updateStatus?.resolvedStrategy ?? "release" }} · {{ updateStatus?.state ?? "idle" }}</dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.reloads") }}</dt>
-          <dd>{{ updateStatus?.reloadCount ?? 0 }}</dd>
-        </div>
-        <div>
-          <dt>{{ t("dashboard.update.console") }}</dt>
-          <dd>{{ updateStatus?.webUiOverridden ? t("dashboard.update.consoleLive") : t("dashboard.update.consoleBuiltin") }}</dd>
-        </div>
-      </dl>
-      <UiAlert v-if="updateError || updateStatus?.lastError" tone="danger" class="mt-4">
-        <span class="font-mono text-xs">{{ updateError ?? updateStatus?.lastError }}</span>
+
+        <span class="font-mono text-2xs text-fg-subtle">
+          {{ systemUpdate.status?.repo ?? "dreamforSh/Slipgate" }} · {{ systemUpdate.status?.branch ?? "main" }}
+        </span>
+      </div>
+
+      <UiAlert v-if="systemUpdate.error || systemUpdate.status?.lastError" tone="danger" class="mt-4">
+        <span class="font-mono text-xs">{{ systemUpdate.error ?? systemUpdate.status?.lastError }}</span>
       </UiAlert>
     </UiCard>
   </div>

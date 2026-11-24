@@ -138,6 +138,7 @@ const router = createRouter({
     admin("/admin/monitor", "admin-monitor", () => import("../portals/admin/AdminChannelMonitorView.vue"), "nav.channelMonitor"),
     admin("/admin/audit-logs", "admin-audit", () => import("../portals/admin/AdminAuditLogsView.vue"), "nav.auditLogs"),
     admin("/admin/system-logs", "admin-system-logs", () => import("../portals/admin/AdminSystemLogsView.vue"), "systemLogs.title"),
+    admin("/admin/updates", "admin-updates", () => import("../portals/admin/AdminUpdatesView.vue"), "nav.updates"),
     admin("/admin/settings", "admin-settings", () => import("../portals/admin/AdminSettingsView.vue"), "nav.settings"),
 
     /* ---------- Signed-in users ---------- */

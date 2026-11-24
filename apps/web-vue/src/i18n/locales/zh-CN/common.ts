@@ -75,6 +75,7 @@ export default {
     redeem: "兑换码",
     promoCodes: "优惠码",
     auditLogs: "操作日志",
+    updates: "系统更新",
     settings: "系统设置",
     myDashboard: "仪表盘",
     myUsage: "使用记录",

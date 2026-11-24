@@ -44,7 +44,6 @@ import {
   SlotSeedSnapshotSchema,
   SubscriptionTierSchema,
   SystemUpdateStatusSchema,
-  TriggerUpdateSyncRequestSchema,
   TurnSettlementEventSchema,
   UpdateAccountRequestSchema,
   UpdateApiKeyRequestSchema,
@@ -88,6 +87,7 @@ import { CoalescingRunner, KeyedThrottle } from "./settlement_guards.ts";
 import { AccountAutoTester, registerAutoTestRoutes } from "./autotest.ts";
 import { mountAuditRetention } from "./audit_retention.ts";
 import { logRouteError, mountSystemLogging, registerSystemLogRoutes } from "./routes/system_logs.ts";
+import { registerSystemUpdateRoutes } from "./routes/system_update.ts";
 import { registerRequestErrorRoutes } from "./routes/request_errors.ts";
 import { AlertService } from "./alerts/service.ts";
 import { registerAlertRoutes } from "./routes/alerts.ts";
@@ -255,6 +255,8 @@ function buildStandaloneSystemUpdateStatus() {
 
   return SystemUpdateStatusSchema.parse({
     mode,
+    channel: mode === "dev" ? "dev" : "stable",
+    standalone: true,
     strategy,
     resolvedStrategy: strategy === "git" ? "git" : "release",
     repo: process.env.SLIPGATE_UPDATE_REPO || "dreamforSh/Slipgate",
@@ -1350,81 +1352,11 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   app.use("/api/v1/admin/*", sessions.requireAdmin());
   app.use("/api/v1/admin/*", auditMiddleware(store));
 
-  app.get("/api/v1/admin/system/update", async (c) => {
-    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
-    const internalToken = process.env.SLIPGATE_INTERNAL_TOKEN;
-    if (!internalUrl || !internalToken) {
-      return c.json(buildStandaloneSystemUpdateStatus());
-    }
-    try {
-      const res = await fetch(`${internalUrl}/internal/supervisor/update`, {
-        headers: { "X-Slipgate-Internal-Token": internalToken },
-        signal: AbortSignal.timeout(5000),
-      });
-      const payload = (await res.json()) as Record<string, unknown>;
-      if (!res.ok) {
-        return c.json(payload, 502);
-      }
-      return c.json(SystemUpdateStatusSchema.parse(payload));
-    } catch (err) {
-      return c.json(
-        {
-          error: "net_supervisor_unreachable",
-          message: err instanceof Error ? err.message : String(err),
-        },
-        502,
-      );
-    }
-  });
-
-  app.post("/api/v1/admin/system/update/sync", async (c) => {
-    let rawBody: unknown = {};
-    const rawText = await c.req.text();
-    if (rawText.trim().length > 0) {
-      try {
-        rawBody = JSON.parse(rawText);
-      } catch {
-        return c.json({ error: "invalid_request", message: "Malformed JSON request body" }, 400);
-      }
-    }
-    const parsed = TriggerUpdateSyncRequestSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
-    }
-
-    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
-    const internalToken = process.env.SLIPGATE_INTERNAL_TOKEN;
-    if (!internalUrl || !internalToken) {
-      return c.json({
-        ...buildStandaloneSystemUpdateStatus(),
-        lastCheckedAtIso: new Date().toISOString(),
-      });
-    }
-
-    try {
-      const res = await fetch(`${internalUrl}/internal/supervisor/update/sync`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Slipgate-Internal-Token": internalToken,
-        },
-        body: JSON.stringify(parsed.data),
-        signal: AbortSignal.timeout(120_000),
-      });
-      const payload = (await res.json()) as Record<string, unknown>;
-      if (!res.ok) {
-        return c.json(payload, 502);
-      }
-      return c.json(SystemUpdateStatusSchema.parse(payload));
-    } catch (err) {
-      return c.json(
-        {
-          error: "net_supervisor_unreachable",
-          message: err instanceof Error ? err.message : String(err),
-        },
-        502,
-      );
-    }
+  registerSystemUpdateRoutes(app, {
+    store,
+    sessions,
+    vaultSecret,
+    buildStandaloneSystemUpdateStatus,
   });
 
   app.get("/api/v1/admin/groups", async (c) => {

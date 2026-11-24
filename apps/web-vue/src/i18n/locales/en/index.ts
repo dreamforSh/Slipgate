@@ -29,6 +29,7 @@ import admin_tools from "./admin_tools";
 import system_logs from "./system_logs";
 import auth_guards from "./auth_guards";
 import db_backups from "./db_backups";
+import updates from "./updates";
 
 export default {
   ...common,
@@ -61,4 +62,5 @@ export default {
   ...system_logs,
   ...auth_guards,
   ...db_backups,
+  ...updates,
 };

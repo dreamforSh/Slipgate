@@ -239,6 +239,8 @@ export default {
       affiliateRateUpdate: "设置用户专属返利比例",
       affiliateWithdrawalReview: "审核返利提现申请",
       systemUpdateSync: "同步系统更新",
+      systemUpdateConfig: "修改更新策略",
+      systemUpdateRollback: "回滚系统版本",
       userAttrCreate: "创建用户属性",
       userAttrUpdate: "修改用户属性",
       userAttrDelete: "删除用户属性",

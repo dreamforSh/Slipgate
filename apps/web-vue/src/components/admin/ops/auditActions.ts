@@ -122,6 +122,8 @@ export const AUDIT_ACTION_KEYS: Record<string, string> = {
   [`POST ${A}/affiliates/withdrawals/:id/review`]: "affiliateWithdrawalReview",
 
   [`POST ${A}/system/update/sync`]: "systemUpdateSync",
+  [`PUT ${A}/system/update/config`]: "systemUpdateConfig",
+  [`POST ${A}/system/update/rollback`]: "systemUpdateRollback",
 
   [`POST ${A}/user-attributes`]: "userAttrCreate",
   [`PATCH ${A}/user-attributes/:id`]: "userAttrUpdate",

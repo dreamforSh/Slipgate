@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -65,6 +66,14 @@ func (s *Server) SetWebUIOverrideDir(dir string) {
 	if s.uiDynamic != nil {
 		s.uiDynamic.SetOverrideDir(dir)
 	}
+}
+
+// WebUIOverrideDir returns the currently active hot-synced frontend directory, or empty string if none.
+func (s *Server) WebUIOverrideDir() string {
+	if s.uiDynamic == nil {
+		return ""
+	}
+	return s.uiDynamic.OverrideDir()
 }
 
 // WithVmSlotManager attaches the VM full-emulation slot manager for readiness observability.
@@ -143,7 +152,10 @@ func (s *Server) Handler() http.Handler {
 
 	// Token-authenticated internal supervisor & net-plane bridges for slipgate-bff admin actions.
 	mux.HandleFunc("GET /internal/supervisor/update", s.handleInternalUpdateStatus)
+	mux.HandleFunc("GET /internal/supervisor/update/releases", s.handleInternalUpdateReleases)
 	mux.HandleFunc("POST /internal/supervisor/update/sync", s.handleInternalUpdateSync)
+	mux.HandleFunc("PUT /internal/supervisor/update/config", s.handleInternalUpdateConfig)
+	mux.HandleFunc("POST /internal/supervisor/update/rollback", s.handleInternalUpdateRollback)
 	mux.HandleFunc("POST /internal/net/dataplane/sync", s.handleInternalDataPlaneSync)
 	s.registerClashInternalRoutes(mux)
 	s.registerVmInternalRoutes(mux)
@@ -284,6 +296,28 @@ func (s *Server) handleInternalUpdateStatus(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, s.updater.Status())
 }
 
+func (s *Server) handleInternalUpdateReleases(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.updater == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "hotupdate_unavailable",
+		})
+		return
+	}
+	refresh := r.URL.Query().Get("refresh") == "1" || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	res, err := s.updater.ListReleases(r.Context(), refresh)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":   "releases_fetch_failed",
+			"message": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 func (s *Server) handleInternalUpdateSync(w http.ResponseWriter, r *http.Request) {
 	if !s.requireInternalAuth(w, r) {
 		return
@@ -296,7 +330,98 @@ func (s *Server) handleInternalUpdateSync(w http.ResponseWriter, r *http.Request
 	}
 
 	var body struct {
-		CheckOnly bool `json:"checkOnly"`
+		CheckOnly         bool   `json:"checkOnly"`
+		Channel           string `json:"channel"`
+		TargetTag         string `json:"targetTag"`
+		Force             bool   `json:"force"`
+		AllowReleaseApply bool   `json:"allowReleaseApply"`
+	}
+	if r.Body != nil {
+		raw, _ := io.ReadAll(io.LimitReader(r.Body, 8192))
+		if len(strings.TrimSpace(string(raw))) > 0 {
+			if err := json.Unmarshal(raw, &body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error":   "invalid_request",
+					"message": err.Error(),
+				})
+				return
+			}
+		}
+	}
+
+	status, err := s.updater.SyncWithOptions(r.Context(), hotupdate.SyncOptions{
+		CheckOnly:         body.CheckOnly,
+		AsyncRestart:      true,
+		Channel:           body.Channel,
+		TargetTag:         body.TargetTag,
+		Force:             body.Force,
+		AllowReleaseApply: body.AllowReleaseApply,
+	})
+	if err != nil {
+		code := http.StatusBadGateway
+		errCode := "update_sync_failed"
+		if errors.Is(err, hotupdate.ErrInvalidUpdateConfig) {
+			code = http.StatusBadRequest
+			errCode = "invalid_request"
+		} else if errors.Is(err, hotupdate.ErrUpdateBusy) {
+			code = http.StatusConflict
+			errCode = "update_in_progress"
+		}
+		writeJSON(w, code, map[string]any{
+			"error":   errCode,
+			"message": err.Error(),
+			"status":  status,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleInternalUpdateConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.updater == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "hotupdate_unavailable",
+		})
+		return
+	}
+	var patch hotupdate.ConfigPatch
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&patch); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":   "invalid_request",
+			"message": err.Error(),
+		})
+		return
+	}
+	status, err := s.updater.UpdateConfig(patch)
+	if err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, hotupdate.ErrInvalidUpdateConfig) {
+			code = http.StatusBadRequest
+		}
+		writeJSON(w, code, map[string]any{
+			"error":   "invalid_update_config",
+			"message": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleInternalUpdateRollback(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.updater == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "hotupdate_unavailable",
+		})
+		return
+	}
+	var body struct {
+		ReleaseID string `json:"releaseId"`
 	}
 	if r.Body != nil {
 		raw, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
@@ -310,12 +435,18 @@ func (s *Server) handleInternalUpdateSync(w http.ResponseWriter, r *http.Request
 			}
 		}
 	}
-
-	status, err := s.updater.Sync(r.Context(), body.CheckOnly, true)
+	status, err := s.updater.Rollback(r.Context(), strings.TrimSpace(body.ReleaseID), true)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"error":  err.Error(),
-			"status": status,
+		code := http.StatusBadGateway
+		errCode := "rollback_failed"
+		if errors.Is(err, hotupdate.ErrRollbackUnavailable) || errors.Is(err, hotupdate.ErrUpdateBusy) {
+			code = http.StatusConflict
+			errCode = "rollback_unavailable"
+		}
+		writeJSON(w, code, map[string]any{
+			"error":   errCode,
+			"message": err.Error(),
+			"status":  status,
 		})
 		return
 	}

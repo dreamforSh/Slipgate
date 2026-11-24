@@ -76,6 +76,7 @@ const en: typeof zh = {
     redeem: "Redeem codes",
     promoCodes: "Promo codes",
     auditLogs: "Audit log",
+    updates: "System updates",
     settings: "Settings",
     myDashboard: "Dashboard",
     myUsage: "Usage",

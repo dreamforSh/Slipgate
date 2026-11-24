@@ -99,6 +99,10 @@ export default {
       consoleBuiltin: "内置版本",
       failed: "更新失败",
       syncFailed: "同步失败",
+      manage: "管理更新",
+      upToDate: "已是最新",
+      edgeRestartNeeded: "Edge 待重启",
+      remoteHint: "新版本 {version}",
     },
     routes: {
       title: "模型路由",

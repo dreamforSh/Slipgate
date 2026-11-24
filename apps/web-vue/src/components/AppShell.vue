@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 import { usePortalStore } from "../stores/portal";
+import { useSystemUpdateStore } from "../stores/systemUpdate";
 import AnnouncementBell from "./AnnouncementBell.vue";
 import BrandMark from "./BrandMark.vue";
 import LocaleSwitcher from "./LocaleSwitcher.vue";
@@ -13,6 +14,7 @@ import UiIcon, { type IconName } from "./ui/UiIcon.vue";
 const { t } = useI18n();
 const auth = useAuthStore();
 const portal = usePortalStore();
+const systemUpdate = useSystemUpdateStore();
 const route = useRoute();
 const router = useRouter();
 
@@ -21,6 +23,8 @@ interface NavItem {
   label: string;
   icon: IconName;
   exact?: boolean;
+  badgeDot?: boolean;
+  badgeTone?: "accent" | "warning";
   /** External link (admin-defined nav links) rendered as a plain anchor in a new tab. */
   href?: string;
   /** A collapsible group: the parent only toggles; `to` is where the icon rail sends a click. */
@@ -98,6 +102,13 @@ const sections = computed<NavSection[]>(() => {
           { to: "/admin/system-logs", label: t("systemLogs.title"), icon: "terminal" },
           { to: "/admin/plugins", label: t("nav.plugins"), icon: "plug" },
           { to: "/admin/backup", label: t("nav.backup"), icon: "database" },
+          {
+            to: "/admin/updates",
+            label: t("nav.updates"),
+            icon: "download",
+            badgeDot: systemUpdate.updateAvailable || systemUpdate.needsEdgeRestart,
+            badgeTone: systemUpdate.needsEdgeRestart ? "warning" : "accent",
+          },
           { to: "/admin/settings", label: t("nav.settings"), icon: "settings" },
         ],
       },
@@ -266,6 +277,15 @@ onMounted(() => {
   document.addEventListener("pointerdown", onPointerDown);
   document.addEventListener("keydown", onKeydown);
 });
+watch(
+  () => auth.isAdmin,
+  (isAdmin) => {
+    if (isAdmin && !systemUpdate.status) {
+      void systemUpdate.loadStatus(true);
+    }
+  },
+  { immediate: true },
+);
 onBeforeUnmount(() => {
   desktopQuery.removeEventListener("change", onDesktopChange);
   document.removeEventListener("pointerdown", onPointerDown);
@@ -401,13 +421,25 @@ async function handleLogout() {
               <RouterLink
                 v-else
                 :to="item.to"
-                class="nav-link"
+                class="nav-link relative"
                 :class="{ 'nav-link-active': isActive(item), 'nav-link-rail': rail }"
                 :aria-label="rail ? item.label : undefined"
                 :aria-current="isActive(item) ? 'page' : undefined"
               >
                 <UiIcon :name="item.icon" :size="18" />
-                <span class="fade-x truncate" :class="{ 'fade-x-hidden': rail }">{{ item.label }}</span>
+                <span class="fade-x flex min-w-0 flex-1 items-center justify-between gap-2" :class="{ 'fade-x-hidden': rail }">
+                  <span class="truncate">{{ item.label }}</span>
+                  <span
+                    v-if="item.badgeDot"
+                    class="h-2 w-2 shrink-0 rounded-full"
+                    :class="item.badgeTone === 'warning' ? 'bg-warning' : 'bg-accent'"
+                  />
+                </span>
+                <span
+                  v-if="rail && item.badgeDot"
+                  class="absolute right-2.5 top-2.5 h-2 w-2 rounded-full ring-2 ring-surface"
+                  :class="item.badgeTone === 'warning' ? 'bg-warning' : 'bg-accent'"
+                />
               </RouterLink>
             </li>
           </ul>

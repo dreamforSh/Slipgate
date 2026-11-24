@@ -245,6 +245,8 @@ const en: typeof zh = {
       affiliateRateUpdate: "Set custom affiliate rebate rate",
       affiliateWithdrawalReview: "Review affiliate withdrawal",
       systemUpdateSync: "Sync system update",
+      systemUpdateConfig: "Update system update policy",
+      systemUpdateRollback: "Roll back system version",
       userAttrCreate: "Create user attribute",
       userAttrUpdate: "Update user attribute",
       userAttrDelete: "Delete user attribute",

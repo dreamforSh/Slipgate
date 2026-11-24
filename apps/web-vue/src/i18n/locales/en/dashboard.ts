@@ -100,6 +100,10 @@ const en: typeof zh = {
       consoleBuiltin: "Built-in",
       failed: "Update failed",
       syncFailed: "Sync failed",
+      manage: "Manage updates",
+      upToDate: "Up to date",
+      edgeRestartNeeded: "Restart edge",
+      remoteHint: "New: {version}",
     },
     routes: {
       title: "Model routing",

@@ -157,6 +157,20 @@ export function formatDateShort(iso: string | null | undefined): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+/** 1.2 MB / 842 KB — concise byte size formatting for release archives and download progress. */
+export function formatBytes(bytes: number | null | undefined): string {
+  const v = bytes ?? 0;
+  if (!Number.isFinite(v) || v <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let idx = 0;
+  let val = v;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx++;
+  }
+  return `${val >= 10 || idx === 0 ? val.toFixed(0) : val.toFixed(1)} ${units[idx]}`;
+}
+
 /** 850ms / 1.2s / 2m 05s */
 export function formatDurationMs(ms: number | null | undefined): string {
   const v = Math.max(0, Math.round(ms ?? 0));

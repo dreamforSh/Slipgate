@@ -38,6 +38,7 @@ type ChildSnapshot struct {
 	Name      string      `json:"name"`
 	Status    ChildStatus `json:"status"`
 	PID       int         `json:"pid"`
+	Binary    string      `json:"binary,omitempty"`
 	LastError string      `json:"last_error,omitempty"`
 }
 
@@ -145,6 +146,19 @@ func (s *Supervisor) UpdateChildBinary(name, binaryPath string) error {
 		}
 	}
 	return fmt.Errorf("supervisor: unknown child %q", name)
+}
+
+// ChildBinary returns the configured binary path for a named supervised child.
+func (s *Supervisor) ChildBinary(name string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, c := range s.children {
+		if c != nil && c.spec.Name == name {
+			return c.spec.Binary, true
+		}
+	}
+	return "", false
 }
 
 // RestartChild gracefully stops a single supervised child and launches it again without affecting other children.
@@ -435,6 +449,7 @@ func (s *Supervisor) Snapshots() []ChildSnapshot {
 			Name:      c.spec.Name,
 			Status:    c.status,
 			PID:       c.pid,
+			Binary:    c.spec.Binary,
 			LastError: c.lastError,
 		})
 	}

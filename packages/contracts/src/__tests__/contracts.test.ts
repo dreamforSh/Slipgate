@@ -17,11 +17,14 @@ import {
   parseUsdToNano,
   ProvisionVmSlotRequestSchema,
   RecordRiskBanInputSchema,
+  RollbackUpdateRequestSchema,
   SetupInitializeRequestSchema,
   subscriptionTierMultiplier,
+  SystemReleasesResponseSchema,
   SystemUpdateStatusSchema,
   TriggerUpdateSyncRequestSchema,
   TurnSettlementEventSchema,
+  UpdateSystemConfigRequestSchema,
   UpdateTlsProfileRequestSchema,
   VmFleetOverviewSchema,
   VmTerminalTicketResponseSchema,
@@ -197,6 +200,40 @@ describe("IAM, Pool and API Key contracts", () => {
     });
     expect(status.mode).toBe("dev");
     expect(status.autoSyncEnabled).toBe(true);
+    expect(status.channel).toBe("stable");
+    expect(status.standalone).toBe(false);
+    expect(status.components).toEqual([]);
+    expect(status.history).toEqual([]);
+    expect(status.canRollback).toBe(false);
+
+    const cfgReq = UpdateSystemConfigRequestSchema.parse({
+      channel: "dev",
+      autoSyncEnabled: true,
+      intervalSeconds: 300,
+      strategy: "release",
+    });
+    expect(cfgReq.channel).toBe("dev");
+    expect(() => UpdateSystemConfigRequestSchema.parse({ intervalSeconds: 5 })).toThrow();
+
+    const rollbackReq = RollbackUpdateRequestSchema.parse({ releaseId: "rel-123" });
+    expect(rollbackReq.releaseId).toBe("rel-123");
+
+    const releasesResp = SystemReleasesResponseSchema.parse({
+      repo: "dreamforSh/Slipgate",
+      currentVersion: "0.1.0",
+      currentCommit: "abc1234",
+      releases: [
+        {
+          tag: "v0.2.0",
+          name: "v0.2.0",
+          version: "0.2.0",
+          channel: "stable",
+          prerelease: false,
+          installable: true,
+        },
+      ],
+    });
+    expect(releasesResp.releases[0]?.version).toBe("0.2.0");
 
     const subReq = CreateClashSubscriptionRequestSchema.parse({
       name: "Tokyo Inline",
