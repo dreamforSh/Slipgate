@@ -16,9 +16,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -30,7 +32,12 @@ func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HOTUPDATE_HELPER") != "1" {
 		return
 	}
-	time.Sleep(10 * time.Second)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	select {
+	case <-sigCh:
+	case <-time.After(5 * time.Minute):
+	}
 	os.Exit(0)
 }
 
@@ -41,7 +48,10 @@ func buildMockArchive(t *testing.T, assetName string, files map[string][]byte) [
 	if strings.HasSuffix(assetName, ".zip") {
 		zw := zip.NewWriter(&buf)
 		for name, data := range files {
-			w, err := zw.Create(name)
+			w, err := zw.CreateHeader(&zip.FileHeader{
+				Name:   name,
+				Method: zip.Store,
+			})
 			if err != nil {
 				t.Fatalf("zip create %s: %v", name, err)
 			}
@@ -55,7 +65,10 @@ func buildMockArchive(t *testing.T, assetName string, files map[string][]byte) [
 		return buf.Bytes()
 	}
 
-	gzw := gzip.NewWriter(&buf)
+	gzw, err := gzip.NewWriterLevel(&buf, gzip.NoCompression)
+	if err != nil {
+		t.Fatalf("gzip writer: %v", err)
+	}
 	tw := tar.NewWriter(gzw)
 	for name, data := range files {
 		hdr := &tar.Header{
@@ -688,7 +701,6 @@ func TestAutoRestartAfterUpdateAndActiveReleasePersistence(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("StartAll: %v", err)
 	}
-	beforeSnaps := sup.Snapshots()
 
 	ext := exeExt()
 	edgeExe := filepath.Join(t.TempDir(), "slipgate"+ext)
@@ -765,6 +777,7 @@ func TestAutoRestartAfterUpdateAndActiveReleasePersistence(t *testing.T) {
 		},
 	})
 
+	beforeSnaps := sup.Snapshots()
 	st, err := mgr.SyncWithOptions(context.Background(), SyncOptions{
 		AsyncRestart:      true,
 		AllowReleaseApply: true,
@@ -945,7 +958,6 @@ func TestManualTriggerRestartAndAutoRestartConfigToggle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("StartAll: %v", err)
 	}
-	beforeSnaps := sup.Snapshots()
 
 	ext := exeExt()
 	edgeExe := filepath.Join(t.TempDir(), "slipgate"+ext)
@@ -1031,6 +1043,7 @@ func TestManualTriggerRestartAndAutoRestartConfigToggle(t *testing.T) {
 		t.Fatalf("expected persisted AutoRestartAfterUpdate=false in config.json")
 	}
 
+	beforeSnaps := sup.Snapshots()
 	st, err := mgr.Sync(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("Sync with autoRestartAfterUpdate=false failed: %v", err)
