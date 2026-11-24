@@ -209,6 +209,7 @@ export default {
       tlsCreate: "创建 TLS 指纹",
       tlsUpdate: "修改 TLS 指纹",
       tlsDelete: "删除 TLS 指纹",
+      opsDeadLetterReplay: "重放结算死信",
       systemUpdateSync: "同步系统更新",
     },
     errors: {

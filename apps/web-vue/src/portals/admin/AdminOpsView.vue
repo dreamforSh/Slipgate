@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import type { OpsOverview, OpsRange } from "@slipgate/contracts";
 import OpsAccountsTable from "../../components/admin/ops-monitor/OpsAccountsTable.vue";
+import OpsDeadLettersCard from "../../components/admin/ops-monitor/OpsDeadLettersCard.vue";
 import OpsFleetCard from "../../components/admin/ops-monitor/OpsFleetCard.vue";
 import OpsModelsTable from "../../components/admin/ops-monitor/OpsModelsTable.vue";
 import OpsRecentErrors from "../../components/admin/ops-monitor/OpsRecentErrors.vue";
@@ -18,8 +19,10 @@ import { useNow } from "../../composables/useNow";
 import { usePersistentState } from "../../composables/usePersistentState";
 import { apiJson, errorText } from "../../lib/api";
 import { formatCompact, formatDurationMs, formatNumber, formatUsd, type Tone } from "../../lib/format";
+import { useToastStore } from "../../stores/toast";
 
 const { t, locale } = useI18n();
+const toast = useToastStore();
 const now = useNow(15_000);
 
 const REFRESH_MS = 30_000;
@@ -33,28 +36,69 @@ const rangeOptions = computed(() => RANGES.map((value) => ({ value, label: t(`se
 const overview = ref<OpsOverview | null>(null);
 const loading = ref(false);
 const error = ref<string | null>(null);
+const deadLetters = ref<{ count: number; mode?: string }>({ count: 0 });
+const deadLettersLoading = ref(false);
+const deadLettersReplaying = ref(false);
+const deadLettersError = ref<string | null>(null);
 const lastLoadedAt = ref(0);
 const autoRefresh = ref(true);
 const pageVisible = ref(document.visibilityState !== "hidden");
+
+let deadLetterSeq = 0;
+async function loadDeadLetters() {
+  const id = ++deadLetterSeq;
+  deadLettersLoading.value = true;
+  try {
+    const res = await apiJson<{ count: number; mode?: string }>("/api/v1/admin/ops/settlement-dead-letters", {
+      fallbackError: t("security.ops.deadLetters.loadFailed"),
+    });
+    if (id !== deadLetterSeq) return;
+    deadLetters.value = { count: Math.max(0, res.count ?? 0), mode: res.mode };
+    deadLettersError.value = null;
+  } catch (err) {
+    if (id === deadLetterSeq) deadLettersError.value = errorText(err, t("security.ops.deadLetters.loadFailed"));
+  } finally {
+    if (id === deadLetterSeq) deadLettersLoading.value = false;
+  }
+}
+
+async function replayDeadLetters() {
+  if (deadLettersReplaying.value) return;
+  deadLettersReplaying.value = true;
+  try {
+    const res = await apiJson<{ replayed: number }>("/api/v1/admin/ops/settlement-dead-letters/replay", {
+      method: "POST",
+      fallbackError: t("security.ops.deadLetters.replayFailed"),
+    });
+    toast.success(t("security.ops.deadLetters.replayedToast", { n: formatNumber(res.replayed) }));
+    await load();
+  } catch (err) {
+    toast.error(errorText(err, t("security.ops.deadLetters.replayFailed")));
+  } finally {
+    deadLettersReplaying.value = false;
+  }
+}
 
 let seq = 0;
 async function load() {
   const id = ++seq;
   loading.value = true;
-  try {
-    const res = await apiJson<OpsOverview>(`/api/v1/admin/ops/overview?range=${range.value}`, {
+  const [overviewRes] = await Promise.allSettled([
+    apiJson<OpsOverview>(`/api/v1/admin/ops/overview?range=${range.value}`, {
       fallbackError: t("security.ops.errors.load"),
-    });
-    if (id !== seq) return;
-    overview.value = res;
+    }),
+    loadDeadLetters(),
+  ]);
+  if (id !== seq) return;
+  if (overviewRes.status === "fulfilled") {
+    overview.value = overviewRes.value;
     error.value = null;
     lastLoadedAt.value = Date.now();
-  } catch (err) {
+  } else {
     // Keep the last good snapshot on screen; the banner says it is stale.
-    if (id === seq) error.value = errorText(err, t("security.ops.errors.load"));
-  } finally {
-    if (id === seq) loading.value = false;
+    error.value = errorText(overviewRes.reason, t("security.ops.errors.load"));
   }
+  loading.value = false;
 }
 
 watch(range, () => void load());
@@ -271,6 +315,16 @@ const stats = computed<Stat[]>(() => {
         <OpsAccountsTable :accounts="overview.accounts" />
         <OpsModelsTable :models="overview.models" />
       </div>
+
+      <OpsDeadLettersCard
+        :count="deadLetters.count"
+        :mode="deadLetters.mode"
+        :loading="deadLettersLoading"
+        :replaying="deadLettersReplaying"
+        :error="deadLettersError"
+        @refresh="loadDeadLetters"
+        @replay="replayDeadLetters"
+      />
 
       <OpsRecentErrors :errors="overview.recentErrors" :now="now" />
     </div>
