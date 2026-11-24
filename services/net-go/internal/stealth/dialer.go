@@ -22,6 +22,7 @@ import (
 	"golang.org/x/net/proxy"
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/netguard"
 )
 
 const (
@@ -246,17 +247,51 @@ func (d *AccountDialer) DoAccountRequest(ctx context.Context, accountID, utlsPro
 	if err != nil {
 		return nil, err
 	}
+	baseDial := func(dCtx context.Context, _ string, addr string) (net.Conn, error) {
+		return dialThroughSOCKS5(dCtx, target.SOCKSAddr, target.SocksUsername, target.SocksPassword, addr)
+	}
+	return d.executeTransportRequest(ctx, accountID, target.SOCKSAddr, target, utlsProfileID, req, baseDial)
+}
+
+// DoDirectRequest routes req directly over an SSRF-validated TCP connection with uTLS ClientHello
+// mimicry and adaptive H2/H1 pooling (so direct_api accounts match CLI TLS & wire headers without Clash).
+func (d *AccountDialer) DoDirectRequest(ctx context.Context, accountID, utlsProfileID string, req *http.Request, allowPrivate bool) (*OutboundResult, error) {
+	if req == nil || req.URL == nil {
+		return nil, errors.New("stealth: HTTP request URL is required")
+	}
+	if err := netguard.ValidateOutboundURL(req.URL.String(), allowPrivate); err != nil {
+		return nil, err
+	}
+	scope := "direct:public"
+	if allowPrivate {
+		scope = "direct:private"
+	}
+	target := clashpool.DialTarget{NodeID: "direct", ProxySlotID: "direct"}
+	baseDial := netguard.NewSafeDialContext(defaultDialTimeout, allowPrivate)
+	return d.executeTransportRequest(ctx, accountID, scope, target, utlsProfileID, req, baseDial)
+}
+
+func (d *AccountDialer) executeTransportRequest(
+	ctx context.Context,
+	accountID string,
+	transportScope string,
+	target clashpool.DialTarget,
+	utlsProfileID string,
+	req *http.Request,
+	baseDial func(ctx context.Context, network, addr string) (net.Conn, error),
+) (*OutboundResult, error) {
 	spec, err := d.ResolveEffectiveProfile(accountID, utlsProfileID, "")
 	if err != nil {
 		return nil, err
 	}
 	start := time.Now()
-	rt := d.getOrCreateTransport(accountID, target, spec)
+	rt := d.getOrCreateTransport(accountID, transportScope, target.NodeID, spec, baseDial)
 
 	outReq := req.Clone(ctx)
 	if spec.UserAgentTemplate != "" && outReq.Header.Get("User-Agent") == "" {
 		outReq.Header.Set("User-Agent", spec.UserAgentTemplate)
 	}
+	normalizeWireHeaderCasing(outReq.Header)
 
 	resp, err := rt.RoundTrip(outReq)
 	if err != nil {
@@ -282,10 +317,16 @@ func (d *AccountDialer) DoAccountRequest(ctx context.Context, accountID, utlsPro
 	}, nil
 }
 
-func (d *AccountDialer) getOrCreateTransport(accountID string, target clashpool.DialTarget, spec ProfileSpec) *http2AdaptiveTransport {
+func (d *AccountDialer) getOrCreateTransport(
+	accountID string,
+	transportScope string,
+	nodeLabel string,
+	spec ProfileSpec,
+	baseDial func(ctx context.Context, network, addr string) (net.Conn, error),
+) *http2AdaptiveTransport {
 	key := transportCacheKey{
 		AccountID:   accountID,
-		SocksAddr:   target.SOCKSAddr,
+		SocksAddr:   transportScope,
 		ProfileHash: ProfileCacheKey(spec),
 	}
 	d.mu.Lock()
@@ -297,10 +338,72 @@ func (d *AccountDialer) getOrCreateTransport(accountID string, target clashpool.
 		spec,
 		d.accountSessionCacheLocked(accountID),
 		d.rootCAs,
-		target,
+		nodeLabel,
+		baseDial,
 	)
 	d.transports[key] = rt
 	return rt
+}
+
+// wireHeaderCasing restores exact CLI wire header casing right before RoundTrip, avoiding Go's
+// canonical Title-Case keys for CLI-sensitive headers while leaving framing/encoding headers canonical.
+var wireHeaderCasing = map[string]string{
+	"x-stainless-retry-count":                   "X-Stainless-Retry-Count",
+	"x-stainless-timeout":                       "X-Stainless-Timeout",
+	"x-stainless-lang":                          "X-Stainless-Lang",
+	"x-stainless-package-version":               "X-Stainless-Package-Version",
+	"x-stainless-os":                            "X-Stainless-OS",
+	"x-stainless-arch":                          "X-Stainless-Arch",
+	"x-stainless-runtime":                       "X-Stainless-Runtime",
+	"x-stainless-runtime-version":               "X-Stainless-Runtime-Version",
+	"x-stainless-helper-method":                 "x-stainless-helper-method",
+	"anthropic-dangerous-direct-browser-access": "anthropic-dangerous-direct-browser-access",
+	"anthropic-version":                         "anthropic-version",
+	"anthropic-beta":                            "anthropic-beta",
+	"x-app":                                     "x-app",
+	"x-api-key":                                 "x-api-key",
+	"x-client-request-id":                       "x-client-request-id",
+	"x-claude-code-session-id":                  "X-Claude-Code-Session-Id",
+	"originator":                                "originator",
+	"version":                                   "version",
+	"session_id":                                "session_id",
+	"session-id":                                "session-id",
+	"conversation_id":                           "Conversation_id",
+	"chatgpt-account-id":                        "chatgpt-account-id",
+	"x-codex-window-id":                         "x-codex-window-id",
+	"x-codex-installation-id":                   "x-codex-installation-id",
+	"x-goog-api-client":                         "x-goog-api-client",
+	"x-goog-api-key":                            "x-goog-api-key",
+	"x-goog-device-id":                          "X-Goog-Device-Id",
+	"client-metadata":                           "Client-Metadata",
+	"x-dashscope-useragent":                     "X-DashScope-UserAgent",
+	"x-dashscope-cachecontrol":                  "X-DashScope-CacheControl",
+	"x-dashscope-authtype":                      "X-DashScope-AuthType",
+	"x-grok-client-version":                     "x-grok-client-version",
+	"x-grok-client-identifier":                  "x-grok-client-identifier",
+	"x-grok-client-mode":                        "x-grok-client-mode",
+	"x-authenticateresponse":                    "x-authenticateresponse",
+	"x-xai-token-auth":                          "X-XAI-Token-Auth",
+	"x-opencode-session":                        "X-OpenCode-Session",
+}
+
+func normalizeWireHeaderCasing(h http.Header) {
+	if len(h) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		wireKey, ok := wireHeaderCasing[strings.ToLower(k)]
+		if !ok || wireKey == k {
+			continue
+		}
+		vals := h[k]
+		delete(h, k)
+		h[wireKey] = append(h[wireKey], vals...)
+	}
 }
 
 func (d *AccountDialer) invalidateAllTransportsLocked() {
@@ -328,7 +431,8 @@ func (d *AccountDialer) accountSessionCacheLocked(accountID string) utls.ClientS
 // http2AdaptiveTransport mirrors linksyncx's pooled H2/H1 RoundTripper sharing per-account ClientSessionCache.
 type http2AdaptiveTransport struct {
 	spec       ProfileSpec
-	target     clashpool.DialTarget
+	nodeLabel  string
+	baseDial   func(ctx context.Context, network, addr string) (net.Conn, error)
 	supportsH2 bool
 
 	h1Hosts sync.Map // host[:port] -> struct{}
@@ -344,16 +448,18 @@ func newHTTP2AdaptiveTransport(
 	spec ProfileSpec,
 	sessCache utls.ClientSessionCache,
 	roots *x509.CertPool,
-	target clashpool.DialTarget,
+	nodeLabel string,
+	baseDial func(ctx context.Context, network, addr string) (net.Conn, error),
 ) *http2AdaptiveTransport {
 	t := &http2AdaptiveTransport{
 		spec:       spec.Clone(),
-		target:     target,
+		nodeLabel:  nodeLabel,
+		baseDial:   baseDial,
 		supportsH2: spec.SupportsHTTP2(),
 	}
 
 	dialTLS := func(ctx context.Context, _ string, addr string, forceHTTP1 bool) (net.Conn, error) {
-		rawConn, err := dialThroughSOCKS5(ctx, t.target.SOCKSAddr, t.target.SocksUsername, t.target.SocksPassword, addr)
+		rawConn, err := t.baseDial(ctx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}
@@ -372,7 +478,7 @@ func newHTTP2AdaptiveTransport(
 		}
 		if err := uConn.HandshakeContext(ctx); err != nil {
 			_ = uConn.Close()
-			return nil, fmt.Errorf("stealth: uTLS handshake via %s (%s): %w", t.target.NodeID, profileForDial.ID, err)
+			return nil, fmt.Errorf("stealth: uTLS handshake via %s (%s): %w", t.nodeLabel, profileForDial.ID, err)
 		}
 		st := uConn.ConnectionState()
 		t.recordHandshakeMeta(formatTLSVersion(st.Version), st.NegotiatedProtocol)
@@ -400,8 +506,8 @@ func newHTTP2AdaptiveTransport(
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     90 * time.Second,
-		DialContext: func(ctx context.Context, _ string, addr string) (net.Conn, error) {
-			return dialThroughSOCKS5(ctx, t.target.SOCKSAddr, t.target.SocksUsername, t.target.SocksPassword, addr)
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return t.baseDial(ctx, network, addr)
 		},
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialTLS(ctx, network, addr, true)

@@ -25,8 +25,7 @@ const (
 	AccountModeGo     = "go"
 	AccountModeZen    = "zen"
 
-	openCodeSessionHeader     = "X-OpenCode-Session"
-	openCodeUpstreamUserAgent = "opencode/1.0.0"
+	openCodeSessionHeader = "X-OpenCode-Session"
 
 	DefaultOpenCodeGoTestModel  = "glm-5.3"
 	DefaultCommandCodeTestModel = "deepseek/deepseek-v4-flash"
@@ -577,10 +576,10 @@ func applyOpenCodeAndCommandCodeHeaders(
 	}
 	prov := strings.ToLower(strings.TrimSpace(pctx.Provider))
 	switch {
-	case isOfficialCommandCodeHost(targetURL):
-		req.Header.Set("User-Agent", codexCLIUserAgent)
+	case prov == "command_code", isOfficialCommandCodeHost(targetURL):
+		req.Header.Set("User-Agent", CodexCLIUserAgent(""))
 	case prov == "opencode_go", isOfficialOpenCodeHost(targetURL):
-		req.Header.Set("User-Agent", openCodeUpstreamUserAgent)
+		req.Header.Set("User-Agent", OpenCodeCLIUserAgent(""))
 	}
 
 	isOpenCodeGoPlan := prov == "opencode_go" && !strings.EqualFold(strings.TrimSpace(secret.AccountMode), AccountModeZen)

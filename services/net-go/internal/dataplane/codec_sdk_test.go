@@ -103,7 +103,7 @@ func TestAnthropicParallelToolResultsSurviveTranslation(t *testing.T) {
 		t.Fatalf("second tool message lost its id: %v", msgs[3])
 	}
 
-	ant := jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-4-5", turn, turn.Tools, false, true, OutboundPersonaContext{}, false))
+	ant := jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-4-5", turn, turn.Tools, false, true, OutboundPersonaContext{}, false, ""))
 	antMsgs := ant["messages"].([]any)
 	if len(antMsgs) != 3 {
 		t.Fatalf("expected merged user/assistant/user turns, got %v", antMsgs)
@@ -120,7 +120,7 @@ func TestImagesTranslateBetweenOpenAIAndAnthropic(t *testing.T) {
 	chat := mustParseTurn(t, "/v1/chat/completions", `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":[
 		{"type":"text","text":"what is this?"},
 		{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}]}`)
-	ant := jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-4-5", chat, nil, false, true, OutboundPersonaContext{}, false))
+	ant := jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-4-5", chat, nil, false, true, OutboundPersonaContext{}, false, ""))
 	if ant["max_tokens"] != float64(8192) {
 		t.Fatalf("unset max_tokens should default to 8192, got %v", ant["max_tokens"])
 	}
@@ -180,7 +180,7 @@ func TestSamplingAndToolChoiceMapToAnthropic(t *testing.T) {
 		"stop":["END"],"tool_choice":"required","parallel_tool_calls":false,
 		"messages":[{"role":"user","content":"hi"}],
 		"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]}`)
-	ant := jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-4-5", turn, turn.Tools, false, true, OutboundPersonaContext{}, false))
+	ant := jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-4-5", turn, turn.Tools, false, true, OutboundPersonaContext{}, false, ""))
 	if ant["temperature"] != 0.3 || ant["top_p"] != nil {
 		t.Fatalf("temperature and top_p must not both reach Claude: %v", ant)
 	}
@@ -197,7 +197,7 @@ func TestSamplingAndToolChoiceMapToAnthropic(t *testing.T) {
 
 	reasoning := mustParseTurn(t, "/v1/chat/completions", `{"model":"claude-sonnet-4-5","reasoning_effort":"high",
 		"temperature":0.5,"max_tokens":1000,"messages":[{"role":"user","content":"think"}]}`)
-	ant = jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-4-5", reasoning, nil, false, true, OutboundPersonaContext{}, false))
+	ant = jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-4-5", reasoning, nil, false, true, OutboundPersonaContext{}, false, ""))
 	thinking := ant["thinking"].(map[string]any)
 	if thinking["budget_tokens"] != float64(24576) || ant["max_tokens"] != float64(24576+4096) || ant["temperature"] != nil {
 		t.Fatalf("reasoning_effort=high should become thinking with room for output and no temperature: %v", ant)
@@ -209,7 +209,7 @@ func TestCurrentClaudeModelsGetAdaptiveThinkingAndNoSampling(t *testing.T) {
 	turn := mustParseTurn(t, "/v1/chat/completions", `{"model":"claude-sonnet-5-5","reasoning_effort":"high","temperature":0.4,"top_p":0.9,
 		"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":{"type":"object"}}},
 		"messages":[{"role":"user","content":"hi"}]}`)
-	ant := jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-5-5", turn, nil, false, true, OutboundPersonaContext{}, false))
+	ant := jsonOf(t)(encodeAnthropicRequestBody("claude-sonnet-5-5", turn, nil, false, true, OutboundPersonaContext{}, false, ""))
 	if ant["temperature"] != nil || ant["top_p"] != nil || ant["top_k"] != nil {
 		t.Fatalf("current Claude models take no sampling parameters: %v", ant)
 	}

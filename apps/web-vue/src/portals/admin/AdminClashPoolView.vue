@@ -87,7 +87,7 @@ const subExclude = ref(DEFAULT_EXCLUDE);
 // Account <-> Exit binding form
 const bindAccountId = ref("");
 const bindNodeId = ref("");
-const bindProfileId = ref("chrome-131");
+const bindProfileId = ref("auto");
 const bindShadow = ref(false);
 
 // Outbound test target & result
@@ -97,8 +97,8 @@ const outboundResult = ref<ClashOutboundTestResponse | null>(null);
 // Custom TLS Profile form (supports wire-level linksyncx parameters & PUT updates)
 const editingProfileId = ref<string | null>(null);
 const tlsName = ref("");
-const tlsPreset = ref<ClientHelloPreset>("claude_bun_21");
-const tlsAlpnRaw = ref("h2,http/1.1");
+const tlsPreset = ref<ClientHelloPreset>("claude_node_24");
+const tlsAlpnRaw = ref("http/1.1");
 const tlsUA = ref("");
 const tlsJA3 = ref("");
 const tlsOsHint = ref("");
@@ -152,9 +152,16 @@ const subKindOptions = computed(() => [
 const PRESET_OPTIONS: ClientHelloPreset[] = [
   "auto",
   "custom_wire",
+  "claude_node_24",
   "claude_bun_21",
   "codex_rustls",
   "antigravity_ide",
+  "gemini_cli_node",
+  "qwen_cli_node",
+  "grok_rustls",
+  "opencode_bun",
+  "cline_node",
+  "node_sdk_24",
   "chrome_auto",
   "firefox_auto",
   "safari_auto",
@@ -446,7 +453,7 @@ function fillClaudeBunWirePreset() {
   tlsOsHint.value = "linux";
   tlsEnableGrease.value = false;
   tlsAlpnRaw.value = "h2,http/1.1";
-  tlsUA.value = "claude-cli/2.1.280 (external, cli)";
+  tlsUA.value = "claude-cli/2.1.321 (external, cli)";
   tlsCurvesRaw.value = "4588,29,23,24";
   tlsKeySharesRaw.value = "4588,29";
   tlsExtensionsRaw.value = "0,23,65281,10,11,35,16,5,13,18,51,45,43";
@@ -455,8 +462,8 @@ function fillClaudeBunWirePreset() {
 function resetTlsForm() {
   editingProfileId.value = null;
   tlsName.value = "";
-  tlsPreset.value = "claude_bun_21";
-  tlsAlpnRaw.value = "h2,http/1.1";
+  tlsPreset.value = "claude_node_24";
+  tlsAlpnRaw.value = "http/1.1";
   tlsUA.value = "";
   tlsJA3.value = "";
   tlsOsHint.value = "";
@@ -862,7 +869,7 @@ onMounted(() => {
                     {{ b.boundExitIp || "-" }}
                     <UiBadge v-if="b.isShadowFollower" tone="violet" class="ml-1">{{ t("clash.bindings.shadowBadge") }}</UiBadge>
                   </td>
-                  <td><span class="code-chip">{{ b.utlsProfileId || "chrome-131" }}</span></td>
+                  <td><span class="code-chip">{{ b.utlsProfileId || "auto" }}</span></td>
                   <td class="text-right">
                     <div class="inline-flex gap-1">
                       <button

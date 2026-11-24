@@ -145,6 +145,7 @@ func (c *Coordinator) ProbeAccount(ctx context.Context, accountID string, req Pr
 		AccountID:        accountID,
 		CleanseMode:      "zero",
 		RequestID:        requestID,
+		UTLSProfileID:    c.resolveAccountUTLSProfileID(accountID, meta.Platform, meta.AuthKind, secret),
 	}
 
 	startedAt := time.Now()

@@ -1248,6 +1248,8 @@ func BuildUpstreamHTTPRequestWithPersona(
 	}
 	isClaudeSub := IsClaudeSubscription(pctx, secret)
 	isCodexSub := IsCodexSubscription(pctx, secret)
+	// Lock the Claude CLI version once per request so User-Agent header and system[0] billing block never diverge.
+	claudeCLIVer := CLIClaudeVersion()
 
 	filteredTools := make([]CanonicalTool, 0, len(turn.Tools))
 	for _, t := range turn.Tools {
@@ -1281,7 +1283,7 @@ func BuildUpstreamHTTPRequestWithPersona(
 			suffix += "?beta=true"
 		}
 		fullURL = joinProviderPath(baseURL, suffix)
-		bodyRaw, err = encodeAnthropicRequestBody(effectiveModel, turn, filteredTools, false, false, pctx, isClaudeSub)
+		bodyRaw, err = encodeAnthropicRequestBody(effectiveModel, turn, filteredTools, false, false, pctx, isClaudeSub, claudeCLIVer)
 
 	case egress == CodecAnthropicMessages:
 		suffix := "/v1/messages"
@@ -1289,7 +1291,7 @@ func BuildUpstreamHTTPRequestWithPersona(
 			suffix += "?beta=true"
 		}
 		fullURL = joinProviderPath(baseURL, suffix)
-		bodyRaw, err = encodeAnthropicRequestBody(effectiveModel, turn, filteredTools, turn.Stream, true, pctx, isClaudeSub)
+		bodyRaw, err = encodeAnthropicRequestBody(effectiveModel, turn, filteredTools, turn.Stream, true, pctx, isClaudeSub, claudeCLIVer)
 
 	case egress == CodecOpenAIResponses:
 		if isCodexSub {
@@ -1343,7 +1345,7 @@ func BuildUpstreamHTTPRequestWithPersona(
 	switch egress {
 	case CodecAnthropicMessages, CodecAnthropicCountTokens:
 		if isClaudeSub {
-			ApplyClaudeSubscriptionHeaders(req, secret, turn.AnthropicBeta)
+			ApplyClaudeSubscriptionHeadersWithContext(req, pctx, secret, turn.AnthropicBeta, turn.Stream, egress == CodecAnthropicCountTokens, claudeCLIVer)
 		} else {
 			if secret.APIKey != "" {
 				req.Header.Set("x-api-key", secret.APIKey)
@@ -1385,6 +1387,7 @@ func BuildUpstreamHTTPRequestWithPersona(
 	}
 
 	applyOpenCodeAndCommandCodeHeaders(req, pctx, secret, fullURL, turn)
+	ApplyCLIProviderHeaders(req, pctx, secret, fullURL, egress)
 
 	for k, v := range secret.Headers {
 		if strings.TrimSpace(k) != "" {
@@ -1402,6 +1405,7 @@ func encodeAnthropicRequestBody(
 	includeMaxTokens bool,
 	pctx OutboundPersonaContext,
 	isClaudeSub bool,
+	claudeCLIVersion string,
 ) ([]byte, error) {
 	payload := map[string]any{
 		"model": model,
@@ -1468,6 +1472,10 @@ func encodeAnthropicRequestBody(
 	}
 	if isClaudeSub {
 		sysBlocks := []map[string]any{
+			{
+				"type": "text",
+				"text": BuildClaudeBillingHeader(firstUserMessageText(turn), claudeCLIVersion),
+			},
 			{
 				"type":          "text",
 				"text":          claudeCodeSystemPreamble,

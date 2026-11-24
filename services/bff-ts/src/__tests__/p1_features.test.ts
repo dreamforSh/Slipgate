@@ -57,7 +57,9 @@ describe("P1 gateway, pricing, window reset & payment features", () => {
 
     const mockOAuthFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      const headers = new Headers(init?.headers);
       if (url === "https://platform.claude.com/v1/oauth/token") {
+        assert.equal(headers.get("User-Agent"), "claude-cli/2.1.321 (external, cli)");
         const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
         assert.equal(body.grant_type, "authorization_code");
         assert.equal(body.code, "ant-auth-code-123");
@@ -73,6 +75,11 @@ describe("P1 gateway, pricing, window reset & payment features", () => {
         );
       }
       if (url === "https://auth.openai.com/oauth/token") {
+        assert.equal(
+          headers.get("User-Agent"),
+          "codex_cli_rs/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color",
+        );
+        assert.equal(headers.get("originator"), "codex_cli_rs");
         const params = new URLSearchParams(String(init?.body ?? ""));
         assert.equal(params.get("code"), "codex-code-999");
         return new Response(

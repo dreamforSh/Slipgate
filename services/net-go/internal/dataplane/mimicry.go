@@ -7,14 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
 )
 
 const (
 	claudeCodeSystemPreamble = "You are Claude Code, Anthropic's official CLI for Claude."
-	claudeCodeBetaHeader     = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
-	claudeCLIUserAgent       = "claude-cli/2.1.280 (external, cli)"
-	codexCLIUserAgent        = "codex_cli_rs/0.38.0 (Linux 6.8.0; x86_64)"
-	antigravityUserAgent     = "antigravity/1.15.8 linux/amd64"
+	claudeCodeBetaHeader     = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,thinking-binding-controls-2026-08-01,mid-conversation-output-config-2026-07-01,extended-cache-ttl-2025-04-11"
+	claudeTokenCountingBeta  = "token-counting-2024-11-01"
 	defaultAntigravityProj   = "rising-fact-p41fc"
 )
 
@@ -30,6 +30,7 @@ type OutboundPersonaContext struct {
 	RuntimeProfile   string
 	CleanseMode      string
 	RequestID        string
+	UTLSProfileID    string
 	CatalogProtocols []string
 }
 
@@ -77,12 +78,18 @@ func DeterministicUUID(namespace, seed string) string {
 	)
 }
 
+// ClaudeSessionUUID derives the stable RFC 4122 v4 session UUID shared between metadata.user_id and X-Claude-Code-Session-Id.
+func ClaudeSessionUUID(accountID, guestMachineID string) string {
+	anchor := strings.TrimSpace(accountID) + "|" + strings.TrimSpace(guestMachineID)
+	return DeterministicUUID("slipgate-claude-sess", anchor)
+}
+
 // ClaudeMetadataUserID builds a stable per-account/per-VM `user_<64hex>_account_<uuid>_session_<uuid>` identifier without leaking caller PII.
 func ClaudeMetadataUserID(accountID, guestMachineID string) string {
 	anchor := strings.TrimSpace(accountID) + "|" + strings.TrimSpace(guestMachineID)
 	deviceHash := sha256.Sum256([]byte("slipgate-claude-device:" + anchor))
 	accUUID := DeterministicUUID("slipgate-claude-acc", anchor)
-	sessUUID := DeterministicUUID("slipgate-claude-sess", anchor)
+	sessUUID := ClaudeSessionUUID(accountID, guestMachineID)
 	return fmt.Sprintf("user_%s_account_%s_session_%s", hex.EncodeToString(deviceHash[:]), accUUID, sessUUID)
 }
 
@@ -105,26 +112,61 @@ func StripAntigravityModelPrefix(model string) string {
 	return trimmed
 }
 
-// ApplyClaudeSubscriptionHeaders sets official Claude Code 2.1 CLI + Stainless headers and removes
-// x-api-key. callerBeta is the caller's own anthropic-beta: its opt-ins (1M context, files, ...)
-// follow the Claude Code set, since the request body may depend on them.
+// ApplyClaudeSubscriptionHeaders sets official Claude Code CLI + Stainless headers with Node 24.x runtime defaults.
 func ApplyClaudeSubscriptionHeaders(req *http.Request, secret AccountSecret, callerBeta string) {
+	ApplyClaudeSubscriptionHeadersWithContext(req, OutboundPersonaContext{}, secret, callerBeta, false, false, CLIClaudeVersion())
+}
+
+// ApplyClaudeSubscriptionHeadersWithContext sets official Claude Code CLI + Stainless headers in lockstep
+// with the effective CLI version, TLS runtime (Node 24 vs Bun), session UUID, and Accept headers.
+func ApplyClaudeSubscriptionHeadersWithContext(
+	req *http.Request,
+	pctx OutboundPersonaContext,
+	secret AccountSecret,
+	callerBeta string,
+	isStream bool,
+	isCountTokens bool,
+	cliVersion string,
+) {
 	req.Header.Del("x-api-key")
 	if secret.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+secret.APIKey)
 	}
+	// Real Claude Code CLI always sends Accept: application/json (even for streaming SSE requests).
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("anthropic-beta", mergeHeaderTokens(claudeCodeBetaHeader, sanitizeHeaderToken(callerBeta)))
+	requiredBetas := claudeCodeBetaHeader
+	if isCountTokens {
+		requiredBetas += "," + claudeTokenCountingBeta
+	}
+	req.Header.Set("anthropic-beta", mergeHeaderTokens(requiredBetas, sanitizeHeaderToken(callerBeta)))
 	req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
 	req.Header.Set("x-app", "cli")
-	req.Header.Set("User-Agent", claudeCLIUserAgent)
+	req.Header.Set("User-Agent", ClaudeCLIUserAgent(cliVersion))
 	req.Header.Set("X-Stainless-Lang", "js")
-	req.Header.Set("X-Stainless-Package-Version", "0.55.1")
+	req.Header.Set("X-Stainless-Package-Version", claudeStainlessPkgVersion)
 	req.Header.Set("X-Stainless-OS", "Linux")
-	req.Header.Set("X-Stainless-Arch", "x64")
-	req.Header.Set("X-Stainless-Runtime", "bun")
-	req.Header.Set("X-Stainless-Runtime-Version", "1.2.9")
+	req.Header.Set("X-Stainless-Arch", "arm64")
+	if strings.EqualFold(strings.TrimSpace(pctx.UTLSProfileID), stealth.ClaudeBunProfileID) {
+		req.Header.Set("X-Stainless-Runtime", "bun")
+		req.Header.Set("X-Stainless-Runtime-Version", "1.2.9")
+	} else {
+		req.Header.Set("X-Stainless-Runtime", "node")
+		req.Header.Set("X-Stainless-Runtime-Version", "v24.3.0")
+	}
 	req.Header.Set("X-Stainless-Retry-Count", "0")
+	req.Header.Set("X-Stainless-Timeout", "600")
+	if isStream {
+		req.Header.Set("x-stainless-helper-method", "stream")
+	}
+	if pctx.AccountID != "" || pctx.GuestMachineID != "" {
+		req.Header.Set("X-Claude-Code-Session-Id", ClaudeSessionUUID(pctx.AccountID, pctx.GuestMachineID))
+	}
+	if rid := strings.TrimSpace(pctx.RequestID); rid != "" {
+		req.Header.Set("x-client-request-id", DeterministicUUID("slipgate-claude-req", rid))
+	} else {
+		req.Header.Set("x-client-request-id", DeterministicUUID("slipgate-claude-req", newTurnNonce()))
+	}
 }
 
 // mergeHeaderTokens joins comma-separated token lists, keeping the first occurrence of each token
@@ -144,17 +186,24 @@ func mergeHeaderTokens(lists ...string) string {
 	return strings.Join(out, ",")
 }
 
-// ApplyCodexSubscriptionHeaders sets official OpenAI Codex CLI Rust headers (`originator`, `session_id`, `chatgpt-account-id`).
+// ApplyCodexSubscriptionHeaders sets official OpenAI Codex CLI Rust headers (`originator`, `version`, `session_id`, `chatgpt-account-id`).
 func ApplyCodexSubscriptionHeaders(req *http.Request, pctx OutboundPersonaContext, secret AccountSecret) {
 	if secret.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+secret.APIKey)
 	}
+	ver := CLICodexVersion()
 	sessID := CodexSessionUUID(pctx.AccountID, pctx.GuestMachineID)
+	installID := DeterministicUUID("slipgate-codex-install", strings.TrimSpace(pctx.AccountID)+"|"+strings.TrimSpace(pctx.GuestMachineID))
 	req.Header.Set("originator", "codex_cli_rs")
+	req.Header.Set("version", ver)
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
 	req.Header.Set("session_id", sessID)
+	req.Header.Set("session-id", sessID)
 	req.Header.Set("Conversation_id", sessID)
-	req.Header.Set("User-Agent", codexCLIUserAgent)
+	req.Header.Set("x-codex-installation-id", installID)
+	req.Header.Set("x-codex-window-id", sessID+":0")
+	req.Header.Set("x-client-request-id", sessID)
+	req.Header.Set("User-Agent", CodexCLIUserAgent(ver))
 	req.Header.Set("Accept", "text/event-stream")
 	if strings.TrimSpace(secret.ChatGPTAccountID) != "" {
 		req.Header.Set("chatgpt-account-id", strings.TrimSpace(secret.ChatGPTAccountID))
@@ -164,15 +213,13 @@ func ApplyCodexSubscriptionHeaders(req *http.Request, pctx OutboundPersonaContex
 	}
 }
 
-// ApplyAntigravityHeaders sets Cloud Code v1internal / Antigravity IDE headers.
+// ApplyAntigravityHeaders sets Cloud Code v1internal / Antigravity IDE headers (matching Antigravity-Manager / sub2api).
 func ApplyAntigravityHeaders(req *http.Request, pctx OutboundPersonaContext, secret AccountSecret) {
 	req.Header.Del("x-goog-api-key")
 	if secret.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+secret.APIKey)
 	}
-	req.Header.Set("User-Agent", antigravityUserAgent)
-	req.Header.Set("X-Goog-Api-Client", "gl-node/22.14.0 antigravity/1.15.8")
-	req.Header.Set("Client-Metadata", `{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}`)
+	req.Header.Set("User-Agent", AntigravityCLIUserAgent(""))
 	if strings.TrimSpace(pctx.GuestMachineID) != "" {
 		req.Header.Set("X-Goog-Device-Id", strings.TrimSpace(pctx.GuestMachineID))
 	}
@@ -184,6 +231,8 @@ func SanitizeOutboundHeaders(h http.Header) {
 		"X-Forwarded-For",
 		"X-Forwarded-Host",
 		"X-Forwarded-Proto",
+		"X-Original-Forwarded-For",
+		"X-Cluster-Client-IP",
 		"X-Real-IP",
 		"Forwarded",
 		"Via",
@@ -337,13 +386,18 @@ func EncodeAntigravityRequestBody(upstreamModel string, pctx OutboundPersonaCont
 	if err := json.Unmarshal(innerRaw, &innerObj); err != nil {
 		return nil, err
 	}
+	if _, hasSess := innerObj["sessionId"]; !hasSess {
+		sessSeed := strings.TrimSpace(pctx.AccountID) + "|" + firstNonEmpty(turn.SessionHint, pctx.GuestMachineID, "default")
+		innerObj["sessionId"] = DeterministicUUID("slipgate-ag-session", sessSeed)
+	}
 	proj := firstNonEmpty(secret.ProjectID, defaultAntigravityProj)
 	envelope := map[string]any{
-		"project":   proj,
-		"model":     StripAntigravityModelPrefix(upstreamModel),
-		"userAgent": "antigravity",
-		"requestId": AntigravityAgentRequestID(pctx.AccountID, pctx.RequestID),
-		"request":   innerObj,
+		"project":     proj,
+		"model":       StripAntigravityModelPrefix(upstreamModel),
+		"userAgent":   "antigravity",
+		"requestType": "agent",
+		"requestId":   AntigravityAgentRequestID(pctx.AccountID, pctx.RequestID),
+		"request":     innerObj,
 	}
 	return json.Marshal(envelope)
 }

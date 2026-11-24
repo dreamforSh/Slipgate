@@ -14,8 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dreamforSh/slipgate/services/net-go/internal/netguard"
-	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
 )
 
 const (
@@ -179,7 +177,7 @@ func (c *Coordinator) buildOAuthRefreshRequest(ctx context.Context, platform str
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", claudeCLIUserAgent)
+		ApplyOAuthRefreshCLIHeaders(req, prov)
 		return req, nil
 
 	case "codex", "openai":
@@ -197,7 +195,7 @@ func (c *Coordinator) buildOAuthRefreshRequest(ctx context.Context, platform str
 			}
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Accept", "application/json")
-			req.Header.Set("User-Agent", codexCLIUserAgent)
+			ApplyOAuthRefreshCLIHeaders(req, prov)
 			return req, nil
 		}
 		form := url.Values{
@@ -212,7 +210,7 @@ func (c *Coordinator) buildOAuthRefreshRequest(ctx context.Context, platform str
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", codexCLIUserAgent)
+		ApplyOAuthRefreshCLIHeaders(req, prov)
 		return req, nil
 
 	case "antigravity", "gemini":
@@ -241,9 +239,7 @@ func (c *Coordinator) buildOAuthRefreshRequest(ctx context.Context, platform str
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "application/json")
-		if prov == "antigravity" {
-			req.Header.Set("User-Agent", antigravityUserAgent)
-		}
+		ApplyOAuthRefreshCLIHeaders(req, prov)
 		return req, nil
 
 	case "qwen":
@@ -261,6 +257,7 @@ func (c *Coordinator) buildOAuthRefreshRequest(ctx context.Context, platform str
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "application/json")
+		ApplyOAuthRefreshCLIHeaders(req, prov)
 		return req, nil
 
 	default:
@@ -286,15 +283,7 @@ func (c *Coordinator) executeControlHTTPRequest(
 		if c.stealth == nil {
 			return nil, errors.New("stealth uTLS dialer is not configured")
 		}
-		utlsProfileID := strings.TrimSpace(secret.UTLSProfileID)
-		if utlsProfileID == "" && c.pool != nil {
-			if binding, ok := c.pool.GetBinding(accountID); ok && strings.TrimSpace(binding.UTLSProfileID) != "" {
-				utlsProfileID = strings.TrimSpace(binding.UTLSProfileID)
-			}
-		}
-		if utlsProfileID == "" {
-			utlsProfileID = stealth.DefaultProfileForProvider(meta.Platform, meta.AuthKind)
-		}
+		utlsProfileID := c.resolveAccountUTLSProfileID(accountID, meta.Platform, meta.AuthKind, secret)
 		out, err := c.stealth.DoAccountRequest(ctx, accountID, utlsProfileID, req)
 		if err != nil {
 			return nil, err
@@ -302,10 +291,7 @@ func (c *Coordinator) executeControlHTTPRequest(
 		return out.Response, nil
 
 	default:
-		if err := netguard.ValidateOutboundURL(req.URL.String(), c.allowPrivateUpstreams); err != nil {
-			return nil, err
-		}
-		return c.directClient.Do(req)
+		return c.executeDirectHTTPRequest(ctx, accountID, meta.Platform, meta.AuthKind, secret, req)
 	}
 }
 

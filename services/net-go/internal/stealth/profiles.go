@@ -21,9 +21,19 @@ type ProfileSpec = clashpool.TLSProfile
 const (
 	DefaultProfileID             = "chrome-131"
 	ClaudeBunProfileID           = "claude-bun-21"
+	ClaudeNodeProfileID          = "claude-node-24"
 	CodexRustlsProfileID         = "codex-rustls-01"
 	AntigravityElectronProfileID = "antigravity-electron-15"
+	GeminiCLINodeProfileID       = "gemini-cli-node-24"
+	QwenCLINodeProfileID         = "qwen-cli-node-24"
+	GrokRustlsProfileID          = "grok-rustls-01"
+	OpenCodeBunProfileID         = "opencode-bun-01"
+	ClineNodeProfileID           = "cline-node-24"
+	NodeSDKProfileID             = "node-sdk-24"
 	AutoProfileID                = "auto"
+
+	node24JA3 = "44f88fca027f27bab4bb08d4af15f23e"
+	node24JA4 = "t13d1714h1_5b57614c22b0_7baf387fc6ff"
 )
 
 var (
@@ -34,7 +44,7 @@ var (
 
 type KeyShareNotInSupportedGroupsError = clashpool.KeyShareNotInSupportedGroupsError
 
-// Default BoringSSL / Claude Code 2.1.280 Bun wire parameters (mirrors linksyncx defaults).
+// Default BoringSSL / Claude Code 2.1.321 Bun wire parameters (mirrors linksyncx defaults).
 var (
 	defaultWireCipherSuites = []uint16{
 		utls.TLS_AES_128_GCM_SHA256,
@@ -111,8 +121,15 @@ var allowedPresets = map[string]struct{}{
 	"auto":            {},
 	"custom_wire":     {},
 	"claude_bun_21":   {},
+	"claude_node_24":  {},
 	"codex_rustls":    {},
 	"antigravity_ide": {},
+	"gemini_cli_node": {},
+	"qwen_cli_node":   {},
+	"grok_rustls":     {},
+	"opencode_bun":    {},
+	"cline_node":      {},
+	"node_sdk_24":     {},
 	"bun_default":     {},
 	"chrome_auto":     {},
 	"chrome_131":      {},
@@ -125,6 +142,31 @@ var allowedPresets = map[string]struct{}{
 }
 
 var (
+	// Node.js 24.x (OpenSSL 3.5) wire parameters aligned with sub2api pkg/tlsfingerprint/dialer.go.
+	node24WireCipherSuites = []uint16{
+		utls.TLS_AES_128_GCM_SHA256,
+		utls.TLS_AES_256_GCM_SHA384,
+		utls.TLS_CHACHA20_POLY1305_SHA256,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+		utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+		utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		utls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		utls.TLS_RSA_WITH_AES_256_CBC_SHA,
+	}
+	node24WireCurves         = []uint16{uint16(utls.X25519), uint16(utls.CurveP256), uint16(utls.CurveP384)}
+	node24WireKeyShares      = []uint16{uint16(utls.X25519)}
+	node24WireExtensions     = []uint16{0, 65037, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43}
+	node24WireHTTP1ALPN      = []string{"http/1.1"}
+
 	codexRustlsCiphers = []uint16{
 		utls.TLS_AES_256_GCM_SHA384,
 		utls.TLS_AES_128_GCM_SHA256,
@@ -151,41 +193,83 @@ func DefaultProfileForProvider(provider, authKind string) string {
 	switch p {
 	case "anthropic":
 		if ak == "oauth" || ak == "setup_token" || ak == "vm_cli_seed" {
-			return ClaudeBunProfileID
+			return ClaudeNodeProfileID
 		}
-		return DefaultProfileID
-	case "codex":
+		return NodeSDKProfileID
+	case "codex", "command_code":
 		return CodexRustlsProfileID
 	case "openai":
 		if ak == "oauth" || ak == "vm_cli_seed" {
 			return CodexRustlsProfileID
 		}
-		return DefaultProfileID
+		return NodeSDKProfileID
 	case "antigravity":
 		return AntigravityElectronProfileID
+	case "gemini":
+		return GeminiCLINodeProfileID
+	case "qwen":
+		return QwenCLINodeProfileID
+	case "grok":
+		return GrokRustlsProfileID
+	case "opencode_go", "opencode":
+		return OpenCodeBunProfileID
+	case "cline":
+		return ClineNodeProfileID
 	default:
-		return DefaultProfileID
+		return NodeSDKProfileID
 	}
 }
 
-// DefaultProfiles returns built-in uTLS profiles including selector "auto", Claude Bun 2.1.280 PQ wire defaults, and desktop browsers.
+func node24BuiltinProfile(id, name, desc, preset, ua, osHint string) ProfileSpec {
+	return ProfileSpec{
+		ID:                  id,
+		Name:                name,
+		Description:         desc,
+		ClientHelloPreset:   preset,
+		JA3Fingerprint:      node24JA3,
+		JA4Fingerprint:      node24JA4,
+		ALPNProtocols:       append([]string(nil), node24WireHTTP1ALPN...),
+		UserAgentTemplate:   ua,
+		EnableGREASE:        false,
+		CipherSuites:        append([]uint16(nil), node24WireCipherSuites...),
+		Curves:              append([]uint16(nil), node24WireCurves...),
+		PointFormats:        append([]uint16(nil), defaultWirePointFormats...),
+		SignatureAlgorithms: append([]uint16(nil), defaultWireSignatureAlgorithms...),
+		SupportedVersions:   append([]uint16(nil), defaultWireSupportedVersions...),
+		KeyShareGroups:      append([]uint16(nil), node24WireKeyShares...),
+		PSKModes:            append([]uint16(nil), defaultWirePSKModes...),
+		Extensions:          append([]uint16(nil), node24WireExtensions...),
+		OSHint:              osHint,
+		BuiltIn:             true,
+	}
+}
+
+// DefaultProfiles returns built-in uTLS profiles including selector "auto", official CLI profiles, and desktop browsers.
 func DefaultProfiles() []ProfileSpec {
 	return []ProfileSpec{
 		{
 			ID:                AutoProfileID,
 			Name:              "Auto Sticky (Rendezvous OS-Aware)",
-			Description:       "Deterministically assigns a concrete browser or Bun profile per account ID via Rendezvous hashing",
+			Description:       "Deterministically assigns a concrete browser or CLI profile per account ID via Rendezvous hashing",
 			ClientHelloPreset: "auto",
 			ALPNProtocols:     []string{"h2", "http/1.1"},
 			BuiltIn:           true,
 		},
+		node24BuiltinProfile(
+			ClaudeNodeProfileID,
+			"Claude Code 2.1.321 (Node.js 24.x uTLS)",
+			"Exact Node.js 24.x OpenSSL ClientHello matching official Claude Code CLI + http/1.1 ALPN",
+			"claude_node_24",
+			"claude-cli/2.1.321 (external, cli)",
+			"linux",
+		),
 		{
 			ID:                  ClaudeBunProfileID,
-			Name:                "Claude Code 2.1.280 (Bun uTLS + PQ X25519MLKEM768)",
+			Name:                "Claude Code 2.1.321 (Bun uTLS + PQ X25519MLKEM768)",
 			Description:         "Wire-exact BoringSSL/Bun ClientHello with X25519MLKEM768 hybrid key share",
-			ClientHelloPreset:   "custom_wire",
+			ClientHelloPreset:   "claude_bun_21",
 			ALPNProtocols:       []string{"h2", "http/1.1"},
-			UserAgentTemplate:   "claude-cli/2.1.280 (external, cli)",
+			UserAgentTemplate:   "claude-cli/2.1.321 (external, cli)",
 			EnableGREASE:        false,
 			CipherSuites:        append([]uint16(nil), defaultWireCipherSuites...),
 			Curves:              append([]uint16(nil), defaultWireCurves...),
@@ -200,11 +284,11 @@ func DefaultProfiles() []ProfileSpec {
 		},
 		{
 			ID:                  CodexRustlsProfileID,
-			Name:                "OpenAI Codex CLI (Rust reqwest/rustls)",
+			Name:                "OpenAI Codex CLI 0.146.0 (Rust reqwest/rustls)",
 			Description:         "GREASE-free Rustls TLS 1.3/1.2 ClientHello with AES-256-GCM preference and X25519 key share",
 			ClientHelloPreset:   "codex_rustls",
 			ALPNProtocols:       []string{"h2", "http/1.1"},
-			UserAgentTemplate:   "codex_cli_rs/0.38.0 (Linux 6.8.0; x86_64)",
+			UserAgentTemplate:   "codex_cli_rs/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color",
 			EnableGREASE:        false,
 			CipherSuites:        append([]uint16(nil), codexRustlsCiphers...),
 			Curves:              append([]uint16(nil), codexRustlsCurves...),
@@ -219,11 +303,11 @@ func DefaultProfiles() []ProfileSpec {
 		},
 		{
 			ID:                  AntigravityElectronProfileID,
-			Name:                "Antigravity IDE 1.15 (Electron BoringSSL + PQ)",
+			Name:                "Antigravity IDE 2.23 (Electron BoringSSL + PQ)",
 			Description:         "Electron/Chromium GREASE + X25519MLKEM768 + Brotli cert compression + ALPS h2 ClientHello",
 			ClientHelloPreset:   "antigravity_ide",
 			ALPNProtocols:       []string{"h2", "http/1.1"},
-			UserAgentTemplate:   "antigravity/1.15.8 linux/amd64",
+			UserAgentTemplate:   "antigravity/hub/2.23.0 windows/amd64",
 			EnableGREASE:        true,
 			CipherSuites:        append([]uint16(nil), defaultWireCipherSuites...),
 			Curves:              append([]uint16(nil), defaultWireCurves...),
@@ -233,9 +317,79 @@ func DefaultProfiles() []ProfileSpec {
 			KeyShareGroups:      append([]uint16(nil), defaultWireKeyShareGroups...),
 			PSKModes:            append([]uint16(nil), defaultWirePSKModes...),
 			Extensions:          append([]uint16(nil), antigravityExtensions...),
+			OSHint:              "windows",
+			BuiltIn:             true,
+		},
+		node24BuiltinProfile(
+			GeminiCLINodeProfileID,
+			"Gemini CLI 0.73.0 (Node.js 24.x uTLS)",
+			"Node.js 24.x ClientHello matching official @google/gemini-cli",
+			"gemini_cli_node",
+			"GeminiCLI/0.73.0 (linux; x64) google-api-nodejs-client/9.15.1",
+			"linux",
+		),
+		node24BuiltinProfile(
+			QwenCLINodeProfileID,
+			"Qwen Code CLI 0.28.3 (Node.js 24.x uTLS)",
+			"Node.js 24.x ClientHello matching official @qwen-code/qwen-code",
+			"qwen_cli_node",
+			"QwenCode/0.28.3 (linux; x64)",
+			"linux",
+		),
+		{
+			ID:                  GrokRustlsProfileID,
+			Name:                "xAI Grok CLI 1.0.46 (Rust reqwest/rustls)",
+			Description:         "GREASE-free Rustls TLS 1.3/1.2 ClientHello matching official grok-pager CLI",
+			ClientHelloPreset:   "grok_rustls",
+			ALPNProtocols:       []string{"h2", "http/1.1"},
+			UserAgentTemplate:   "grok-pager/1.0.46 grok-shell/1.0.46 (linux; x86_64)",
+			EnableGREASE:        false,
+			CipherSuites:        append([]uint16(nil), codexRustlsCiphers...),
+			Curves:              append([]uint16(nil), codexRustlsCurves...),
+			PointFormats:        append([]uint16(nil), defaultWirePointFormats...),
+			SignatureAlgorithms: append([]uint16(nil), defaultWireSignatureAlgorithms...),
+			SupportedVersions:   append([]uint16(nil), defaultWireSupportedVersions...),
+			KeyShareGroups:      append([]uint16(nil), codexRustlsKeyShares...),
+			PSKModes:            append([]uint16(nil), defaultWirePSKModes...),
+			Extensions:          append([]uint16(nil), codexRustlsExtensions...),
 			OSHint:              "linux",
 			BuiltIn:             true,
 		},
+		{
+			ID:                  OpenCodeBunProfileID,
+			Name:                "OpenCode CLI 1.0.0 (Bun uTLS + PQ)",
+			Description:         "BoringSSL/Bun ClientHello matching official OpenCode CLI",
+			ClientHelloPreset:   "opencode_bun",
+			ALPNProtocols:       []string{"h2", "http/1.1"},
+			UserAgentTemplate:   "opencode/1.0.0",
+			EnableGREASE:        false,
+			CipherSuites:        append([]uint16(nil), defaultWireCipherSuites...),
+			Curves:              append([]uint16(nil), defaultWireCurves...),
+			PointFormats:        append([]uint16(nil), defaultWirePointFormats...),
+			SignatureAlgorithms: append([]uint16(nil), defaultWireSignatureAlgorithms...),
+			SupportedVersions:   append([]uint16(nil), defaultWireSupportedVersions...),
+			KeyShareGroups:      append([]uint16(nil), defaultWireKeyShareGroups...),
+			PSKModes:            append([]uint16(nil), defaultWirePSKModes...),
+			Extensions:          append([]uint16(nil), defaultWireExtensions...),
+			OSHint:              "linux",
+			BuiltIn:             true,
+		},
+		node24BuiltinProfile(
+			ClineNodeProfileID,
+			"Cline CLI / Extension (Node.js 24.x uTLS)",
+			"Node.js 24.x ClientHello matching Cline client requests",
+			"cline_node",
+			"Cline/3.17.0",
+			"linux",
+		),
+		node24BuiltinProfile(
+			NodeSDKProfileID,
+			"Node.js 24.x Official SDK (uTLS)",
+			"Standard Node.js 24.x TLS fingerprint for plain API-key SDK traffic",
+			"node_sdk_24",
+			"node",
+			"linux",
+		),
 		{
 			ID:                "chrome-131",
 			Name:              "Chrome 131 (Desktop)",
@@ -260,18 +414,14 @@ func DefaultProfiles() []ProfileSpec {
 			OSHint:            "windows",
 			BuiltIn:           true,
 		},
-		{
-			ID:                "claude-cli-mac",
-			Name:              "Claude Code CLI (macOS)",
-			Description:       "HTTP/1.1 pinned CLI profile for macOS hosts",
-			ClientHelloPreset: "chrome_auto",
-			JA3Fingerprint:    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392,0-23-65281-10-11-35-16-5-13-51-45-43-27,29-23-24,0",
-			JA4Fingerprint:    "t13d1514h1_8daaf6152771_e5627efa2ab1",
-			ALPNProtocols:     []string{"http/1.1"},
-			UserAgentTemplate: "claude-cli/2.1.280 (external, cli)",
-			OSHint:            "darwin",
-			BuiltIn:           true,
-		},
+		node24BuiltinProfile(
+			"claude-cli-mac",
+			"Claude Code CLI (macOS Node.js 24.x)",
+			"HTTP/1.1 pinned Node.js 24.x CLI profile for macOS hosts",
+			"claude_cli",
+			"claude-cli/2.1.321 (external, cli)",
+			"darwin",
+		),
 	}
 }
 
@@ -475,7 +625,9 @@ func ResolveClientHelloID(preset string) utls.ClientHelloID {
 		return utls.HelloEdge_Auto
 	case "randomized", "random":
 		return utls.HelloRandomizedALPN
-	case "custom_wire", "claude_bun_21", "codex_rustls", "antigravity_ide", "bun_default":
+	case "custom_wire", "claude_bun_21", "claude_node_24", "codex_rustls", "antigravity_ide",
+		"gemini_cli_node", "qwen_cli_node", "grok_rustls", "opencode_bun", "cline_node", "node_sdk_24",
+		"claude_cli", "bun_default":
 		return utls.HelloCustom
 	case "chrome_auto", "chrome_131", "":
 		return utls.HelloChrome_Auto
@@ -493,8 +645,16 @@ func BuildClientHelloSpec(spec ProfileSpec) (*utls.ClientHelloSpec, error) {
 	useWire := spec.HasCustomWireSpec() ||
 		preset == "custom_wire" ||
 		preset == "claude_bun_21" ||
+		preset == "claude_node_24" ||
 		preset == "codex_rustls" ||
 		preset == "antigravity_ide" ||
+		preset == "gemini_cli_node" ||
+		preset == "qwen_cli_node" ||
+		preset == "grok_rustls" ||
+		preset == "opencode_bun" ||
+		preset == "cline_node" ||
+		preset == "node_sdk_24" ||
+		preset == "claude_cli" ||
 		preset == "bun_default"
 	if !useWire {
 		return nil, nil
@@ -639,6 +799,8 @@ func BuildClientHelloSpec(spec ProfileSpec) (*utls.ClientHelloSpec, error) {
 			exts = append(exts, &utls.SupportedVersionsExtension{Versions: versions})
 		case 45:
 			exts = append(exts, &utls.PSKKeyExchangeModesExtension{Modes: pskModes})
+		case 50:
+			exts = append(exts, &utls.SignatureAlgorithmsCertExtension{SupportedSignatureAlgorithms: sigAlgs})
 		case 51:
 			exts = append(exts, &utls.KeyShareExtension{KeyShares: keyShares})
 		case 17513:

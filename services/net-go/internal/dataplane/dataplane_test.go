@@ -650,9 +650,11 @@ func TestSubscriptionMimicryClaudeCodexAndAntigravityVM(t *testing.T) {
 	}
 	if claudeReq.Header.Get("Authorization") != "Bearer sk-ant-oat01-max-token" ||
 		claudeReq.Header.Get("x-app") != "cli" ||
-		claudeReq.Header.Get("X-Stainless-Runtime") != "bun" ||
+		claudeReq.Header.Get("X-Stainless-Runtime") != "node" ||
+		claudeReq.Header.Get("Accept") != "application/json" ||
+		strings.TrimSpace(claudeReq.Header.Get("X-Claude-Code-Session-Id")) == "" ||
 		!strings.Contains(claudeReq.Header.Get("anthropic-beta"), "oauth-2025-04-20") ||
-		!strings.Contains(claudeReq.Header.Get("User-Agent"), "claude-cli/2.1.280") {
+		!strings.Contains(claudeReq.Header.Get("User-Agent"), "claude-cli/"+CLIClaudeVersion()) {
 		t.Fatalf("missing Claude CLI subscription headers: %+v", claudeReq.Header)
 	}
 	claudeBodyBytes, _ := io.ReadAll(claudeReq.Body)
@@ -672,8 +674,11 @@ func TestSubscriptionMimicryClaudeCodexAndAntigravityVM(t *testing.T) {
 	if !strings.HasPrefix(claudePayload.Metadata.UserID, "user_") || !strings.Contains(claudePayload.Metadata.UserID, "_account_") || !strings.Contains(claudePayload.Metadata.UserID, "_session_") {
 		t.Fatalf("unexpected metadata.user_id: %q", claudePayload.Metadata.UserID)
 	}
-	if len(claudePayload.System) < 2 || !strings.Contains(claudePayload.System[0].Text, "Claude Code") || claudePayload.System[0].CacheControl["type"] != "ephemeral" {
-		t.Fatalf("expected Claude Code ephemeral system preamble, got %+v", claudePayload.System)
+	if len(claudePayload.System) < 2 ||
+		!strings.HasPrefix(claudePayload.System[0].Text, "x-anthropic-billing-header: cc_version="+CLIClaudeVersion()+".") ||
+		!strings.Contains(claudePayload.System[1].Text, "Claude Code") ||
+		claudePayload.System[1].CacheControl["type"] != "ephemeral" {
+		t.Fatalf("expected Claude Code billing header + ephemeral system preamble, got %+v", claudePayload.System)
 	}
 
 	// Verify Anthropic unified ratelimit header extraction (0.425 -> 4250 bps).
@@ -728,9 +733,14 @@ func TestSubscriptionMimicryClaudeCodexAndAntigravityVM(t *testing.T) {
 		t.Fatalf("unexpected codex egress/url: %s %s", codexEgress, codexReq.URL.String())
 	}
 	if codexReq.Header.Get("originator") != "codex_cli_rs" ||
+		codexReq.Header.Get("version") != CLICodexVersion() ||
 		codexReq.Header.Get("chatgpt-account-id") != "acct_plus_777" ||
 		codexReq.Header.Get("OpenAI-Beta") != "responses=experimental" ||
-		codexReq.Header.Get("session_id") == "" {
+		codexReq.Header.Get("session_id") == "" ||
+		codexReq.Header.Get("session-id") != codexReq.Header.Get("session_id") ||
+		codexReq.Header.Get("x-codex-window-id") == "" ||
+		codexReq.Header.Get("x-codex-installation-id") == "" ||
+		!strings.Contains(codexReq.Header.Get("User-Agent"), "codex_cli_rs/"+CLICodexVersion()) {
 		t.Fatalf("missing Codex CLI headers: %+v", codexReq.Header)
 	}
 	codexReqBody, _ := io.ReadAll(codexReq.Body)
@@ -814,23 +824,25 @@ func TestSubscriptionMimicryClaudeCodexAndAntigravityVM(t *testing.T) {
 		}
 		if r.Header.Get("Authorization") != "Bearer ya29.ag-live-oauth" ||
 			r.Header.Get("X-Goog-Device-Id") != agMachineID ||
-			!strings.Contains(r.Header.Get("User-Agent"), "antigravity/1.15.8") ||
-			!strings.Contains(r.Header.Get("Client-Metadata"), "GEMINI") {
+			!strings.Contains(r.Header.Get("User-Agent"), "antigravity/hub/"+CLIAntigravityVersion()) ||
+			r.Header.Get("Client-Metadata") != "" {
 			http.Error(w, "bad antigravity headers", http.StatusUnauthorized)
 			return
 		}
 		var env struct {
-			Project   string         `json:"project"`
-			Model     string         `json:"model"`
-			UserAgent string         `json:"userAgent"`
-			RequestID string         `json:"requestId"`
-			Request   map[string]any `json:"request"`
+			Project     string         `json:"project"`
+			Model       string         `json:"model"`
+			UserAgent   string         `json:"userAgent"`
+			RequestType string         `json:"requestType"`
+			RequestID   string         `json:"requestId"`
+			Request     map[string]any `json:"request"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if env.Project != "ag-cloud-proj" || env.Model != "claude-sonnet-4-5" || env.UserAgent != "antigravity" || !strings.HasPrefix(env.RequestID, "agent-") {
+		sid, _ := env.Request["sessionId"].(string)
+		if env.Project != "ag-cloud-proj" || env.Model != "claude-sonnet-4-5" || env.UserAgent != "antigravity" || env.RequestType != "agent" || !strings.HasPrefix(env.RequestID, "agent-") || strings.TrimSpace(sid) == "" {
 			http.Error(w, "bad antigravity envelope", http.StatusBadRequest)
 			return
 		}

@@ -163,9 +163,9 @@ func (c *Coordinator) fetchProviderModelsOnce(ctx context.Context, accountID str
 		AuthKind:      meta.AuthKind,
 		ExecutionMode: meta.ExecutionMode,
 		AccountID:     accountID,
+		UTLSProfileID: c.resolveAccountUTLSProfileID(accountID, prov, meta.AuthKind, sec),
 	}
 	applyUpstreamAuthHeaders(req, pctx, sec)
-	applyOpenCodeAndCommandCodeHeaders(req, pctx, sec, targetURL, &CanonicalTurn{})
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.executeControlHTTPRequest(reqCtx, accountID, meta, sec, req)

@@ -54,14 +54,39 @@ const ANTHROPIC_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 const ANTHROPIC_SCOPE_OAUTH =
   "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins";
 const ANTHROPIC_SCOPE_SETUP = "user:inference";
-const ANTHROPIC_UA = "claude-cli/2.1.280 (external, cli)";
+function envVersion(keys: string[], fallback: string): string {
+  for (const key of keys) {
+    const val = process.env[key]?.trim();
+    if (val) return val;
+  }
+  return fallback;
+}
+
+function anthropicCLIUserAgent(): string {
+  return `claude-cli/${envVersion(["SLIPGATE_CLAUDE_CLI_VERSION", "SUB2API_CLAUDE_CLI_VERSION"], "2.1.321")} (external, cli)`;
+}
 
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
 const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const CODEX_SCOPES = "openid profile email offline_access api.connectors.read api.connectors.invoke";
-const CODEX_UA = "codex_cli_rs/0.38.0 (Linux 6.8.0; x86_64)";
+
+function codexCLIUserAgent(): string {
+  return `codex_cli_rs/${envVersion(["SLIPGATE_CODEX_CLI_VERSION"], "0.146.0")} (Ubuntu 22.4.0; x86_64) xterm-256color`;
+}
+
+function antigravityCLIUserAgent(): string {
+  return `antigravity/hub/${envVersion(["SLIPGATE_ANTIGRAVITY_VERSION"], "2.23.0")} windows/amd64`;
+}
+
+function geminiCLIUserAgent(): string {
+  return `GeminiCLI/${envVersion(["SLIPGATE_GEMINI_CLI_VERSION"], "0.73.0")} (linux; x64) google-api-nodejs-client/9.15.1`;
+}
+
+function qwenCLIUserAgent(): string {
+  return `QwenCode/${envVersion(["SLIPGATE_QWEN_CLI_VERSION"], "0.28.3")} (linux; x64)`;
+}
 
 const GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -330,7 +355,7 @@ export function registerAccountOAuthRoutes(app: Hono<AuthEnv>, ctx: AccountOAuth
           headers: {
             "Content-Type": "application/json",
             Accept: "application/json",
-            "User-Agent": ANTHROPIC_UA,
+            "User-Agent": anthropicCLIUserAgent(),
           },
           body: JSON.stringify(payload),
           signal: AbortSignal.timeout(25_000),
@@ -351,7 +376,8 @@ export function registerAccountOAuthRoutes(app: Hono<AuthEnv>, ctx: AccountOAuth
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
             Accept: "application/json",
-            "User-Agent": CODEX_UA,
+            "User-Agent": codexCLIUserAgent(),
+            originator: "codex_cli_rs",
           },
           body: form.toString(),
           signal: AbortSignal.timeout(25_000),
@@ -374,6 +400,7 @@ export function registerAccountOAuthRoutes(app: Hono<AuthEnv>, ctx: AccountOAuth
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
             Accept: "application/json",
+            "User-Agent": session.platform === "antigravity" ? antigravityCLIUserAgent() : geminiCLIUserAgent(),
           },
           body: form.toString(),
           signal: AbortSignal.timeout(25_000),
@@ -395,6 +422,8 @@ export function registerAccountOAuthRoutes(app: Hono<AuthEnv>, ctx: AccountOAuth
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
             Accept: "application/json",
+            "User-Agent": qwenCLIUserAgent(),
+            "X-DashScope-UserAgent": qwenCLIUserAgent(),
           },
           body: form.toString(),
           signal: AbortSignal.timeout(25_000),
@@ -465,7 +494,11 @@ export function registerAccountOAuthRoutes(app: Hono<AuthEnv>, ctx: AccountOAuth
         const uRes = await ssrfSafeFetch(
           GOOGLE_USERINFO_URL,
           {
-            headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              Accept: "application/json",
+              "User-Agent": session.platform === "antigravity" ? antigravityCLIUserAgent() : geminiCLIUserAgent(),
+            },
             signal: AbortSignal.timeout(8_000),
           },
           doFetch,

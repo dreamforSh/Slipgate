@@ -282,6 +282,7 @@ func buildBedrockConverseRequest(
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
+	ApplyCLIProviderHeaders(req, OutboundPersonaContext{Provider: "bedrock"}, secret, fullURL, CodecBedrockConverse)
 	for k, v := range secret.Headers {
 		if strings.TrimSpace(k) != "" {
 			req.Header.Set(k, v)
@@ -904,6 +905,8 @@ func (c *VertexTokenCache) Resolve(
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", vertexJSUserAgent)
+	req.Header.Set("X-Goog-Api-Client", geminiGoogAPIClientHeader)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -1019,7 +1022,7 @@ func buildVertexRequest(
 			"%s/v1/projects/%s/locations/%s/publishers/anthropic/models/%s%s",
 			baseURL, url.PathEscape(project), url.PathEscape(location), url.PathEscape(claudeModel), action,
 		)
-		rawAnt, bErr := encodeAnthropicRequestBody(claudeModel, turn, filteredTools, turn.Stream, true, pctx, false)
+		rawAnt, bErr := encodeAnthropicRequestBody(claudeModel, turn, filteredTools, turn.Stream, true, pctx, false, CLIClaudeVersion())
 		if bErr != nil {
 			return nil, egress, bErr
 		}
@@ -1061,6 +1064,7 @@ func buildVertexRequest(
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	ApplyCLIProviderHeaders(req, OutboundPersonaContext{Provider: "vertex", AuthKind: pctx.AuthKind}, secret, fullURL, egress)
 	for k, v := range secret.Headers {
 		if strings.TrimSpace(k) != "" {
 			req.Header.Set(k, v)

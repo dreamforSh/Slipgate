@@ -1,14 +1,22 @@
 package stealth
 
 import (
+	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -191,10 +199,23 @@ func TestDoAccountRequestFailClosedAndUTLSHandshake(t *testing.T) {
 	if socksHits.Load() < 1 || seenUA == "" {
 		t.Fatalf("expected request to traverse SOCKS5 with template UA, hits=%d ua=%q", socksHits.Load(), seenUA)
 	}
-	if DefaultProfileForProvider("codex", "oauth") != CodexRustlsProfileID ||
-		DefaultProfileForProvider("antigravity", "vm_cli_seed") != AntigravityElectronProfileID ||
-		DefaultProfileForProvider("anthropic", "oauth") != ClaudeBunProfileID {
-		t.Fatalf("unexpected DefaultProfileForProvider mapping")
+	for _, tc := range []struct {
+		provider, authKind, want string
+	}{
+		{"codex", "oauth", CodexRustlsProfileID},
+		{"antigravity", "vm_cli_seed", AntigravityElectronProfileID},
+		{"anthropic", "oauth", ClaudeNodeProfileID},
+		{"anthropic", "api_key", NodeSDKProfileID},
+		{"gemini", "oauth", GeminiCLINodeProfileID},
+		{"qwen", "oauth", QwenCLINodeProfileID},
+		{"grok", "api_key", GrokRustlsProfileID},
+		{"opencode_go", "api_key", OpenCodeBunProfileID},
+		{"opencode", "api_key", OpenCodeBunProfileID},
+		{"cline", "api_key", ClineNodeProfileID},
+	} {
+		if got := DefaultProfileForProvider(tc.provider, tc.authKind); got != tc.want {
+			t.Fatalf("DefaultProfileForProvider(%q, %q) = %q, want %q", tc.provider, tc.authKind, got, tc.want)
+		}
 	}
 
 	// 5. Built-in claude-cli-mac profile forces http/1.1 without h2 (check http/1.1 or empty ALPN on HTTP/1.1-selected TLS)
@@ -240,7 +261,7 @@ func TestValidateProfileAndWireClientHelloParity(t *testing.T) {
 		t.Fatalf("expected KeyShareNotInSupportedGroupsError{29}, got %v", err)
 	}
 
-	// 3. Claude Code 2.1.280 Bun wire profile builds valid ClientHelloSpec with PQ X25519MLKEM768 + GREASE ECH option.
+	// 3. Claude Code 2.1.321 Bun wire profile builds valid ClientHelloSpec with PQ X25519MLKEM768 + GREASE ECH option.
 	dialer := NewAccountDialer(clashpool.NewManager(1, 65535, 1))
 	bunSpec, ok := dialer.GetProfile(ClaudeBunProfileID)
 	if !ok {
@@ -357,5 +378,355 @@ func TestAutoStickyProfileEndToEndAndUpdateInvalidation(t *testing.T) {
 	_ = res3.Response.Body.Close()
 	if socksHits.Load() < 2 {
 		t.Fatalf("expected SOCKS5 tunnel usage across custom profile update, hits=%d", socksHits.Load())
+	}
+}
+
+type parsedWireClientHello struct {
+	extIDs         map[uint16]bool
+	alpn           []string
+	keyShareGroups []uint16
+}
+
+func readAndParseWireClientHello(t *testing.T, conn net.Conn) parsedWireClientHello {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var hdr [5]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		t.Fatalf("read TLS record header: %v", err)
+	}
+	if hdr[0] != 0x16 {
+		t.Fatalf("expected TLS handshake record (0x16), got 0x%02x", hdr[0])
+	}
+	recLen := int(binary.BigEndian.Uint16(hdr[3:5]))
+	rec := make([]byte, recLen)
+	if _, err := io.ReadFull(conn, rec); err != nil {
+		t.Fatalf("read TLS ClientHello record: %v", err)
+	}
+	if len(rec) < 42 || rec[0] != 0x01 {
+		t.Fatalf("expected TLS ClientHello (0x01), len=%d type=0x%02x", len(rec), rec[0])
+	}
+
+	pos := 4 + 2 + 32 // handshake hdr (4) + legacy_version (2) + random (32)
+	sidLen := int(rec[pos])
+	pos += 1 + sidLen
+	csLen := int(binary.BigEndian.Uint16(rec[pos : pos+2]))
+	pos += 2 + csLen
+	compLen := int(rec[pos])
+	pos += 1 + compLen
+	if pos+2 > len(rec) {
+		t.Fatalf("ClientHello truncated before extensions")
+	}
+	extTotal := int(binary.BigEndian.Uint16(rec[pos : pos+2]))
+	pos += 2
+	end := pos + extTotal
+	if end > len(rec) {
+		t.Fatalf("ClientHello extensions exceed record: %d > %d", end, len(rec))
+	}
+
+	out := parsedWireClientHello{extIDs: make(map[uint16]bool)}
+	for pos+4 <= end {
+		extType := binary.BigEndian.Uint16(rec[pos : pos+2])
+		extLen := int(binary.BigEndian.Uint16(rec[pos+2 : pos+4]))
+		if pos+4+extLen > end {
+			t.Fatalf("extension 0x%04x truncated", extType)
+		}
+		extData := rec[pos+4 : pos+4+extLen]
+		pos += 4 + extLen
+		out.extIDs[extType] = true
+
+		switch extType {
+		case 0x0010: // ALPN
+			if len(extData) >= 2 {
+				listLen := int(binary.BigEndian.Uint16(extData[0:2]))
+				p := 2
+				for p < 2+listLen && p < len(extData) {
+					n := int(extData[p])
+					p++
+					if p+n <= len(extData) {
+						out.alpn = append(out.alpn, string(extData[p:p+n]))
+					}
+					p += n
+				}
+			}
+		case 0x0033: // key_share
+			if len(extData) >= 2 {
+				sharesLen := int(binary.BigEndian.Uint16(extData[0:2]))
+				p := 2
+				for p+4 <= 2+sharesLen && p+4 <= len(extData) {
+					grp := binary.BigEndian.Uint16(extData[p : p+2])
+					klen := int(binary.BigEndian.Uint16(extData[p+2 : p+4]))
+					out.keyShareGroups = append(out.keyShareGroups, grp)
+					p += 4 + klen
+				}
+			}
+		}
+	}
+	return out
+}
+
+func makeSelfSignedLoopbackCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa keygen: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost", "api.anthropic.com"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create self-signed cert: %v", err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse cert: %v", err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(parsed)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}, roots
+}
+
+func TestWireClientHelloDirectAndSocksParity(t *testing.T) {
+	t.Parallel()
+
+	captureLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen raw capture: %v", err)
+	}
+	defer func() { _ = captureLn.Close() }()
+
+	capturedCh := make(chan parsedWireClientHello, 4)
+	go func() {
+		for {
+			c, err := captureLn.Accept()
+			if err != nil {
+				return
+			}
+			hello := readAndParseWireClientHello(t, c)
+			_ = c.Close()
+			capturedCh <- hello
+		}
+	}()
+
+	var socksHits atomic.Int32
+	socksPort := startTestSocks5Server(t, "u1", "p1", &socksHits)
+	pool := clashpool.NewManager(1, 65535, 1)
+	if _, err := pool.SyncNodes("sub-wire", []clashpool.Node{
+		{
+			ID:            "node-wire",
+			Name:          "WireCapture",
+			ProxySlotID:   "slot-wire",
+			ListenerPort:  socksPort,
+			SocksUsername: "u1",
+			SocksPassword: "p1",
+			ExitIP:        "198.51.100.10",
+			Health:        clashpool.HealthHealthy,
+			Enabled:       true,
+		},
+	}, true); err != nil {
+		t.Fatalf("SyncNodes: %v", err)
+	}
+	if err := pool.BindAccountWithProfile("acc-wire", "node-wire", false, ClaudeNodeProfileID); err != nil {
+		t.Fatalf("BindAccountWithProfile: %v", err)
+	}
+
+	dialer := NewAccountDialer(pool)
+	targetURL := "https://" + captureLn.Addr().String() + "/v1/messages"
+
+	// 1. DoDirectRequest with allowPrivate=false must fail SSRF check before dialing TCP.
+	reqSSRF, _ := http.NewRequest(http.MethodPost, targetURL, nil)
+	if _, err := dialer.DoDirectRequest(context.Background(), "acc-ssrf", ClaudeNodeProfileID, reqSSRF, false); err == nil {
+		t.Fatalf("expected DoDirectRequest with allowPrivate=false to reject loopback URL")
+	}
+
+	// 2. DoDirectRequest (direct_api) with claude-node-24 sends exact Node 24 ClientHello on raw TCP.
+	reqDirect, _ := http.NewRequest(http.MethodPost, targetURL, nil)
+	_, _ = dialer.DoDirectRequest(context.Background(), "acc-direct", ClaudeNodeProfileID, reqDirect, true)
+	helloDirect := <-capturedCh
+
+	// 3. DoAccountRequest (SOCKS5) with claude-node-24 matches Node 24 ClientHello wire bytes.
+	reqSocksNode, _ := http.NewRequest(http.MethodPost, targetURL, nil)
+	_, _ = dialer.DoAccountRequest(context.Background(), "acc-wire", ClaudeNodeProfileID, reqSocksNode)
+	helloSocksNode := <-capturedCh
+
+	for _, tc := range []struct {
+		name  string
+		hello parsedWireClientHello
+	}{
+		{"direct_api claude-node-24", helloDirect},
+		{"socks5 claude-node-24", helloSocksNode},
+	} {
+		if strings.Join(tc.hello.alpn, ",") != "http/1.1" {
+			t.Fatalf("%s expected ALPN=[http/1.1] without h2, got %v", tc.name, tc.hello.alpn)
+		}
+		if !tc.hello.extIDs[0xfe0d] {
+			t.Fatalf("%s expected GREASE ECH extension 0xfe0d on wire", tc.name)
+		}
+		hasX25519 := false
+		for _, g := range tc.hello.keyShareGroups {
+			if g == uint16(utls.X25519) {
+				hasX25519 = true
+			}
+			if g == uint16(utls.X25519MLKEM768) {
+				t.Fatalf("%s must not advertise X25519MLKEM768 key share on wire: %v", tc.name, tc.hello.keyShareGroups)
+			}
+		}
+		if !hasX25519 {
+			t.Fatalf("%s expected X25519 key share on wire, got %v", tc.name, tc.hello.keyShareGroups)
+		}
+	}
+
+	// 4. codex-rustls-01 over SOCKS5 offers h2+http/1.1 ALPN and no ECH 0xfe0d extension.
+	reqCodex, _ := http.NewRequest(http.MethodPost, targetURL, nil)
+	_, _ = dialer.DoAccountRequest(context.Background(), "acc-wire", CodexRustlsProfileID, reqCodex)
+	helloCodex := <-capturedCh
+	if strings.Join(helloCodex.alpn, ",") != "h2,http/1.1" {
+		t.Fatalf("codex-rustls-01 expected ALPN=[h2,http/1.1], got %v", helloCodex.alpn)
+	}
+	if helloCodex.extIDs[0xfe0d] {
+		t.Fatalf("codex-rustls-01 must not send GREASE ECH 0xfe0d")
+	}
+	if socksHits.Load() < 2 {
+		t.Fatalf("expected SOCKS5 proxy hits >= 2, got %d", socksHits.Load())
+	}
+}
+
+func TestWireHTTP11HeaderCasingDirectAndSocks(t *testing.T) {
+	t.Parallel()
+
+	cert, roots := makeSelfSignedLoopbackCert(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tls wire: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	type wireResult struct {
+		alpn    string
+		rawWire string
+	}
+	resCh := make(chan wireResult, 4)
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(rawConn net.Conn) {
+				defer func() { _ = rawConn.Close() }()
+				tlsConn := tls.Server(rawConn, tlsCfg)
+				_ = tlsConn.SetDeadline(time.Now().Add(3 * time.Second))
+				if err := tlsConn.Handshake(); err != nil {
+					return
+				}
+				alpn := tlsConn.ConnectionState().NegotiatedProtocol
+				br := bufio.NewReader(tlsConn)
+				var sb strings.Builder
+				for {
+					line, err := br.ReadString('\n')
+					sb.WriteString(line)
+					if err != nil || line == "\r\n" || line == "\n" {
+						break
+					}
+				}
+				resCh <- wireResult{alpn: alpn, rawWire: sb.String()}
+				_, _ = io.WriteString(tlsConn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+			}(c)
+		}
+	}()
+
+	var socksHits atomic.Int32
+	socksPort := startTestSocks5Server(t, "u2", "p2", &socksHits)
+	pool := clashpool.NewManager(1, 65535, 1)
+	if _, err := pool.SyncNodes("sub-http", []clashpool.Node{
+		{
+			ID:            "node-http",
+			Name:          "HTTPWire",
+			ProxySlotID:   "slot-http",
+			ListenerPort:  socksPort,
+			SocksUsername: "u2",
+			SocksPassword: "p2",
+			ExitIP:        "198.51.100.11",
+			Health:        clashpool.HealthHealthy,
+			Enabled:       true,
+		},
+	}, true); err != nil {
+		t.Fatalf("SyncNodes: %v", err)
+	}
+	if err := pool.BindAccountWithProfile("acc-http-socks", "node-http", false, ClaudeNodeProfileID); err != nil {
+		t.Fatalf("BindAccountWithProfile: %v", err)
+	}
+
+	dialer := NewAccountDialer(pool)
+	dialer.SetRootCAs(roots)
+	targetURL := "https://" + ln.Addr().String() + "/v1/messages"
+
+	makeReq := func() *http.Request {
+		r, _ := http.NewRequest(http.MethodPost, targetURL, strings.NewReader(`{}`))
+		// Use canonical Header.Set to simulate Go callers; Dialer must emit exact CLI wire casing.
+		r.Header.Set("User-Agent", "claude-cli/2.1.321 (external, cli)")
+		r.Header.Set("X-Stainless-OS", "Linux")
+		r.Header.Set("X-App", "cli")
+		r.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
+		r.Header.Set("Anthropic-Version", "2023-06-01")
+		r.Header.Set("X-Claude-Code-Session-Id", "sess-123")
+		return r
+	}
+
+	resDirect, err := dialer.DoDirectRequest(context.Background(), "acc-http-direct", ClaudeNodeProfileID, makeReq(), true)
+	if err != nil {
+		t.Fatalf("DoDirectRequest failed: %v", err)
+	}
+	_ = resDirect.Response.Body.Close()
+	wireDirect := <-resCh
+
+	resSocks, err := dialer.DoAccountRequest(context.Background(), "acc-http-socks", ClaudeNodeProfileID, makeReq())
+	if err != nil {
+		t.Fatalf("DoAccountRequest failed: %v", err)
+	}
+	_ = resSocks.Response.Body.Close()
+	wireSocks := <-resCh
+
+	for _, tc := range []struct {
+		name string
+		got  wireResult
+	}{
+		{"direct_api", wireDirect},
+		{"socks5", wireSocks},
+	} {
+		if tc.got.alpn != "http/1.1" {
+			t.Fatalf("%s negotiated ALPN=%q, want http/1.1", tc.name, tc.got.alpn)
+		}
+		for _, wantLine := range []string{
+			"X-Stainless-OS: Linux\r\n",
+			"x-app: cli\r\n",
+			"anthropic-beta: oauth-2025-04-20\r\n",
+			"anthropic-version: 2023-06-01\r\n",
+			"X-Claude-Code-Session-Id: sess-123\r\n",
+			"User-Agent: claude-cli/2.1.321 (external, cli)\r\n",
+		} {
+			if !strings.Contains(tc.got.rawWire, wantLine) {
+				t.Fatalf("%s missing exact wire header %q in:\n%s", tc.name, wantLine, tc.got.rawWire)
+			}
+		}
+		for _, forbidden := range []string{"Go-http-client", "X-App:", "Anthropic-Beta:", "Anthropic-Version:"} {
+			if strings.Contains(tc.got.rawWire, forbidden) {
+				t.Fatalf("%s leaked forbidden wire string %q in:\n%s", tc.name, forbidden, tc.got.rawWire)
+			}
+		}
+	}
+	if socksHits.Load() < 1 {
+		t.Fatalf("expected SOCKS5 hit, got %d", socksHits.Load())
 	}
 }

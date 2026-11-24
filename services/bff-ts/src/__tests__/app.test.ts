@@ -237,10 +237,21 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
     const tlsListRes = await app.request("/api/v1/admin/tls-profiles", { headers: adminHeaders });
     expect(tlsListRes.status).toBe(200);
     const tlsListBody = (await tlsListRes.json()) as { profiles: Array<{ id: string }> };
-    expect(tlsListBody.profiles.some((p) => p.id === "claude-bun-21")).toBe(true);
-    expect(tlsListBody.profiles.some((p) => p.id === "codex-rustls-01")).toBe(true);
-    expect(tlsListBody.profiles.some((p) => p.id === "antigravity-electron-15")).toBe(true);
-    expect(tlsListBody.profiles.some((p) => p.id === "auto")).toBe(true);
+    for (const id of [
+      "auto",
+      "claude-node-24",
+      "claude-bun-21",
+      "codex-rustls-01",
+      "antigravity-electron-15",
+      "gemini-cli-node",
+      "qwen-cli-node",
+      "grok-rustls-01",
+      "opencode-bun-01",
+      "cline-node-01",
+      "node-sdk-24",
+    ]) {
+      expect(tlsListBody.profiles.some((p) => p.id === id)).toBe(true);
+    }
 
     const putLocked = await app.request("/api/v1/admin/tls-profiles/claude-bun-21", {
       method: "PUT",
@@ -248,6 +259,13 @@ describe("slipgate-bff ControlPlane IAM, Pool, and API Key CRUD", () => {
       body: JSON.stringify({ name: "Cannot Mutate Builtin" }),
     });
     expect(putLocked.status).toBe(403);
+
+    const putNodeLocked = await app.request("/api/v1/admin/tls-profiles/claude-node-24", {
+      method: "PUT",
+      headers: adminHeaders,
+      body: JSON.stringify({ name: "Cannot Mutate Node Builtin" }),
+    });
+    expect(putNodeLocked.status).toBe(403);
 
     const putAgLocked = await app.request("/api/v1/admin/tls-profiles/antigravity-electron-15", {
       method: "PUT",

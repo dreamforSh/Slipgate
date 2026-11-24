@@ -264,8 +264,10 @@ type Coordinator struct {
 	vault                 *Vault
 	pool                  *clashpool.Manager
 	stealth               *stealth.AccountDialer
+	directStealth         *stealth.AccountDialer
 	vmSlots               *vmslot.Manager
 	directClient          *http.Client
+	customDirectClient    bool
 	upstreamTimeouts      UpstreamTimeouts
 	bffClient             *http.Client
 	allowPrivateUpstreams bool
@@ -311,10 +313,15 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		logger = log.New(io.Discard, "", 0)
 	}
 	allowPrivate := opts.AllowPrivateUpstreams || netguard.AllowPrivateUpstreamsFromEnv()
+	customDirectClient := opts.DirectClient != nil
 	directClient := opts.DirectClient
 	if directClient == nil {
 		// No whole-request deadline: UpstreamTimeouts bounds the header wait and stream stalls.
 		directClient = netguard.NewSafeHTTPClient(0, allowPrivate)
+	}
+	directStealth := opts.StealthDialer
+	if directStealth == nil {
+		directStealth = stealth.NewAccountDialer(opts.ClashPool)
 	}
 	trustedProxies := opts.TrustedProxies
 	if trustedProxies == nil {
@@ -336,8 +343,10 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		vault:                 NewVault(opts.VaultSecret),
 		pool:                  opts.ClashPool,
 		stealth:               opts.StealthDialer,
+		directStealth:         directStealth,
 		vmSlots:               opts.VMSlots,
 		directClient:          directClient,
+		customDirectClient:    customDirectClient,
 		upstreamTimeouts:      opts.UpstreamTimeouts,
 		bffClient:             &http.Client{Timeout: 5 * time.Second},
 		allowPrivateUpstreams: allowPrivate,
@@ -1467,6 +1476,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			CleanseMode:      cleanseMode,
 			RequestID:        requestID,
 			CatalogProtocols: catalogProtocols,
+			UTLSProfileID:    c.resolveAccountUTLSProfileID(directive.AccountID, directive.Provider, firstNonEmpty(directive.AuthKind, c.accountAuthKind(directive.AccountID)), secret),
 		}
 
 		var releaseVMSeat func()
@@ -1795,15 +1805,7 @@ func (c *Coordinator) executeOutbound(
 		if c.stealth == nil {
 			return nil, errors.New("stealth uTLS dialer is not configured")
 		}
-		utlsProfileID := strings.TrimSpace(secret.UTLSProfileID)
-		if utlsProfileID == "" && c.pool != nil {
-			if binding, ok := c.pool.GetBinding(pctx.AccountID); ok && strings.TrimSpace(binding.UTLSProfileID) != "" {
-				utlsProfileID = strings.TrimSpace(binding.UTLSProfileID)
-			}
-		}
-		if utlsProfileID == "" {
-			utlsProfileID = stealth.DefaultProfileForProvider(pctx.Provider, pctx.AuthKind)
-		}
+		utlsProfileID := c.resolveAccountUTLSProfileID(pctx.AccountID, pctx.Provider, pctx.AuthKind, secret)
 		return c.upstreamTimeouts.do(req.WithContext(ctx), func(out *http.Request) (*http.Response, error) {
 			res, err := c.stealth.DoAccountRequest(out.Context(), pctx.AccountID, utlsProfileID, out)
 			if err != nil {
@@ -1816,11 +1818,53 @@ func (c *Coordinator) executeOutbound(
 		if secret.IsMock() {
 			return ExecuteMockTurn(secret.EffectiveMockTarget(), upstreamModel, egressCodec, turn), nil
 		}
-		if err := netguard.ValidateOutboundURL(req.URL.String(), c.allowPrivateUpstreams); err != nil {
+		return c.upstreamTimeouts.do(req.WithContext(ctx), func(out *http.Request) (*http.Response, error) {
+			return c.executeDirectHTTPRequest(out.Context(), pctx.AccountID, pctx.Provider, pctx.AuthKind, secret, out)
+		})
+	}
+}
+
+func (c *Coordinator) resolveAccountUTLSProfileID(accountID, provider, authKind string, secret AccountSecret) string {
+	utlsProfileID := strings.TrimSpace(secret.UTLSProfileID)
+	if utlsProfileID == "" && c.pool != nil && strings.TrimSpace(accountID) != "" {
+		if binding, ok := c.pool.GetBinding(accountID); ok && strings.TrimSpace(binding.UTLSProfileID) != "" {
+			utlsProfileID = strings.TrimSpace(binding.UTLSProfileID)
+		}
+	}
+	if utlsProfileID == "" {
+		utlsProfileID = stealth.DefaultProfileForProvider(provider, authKind)
+	}
+	return utlsProfileID
+}
+
+func (c *Coordinator) executeDirectHTTPRequest(ctx context.Context, accountID, provider, authKind string, secret AccountSecret, req *http.Request) (*http.Response, error) {
+	if !c.customDirectClient && c.directStealth != nil {
+		utlsProfileID := c.resolveAccountUTLSProfileID(accountID, provider, authKind, secret)
+		out, err := c.directStealth.DoDirectRequest(ctx, accountID, utlsProfileID, req, c.allowPrivateUpstreams)
+		if err != nil {
 			return nil, err
 		}
-		return c.upstreamTimeouts.do(req, c.directClient.Do)
+		return out.Response, nil
 	}
+	if err := netguard.ValidateOutboundURL(req.URL.String(), c.allowPrivateUpstreams); err != nil {
+		return nil, err
+	}
+	return c.directClient.Do(req.WithContext(ctx))
+}
+
+type directStealthRoundTripper struct {
+	dialer        *stealth.AccountDialer
+	accountID     string
+	utlsProfileID string
+	allowPrivate  bool
+}
+
+func (rt directStealthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	out, err := rt.dialer.DoDirectRequest(req.Context(), rt.accountID, rt.utlsProfileID, req, rt.allowPrivate)
+	if err != nil {
+		return nil, err
+	}
+	return out.Response, nil
 }
 
 func (c *Coordinator) accountAuthKind(accountID string) string {
@@ -1840,7 +1884,18 @@ func (c *Coordinator) prepareCloudProviderSecret(ctx context.Context, provider s
 	if cache == nil {
 		cache = defaultVertexTokenCache
 	}
-	tok, err := cache.Resolve(ctx, c.directClient, c.allowPrivateUpstreams, sec)
+	client := c.directClient
+	if !c.customDirectClient && c.directStealth != nil {
+		client = &http.Client{
+			Timeout: 15 * time.Second,
+			Transport: directStealthRoundTripper{
+				dialer:        c.directStealth,
+				utlsProfileID: c.resolveAccountUTLSProfileID("", provider, "", sec),
+				allowPrivate:  c.allowPrivateUpstreams,
+			},
+		}
+	}
+	tok, err := cache.Resolve(ctx, client, c.allowPrivateUpstreams, sec)
 	if err != nil {
 		return sec, err
 	}

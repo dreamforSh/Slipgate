@@ -392,7 +392,7 @@ func applyUpstreamAuthHeaders(req *http.Request, pctx OutboundPersonaContext, se
 		}
 	case "anthropic":
 		if IsClaudeSubscription(pctx, secret) {
-			ApplyClaudeSubscriptionHeaders(req, secret, "")
+			ApplyClaudeSubscriptionHeadersWithContext(req, pctx, secret, "", false, false, CLIClaudeVersion())
 		} else if secret.APIKey != "" {
 			req.Header.Set("x-api-key", secret.APIKey)
 			req.Header.Set("anthropic-version", "2023-06-01")
@@ -402,6 +402,12 @@ func applyUpstreamAuthHeaders(req *http.Request, pctx OutboundPersonaContext, se
 			req.Header.Set("Authorization", "Bearer "+secret.APIKey)
 		}
 	}
+	targetURL := ""
+	if req != nil && req.URL != nil {
+		targetURL = req.URL.String()
+	}
+	applyOpenCodeAndCommandCodeHeaders(req, pctx, secret, targetURL, &CanonicalTurn{})
+	ApplyCLIProviderHeaders(req, pctx, secret, targetURL, CodecOpenAIChat)
 	for k, v := range secret.Headers {
 		if strings.EqualFold(k, "x-oauth-token-url") {
 			continue

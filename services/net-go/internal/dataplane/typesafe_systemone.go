@@ -364,6 +364,7 @@ func (c *Coordinator) probeTypeSafeAccount(
 		AccountID:        accountID,
 		CleanseMode:      "zero",
 		RequestID:        fmt.Sprintf("probe_%s_%d", accountID, time.Now().UnixNano()),
+		UTLSProfileID:    c.resolveAccountUTLSProfileID(accountID, meta.Platform, meta.AuthKind, secret),
 	}
 
 	startedAt := time.Now()
