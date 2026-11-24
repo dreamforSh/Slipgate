@@ -140,6 +140,8 @@ pub const SyncStatePayload = struct {
     wallets: []const SyncWalletJson = &.{},
     priceRules: []const SyncPriceRuleJson = &.{},
     riskBans: []const SyncRiskBanJson = &.{},
+    clearedRiskSubjects: []const []const u8 = &.{},
+    clearAllRiskBans: bool = false,
     userGroupRates: []const SyncUserGroupRateJson = &.{},
     providerModels: []const SyncProviderModelsJson = &.{},
 };
@@ -949,6 +951,19 @@ pub const GatewayEngine = struct {
         }
 
         self.pruneStaleRuntimeMapsLocked(turn_alloc);
+
+        if (in.clearAllRiskBans) {
+            var b_it = self.bans.keyIterator();
+            while (b_it.next()) |k| self.backing.free(k.*);
+            self.bans.clearRetainingCapacity();
+        } else {
+            for (in.clearedRiskSubjects) |subj| {
+                const key = if (std.mem.startsWith(u8, subj, "api_key:")) subj["api_key:".len..] else subj;
+                if (self.bans.fetchRemove(key)) |kv| {
+                    self.backing.free(kv.key);
+                }
+            }
+        }
 
         for (in.riskBans) |rb| {
             if (!std.mem.eql(u8, rb.subjectKind, "api_key") or rb.subjectHash.len == 0) continue;

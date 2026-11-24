@@ -7,6 +7,7 @@ import OpsAccountsTable from "../../components/admin/ops-monitor/OpsAccountsTabl
 import OpsDeadLettersCard from "../../components/admin/ops-monitor/OpsDeadLettersCard.vue";
 import OpsErrorCenterPanel from "../../components/admin/ops-monitor/OpsErrorCenterPanel.vue";
 import OpsAlertsPanel from "../../components/admin/ops-monitor/OpsAlertsPanel.vue";
+import OpsRollupsPanel from "../../components/admin/ops-monitor/OpsRollupsPanel.vue";
 import OpsFleetCard from "../../components/admin/ops-monitor/OpsFleetCard.vue";
 import OpsModelsTable from "../../components/admin/ops-monitor/OpsModelsTable.vue";
 import OpsRecentErrors from "../../components/admin/ops-monitor/OpsRecentErrors.vue";
@@ -31,11 +32,19 @@ const router = useRouter();
 const toast = useToastStore();
 const now = useNow(15_000);
 
-type OpsTab = "overview" | "errors" | "alerts";
-const initialTab = route.query.tab === "errors" ? "errors" : route.query.tab === "alerts" ? "alerts" : "overview";
+type OpsTab = "overview" | "errors" | "alerts" | "rollups";
+const initialTab: OpsTab =
+  route.query.tab === "errors"
+    ? "errors"
+    : route.query.tab === "alerts"
+      ? "alerts"
+      : route.query.tab === "rollups"
+        ? "rollups"
+        : "overview";
 const tab = ref<OpsTab>(initialTab);
 const errorsVisited = ref(tab.value === "errors");
 const alertsVisited = ref(tab.value === "alerts");
+const rollupsVisited = ref(tab.value === "rollups");
 const openErrorCount = ref(0);
 const firingAlertCount = ref(0);
 const errorRefreshToken = ref(0);
@@ -54,11 +63,17 @@ const tabs = computed(() => [
     icon: "bell" as const,
     ...(firingAlertCount.value > 0 ? { count: firingAlertCount.value } : {}),
   },
+  {
+    key: "rollups" as OpsTab,
+    label: t("security.ops.tabs.rollups"),
+    icon: "database" as const,
+  },
 ]);
 
 watch(tab, (value) => {
   if (value === "errors") errorsVisited.value = true;
   if (value === "alerts") alertsVisited.value = true;
+  if (value === "rollups") rollupsVisited.value = true;
   const query = { ...route.query };
   if (value === "overview") delete query.tab;
   else query.tab = value;
@@ -388,6 +403,13 @@ const stats = computed<Stat[]>(() => {
       :now="now"
       :refresh-token="errorRefreshToken"
       @firing-count="firingAlertCount = $event"
+    />
+
+    <OpsRollupsPanel
+      v-if="rollupsVisited"
+      v-show="tab === 'rollups'"
+      :now="now"
+      :refresh-token="errorRefreshToken"
     />
   </div>
 </template>

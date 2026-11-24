@@ -33,6 +33,8 @@ import type { RequestErrorStore } from "./request_errors_types.ts";
 import type { AlertStore } from "./alerts_types.ts";
 import type { ChannelMonitorStore } from "./channel_monitors_types.ts";
 import type { PlatformQuotasStore } from "./platform_quotas_types.ts";
+import type { UsageRollupsStore } from "./usage_rollups_types.ts";
+import type { ModerationStore } from "./moderation_types.ts";
 
 export type StoreErrorCode = "conflict" | "not_found" | "forbidden" | "bad_request";
 
@@ -141,6 +143,10 @@ export interface ControlStore {
   readonly channelMonitors: ChannelMonitorStore;
   /** Per-user per-platform spend quotas (lane U2). */
   readonly platformQuotas: PlatformQuotasStore;
+  /** Usage rollups and retention cleanup (lane O4). */
+  readonly usageRollups: UsageRollupsStore;
+  /** Prompt moderation rules, settings, and events (lane O5). */
+  readonly moderation: ModerationStore;
 
   init(): Promise<void>;
   close(): Promise<void>;
@@ -232,6 +238,8 @@ export interface ControlStore {
 
   recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent>;
   listRiskBanEvents(limit?: number): Promise<RiskBanEvent[]>;
+  unbanRiskSubject(subjectKind: RiskBanEvent["subjectKind"], subjectHash: string): Promise<number>;
+  clearRiskBansAndRefusalCache(): Promise<{ unbanned: number; refusalCacheCleared: number }>;
 
   listPricingRules(): Promise<ModelPricingRule[]>;
   savePricingRules(rules: ModelPricingRule[]): Promise<void>;

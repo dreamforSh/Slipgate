@@ -27,6 +27,8 @@ export * from "./step_up.ts";
 export * from "./request_errors.ts";
 export * from "./alerts.ts";
 export * from "./channel_monitors.ts";
+export * from "./usage_rollups.ts";
+export * from "./moderation.ts";
 export * from "./platform_quotas.ts";
 export * from "./affiliate.ts";
 
@@ -218,11 +220,14 @@ export type VmFleetOverview = z.infer<typeof VmFleetOverviewSchema>;
 export const RiskBanEventSchema = z.object({
   eventId: z.string().min(1),
   subjectKind: z.enum(["device", "session", "api_key", "ip"]),
+  subjectHash: z.string().optional(),
   strikeLevel: z.number().int().min(1).max(3),
   banDuration: z.enum(["10m", "24h", "permanent"]),
   reason: z.string().min(1),
   ordinaryUpstream400Count: z.number().int().nonnegative(),
   downgradedCount: z.number().int().nonnegative(),
+  active: z.boolean().optional(),
+  unbannedAtIso: z.string().nullable().optional(),
   createdAtIso: z.string(),
 });
 export type RiskBanEvent = z.infer<typeof RiskBanEventSchema>;

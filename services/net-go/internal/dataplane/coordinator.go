@@ -136,9 +136,12 @@ type SyncSnapshot struct {
 	APIKeys          []SyncApiKeyInput     `json:"apiKeys"`
 	Wallets          []SyncWalletInput     `json:"wallets"`
 	PriceRules       []SyncPriceRuleInput  `json:"priceRules"`
-	RiskBans         []SyncRiskBanInput    `json:"riskBans"`
-	UserLimits       *SyncUserLimitsInput  `json:"userLimits"` // enforced in user_limits.go
-	DiscoveredModels map[string][]string   `json:"discoveredModels,omitempty"`
+	RiskBans            []SyncRiskBanInput     `json:"riskBans"`
+	ClearedRiskSubjects []string               `json:"clearedRiskSubjects,omitempty"`
+	ClearAllRiskBans    bool                   `json:"clearAllRiskBans,omitempty"`
+	UserLimits          *SyncUserLimitsInput   `json:"userLimits"` // enforced in user_limits.go
+	DiscoveredModels    map[string][]string    `json:"discoveredModels,omitempty"`
+	Moderation          *SyncModerationInput   `json:"moderation,omitempty"`
 }
 
 // SyncAckResult summarizes the result of applying a DataPlaneSyncSnapshot across Go and Zig.
@@ -285,7 +288,8 @@ type Coordinator struct {
 	accountMetas       map[string]accountMeta
 	lastCoreSyncJSON   []byte
 	lastRevisionUnixMs int64
-	userLimits         userLimitGate // per-user / per-group caps (user_limits.go)
+	userLimits         userLimitGate  // per-user / per-group caps (user_limits.go)
+	moderation         moderationGate // prompt moderation rules & external gate (moderation.go)
 	oauthRefresher     oauthRefreshDeduper
 	responsesState     responseStateStore
 	mediaTasks         mediaTaskStore
@@ -588,6 +592,10 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	if riskBans == nil {
 		riskBans = []SyncRiskBanInput{}
 	}
+	clearedRiskSubjects := snap.ClearedRiskSubjects
+	if clearedRiskSubjects == nil {
+		clearedRiskSubjects = []string{}
+	}
 
 	type coreUserGroupRate struct {
 		UserID               string `json:"userId"`
@@ -631,16 +639,18 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	}
 
 	corePayload, err := json.Marshal(map[string]any{
-		"revisionUnixMs": snap.RevisionUnixMs,
-		"groups":         coreGroups,
-		"routes":         routes,
-		"accounts":       coreAccounts,
-		"apiKeys":        coreKeys,
-		"wallets":        coreWallets,
-		"priceRules":     priceRules,
-		"riskBans":       riskBans,
-		"userGroupRates": userGroupRates,
-		"providerModels": providerModels,
+		"revisionUnixMs":      snap.RevisionUnixMs,
+		"groups":              coreGroups,
+		"routes":              routes,
+		"accounts":            coreAccounts,
+		"apiKeys":             coreKeys,
+		"wallets":             coreWallets,
+		"priceRules":          priceRules,
+		"riskBans":            riskBans,
+		"clearedRiskSubjects": clearedRiskSubjects,
+		"clearAllRiskBans":    snap.ClearAllRiskBans,
+		"userGroupRates":      userGroupRates,
+		"providerModels":      providerModels,
 	})
 	if err != nil {
 		return SyncAckResult{}, err
@@ -659,6 +669,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	c.snapshotApplied = true
 	c.mu.Unlock()
 	c.userLimits.apply(snap.UserLimits)
+	c.moderation.Apply(snap.Moderation, c.vault, c.allowPrivateUpstreams)
 
 	res := SyncAckResult{
 		OK:             true,
@@ -1015,6 +1026,67 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 				rep.GroupID = optStringPtr(km.GroupID)
 				c.reportRequestError(rep)
 				WriteProtocolError(w, turn.IngressCodec, rej.status, rej.errType, rej.code, rej.message)
+				return
+			}
+		}
+	}
+
+	if !isModelsReq && strings.TrimSpace(turn.BodyExcerpt) != "" {
+		var modPlatform, modGroupID, modUserID, modKeyID string
+		if km, known := c.lookupKeyByPlaintext(apiKey); known && km.Enabled {
+			modPlatform = km.Platform
+			modGroupID = km.GroupID
+			modUserID = km.UserID
+			modKeyID = km.ID
+		}
+		if verdict := c.moderation.Evaluate(r.Context(), turn.BodyExcerpt, modPlatform, modGroupID); verdict != nil {
+			ev := ModerationEventPayload{
+				RequestID:      requestID,
+				Platform:       modPlatform,
+				PublicModel:    turn.PublicModel,
+				RuleID:         optStringPtr(verdict.RuleID),
+				RuleName:       verdict.RuleName,
+				Source:         verdict.Source,
+				Action:         verdict.Action,
+				MatchedExcerpt: verdict.MatchedExcerpt,
+			}
+			if modUserID != "" {
+				ev.UserID = &modUserID
+			}
+			if modKeyID != "" {
+				ev.APIKeyID = &modKeyID
+			}
+			if modGroupID != "" {
+				ev.GroupID = &modGroupID
+			}
+			c.postModerationEventBounded(ev)
+			if verdict.Action == "block" || verdict.Action == "strike" {
+				if verdict.Action == "strike" && modKeyID != "" {
+					c.postRiskEventBounded(RiskBanEventPayload{
+						SubjectKind:     "api_key",
+						SubjectHash:     modKeyID,
+						StrikeLevel:     1,
+						BanDuration:     "10m",
+						Reason:          "moderation:" + verdict.RuleName,
+						SourceRequestID: requestID,
+					})
+				}
+				rep := buildDirectiveErrorReport(
+					r, requestID, startedAt, nil, turn.PublicModel,
+					"ingress", "content_policy_violation", http.StatusBadRequest, 0,
+					"invalid_request_error", "content_policy_violation", verdict.RejectMessage, "", 1, false,
+				)
+				if modUserID != "" {
+					rep.UserID = &modUserID
+				}
+				if modKeyID != "" {
+					rep.APIKeyID = &modKeyID
+				}
+				if modGroupID != "" {
+					rep.GroupID = &modGroupID
+				}
+				c.reportRequestError(rep)
+				WriteProtocolError(w, turn.IngressCodec, http.StatusBadRequest, "invalid_request_error", "content_policy_violation", verdict.RejectMessage)
 				return
 			}
 		}
@@ -1730,6 +1802,13 @@ func (c *Coordinator) postRiskEventBounded(ev RiskBanEventPayload) {
 		return
 	}
 	c.postInternalJSONBounded("/api/v1/internal/dataplane/risk-events", ev)
+}
+
+func (c *Coordinator) postModerationEventBounded(ev ModerationEventPayload) {
+	if c.bffOrigin == "" || c.internalToken == "" {
+		return
+	}
+	c.postInternalJSONBounded("/api/v1/internal/dataplane/moderation-events", ev)
 }
 
 func (c *Coordinator) postInternalJSONBounded(path string, payload any) {

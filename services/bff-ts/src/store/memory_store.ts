@@ -46,6 +46,8 @@ import { MemoryRequestErrorStore } from "./memory_request_errors.ts";
 import { MemoryAlertStore } from "./memory_alerts.ts";
 import { MemoryChannelMonitorStore } from "./memory_channel_monitors.ts";
 import { MemoryPlatformQuotasStore } from "./memory_platform_quotas.ts";
+import { MemoryUsageRollupsStore } from "./memory_usage_rollups.ts";
+import { MemoryModerationStore } from "./memory_moderation.ts";
 import type { OpsStore } from "./ops_types.ts";
 import type { PaymentsStore } from "./payments_types.ts";
 import {
@@ -123,7 +125,11 @@ export class MemoryControlStore implements ControlStore {
   private readonly usageLogs: UsageLogItem[] = [];
   private pricingRules: ModelPricingRule[] | null = null;
   private readonly mediaTasks = new Map<string, PersistedMediaTaskRecord>();
-  private readonly riskEvents: RiskBanEvent[] = [];
+  private readonly riskEvents: {
+    event: RiskBanEvent;
+    expiresAtMs: number | null;
+    unbannedAtMs: number | null;
+  }[] = [];
   private readonly activeRiskBans = new Map<
     string,
     { subjectKind: RiskBanEvent["subjectKind"]; subjectHash: string; strikeLevel: number; bannedUntilUnixMs: number }
@@ -175,6 +181,12 @@ export class MemoryControlStore implements ControlStore {
     users: this.users,
     usageLogs: this.usageLogs,
   });
+
+  readonly usageRollups = new MemoryUsageRollupsStore({
+    usageLogs: this.usageLogs,
+  });
+
+  readonly moderation = new MemoryModerationStore();
 
   readonly payments: PaymentsStore = new MemoryPaymentsStore(
     {
@@ -1048,8 +1060,9 @@ export class MemoryControlStore implements ControlStore {
 
   async recordRiskBanEvent(ev: RecordRiskBanInput): Promise<RiskBanEvent> {
     const nowMs = Date.now();
-    const bannedUntilUnixMs =
-      ev.banDuration === "permanent" ? -1 : ev.banDuration === "24h" ? nowMs + 24 * 3_600_000 : nowMs + 10 * 60_000;
+    const expiresAtMs =
+      ev.banDuration === "permanent" ? null : ev.banDuration === "24h" ? nowMs + 24 * 3_600_000 : nowMs + 10 * 60_000;
+    const bannedUntilUnixMs = expiresAtMs ?? -1;
     const banKey = `${ev.subjectKind}:${ev.subjectHash}`;
     const prevBan = this.activeRiskBans.get(banKey);
     this.activeRiskBans.set(banKey, {
@@ -1064,14 +1077,17 @@ export class MemoryControlStore implements ControlStore {
     const record: RiskBanEvent = {
       eventId: `rsk_${crypto.randomUUID()}`,
       subjectKind: ev.subjectKind,
+      subjectHash: ev.subjectHash,
       strikeLevel: ev.strikeLevel,
       banDuration: ev.banDuration,
       reason: ev.reason,
       ordinaryUpstream400Count: ev.ordinaryUpstream400Count,
       downgradedCount: ev.downgradedCount,
+      active: true,
+      unbannedAtIso: null,
       createdAtIso: new Date(nowMs).toISOString(),
     };
-    this.riskEvents.unshift(record);
+    this.riskEvents.unshift({ event: record, expiresAtMs, unbannedAtMs: null });
     if (this.riskEvents.length > 200) {
       this.riskEvents.length = 200;
     }
@@ -1079,7 +1095,47 @@ export class MemoryControlStore implements ControlStore {
   }
 
   async listRiskBanEvents(limit = 50): Promise<RiskBanEvent[]> {
-    return this.riskEvents.slice(0, Math.max(1, Math.min(200, limit))).map((e) => ({ ...e }));
+    const nowMs = Date.now();
+    return this.riskEvents.slice(0, Math.max(1, Math.min(200, limit))).map((entry) => ({
+      ...entry.event,
+      active: entry.unbannedAtMs === null && (entry.expiresAtMs === null || entry.expiresAtMs > nowMs),
+      unbannedAtIso: entry.unbannedAtMs !== null ? new Date(entry.unbannedAtMs).toISOString() : null,
+    }));
+  }
+
+  async unbanRiskSubject(subjectKind: RiskBanEvent["subjectKind"], subjectHash: string): Promise<number> {
+    const nowMs = Date.now();
+    const removedActive = this.activeRiskBans.delete(`${subjectKind}:${subjectHash}`);
+    let updated = 0;
+    for (const entry of this.riskEvents) {
+      if (
+        entry.event.subjectKind === subjectKind &&
+        entry.event.subjectHash === subjectHash &&
+        entry.unbannedAtMs === null &&
+        (entry.expiresAtMs === null || entry.expiresAtMs > nowMs)
+      ) {
+        entry.unbannedAtMs = nowMs;
+        updated += 1;
+      }
+    }
+    return updated > 0 ? updated : removedActive ? 1 : 0;
+  }
+
+  async clearRiskBansAndRefusalCache(): Promise<{ unbanned: number; refusalCacheCleared: number }> {
+    const nowMs = Date.now();
+    const activeCount = this.activeRiskBans.size;
+    this.activeRiskBans.clear();
+    let updated = 0;
+    for (const entry of this.riskEvents) {
+      if (entry.unbannedAtMs === null && (entry.expiresAtMs === null || entry.expiresAtMs > nowMs)) {
+        entry.unbannedAtMs = nowMs;
+        updated += 1;
+      }
+    }
+    return {
+      unbanned: Math.max(updated, activeCount),
+      refusalCacheCleared: 0,
+    };
   }
 
   async listPricingRules(): Promise<ModelPricingRule[]> {

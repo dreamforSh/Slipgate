@@ -106,29 +106,46 @@ func (v *Vault) EncryptHex(plaintext string) (string, error) {
 	return hex.EncodeToString(sealed), nil
 }
 
-// DecryptHex decrypts hex([12-byte IV][AES-256-GCM ciphertext+tag]) and parses raw keys, `baseUrl|apiKey`, `mock://*`, or JSON credentials.
-func (v *Vault) DecryptHex(encHex string) (AccountSecret, error) {
+func (v *Vault) decryptRawHex(encHex string) ([]byte, error) {
 	raw, err := hex.DecodeString(strings.TrimSpace(encHex))
 	if err != nil {
-		return AccountSecret{}, fmt.Errorf("dataplane: invalid credential hex: %w", err)
+		return nil, fmt.Errorf("dataplane: invalid credential hex: %w", err)
 	}
 	block, err := aes.NewCipher(v.key[:])
 	if err != nil {
-		return AccountSecret{}, err
+		return nil, err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return AccountSecret{}, err
+		return nil, err
 	}
 	nonceSize := gcm.NonceSize()
 	if len(raw) <= nonceSize+gcm.Overhead()-1 {
-		return AccountSecret{}, ErrCiphertextTooShort
+		return nil, ErrCiphertextTooShort
 	}
 	plain, err := gcm.Open(nil, raw[:nonceSize], raw[nonceSize:], nil)
 	if err != nil {
-		return AccountSecret{}, fmt.Errorf("dataplane: decrypt credential failed: %w", err)
+		return nil, fmt.Errorf("dataplane: decrypt credential failed: %w", err)
+	}
+	return plain, nil
+}
+
+// DecryptHex decrypts hex([12-byte IV][AES-256-GCM ciphertext+tag]) and parses raw keys, `baseUrl|apiKey`, `mock://*`, or JSON credentials.
+func (v *Vault) DecryptHex(encHex string) (AccountSecret, error) {
+	plain, err := v.decryptRawHex(encHex)
+	if err != nil {
+		return AccountSecret{}, err
 	}
 	return ParseAccountSecret(string(plain)), nil
+}
+
+// DecryptPlaintextHex decrypts hex([12-byte IV][AES-256-GCM ciphertext+tag]) into raw plaintext.
+func (v *Vault) DecryptPlaintextHex(encHex string) (string, error) {
+	plain, err := v.decryptRawHex(encHex)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
 }
 
 // ParseAccountSecret parses plaintext credential material into structured fields.

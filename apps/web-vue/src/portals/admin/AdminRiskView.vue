@@ -3,7 +3,9 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import type { RiskBanEvent } from "@slipgate/contracts";
 import RiskLadderCard from "../../components/admin/ops-monitor/RiskLadderCard.vue";
+import RiskModerationPanel from "../../components/admin/ops-monitor/RiskModerationPanel.vue";
 import { staggerStyle } from "../../components/admin/ops-monitor/opsFormat";
+import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
 import SegmentedControl from "../../components/ui/SegmentedControl.vue";
@@ -12,10 +14,12 @@ import UiBadge from "../../components/ui/UiBadge.vue";
 import UiCard from "../../components/ui/UiCard.vue";
 import UiIcon, { type IconName } from "../../components/ui/UiIcon.vue";
 import UiPagination from "../../components/ui/UiPagination.vue";
+import UiTabs from "../../components/ui/UiTabs.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import { useNow } from "../../composables/useNow";
 import { apiJson, errorText } from "../../lib/api";
-import { formatDateTime, formatNumber, formatRelative, type Tone } from "../../lib/format";
+import { formatDateTime, formatNumber, formatRelative, shortHash, type Tone } from "../../lib/format";
+import { useToastStore } from "../../stores/toast";
 
 type Kind = RiskBanEvent["subjectKind"];
 type Duration = RiskBanEvent["banDuration"];
@@ -27,7 +31,25 @@ interface RiskEventsResponse {
 }
 
 const { t } = useI18n();
+const toast = useToastStore();
 const now = useNow(60_000);
+
+type RiskTab = "bans" | "moderation" | "events";
+const tab = ref<RiskTab>("bans");
+const moderationVisited = ref(false);
+const eventsVisited = ref(false);
+const refreshToken = ref(0);
+
+const tabs = computed(() => [
+  { key: "bans" as RiskTab, label: t("security.risk.tabs.bans"), icon: "shield-alert" as const },
+  { key: "moderation" as RiskTab, label: t("security.risk.tabs.moderation"), icon: "sliders" as const },
+  { key: "events" as RiskTab, label: t("security.risk.tabs.events"), icon: "list" as const },
+]);
+
+watch(tab, (val) => {
+  if (val === "moderation") moderationVisited.value = true;
+  if (val === "events") eventsVisited.value = true;
+});
 
 const KINDS: Kind[] = ["device", "session", "api_key", "ip"];
 const DURATIONS: Duration[] = ["10m", "24h", "permanent"];
@@ -141,18 +163,85 @@ function resetFilters() {
   kindFilter.value = "all";
   durationFilter.value = "all";
 }
+
+const clearingAll = ref(false);
+const unbanningId = ref<string | null>(null);
+
+function banStateOf(e: RiskBanEvent): "active" | "unbanned" | "expired" {
+  if (e.unbannedAtIso) return "unbanned";
+  if (e.active === false) return "expired";
+  return "active";
+}
+
+async function unbanEvent(e: RiskBanEvent) {
+  if (!e.subjectHash) return;
+  unbanningId.value = e.eventId;
+  try {
+    const res = await apiJson<{ ok: boolean; unbanned: number }>("/api/v1/admin/risk/unban", {
+      method: "POST",
+      body: { subjectKind: e.subjectKind, subjectHash: e.subjectHash },
+      fallbackError: t("security.risk.errors.unban"),
+    });
+    toast.success(t("security.risk.unbanDone", { n: formatNumber(res.unbanned) }));
+    await load();
+  } catch (err) {
+    toast.error(errorText(err, t("security.risk.errors.unban")));
+  } finally {
+    unbanningId.value = null;
+  }
+}
+
+async function clearAllBans() {
+  clearingAll.value = true;
+  try {
+    const res = await apiJson<{ ok: boolean; unbanned: number; refusalCacheCleared: number }>("/api/v1/admin/risk/clear-cache", {
+      method: "POST",
+      fallbackError: t("security.risk.errors.clearAll"),
+    });
+    toast.success(
+      t("security.risk.clearAllDone", {
+        unbanned: formatNumber(res.unbanned),
+        cache: formatNumber(res.refusalCacheCleared),
+      }),
+    );
+    await load();
+  } catch (err) {
+    toast.error(errorText(err, t("security.risk.errors.clearAll")));
+  } finally {
+    clearingAll.value = false;
+  }
+}
+
+function refreshActiveTab() {
+  refreshToken.value += 1;
+  void load();
+}
 </script>
 
 <template>
   <div class="space-y-6">
     <PageHeader :title="t('nav.risk')">
       <template #actions>
-        <button type="button" class="btn btn-secondary" :disabled="loading" @click="load">
-          <UiIcon name="refresh" :size="15" :spin="loading" />
-          {{ t("common.refresh") }}
-        </button>
+        <div class="flex flex-wrap items-center gap-2">
+          <ConfirmButton
+            size="sm"
+            icon="rotate-ccw"
+            :label="t('security.risk.clearAll')"
+            :confirm-label="t('security.risk.confirmClearAll')"
+            :disabled="clearingAll"
+            @confirm="clearAllBans"
+          />
+          <button type="button" class="btn btn-secondary" :disabled="loading" @click="refreshActiveTab">
+            <UiIcon name="refresh" :size="15" :spin="loading" />
+            {{ t("common.refresh") }}
+          </button>
+        </div>
       </template>
     </PageHeader>
+
+    <UiTabs v-model="tab" :items="tabs" />
+
+    <div v-show="tab === 'bans'" class="space-y-6">
 
     <div class="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
       <StatCard
@@ -216,11 +305,13 @@ function resetFilters() {
               <tr>
                 <th>{{ t("security.risk.table.time") }}</th>
                 <th>{{ t("security.risk.table.subject") }}</th>
+                <th>{{ t("security.risk.table.status") }}</th>
                 <th>{{ t("security.risk.table.strike") }}</th>
                 <th>{{ t("security.risk.table.duration") }}</th>
                 <th>{{ t("security.risk.table.reason") }}</th>
                 <th class="text-right">{{ t("security.risk.table.upstream400") }}</th>
                 <th class="text-right">{{ t("security.risk.table.downgraded") }}</th>
+                <th class="text-right">{{ t("common.actions") }}</th>
               </tr>
             </thead>
             <tbody>
@@ -235,10 +326,20 @@ function resetFilters() {
                   <p class="mt-0.5 font-mono text-2xs text-fg-subtle">{{ formatDateTime(e.createdAtIso) }}</p>
                 </td>
                 <td class="whitespace-nowrap">
-                  <span class="inline-flex items-center gap-2 text-xs text-fg">
+                  <div class="flex items-center gap-2 text-xs text-fg">
                     <span class="icon-chip h-6 w-6"><UiIcon :name="KIND_ICON[e.subjectKind]" :size="13" /></span>
-                    {{ t(`security.risk.kinds.${e.subjectKind}`) }}
-                  </span>
+                    <div>
+                      <p>{{ t(`security.risk.kinds.${e.subjectKind}`) }}</p>
+                      <p v-if="e.subjectHash" class="font-mono text-2xs text-fg-subtle" :title="e.subjectHash">
+                        {{ shortHash(e.subjectHash, 14) }}
+                      </p>
+                    </div>
+                  </div>
+                </td>
+                <td>
+                  <UiBadge :tone="banStateOf(e) === 'active' ? 'danger' : 'neutral'" dot>
+                    {{ t(`security.risk.states.${banStateOf(e)}`) }}
+                  </UiBadge>
                 </td>
                 <td>
                   <UiBadge :tone="STRIKE_TONE[e.strikeLevel] ?? 'neutral'" dot>{{ t("security.risk.strike", { n: e.strikeLevel }) }}</UiBadge>
@@ -258,6 +359,19 @@ function resetFilters() {
                 <td class="text-right font-mono text-xs tabular-nums" :class="e.downgradedCount > 0 ? 'text-warning' : 'text-fg-subtle'">
                   {{ formatNumber(e.downgradedCount) }}
                 </td>
+                <td class="text-right whitespace-nowrap">
+                  <button
+                    v-if="banStateOf(e) === 'active' && e.subjectHash"
+                    type="button"
+                    class="btn btn-secondary btn-xs"
+                    :disabled="unbanningId === e.eventId"
+                    @click="unbanEvent(e)"
+                  >
+                    <UiIcon :name="unbanningId === e.eventId ? 'loader' : 'rotate-ccw'" :size="12" :spin="unbanningId === e.eventId" />
+                    {{ t("security.risk.unban") }}
+                  </button>
+                  <span v-else class="text-2xs text-fg-subtle">—</span>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -271,5 +385,22 @@ function resetFilters() {
         />
       </template>
     </UiCard>
+    </div>
+
+    <RiskModerationPanel
+      v-if="moderationVisited"
+      v-show="tab === 'moderation'"
+      mode="moderation"
+      :now="now"
+      :refresh-token="refreshToken"
+    />
+
+    <RiskModerationPanel
+      v-if="eventsVisited"
+      v-show="tab === 'events'"
+      mode="events"
+      :now="now"
+      :refresh-token="refreshToken"
+    />
   </div>
 </template>

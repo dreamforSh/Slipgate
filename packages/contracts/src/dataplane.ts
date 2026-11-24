@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DataPlaneSyncModerationSchema } from "./moderation.ts";
 import {
   ExecutionModeSchema,
   GroupPlatformSchema,
@@ -137,6 +138,12 @@ export const DataPlaneSyncSnapshotSchema = z.object({
   userLimits: DataPlaneSyncUserLimitsSchema.optional(),
   /** SWR-discovered upstream model IDs per provider from active accounts. */
   discoveredModels: z.record(z.string(), z.array(z.string())).optional(),
+  /** Prompt moderation policy + encrypted external API key synced to slipgate-net. */
+  moderation: DataPlaneSyncModerationSchema.optional(),
+  /** Unbanned `<kind>:<hash>` subject keys to purge from slipgate-core's in-memory ban table. */
+  clearedRiskSubjects: z.array(z.string()).optional(),
+  /** Clear all active bans in slipgate-core when admin triggers global ban cache flush. */
+  clearAllRiskBans: z.boolean().optional(),
 });
 export type DataPlaneSyncSnapshot = z.infer<typeof DataPlaneSyncSnapshotSchema>;
 

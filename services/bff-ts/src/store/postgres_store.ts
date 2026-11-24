@@ -53,6 +53,8 @@ import { PG_REQUEST_ERRORS_SCHEMA_SQL, PostgresRequestErrorStore } from "./postg
 import { PG_ALERTS_SCHEMA_SQL, PostgresAlertStore } from "./postgres_alerts.ts";
 import { PG_CHANNEL_MONITORS_SCHEMA_SQL, PostgresChannelMonitorStore } from "./postgres_channel_monitors.ts";
 import { PG_PLATFORM_QUOTAS_SCHEMA_SQL, PostgresPlatformQuotasStore } from "./postgres_platform_quotas.ts";
+import { PG_USAGE_ROLLUPS_SCHEMA_SQL, PostgresUsageRollupsStore } from "./postgres_usage_rollups.ts";
+import { PG_MODERATION_SCHEMA_SQL, PostgresModerationStore } from "./postgres_moderation.ts";
 import {
   PG_SETTLEMENT_SCHEMA_SQL,
   pruneSettlementIds,
@@ -138,6 +140,8 @@ export class PostgresControlStore implements ControlStore {
   readonly alerts: PostgresAlertStore;
   readonly channelMonitors: PostgresChannelMonitorStore;
   readonly platformQuotas: PostgresPlatformQuotasStore;
+  readonly usageRollups: PostgresUsageRollupsStore;
+  readonly moderation: PostgresModerationStore;
   private backgroundMaintenance: Promise<void> = Promise.resolve();
   /** Earliest time of the next opportunistic core.settlement_ids prune (off the settlement tx). */
   private settlementPruneAt = 0;
@@ -158,6 +162,8 @@ export class PostgresControlStore implements ControlStore {
     this.alerts = new PostgresAlertStore(this.sql);
     this.channelMonitors = new PostgresChannelMonitorStore(this.sql);
     this.platformQuotas = new PostgresPlatformQuotasStore(this.sql);
+    this.usageRollups = new PostgresUsageRollupsStore(this.sql);
+    this.moderation = new PostgresModerationStore(this.sql);
   }
 
   async init(): Promise<void> {
@@ -548,6 +554,8 @@ export class PostgresControlStore implements ControlStore {
     await this.sql.unsafe(PG_ALERTS_SCHEMA_SQL);
     await this.sql.unsafe(PG_CHANNEL_MONITORS_SCHEMA_SQL);
     await this.sql.unsafe(PG_PLATFORM_QUOTAS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_USAGE_ROLLUPS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_MODERATION_SCHEMA_SQL);
     // Index builds and the one-time spend backfill must not delay startup or block settlements.
     // So is the one-off pass of the current audit-log redaction over rows older builds stored.
     const auditScrub = await pendingAuditSecretScrub(this.sql);
@@ -1936,7 +1944,8 @@ export class PostgresControlStore implements ControlStore {
         SELECT DISTINCT ON (subject_kind, subject_hash)
           subject_kind, subject_hash, strike_level, expires_at
         FROM core.risk_ban_records
-        WHERE expires_at IS NULL OR expires_at > NOW()
+        WHERE unbanned_at IS NULL
+          AND (expires_at IS NULL OR expires_at > NOW())
         ORDER BY subject_kind, subject_hash, strike_level DESC, created_at DESC
       `,
     ]);
@@ -2337,11 +2346,14 @@ export class PostgresControlStore implements ControlStore {
     return {
       eventId: id,
       subjectKind: ev.subjectKind,
+      subjectHash: ev.subjectHash,
       strikeLevel: ev.strikeLevel,
       banDuration: ev.banDuration,
       reason: ev.reason,
       ordinaryUpstream400Count: ev.ordinaryUpstream400Count,
       downgradedCount: ev.downgradedCount,
+      active: true,
+      unbannedAtIso: null,
       createdAtIso: toIso(rows[0]?.created_at),
     };
   }
@@ -2352,34 +2364,75 @@ export class PostgresControlStore implements ControlStore {
       {
         id: string;
         subject_kind: RiskBanEvent["subjectKind"];
+        subject_hash: string;
         strike_level: number;
         ban_reason: string;
         expires_at: Date | null;
+        unbanned_at: Date | null;
         created_at: Date;
       }[]
     >`
-      SELECT id, subject_kind, strike_level, ban_reason, expires_at, created_at
+      SELECT id, subject_kind, subject_hash, strike_level, ban_reason, expires_at, unbanned_at, created_at
       FROM core.risk_ban_records
       ORDER BY created_at DESC
       LIMIT ${capped}
     `;
+    const nowMs = Date.now();
     return rows.map((r) => {
       let banDuration: RiskBanEvent["banDuration"] = "permanent";
       if (r.expires_at) {
         const diffMs = r.expires_at.getTime() - r.created_at.getTime();
         banDuration = diffMs > 3_600_000 ? "24h" : "10m";
       }
+      const unbannedAtIso = r.unbanned_at ? toIso(r.unbanned_at) : null;
+      const active = r.unbanned_at === null && (r.expires_at === null || r.expires_at.getTime() > nowMs);
       return {
         eventId: r.id,
         subjectKind: r.subject_kind,
+        subjectHash: r.subject_hash,
         strikeLevel: r.strike_level,
         banDuration,
         reason: r.ban_reason,
         ordinaryUpstream400Count: 0,
         downgradedCount: 0,
+        active,
+        unbannedAtIso,
         createdAtIso: toIso(r.created_at),
       };
     });
+  }
+
+  async unbanRiskSubject(subjectKind: RiskBanEvent["subjectKind"], subjectHash: string): Promise<number> {
+    const rows = await this.sql<{ id: string }[]>`
+      UPDATE core.risk_ban_records
+      SET unbanned_at = NOW()
+      WHERE subject_kind = ${subjectKind}
+        AND subject_hash = ${subjectHash}
+        AND unbanned_at IS NULL
+        AND (expires_at IS NULL OR expires_at > NOW())
+      RETURNING id
+    `;
+    return rows.length;
+  }
+
+  async clearRiskBansAndRefusalCache(): Promise<{ unbanned: number; refusalCacheCleared: number }> {
+    const [banRows, cacheRows] = await Promise.all([
+      this.sql<{ id: string }[]>`
+        UPDATE core.risk_ban_records
+        SET unbanned_at = NOW()
+        WHERE unbanned_at IS NULL
+          AND (expires_at IS NULL OR expires_at > NOW())
+        RETURNING id
+      `,
+      this.sql<{ request_fingerprint: string }[]>`
+        DELETE FROM core.refusal_cache
+        RETURNING request_fingerprint
+      `,
+    ]);
+    return {
+      unbanned: banRows.length,
+      refusalCacheCleared: cacheRows.length,
+    };
   }
 
   async listPricingRules(): Promise<ModelPricingRule[]> {

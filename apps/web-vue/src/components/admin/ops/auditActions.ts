@@ -107,6 +107,17 @@ export const AUDIT_ACTION_KEYS: Record<string, string> = {
   [`DELETE ${A}/channel-monitors/:id`]: "channelMonitorDelete",
   [`POST ${A}/channel-monitors/:id/run`]: "channelMonitorRun",
 
+  [`PATCH ${A}/ops/usage-rollups/config`]: "opsRollupsConfig",
+  [`PATCH ${A}/usage-rollups/config`]: "opsRollupsConfig",
+  [`POST ${A}/usage-rollups/backfill`]: "opsRollupsBackfill",
+  [`POST ${A}/usage-rollups/cleanup`]: "opsRollupsCleanup",
+  [`PATCH ${A}/moderation/settings`]: "moderationSettingsUpdate",
+  [`POST ${A}/moderation/rules`]: "moderationRuleCreate",
+  [`PUT ${A}/moderation/rules/:id`]: "moderationRuleUpdate",
+  [`DELETE ${A}/moderation/rules/:id`]: "moderationRuleDelete",
+  [`POST ${A}/risk/unban`]: "riskUnban",
+  [`POST ${A}/risk/clear-cache`]: "riskClearCache",
+
   [`PUT ${A}/affiliates/rates/:userId`]: "affiliateRateUpdate",
   [`POST ${A}/affiliates/withdrawals/:id/review`]: "affiliateWithdrawalReview",
 

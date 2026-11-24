@@ -101,6 +101,9 @@ import { AuthGuards, BACKEND_MODE_REFUSAL, conflictRefusal, refusalResponse, reg
 import { RegistrationGuardError } from "./store/auth_guards_store.ts";
 import { registerUserLimitRoutes, repriceForUser, UserRateCache, withApiKeyDefaults, withUserLimits } from "./routes/user_limits.ts";
 import { registerPlatformQuotaRoutes } from "./routes/platform_quotas.ts";
+import { UsageRollupService } from "./usage_rollups/service.ts";
+import { registerUsageRollupRoutes } from "./routes/usage_rollups.ts";
+import { registerModerationRoutes } from "./routes/moderation.ts";
 import {
   credentialFingerprint,
   decryptSecret,
@@ -542,21 +545,59 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return diff === 0;
   }
 
+  const PENDING_UNBAN_TTL_MS = 60_000;
+  const PENDING_UNBAN_MAX = 1000;
+  const pendingClearedRiskSubjects = new Map<string, number>();
+  let pendingClearAllRiskBansUntilMs = 0;
+
+  function onRiskUnban(subjectHash: string): void {
+    const trimmed = subjectHash.trim();
+    if (!trimmed) return;
+    pendingClearedRiskSubjects.delete(trimmed);
+    pendingClearedRiskSubjects.set(trimmed, Date.now());
+    while (pendingClearedRiskSubjects.size > PENDING_UNBAN_MAX) {
+      const oldestKey = pendingClearedRiskSubjects.keys().next().value;
+      if (!oldestKey) break;
+      pendingClearedRiskSubjects.delete(oldestKey);
+    }
+  }
+
+  function onRiskClearAll(): void {
+    pendingClearedRiskSubjects.clear();
+    pendingClearAllRiskBansUntilMs = Date.now() + PENDING_UNBAN_TTL_MS;
+  }
+
   /**
    * The store snapshot with keys of suspended users, ungranted exclusive groups and unusable
    * subscriptions turned off, plus the enabled price rules so slipgate-core holds and settles at
    * the prices the BFF bills.
    */
   async function exportEffectiveSnapshot(): Promise<DataPlaneSyncSnapshot> {
-    const [snapshot, access, entitlements, groups, overLimit, rules] = await Promise.all([
+    const [snapshot, access, entitlements, groups, overLimit, rules, moderation] = await Promise.all([
       store.exportDataPlaneSnapshot(),
       store.ops.listUserAccess(),
       store.ops.subscriptionEntitlements(),
       store.listGroups(false),
       store.listOverLimitKeyIds(),
       pricing.rules(),
+      store.moderation.exportDataPlaneModeration(),
     ]);
-    const effective = { ...applyEntitlements(snapshot, access, entitlements, groups, new Set(overLimit)), priceRules: snapshotPriceRules(rules) };
+    const nowMs = Date.now();
+    for (const [k, addedMs] of pendingClearedRiskSubjects) {
+      if (nowMs - addedMs > PENDING_UNBAN_TTL_MS) pendingClearedRiskSubjects.delete(k);
+    }
+    const clearAllRiskBans = pendingClearAllRiskBansUntilMs > nowMs;
+    const clearedRiskSubjects = clearAllRiskBans ? [] : Array.from(pendingClearedRiskSubjects.keys());
+    const effective = {
+      ...applyEntitlements(snapshot, access, entitlements, groups, new Set(overLimit)),
+      priceRules: snapshotPriceRules(rules),
+      moderation,
+      ...(clearAllRiskBans
+        ? { clearAllRiskBans: true }
+        : clearedRiskSubjects.length > 0
+          ? { clearedRiskSubjects }
+          : {}),
+    };
     // Per-user / per-group RPM and concurrency caps (slipgate-net enforces them; key limits clamped).
     return withUserLimits(store, effective);
   }
@@ -629,8 +670,9 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   const dataPlanePush = new CoalescingRunner(async () => {
     const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
     if (!internalUrl || !internalToken) return;
+    const pushedAtMs = Date.now();
     const snapshot = await sharedSnapshot();
-    await fetch(`${internalUrl}/internal/net/dataplane/sync`, {
+    const pushRes = await fetch(`${internalUrl}/internal/net/dataplane/sync`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -639,6 +681,14 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       body: JSON.stringify(snapshot),
       signal: AbortSignal.timeout(2500),
     });
+    if (pushRes.ok) {
+      for (const [k, addedMs] of pendingClearedRiskSubjects) {
+        if (addedMs <= pushedAtMs) pendingClearedRiskSubjects.delete(k);
+      }
+      if (pendingClearAllRiskBansUntilMs > 0 && pendingClearAllRiskBansUntilMs <= pushedAtMs + PENDING_UNBAN_TTL_MS) {
+        pendingClearAllRiskBansUntilMs = 0;
+      }
+    }
     // Failures are swallowed by the runner: the DataPlane coordinator also pulls every 15 s.
   });
 
@@ -2697,6 +2747,16 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   mountAuditRetention(app, store, options.startSchedulers === true, vaultSecret);
   registerSystemLogRoutes(app, store, systemLogs, { verifyInternal: verifyInternalHeader });
   registerRequestErrorRoutes(app, store, { verifyInternal: verifyInternalHeader });
+  registerUsageRollupRoutes(app, store);
+  const usageRollupService = new UsageRollupService({ store });
+  if (options.startSchedulers) usageRollupService.start();
+  registerModerationRoutes(app, store, {
+    verifyInternal: verifyInternalHeader,
+    vaultSecret,
+    syncDataPlane: syncDataPlaneBestEffort,
+    onRiskUnban,
+    onRiskClearAll,
+  });
   const alertService = new AlertService({
     store,
     mail: () => mail,
