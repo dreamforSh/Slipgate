@@ -100,7 +100,6 @@ export class AlertService {
     const windowMs = Math.max(1, rule.windowMinutes) * 60_000;
     const sinceMs = nowMs - windowMs;
     const sinceIso = new Date(sinceMs).toISOString();
-    const untilIso = new Date(nowMs).toISOString();
     const scope = rule.scope ?? {};
 
     switch (rule.metric) {
@@ -150,7 +149,7 @@ export class AlertService {
           );
           return total;
         }
-        const summary = await this.store.requestErrors.summarizeRequestErrors(sinceIso, untilIso);
+        const summary = await this.store.requestErrors.summarizeRequestErrors(sinceIso);
         return summary.openCount;
       }
       case "dead_letter_count": {
