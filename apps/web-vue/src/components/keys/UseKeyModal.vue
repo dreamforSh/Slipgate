@@ -57,6 +57,10 @@ const MODEL_BY_PLATFORM: Record<string, string> = {
   qwen: "qwen3-coder-plus",
   bedrock: "anthropic.claude-sonnet-4-5-20250929-v1:0",
   vertex: "gemini-2.5-flash",
+  opencode_go: "glm-5.3",
+  command_code: "deepseek/deepseek-v4-flash",
+  cline: "deepseek/deepseek-v4-flash",
+  typesafe: "jev-latest",
 };
 
 const CLIENT_ICON: Record<Client, IconName> = {
@@ -83,6 +87,8 @@ function defaultClient(platform: string | undefined): Client {
     case "gemini":
     case "antigravity":
       return "gemini";
+    case "typesafe":
+      return "curl";
     default:
       return "sdk";
   }
@@ -297,9 +303,32 @@ const snippets = computed<Snippet[]>(() => {
       ];
 
     default: {
-      const url = `${base}/v1/chat/completions`;
+      const isTypeSafe = props.group?.platform === "typesafe" || mdl.startsWith("jev-");
+      const url = isTypeSafe ? `${base}/v1/systemone` : `${base}/v1/chat/completions`;
       let content: string;
-      if (os.value === "powershell") {
+      if (isTypeSafe) {
+        if (os.value === "powershell") {
+          content = [
+            `$headers = @{ Authorization = "Bearer ${key}" }`,
+            `$body = @{ model = "${mdl}"; state = "Hello!"; questions = @{ check = @{ type = "noul"; instructions = "Is this valid?" } } } | ConvertTo-Json -Depth 6`,
+            `Invoke-RestMethod -Uri "${url}" -Method Post -Headers $headers -ContentType "application/json" -Body $body`,
+          ].join("\n");
+        } else if (os.value === "cmd") {
+          content = [
+            `curl ${url} ^`,
+            `  -H "Authorization: Bearer ${key}" ^`,
+            `  -H "Content-Type: application/json" ^`,
+            `  -d "{\\"model\\":\\"${mdl}\\",\\"state\\":\\"Hello!\\",\\"questions\\":{\\"check\\":{\\"type\\":\\"noul\\",\\"instructions\\":\\"Is this valid?\\"}}}"`,
+          ].join("\n");
+        } else {
+          content = [
+            `curl ${url} \\`,
+            `  -H "Authorization: Bearer ${key}" \\`,
+            `  -H "Content-Type: application/json" \\`,
+            `  -d '{"model":"${mdl}","state":"Hello!","questions":{"check":{"type":"noul","instructions":"Is this valid?"}}}'`,
+          ].join("\n");
+        }
+      } else if (os.value === "powershell") {
         content = [
           `$headers = @{ Authorization = "Bearer ${key}" }`,
           `$body = @{ model = "${mdl}"; messages = @(@{ role = "user"; content = "Hello!" }) } | ConvertTo-Json -Depth 5`,

@@ -88,7 +88,7 @@ export function detectBuiltinProvider(model: string): Provider | null {
     return "glm";
   }
   if (model.startsWith("kimi-") || model.startsWith("moonshot-")) return "kimi";
-  if (model.startsWith("minimax-") || model.startsWith("abab")) return "minimax";
+  if (model.toLowerCase().startsWith("minimax-") || model.startsWith("abab")) return "minimax";
   if (model.startsWith("qwen-") || model.startsWith("wanx-")) return "qwen";
   if (
     model.startsWith("bedrock/") ||
@@ -99,6 +99,22 @@ export function detectBuiltinProvider(model: string): Provider | null {
     return "bedrock";
   }
   if (model.startsWith("vertex/") || model.startsWith("vertex_ai/")) return "vertex";
+  if (model.startsWith("jev-") || model.startsWith("typesafe/")) return "typesafe";
+  if (
+    model.startsWith("opencode_go/") ||
+    model.startsWith("opencode-go/") ||
+    model.startsWith("opencode/") ||
+    model.startsWith("longcat-") ||
+    model.startsWith("mimo-") ||
+    model.startsWith("muse-spark-") ||
+    model === "hy3" ||
+    model.startsWith("hy4-") ||
+    model.startsWith("omen-")
+  ) {
+    return "opencode_go";
+  }
+  if (model.startsWith("command_code/") || model.startsWith("command-code/")) return "command_code";
+  if (model.startsWith("cline/") || model.startsWith("cline-pass/") || model.startsWith("cline-free/")) return "cline";
   return null;
 }
 
@@ -125,6 +141,13 @@ export const BUILTIN_MODEL_CANDIDATES: readonly string[] = [
   "deepseek-chat",
   "deepseek-reasoner",
   "glm-4.6",
+  "kimi-k2",
+  "MiniMax-M2",
+  "qwen-max",
+  "opencode_go/glm-5.3",
+  "jev-latest",
+  "command_code/deepseek/deepseek-v4-flash",
+  "cline-pass/glm-5.3-flash",
 ];
 
 /**

@@ -37,6 +37,11 @@ type AccountSecret struct {
 	BaseURL          string            `json:"baseUrl,omitempty"`
 	UTLSProfileID    string            `json:"utlsProfileId,omitempty"`
 	Headers          map[string]string `json:"headers,omitempty"`
+	// Multi-protocol provider configuration (migrated from Wei-Shaw/sub2api).
+	AccountMode   string            `json:"accountMode,omitempty"`
+	APIProtocol   string            `json:"apiProtocol,omitempty"`
+	APIBaseURLs   map[string]string `json:"apiBaseUrls,omitempty"`
+	ProtocolRules []ProtocolRule    `json:"protocolRules,omitempty"`
 	// AWS Bedrock credentials & region.
 	AWSAccessKeyID     string `json:"awsAccessKeyId,omitempty"`
 	AWSSecretAccessKey string `json:"awsSecretAccessKey,omitempty"`
@@ -207,6 +212,15 @@ func ParseAccountSecret(raw string) AccountSecret {
 			Scope            string            `json:"scope"`
 			Email            string            `json:"email"`
 			Headers          map[string]string `json:"headers"`
+			// Multi-protocol provider fields (camelCase & snake_case).
+			AccountMode      string            `json:"accountMode"`
+			AltAccountMode   string            `json:"account_mode"`
+			APIProtocol      string            `json:"apiProtocol"`
+			AltAPIProtocol   string            `json:"api_protocol"`
+			APIBaseURLs      map[string]string `json:"apiBaseUrls"`
+			AltAPIBaseURLs   map[string]string `json:"api_base_urls"`
+			ProtocolRules    []ProtocolRule    `json:"protocolRules"`
+			AltProtocolRules []ProtocolRule    `json:"protocol_rules"`
 			// AWS Bedrock / custom endpoint aliases.
 			AltEndpoint          string `json:"endpoint"`
 			AWSAccessKeyID       string `json:"awsAccessKeyId"`
@@ -293,6 +307,16 @@ func ParseAccountSecret(raw string) AccountSecret {
 			org := firstNonEmpty(envelope.OrganizationID, envelope.AltOrgID)
 			base := firstNonEmpty(envelope.BaseURL, envelope.AltBaseURL, envelope.AltEndpoint)
 			prof := firstNonEmpty(envelope.UTLSProfileID, envelope.AltProfileID)
+			accMode := strings.ToLower(firstNonEmpty(envelope.AccountMode, envelope.AltAccountMode))
+			apiProto := strings.ToLower(firstNonEmpty(envelope.APIProtocol, envelope.AltAPIProtocol))
+			apiBaseURLs := cloneHeaders(envelope.APIBaseURLs)
+			if len(apiBaseURLs) == 0 {
+				apiBaseURLs = cloneHeaders(envelope.AltAPIBaseURLs)
+			}
+			protoRules := cloneProtocolRules(envelope.ProtocolRules)
+			if len(protoRules) == 0 {
+				protoRules = cloneProtocolRules(envelope.AltProtocolRules)
+			}
 			awsKey := firstNonEmpty(envelope.AWSAccessKeyID, envelope.AltAWSAccessKeyID, envelope.AccessKeyID, envelope.AltAccessKeyID)
 			awsSecret := firstNonEmpty(envelope.AWSSecretAccessKey, envelope.AltAWSSecretKey, envelope.SecretAccessKey, envelope.AltSecretAccessKey)
 			awsSess := firstNonEmpty(envelope.AWSSessionToken, envelope.AltAWSSessionToken, envelope.SessionToken, envelope.AltSessionToken)
@@ -336,6 +360,10 @@ func ParseAccountSecret(raw string) AccountSecret {
 				BaseURL:          base,
 				UTLSProfileID:    prof,
 				Headers:          cloneHeaders(envelope.Headers),
+				AccountMode:      accMode,
+				APIProtocol:      apiProto,
+				APIBaseURLs:      apiBaseURLs,
+				ProtocolRules:    protoRules,
 				AWSAccessKeyID:     awsKey,
 				AWSSecretAccessKey: awsSecret,
 				AWSSessionToken:    awsSess,
@@ -410,6 +438,8 @@ func (v *Vault) Get(accountID string) (AccountSecret, bool) {
 func cloneAccountSecret(sec AccountSecret) AccountSecret {
 	out := sec
 	out.Headers = cloneHeaders(sec.Headers)
+	out.APIBaseURLs = cloneHeaders(sec.APIBaseURLs)
+	out.ProtocolRules = cloneProtocolRules(sec.ProtocolRules)
 	return out
 }
 

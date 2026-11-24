@@ -14,6 +14,10 @@ pub const Provider = enum {
     qwen,
     bedrock,
     vertex,
+    opencode_go,
+    typesafe,
+    command_code,
+    cline,
 };
 
 pub const EndpointKind = enum {
@@ -26,6 +30,7 @@ pub const EndpointKind = enum {
     images,
     videos,
     gemini,
+    systemone,
 };
 
 pub const MatchType = enum {
@@ -150,7 +155,7 @@ fn detectBuiltinProvider(model: []const u8) ?Provider {
         std.mem.startsWith(u8, model, "cogvideox-") or
         std.mem.eql(u8, model, "embedding-3")) return .glm;
     if (std.mem.startsWith(u8, model, "kimi-") or std.mem.startsWith(u8, model, "moonshot-")) return .kimi;
-    if (std.mem.startsWith(u8, model, "minimax-") or std.mem.startsWith(u8, model, "abab")) return .minimax;
+    if (std.ascii.startsWithIgnoreCase(model, "minimax-") or std.mem.startsWith(u8, model, "abab")) return .minimax;
     if (std.mem.startsWith(u8, model, "qwen-") or
         std.mem.startsWith(u8, model, "qwq-") or
         std.mem.startsWith(u8, model, "wanx-") or
@@ -160,6 +165,20 @@ fn detectBuiltinProvider(model: []const u8) ?Provider {
         std.mem.startsWith(u8, model, "amazon.nova") or
         std.mem.startsWith(u8, model, "amazon.titan")) return .bedrock;
     if (std.mem.startsWith(u8, model, "vertex/") or std.mem.startsWith(u8, model, "vertex_ai/")) return .vertex;
+    if (std.mem.startsWith(u8, model, "jev-") or std.mem.startsWith(u8, model, "typesafe/")) return .typesafe;
+    if (std.mem.startsWith(u8, model, "opencode_go/") or
+        std.mem.startsWith(u8, model, "opencode-go/") or
+        std.mem.startsWith(u8, model, "opencode/") or
+        std.mem.startsWith(u8, model, "longcat-") or
+        std.mem.startsWith(u8, model, "mimo-") or
+        std.mem.startsWith(u8, model, "muse-spark-") or
+        std.mem.eql(u8, model, "hy3") or
+        std.mem.startsWith(u8, model, "hy4-") or
+        std.mem.startsWith(u8, model, "omen-")) return .opencode_go;
+    if (std.mem.startsWith(u8, model, "command_code/") or std.mem.startsWith(u8, model, "command-code/")) return .command_code;
+    if (std.mem.startsWith(u8, model, "cline/") or
+        std.mem.startsWith(u8, model, "cline-pass/") or
+        std.mem.startsWith(u8, model, "cline-free/")) return .cline;
     return null;
 }
 
@@ -204,4 +223,22 @@ test "builtin detector distinguishes codex and antigravity models" {
 
     const qwen_match = try resolveRoute(&.{}, .chat_completions, "qwen-max");
     try std.testing.expectEqual(Provider.qwen, qwen_match.provider);
+
+    const mm_match = try resolveRoute(&.{}, .chat_completions, "MiniMax-M2");
+    try std.testing.expectEqual(Provider.minimax, mm_match.provider);
+
+    const oc_match = try resolveRoute(&.{}, .chat_completions, "opencode_go/glm-5.3");
+    try std.testing.expectEqual(Provider.opencode_go, oc_match.provider);
+
+    const hy4_match = try resolveRoute(&.{}, .chat_completions, "hy4-preview");
+    try std.testing.expectEqual(Provider.opencode_go, hy4_match.provider);
+
+    const ts_match = try resolveRoute(&.{}, .systemone, "jev-latest");
+    try std.testing.expectEqual(Provider.typesafe, ts_match.provider);
+
+    const cc_match = try resolveRoute(&.{}, .chat_completions, "command_code/deepseek/deepseek-v4-flash");
+    try std.testing.expectEqual(Provider.command_code, cc_match.provider);
+
+    const cline_match = try resolveRoute(&.{}, .chat_completions, "cline-pass/glm-5.3-flash");
+    try std.testing.expectEqual(Provider.cline, cline_match.provider);
 }

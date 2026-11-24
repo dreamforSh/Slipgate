@@ -337,6 +337,13 @@ const SUB2API_PLATFORMS: Record<string, Provider | ((type: string) => Provider)>
   aws: "bedrock",
   vertex: "vertex",
   "vertex-ai": "vertex",
+  opencode_go: "opencode_go",
+  "opencode-go": "opencode_go",
+  opencode: "opencode_go",
+  typesafe: "typesafe",
+  command_code: "command_code",
+  "command-code": "command_code",
+  cline: "cline",
 };
 
 const SUB2API_TYPES: Record<string, AccountAuthKind> = {

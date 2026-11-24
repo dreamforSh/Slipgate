@@ -258,6 +258,9 @@ func ProviderEgressCodecWithPersona(pctx OutboundPersonaContext, secret AccountS
 		!strings.EqualFold(pctx.ExecutionMode, "vm_slot") && isOfficialOpenAIBase(secret.BaseURL) {
 		return CodecOpenAIResponses
 	}
+	if mpEgress, _, _, _, ok := resolveMultiProtocolRoute(pctx.Provider, secret, ingress, "", pctx.CatalogProtocols); ok {
+		return mpEgress
+	}
 	switch strings.ToLower(strings.TrimSpace(pctx.Provider)) {
 	case "anthropic":
 		return CodecAnthropicMessages
@@ -1221,9 +1224,30 @@ func BuildUpstreamHTTPRequestWithPersona(
 	turn *CanonicalTurn,
 ) (*http.Request, CodecKind, error) {
 	cleanseMode := firstNonEmpty(pctx.CleanseMode, "zero")
+	if strings.EqualFold(strings.TrimSpace(pctx.Provider), "opencode_go") && IsOpenCodeUnsupportedModel(upstreamModel) {
+		return nil, CodecOpenAIChat, ErrOpenCodeUnsupportedModel{Model: upstreamModel}
+	}
+
 	egress := ProviderEgressCodecWithPersona(pctx, secret, turn.IngressCodec)
 	baseURL := resolveProviderBaseURL(pctx.Provider, secret.BaseURL)
+	responsesPath := ""
+	effectiveModel := stripPlatformWrapperPrefix(pctx.Provider, upstreamModel)
+	if mpEgress, mpBase, mpRespPath, mpModel, ok := resolveMultiProtocolRoute(
+		pctx.Provider,
+		secret,
+		turn.IngressCodec,
+		upstreamModel,
+		pctx.CatalogProtocols,
+	); ok {
+		egress = mpEgress
+		if mpBase != "" {
+			baseURL = mpBase
+		}
+		responsesPath = mpRespPath
+		effectiveModel = mpModel
+	}
 	isClaudeSub := IsClaudeSubscription(pctx, secret)
+	isCodexSub := IsCodexSubscription(pctx, secret)
 
 	filteredTools := make([]CanonicalTool, 0, len(turn.Tools))
 	for _, t := range turn.Tools {
@@ -1235,9 +1259,9 @@ func BuildUpstreamHTTPRequestWithPersona(
 
 	switch strings.ToLower(strings.TrimSpace(pctx.Provider)) {
 	case "bedrock":
-		return buildBedrockConverseRequest(ctx, upstreamModel, secret, turn, filteredTools)
+		return buildBedrockConverseRequest(ctx, effectiveModel, secret, turn, filteredTools)
 	case "vertex":
-		return buildVertexRequest(ctx, pctx, upstreamModel, secret, turn, filteredTools)
+		return buildVertexRequest(ctx, pctx, effectiveModel, secret, turn, filteredTools)
 	}
 
 	var (
@@ -1246,10 +1270,10 @@ func BuildUpstreamHTTPRequestWithPersona(
 		err     error
 	)
 
-	turn.NativePassthrough = nativePassthroughEligible(pctx, secret, turn, egress, upstreamModel)
+	turn.NativePassthrough = nativePassthroughEligible(pctx, secret, turn, egress, effectiveModel)
 	switch {
 	case turn.NativePassthrough:
-		fullURL, bodyRaw, err = buildNativePassthrough(baseURL, upstreamModel, turn, egress)
+		fullURL, bodyRaw, err = buildNativePassthrough(baseURL, responsesPath, effectiveModel, turn, egress)
 
 	case egress == CodecAnthropicCountTokens:
 		suffix := "/v1/messages/count_tokens"
@@ -1257,7 +1281,7 @@ func BuildUpstreamHTTPRequestWithPersona(
 			suffix += "?beta=true"
 		}
 		fullURL = joinProviderPath(baseURL, suffix)
-		bodyRaw, err = encodeAnthropicRequestBody(upstreamModel, turn, filteredTools, false, false, pctx, isClaudeSub)
+		bodyRaw, err = encodeAnthropicRequestBody(effectiveModel, turn, filteredTools, false, false, pctx, isClaudeSub)
 
 	case egress == CodecAnthropicMessages:
 		suffix := "/v1/messages"
@@ -1265,13 +1289,19 @@ func BuildUpstreamHTTPRequestWithPersona(
 			suffix += "?beta=true"
 		}
 		fullURL = joinProviderPath(baseURL, suffix)
-		bodyRaw, err = encodeAnthropicRequestBody(upstreamModel, turn, filteredTools, turn.Stream, true, pctx, isClaudeSub)
+		bodyRaw, err = encodeAnthropicRequestBody(effectiveModel, turn, filteredTools, turn.Stream, true, pctx, isClaudeSub)
 
 	case egress == CodecOpenAIResponses:
-		fullURL = resolveCodexResponsesURL(pctx, secret)
+		if isCodexSub {
+			fullURL = resolveCodexResponsesURL(pctx, secret)
+		} else if LookupProviderProfile(pctx.Provider) != nil || responsesPath != "" {
+			fullURL = joinResponsesPath(baseURL, responsesPath)
+		} else {
+			fullURL = resolveCodexResponsesURL(pctx, secret)
+		}
 		ak := strings.ToLower(strings.TrimSpace(pctx.AuthKind))
-		forceStream := ak == "oauth" || ak == "vm_cli_seed" || strings.TrimSpace(secret.ChatGPTAccountID) != "" || strings.Contains(strings.ToLower(fullURL), "/backend-api/codex")
-		bodyRaw, err = EncodeCodexResponsesRequestBody(upstreamModel, turn, filteredTools, forceStream)
+		forceStream := isCodexSub && (ak == "oauth" || ak == "vm_cli_seed" || strings.TrimSpace(secret.ChatGPTAccountID) != "" || strings.Contains(strings.ToLower(fullURL), "/backend-api/codex"))
+		bodyRaw, err = EncodeCodexResponsesRequestBody(effectiveModel, turn, filteredTools, forceStream)
 
 	case egress == CodecAntigravityInternal:
 		action := ":generateContent"
@@ -1279,19 +1309,19 @@ func BuildUpstreamHTTPRequestWithPersona(
 			action = ":streamGenerateContent?alt=sse"
 		}
 		fullURL = joinProviderPath(baseURL, "/v1internal"+action)
-		bodyRaw, err = EncodeAntigravityRequestBody(upstreamModel, pctx, secret, turn, filteredTools)
+		bodyRaw, err = EncodeAntigravityRequestBody(effectiveModel, pctx, secret, turn, filteredTools)
 
 	case egress == CodecGeminiGenerate:
 		action := ":generateContent"
 		if turn.Stream {
 			action = ":streamGenerateContent?alt=sse"
 		}
-		fullURL = joinProviderPath(baseURL, "/v1beta/models/"+upstreamModel+action)
-		bodyRaw, err = encodeGeminiRequestBodyForModel(upstreamModel, turn, filteredTools)
+		fullURL = joinProviderPath(baseURL, "/v1beta/models/"+effectiveModel+action)
+		bodyRaw, err = encodeGeminiRequestBodyForModel(effectiveModel, turn, filteredTools)
 
 	default:
 		fullURL = joinOpenAIChatPath(baseURL)
-		bodyRaw, err = encodeOpenAIChatRequestBody(pctx.Provider, upstreamModel, turn, filteredTools)
+		bodyRaw, err = encodeOpenAIChatRequestBody(pctx.Provider, effectiveModel, turn, filteredTools)
 	}
 	if err != nil {
 		return nil, egress, err
@@ -1317,6 +1347,9 @@ func BuildUpstreamHTTPRequestWithPersona(
 		} else {
 			if secret.APIKey != "" {
 				req.Header.Set("x-api-key", secret.APIKey)
+				if !strings.EqualFold(strings.TrimSpace(pctx.Provider), "anthropic") {
+					req.Header.Set("Authorization", "Bearer "+secret.APIKey)
+				}
 			}
 			version := "2023-06-01"
 			if turn.NativePassthrough {
@@ -1330,12 +1363,10 @@ func BuildUpstreamHTTPRequestWithPersona(
 			req.Header.Set("anthropic-version", version)
 		}
 	case CodecOpenAIResponses:
-		if turn.NativePassthrough {
-			if secret.APIKey != "" {
-				req.Header.Set("Authorization", "Bearer "+secret.APIKey)
-			}
-		} else {
+		if isCodexSub && !turn.NativePassthrough {
 			ApplyCodexSubscriptionHeaders(req, pctx, secret)
+		} else if secret.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+secret.APIKey)
 		}
 	case CodecAntigravityInternal:
 		ApplyAntigravityHeaders(req, pctx, secret)
@@ -1352,6 +1383,8 @@ func BuildUpstreamHTTPRequestWithPersona(
 			req.Header.Set("Authorization", "Bearer "+secret.APIKey)
 		}
 	}
+
+	applyOpenCodeAndCommandCodeHeaders(req, pctx, secret, fullURL, turn)
 
 	for k, v := range secret.Headers {
 		if strings.TrimSpace(k) != "" {
@@ -2414,13 +2447,21 @@ func resolveProviderBaseURL(provider, custom string) string {
 	case "kimi":
 		return "https://api.moonshot.cn/v1"
 	case "minimax":
-		return "https://api.minimax.chat/v1"
+		return "https://api.minimaxi.com/v1"
 	case "qwen":
 		return "https://dashscope.aliyuncs.com/compatible-mode/v1"
 	case "bedrock":
 		return "https://bedrock-runtime.us-east-1.amazonaws.com"
 	case "vertex":
 		return "https://us-central1-aiplatform.googleapis.com"
+	case "opencode_go":
+		return "https://opencode.ai/zen/go/v1"
+	case "typesafe":
+		return DefaultTypeSafeBaseURL
+	case "command_code":
+		return "https://api.commandcode.ai/provider/v1"
+	case "cline":
+		return "https://api.cline.bot/api/v1"
 	default:
 		return "https://api.openai.com"
 	}

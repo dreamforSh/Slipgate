@@ -30,6 +30,7 @@ type OutboundPersonaContext struct {
 	RuntimeProfile   string
 	CleanseMode      string
 	RequestID        string
+	CatalogProtocols []string
 }
 
 // IsClaudeSubscription reports whether outbound traffic should emulate official Claude Code Pro/Max OAuth/CLI wire format.

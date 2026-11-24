@@ -27,15 +27,15 @@ func nativePassthroughEligible(pctx OutboundPersonaContext, secret AccountSecret
 	provider := strings.ToLower(strings.TrimSpace(pctx.Provider))
 	switch egress {
 	case CodecAnthropicMessages, CodecAnthropicCountTokens:
-		return provider == "anthropic"
+		return provider == "anthropic" || LookupProviderProfile(provider) != nil
 	case CodecGeminiGenerate:
 		return provider == "gemini"
 	case CodecOpenAIResponses:
-		return provider == "openai"
+		return provider == "openai" || LookupProviderProfile(provider) != nil
 	case CodecOpenAIChat:
 		// OpenAI-compatible vendors differ in which OpenAI parameters they accept. Forward verbatim
 		// only to OpenAI itself, or when the caller addressed the vendor's model by its own name.
-		return provider == "openai" || strings.TrimSpace(turn.PublicModel) == strings.TrimSpace(upstreamModel)
+		return provider == "openai" || strings.TrimSpace(stripPlatformWrapperPrefix(provider, turn.PublicModel)) == strings.TrimSpace(upstreamModel)
 	}
 	return false
 }
@@ -52,7 +52,7 @@ func isOfficialOpenAIBase(base string) bool {
 
 // buildNativePassthrough rewrites only the model (and, for streamed Chat, asks for the usage
 // chunk billing needs) and returns the upstream URL and body.
-func buildNativePassthrough(baseURL, upstreamModel string, turn *CanonicalTurn, egress CodecKind) (string, []byte, error) {
+func buildNativePassthrough(baseURL, responsesPath, upstreamModel string, turn *CanonicalTurn, egress CodecKind) (string, []byte, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(turn.RawBody, &obj); err != nil {
 		return "", nil, err
@@ -76,7 +76,7 @@ func buildNativePassthrough(baseURL, upstreamModel string, turn *CanonicalTurn, 
 		fullURL = joinOpenAIChatPath(baseURL)
 	case CodecOpenAIResponses:
 		obj["model"] = modelRaw
-		fullURL = joinProviderPath(baseURL, "/v1/responses")
+		fullURL = joinResponsesPath(baseURL, responsesPath)
 	case CodecGeminiGenerate:
 		action := ":generateContent"
 		if turn.Stream {

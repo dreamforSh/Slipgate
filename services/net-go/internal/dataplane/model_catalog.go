@@ -105,8 +105,19 @@ func (c *Coordinator) RefreshUpstreamModelCatalog(ctx context.Context, force boo
 			probedProviders[prov] = true
 			continue
 		}
+		if prov == "typesafe" {
+			probedProviders[prov] = true
+			c.modelCatalog.put(prov, []string{TypeSafeJevLatestModel})
+			updatedAny = true
+			continue
+		}
 		sec, ok := c.vault.Get(accID)
 		if !ok || sec.IsMock() || strings.TrimSpace(sec.APIKey) == "" {
+			if prov == "opencode_go" && !c.modelCatalog.isFresh(prov, now) {
+				probedProviders[prov] = true
+				c.modelCatalog.put(prov, DefaultOpenCodeGoModelIDs())
+				updatedAny = true
+			}
 			continue
 		}
 		probedProviders[prov] = true
@@ -114,6 +125,9 @@ func (c *Coordinator) RefreshUpstreamModelCatalog(ctx context.Context, force boo
 		models, err := c.fetchProviderModelsOnce(ctx, accID, meta, sec)
 		if err == nil && len(models) > 0 {
 			c.modelCatalog.put(prov, models)
+			updatedAny = true
+		} else if prov == "opencode_go" {
+			c.modelCatalog.put(prov, DefaultOpenCodeGoModelIDs())
 			updatedAny = true
 		}
 	}
@@ -130,6 +144,11 @@ func (c *Coordinator) fetchProviderModelsOnce(ctx context.Context, accountID str
 
 	prov := strings.ToLower(strings.TrimSpace(meta.Platform))
 	baseURL := resolveProviderBaseURL(prov, sec.BaseURL)
+	if profile := LookupProviderProfile(prov); profile != nil {
+		if chatBase := resolveMultiProtocolBaseURL(profile, sec, APIProtocolChatCompletions); chatBase != "" {
+			baseURL = chatBase
+		}
+	}
 	targetURL := joinProviderPath(baseURL, "/v1/models")
 	if prov == "gemini" {
 		targetURL = joinProviderPath(baseURL, "/v1beta/models")
@@ -146,6 +165,7 @@ func (c *Coordinator) fetchProviderModelsOnce(ctx context.Context, accountID str
 		AccountID:     accountID,
 	}
 	applyUpstreamAuthHeaders(req, pctx, sec)
+	applyOpenCodeAndCommandCodeHeaders(req, pctx, sec, targetURL, &CanonicalTurn{})
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.executeControlHTTPRequest(reqCtx, accountID, meta, sec, req)

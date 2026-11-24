@@ -14,8 +14,197 @@ export const ProviderSchema = z.enum([
   "qwen",
   "bedrock",
   "vertex",
+  "opencode_go",
+  "typesafe",
+  "command_code",
+  "cline",
 ]);
 export type Provider = z.infer<typeof ProviderSchema>;
+
+export const AccountModeSchema = z.enum(["payg", "coding", "go", "zen"]);
+export type AccountMode = z.infer<typeof AccountModeSchema>;
+
+export const NativeApiProtocolSchema = z.enum(["chat_completions", "anthropic", "responses"]);
+export type NativeApiProtocol = z.infer<typeof NativeApiProtocolSchema>;
+
+export const ApiProtocolSchema = z.enum(["adaptive", "chat_completions", "anthropic", "responses"]);
+export type ApiProtocol = z.infer<typeof ApiProtocolSchema>;
+
+export const ProtocolRuleSchema = z.object({
+  pattern: z.string().min(1).max(128),
+  protocol: NativeApiProtocolSchema,
+  protocols: z.array(NativeApiProtocolSchema).optional(),
+});
+export type ProtocolRule = z.infer<typeof ProtocolRuleSchema>;
+
+export interface PlatformModeSpec {
+  mode: AccountMode;
+  baseUrls: Partial<Record<NativeApiProtocol, string>>;
+  protocolRules?: ProtocolRule[];
+}
+
+export interface PlatformMultiProtocolSpec {
+  defaultMode: AccountMode;
+  routing: "by_inbound" | "by_model";
+  responsesPath?: string;
+  modelCatalog?: boolean;
+  defaultTestModel?: string;
+  modes: PlatformModeSpec[];
+}
+
+/** Multi-protocol provider presets migrated from Wei-Shaw/sub2api (`provider_profile.go`). */
+export const PLATFORM_MULTI_PROTOCOL_CATALOG: Partial<Record<Provider, PlatformMultiProtocolSpec>> = {
+  kimi: {
+    defaultMode: "payg",
+    routing: "by_inbound",
+    modes: [
+      {
+        mode: "payg",
+        baseUrls: {
+          chat_completions: "https://api.moonshot.cn/v1",
+          responses: "https://api.moonshot.cn/v1",
+          anthropic: "https://api.moonshot.cn/anthropic",
+        },
+      },
+      {
+        mode: "coding",
+        baseUrls: {
+          chat_completions: "https://api.kimi.com/coding/v1",
+          responses: "https://api.kimi.com/coding/v1",
+          anthropic: "https://api.kimi.com/coding",
+        },
+      },
+    ],
+  },
+  glm: {
+    defaultMode: "payg",
+    routing: "by_inbound",
+    modes: [
+      {
+        mode: "payg",
+        baseUrls: {
+          chat_completions: "https://open.bigmodel.cn/api/paas/v4",
+          anthropic: "https://open.bigmodel.cn/api/anthropic",
+        },
+      },
+      {
+        mode: "coding",
+        baseUrls: {
+          chat_completions: "https://open.bigmodel.cn/api/coding/paas/v4",
+          anthropic: "https://open.bigmodel.cn/api/anthropic",
+        },
+      },
+    ],
+  },
+  deepseek: {
+    defaultMode: "payg",
+    routing: "by_inbound",
+    responsesPath: "/responses",
+    modes: [
+      {
+        mode: "payg",
+        baseUrls: {
+          chat_completions: "https://api.deepseek.com",
+          responses: "https://api.deepseek.com",
+          anthropic: "https://api.deepseek.com/anthropic",
+        },
+      },
+    ],
+  },
+  minimax: {
+    defaultMode: "payg",
+    routing: "by_inbound",
+    modes: [
+      {
+        mode: "payg",
+        baseUrls: {
+          chat_completions: "https://api.minimaxi.com/v1",
+          responses: "https://api.minimaxi.com/v1",
+          anthropic: "https://api.minimaxi.com/anthropic",
+        },
+      },
+      {
+        mode: "coding",
+        baseUrls: {
+          chat_completions: "https://api.minimaxi.com/v1",
+          responses: "https://api.minimaxi.com/v1",
+          anthropic: "https://api.minimaxi.com/anthropic",
+        },
+      },
+    ],
+  },
+  opencode_go: {
+    defaultMode: "go",
+    routing: "by_model",
+    defaultTestModel: "glm-5.3",
+    modes: [
+      {
+        mode: "go",
+        baseUrls: {
+          chat_completions: "https://opencode.ai/zen/go/v1",
+          responses: "https://opencode.ai/zen/go/v1",
+          anthropic: "https://opencode.ai/zen/go",
+        },
+        protocolRules: [
+          { pattern: "grok-*", protocol: "responses" },
+          { pattern: "gpt-*", protocol: "responses" },
+          { pattern: "muse-spark-*", protocol: "responses" },
+          { pattern: "minimax-*", protocol: "anthropic" },
+          { pattern: "qwen*", protocol: "anthropic" },
+        ],
+      },
+      {
+        mode: "zen",
+        baseUrls: {
+          chat_completions: "https://opencode.ai/zen/v1",
+          responses: "https://opencode.ai/zen/v1",
+          anthropic: "https://opencode.ai/zen",
+        },
+        protocolRules: [
+          { pattern: "grok-*", protocol: "responses" },
+          { pattern: "gpt-*", protocol: "responses" },
+          { pattern: "muse-spark-*", protocol: "responses" },
+          { pattern: "claude-*", protocol: "anthropic" },
+          { pattern: "qwen3.8-max", protocol: "chat_completions" },
+          { pattern: "qwen*", protocol: "anthropic" },
+        ],
+      },
+    ],
+  },
+  command_code: {
+    defaultMode: "payg",
+    routing: "by_model",
+    modelCatalog: true,
+    defaultTestModel: "deepseek/deepseek-v4-flash",
+    modes: [
+      {
+        mode: "payg",
+        baseUrls: {
+          chat_completions: "https://api.commandcode.ai/provider/v1",
+          responses: "https://api.commandcode.ai/provider/v1",
+          anthropic: "https://api.commandcode.ai/provider",
+        },
+        protocolRules: [
+          { pattern: "claude-*", protocol: "anthropic" },
+          { pattern: "gpt-*", protocol: "responses", protocols: ["responses", "chat_completions"] },
+        ],
+      },
+    ],
+  },
+  cline: {
+    defaultMode: "payg",
+    routing: "by_inbound",
+    defaultTestModel: "deepseek/deepseek-v4-flash",
+    modes: [
+      {
+        mode: "payg",
+        baseUrls: {
+          chat_completions: "https://api.cline.bot/api/v1",
+        },
+      },
+    ],
+  },
+};
 
 export const SubscriptionTierSchema = z.enum([
   "standard",
@@ -402,4 +591,8 @@ export const ACCOUNT_TEST_MODELS: Record<Provider, string[]> = {
   qwen: ["qwen-plus", "qwen-max"],
   bedrock: ["anthropic.claude-sonnet-4-5-20250929-v1:0", "anthropic.claude-haiku-4-5-20251001-v1:0"],
   vertex: ["gemini-2.5-flash", "gemini-2.5-pro", "claude-sonnet-4-5@20250929"],
+  opencode_go: ["glm-5.3", "grok-4.7", "minimax-m3"],
+  typesafe: ["jev-latest"],
+  command_code: ["deepseek/deepseek-v4-flash", "claude-sonnet-4-6"],
+  cline: ["deepseek/deepseek-v4-flash", "cline-pass/glm-5.3-flash"],
 };

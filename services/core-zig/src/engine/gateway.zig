@@ -572,6 +572,7 @@ fn inferEndpoint(path: []const u8) composite.EndpointKind {
     if (std.mem.startsWith(u8, path, "/v1/embeddings")) return .embeddings;
     if (std.mem.startsWith(u8, path, "/v1/images")) return .images;
     if (std.mem.startsWith(u8, path, "/v1/videos")) return .videos;
+    if (std.mem.startsWith(u8, path, "/v1/systemone")) return .systemone;
     if (std.mem.startsWith(u8, path, "/v1beta/")) {
         if (std.mem.endsWith(u8, path, ":countTokens")) return .count_tokens;
         if (std.mem.endsWith(u8, path, ":embedContent") or std.mem.endsWith(u8, path, ":batchEmbedContents")) return .embeddings;
@@ -604,7 +605,13 @@ const builtin_model_candidates = [_][]const u8{
     "deepseek-chat",
     "deepseek-reasoner",
     "glm-4.6",
+    "kimi-k2",
+    "MiniMax-M2",
     "qwen-max",
+    "opencode_go/glm-5.3",
+    "jev-latest",
+    "command_code/deepseek/deepseek-v4-flash",
+    "cline-pass/glm-5.3-flash",
 };
 
 fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
@@ -624,14 +631,20 @@ fn banRetryAfterMs(d: risk_gate.BanDuration) u64 {
     };
 }
 
-/// Builtin-detected models inside a non-composite antigravity/codex group run on that group's
-/// platform; explicit rules and composite groups keep the resolved provider.
+/// Builtin-detected models inside a non-composite antigravity/codex/bedrock/vertex/aggregator
+/// group run on that group's platform; explicit rules and composite groups keep the resolved provider.
 fn effectiveProvider(group: GroupRecord, route_match: composite.RouteMatch) composite.Provider {
     if (std.mem.eql(u8, group.platform, "composite") or route_match.source != .builtin_detector) {
         return route_match.provider;
     }
     if (std.meta.stringToEnum(composite.Provider, group.platform)) |grp_prov| {
-        if (grp_prov == .antigravity or grp_prov == .codex or grp_prov == .bedrock or grp_prov == .vertex) return grp_prov;
+        if (grp_prov == .antigravity or
+            grp_prov == .codex or
+            grp_prov == .bedrock or
+            grp_prov == .vertex or
+            grp_prov == .opencode_go or
+            grp_prov == .command_code or
+            grp_prov == .cline) return grp_prov;
     }
     return route_match.provider;
 }
@@ -1249,7 +1262,19 @@ pub const GatewayEngine = struct {
         // 7. Resolve Composite Route (explicit group rules -> builtin prefixes -> fail-closed UnknownModel).
         const group_rules = try self.groupRulesLocked(turn_alloc, group.id);
         const endpoint_kind = inferEndpoint(req.path);
-        const route_match = composite.resolveRoute(group_rules, endpoint_kind, public_model) catch {
+        const route_match = composite.resolveRoute(group_rules, endpoint_kind, public_model) catch blk: {
+            if (!std.mem.eql(u8, group.platform, "composite") and public_model.len > 0) {
+                if (std.meta.stringToEnum(composite.Provider, group.platform)) |grp_prov| {
+                    if (grp_prov == .opencode_go or grp_prov == .command_code or grp_prov == .cline) {
+                        break :blk composite.RouteMatch{
+                            .provider = grp_prov,
+                            .upstream_model = public_model,
+                            .rule_id = null,
+                            .source = .builtin_detector,
+                        };
+                    }
+                }
+            }
             return std.json.stringifyAlloc(turn_alloc, DispatchResponse{
                 .action = "reject",
                 .status = 400,
@@ -2392,7 +2417,88 @@ test "holds the edge lost are released by turn nonce or reclaimed after the TTL"
 test "endpoint inference anchors on the path prefix" {
     try std.testing.expectEqual(composite.EndpointKind.count_tokens, inferEndpoint("/v1/messages/count_tokens"));
     try std.testing.expectEqual(composite.EndpointKind.messages, inferEndpoint("/v1/messages"));
+    try std.testing.expectEqual(composite.EndpointKind.systemone, inferEndpoint("/v1/systemone"));
     try std.testing.expectEqual(composite.EndpointKind.any, inferEndpoint("/mcp/v1/messages"));
     try std.testing.expectEqual(composite.EndpointKind.count_tokens, inferEndpoint("/v1beta/models/gemini-2.5-pro:countTokens"));
     try std.testing.expectEqual(composite.EndpointKind.gemini, inferEndpoint("/v1beta/models/gemini-2.5-pro:streamGenerateContent"));
+}
+
+test "aggregator groups and typesafe systemone route migrated sub2api platforms" {
+    var engine = GatewayEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const key_oc = "sk-sg-oc0123456789abcdef0123456789abcdef012345";
+    const key_cc = "sk-sg-cc0123456789abcdef0123456789abcdef012345";
+    const key_cl = "sk-sg-cl0123456789abcdef0123456789abcdef012345";
+    const key_ts = "sk-sg-ts0123456789abcdef0123456789abcdef012345";
+
+    const hashHex = struct {
+        fn calc(k: []const u8) [64]u8 {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(k, &digest, .{});
+            return std.fmt.bytesToHex(digest, .lower);
+        }
+    }.calc;
+
+    const h_oc = hashHex(key_oc);
+    const h_cc = hashHex(key_cc);
+    const h_cl = hashHex(key_cl);
+    const h_ts = hashHex(key_ts);
+
+    const sync_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"groups\":[" ++
+            "{{\"id\":\"grp_oc\",\"platform\":\"opencode_go\",\"subscriptionType\":\"balance\",\"enabled\":true}}," ++
+            "{{\"id\":\"grp_cc\",\"platform\":\"command_code\",\"subscriptionType\":\"balance\",\"enabled\":true}}," ++
+            "{{\"id\":\"grp_cl\",\"platform\":\"cline\",\"subscriptionType\":\"balance\",\"enabled\":true}}," ++
+            "{{\"id\":\"grp_comp\",\"platform\":\"composite\",\"subscriptionType\":\"balance\",\"enabled\":true}}" ++
+            "],\"accounts\":[" ++
+            "{{\"id\":\"acc_oc\",\"groupId\":\"grp_oc\",\"platform\":\"opencode_go\",\"executionMode\":\"direct_api\",\"status\":\"active\"}}," ++
+            "{{\"id\":\"acc_cc\",\"groupId\":\"grp_cc\",\"platform\":\"command_code\",\"executionMode\":\"direct_api\",\"status\":\"active\"}}," ++
+            "{{\"id\":\"acc_cl\",\"groupId\":\"grp_cl\",\"platform\":\"cline\",\"executionMode\":\"direct_api\",\"status\":\"active\"}}," ++
+            "{{\"id\":\"acc_ts\",\"groupId\":\"grp_comp\",\"platform\":\"typesafe\",\"executionMode\":\"direct_api\",\"status\":\"active\"}}" ++
+            "],\"apiKeys\":[" ++
+            "{{\"id\":\"k_oc\",\"userId\":\"usr_s\",\"groupId\":\"grp_oc\",\"keyHashHex\":\"{s}\",\"rpmLimit\":60,\"concurrencyLimit\":5,\"enabled\":true}}," ++
+            "{{\"id\":\"k_cc\",\"userId\":\"usr_s\",\"groupId\":\"grp_cc\",\"keyHashHex\":\"{s}\",\"rpmLimit\":60,\"concurrencyLimit\":5,\"enabled\":true}}," ++
+            "{{\"id\":\"k_cl\",\"userId\":\"usr_s\",\"groupId\":\"grp_cl\",\"keyHashHex\":\"{s}\",\"rpmLimit\":60,\"concurrencyLimit\":5,\"enabled\":true}}," ++
+            "{{\"id\":\"k_ts\",\"userId\":\"usr_s\",\"groupId\":\"grp_comp\",\"keyHashHex\":\"{s}\",\"rpmLimit\":60,\"concurrencyLimit\":5,\"enabled\":true}}" ++
+            "],\"wallets\":[{{\"userId\":\"usr_s\",\"balanceNanoUsd\":\"1000000000\"}}]}}",
+        .{ &h_oc, &h_cc, &h_cl, &h_ts },
+    );
+    _ = try engine.applySyncJson(arena, sync_json);
+
+    // 1. opencode_go dedicated group accepts prefixed, builtin (hy4-preview), and claude-* models.
+    const oc_req = try std.fmt.allocPrint(arena, "{{\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"apiKey\":\"{s}\",\"model\":\"hy4-preview\"}}", .{key_oc});
+    const oc_disp = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, oc_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("dispatch", oc_disp.value.action);
+    try std.testing.expectEqualStrings("opencode_go", oc_disp.value.provider);
+
+    const oc_v4_req = try std.fmt.allocPrint(arena, "{{\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"apiKey\":\"{s}\",\"model\":\"deepseek/deepseek-v4-flash\"}}", .{key_oc});
+    const oc_v4 = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, oc_v4_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("dispatch", oc_v4.value.action);
+    try std.testing.expectEqualStrings("opencode_go", oc_v4.value.provider);
+
+    // 2. command_code and cline dedicated groups pin anthropic/* and vendor-prefixed models to themselves.
+    const cc_req = try std.fmt.allocPrint(arena, "{{\"method\":\"POST\",\"path\":\"/v1/messages\",\"apiKey\":\"{s}\",\"model\":\"anthropic/claude-sonnet-4-6\"}}", .{key_cc});
+    const cc_disp = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, cc_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("dispatch", cc_disp.value.action);
+    try std.testing.expectEqualStrings("command_code", cc_disp.value.provider);
+
+    const cl_req = try std.fmt.allocPrint(arena, "{{\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"apiKey\":\"{s}\",\"model\":\"deepseek/deepseek-v4-flash\"}}", .{key_cl});
+    const cl_disp = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, cl_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("dispatch", cl_disp.value.action);
+    try std.testing.expectEqualStrings("cline", cl_disp.value.provider);
+
+    // 3. composite group routes jev-latest on /v1/systemone to typesafe, while unknown models on composite still fail closed.
+    const ts_req = try std.fmt.allocPrint(arena, "{{\"method\":\"POST\",\"path\":\"/v1/systemone\",\"apiKey\":\"{s}\",\"model\":\"jev-latest\"}}", .{key_ts});
+    const ts_disp = try std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, ts_req), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("dispatch", ts_disp.value.action);
+    try std.testing.expectEqualStrings("typesafe", ts_disp.value.provider);
+
+    const unk_req = try std.fmt.allocPrint(arena, "{{\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"apiKey\":\"{s}\",\"model\":\"vendor/unknown-model\"}}", .{key_ts});
+    const unk_raw = try engine.evaluateTurnJson(arena, unk_req);
+    try std.testing.expect(std.mem.indexOf(u8, unk_raw, "\"errorCode\":\"unknown_model\"") != null);
 }

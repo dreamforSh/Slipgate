@@ -111,6 +111,34 @@ const STYLES: Record<GroupPlatform, PlatformStyle> = {
     bar: "bg-gradient-to-r from-indigo-400 to-indigo-500",
     text: "text-indigo-600 dark:text-indigo-400",
   },
+  opencode_go: {
+    badge: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
+    type: "bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-300",
+    border: "border-amber-500/20 hover:border-amber-500/40",
+    bar: "bg-gradient-to-r from-amber-400 to-amber-500",
+    text: "text-amber-700 dark:text-amber-300",
+  },
+  command_code: {
+    badge: "bg-zinc-100 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200",
+    type: "bg-zinc-50 text-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300",
+    border: "border-zinc-500/20 hover:border-zinc-500/40",
+    bar: "bg-gradient-to-r from-zinc-500 to-zinc-700",
+    text: "text-zinc-700 dark:text-zinc-300",
+  },
+  cline: {
+    badge: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300",
+    type: "bg-purple-50 text-purple-600 dark:bg-purple-900/20 dark:text-purple-300",
+    border: "border-purple-500/20 hover:border-purple-500/40",
+    bar: "bg-gradient-to-r from-purple-400 to-fuchsia-500",
+    text: "text-purple-600 dark:text-purple-300",
+  },
+  typesafe: {
+    badge: "bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-300",
+    type: "bg-sky-50 text-sky-700 dark:bg-sky-900/20 dark:text-sky-300",
+    border: "border-sky-500/20 hover:border-sky-500/40",
+    bar: "bg-gradient-to-r from-sky-400 to-cyan-500",
+    text: "text-sky-700 dark:text-sky-300",
+  },
   composite: {
     badge: "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400",
     type: "bg-cyan-50 text-cyan-600 dark:bg-cyan-900/20 dark:text-cyan-400",
@@ -147,6 +175,10 @@ const SHORT_LABELS: Record<GroupPlatform, string> = {
   qwen: "Qwen",
   bedrock: "Bedrock",
   vertex: "Vertex AI",
+  opencode_go: "OpenCode",
+  command_code: "Command Code",
+  cline: "Cline",
+  typesafe: "TypeSafe",
   composite: "Composite",
 };
 

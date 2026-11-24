@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { reRedactStoredAuditBody, redactAuditBody, WindowLimiter } from "../insights.ts";
+import { detectBuiltinProvider, reRedactStoredAuditBody, redactAuditBody, WindowLimiter } from "../insights.ts";
 
 describe("redactAuditBody", () => {
   it("redacts secret fields at any depth, whatever their spelling", () => {
@@ -210,5 +210,16 @@ describe("WindowLimiter", () => {
     // Short keys are stored as given.
     limiter.allow("code:203.0.113.9", 1_000);
     expect(hits.has("code:203.0.113.9")).toBe(true);
+  });
+});
+
+describe("detectBuiltinProvider (migrated sub2api platforms)", () => {
+  it("detects opencode_go, typesafe, command_code, cline, and mixed-case minimax", () => {
+    expect(detectBuiltinProvider("opencode_go/glm-5.3")).toBe("opencode_go");
+    expect(detectBuiltinProvider("hy4-preview")).toBe("opencode_go");
+    expect(detectBuiltinProvider("jev-latest")).toBe("typesafe");
+    expect(detectBuiltinProvider("command_code/deepseek/deepseek-v4-flash")).toBe("command_code");
+    expect(detectBuiltinProvider("cline-pass/glm-5.3-flash")).toBe("cline");
+    expect(detectBuiltinProvider("MiniMax-M2")).toBe("minimax");
   });
 });

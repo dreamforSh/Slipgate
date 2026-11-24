@@ -298,6 +298,7 @@ type Coordinator struct {
 	responsesState     responseStateStore
 	mediaTasks         mediaTaskStore
 	modelCatalog       modelCatalogCache
+	protocolCatalog    modelProtocolCatalog
 
 	// snapshotApplied: keyByHash holds the same key set slipgate-core authenticates against.
 	snapshotApplied bool
@@ -1355,6 +1356,40 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if turn.IngressCodec == CodecTypeSafeSystemOne && !strings.EqualFold(strings.TrimSpace(directive.Provider), "typesafe") {
+		msg := "System One is only available for TypeSafe and compatible Composite groups"
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, &directive, turn.PublicModel,
+			"ingress", "unsupported_platform", http.StatusNotFound, 0,
+			"not_found_error", "unsupported_platform", msg, "", 1, false,
+		))
+		settleHold(RelayMetrics{UpstreamStatus: http.StatusNotFound})
+		WriteProtocolError(w, CodecAnthropicMessages, http.StatusNotFound, "not_found_error", "unsupported_platform", msg)
+		return
+	}
+	if turn.IngressCodec != CodecTypeSafeSystemOne && strings.EqualFold(strings.TrimSpace(directive.Provider), "typesafe") {
+		msg := "TypeSafe models are only available through POST /v1/systemone"
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, &directive, turn.PublicModel,
+			"ingress", "unsupported_platform", http.StatusNotFound, 0,
+			"not_found_error", "unsupported_platform", msg, "", 1, false,
+		))
+		settleHold(RelayMetrics{UpstreamStatus: http.StatusNotFound})
+		WriteProtocolError(w, turn.IngressCodec, http.StatusNotFound, "not_found_error", "unsupported_platform", msg)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(directive.Provider), "opencode_go") && IsOpenCodeUnsupportedModel(directive.UpstreamModel) {
+		errMsg := ErrOpenCodeUnsupportedModel{Model: directive.UpstreamModel}.Error()
+		c.reportRequestError(buildDirectiveErrorReport(
+			r, requestID, startedAt, &directive, turn.PublicModel,
+			"ingress", "model_not_supported", http.StatusBadRequest, 0,
+			"invalid_request_error", "model_not_supported", errMsg, "", 1, false,
+		))
+		settleHold(RelayMetrics{UpstreamStatus: http.StatusBadRequest})
+		WriteProtocolError(w, turn.IngressCodec, http.StatusBadRequest, "invalid_request_error", "model_not_supported", errMsg)
+		return
+	}
+
 	if turn.IngressCodec == CodecOpenAIResponses && turn.PreviousResponseID != "" {
 		c.responsesState.hydratePreviousTurn(directive.APIKeyID, turn)
 	}
@@ -1417,6 +1452,11 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		if tierMult == 0 {
 			tierMult = SubscriptionTierMultiplier(directive.Provider, subTier)
 		}
+		var catalogProtocols []string
+		if strings.EqualFold(strings.TrimSpace(directive.Provider), "command_code") {
+			accMeta, _ := c.accountMetaFor(directive.AccountID)
+			catalogProtocols = c.lookupCommandCodeModelProtocols(r.Context(), directive.AccountID, accMeta, secret, directive.UpstreamModel)
+		}
 		pctx = OutboundPersonaContext{
 			Provider:         directive.Provider,
 			AuthKind:         firstNonEmpty(directive.AuthKind, c.accountAuthKind(directive.AccountID)),
@@ -1426,6 +1466,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			AccountID:        directive.AccountID,
 			CleanseMode:      cleanseMode,
 			RequestID:        requestID,
+			CatalogProtocols: catalogProtocols,
 		}
 
 		var releaseVMSeat func()
@@ -1582,7 +1623,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Check pre-first-byte upstream HTTP errors eligible for cooldown and cross-account failover.
-		if isFailoverEligibleStatus(upstreamResp.StatusCode) {
+		if !(turn.IngressCodec == CodecTypeSafeSystemOne && IsSystemOneRequestErrorStatus(upstreamResp.StatusCode)) && isFailoverEligibleStatus(upstreamResp.StatusCode) {
 			cooldownMs := computeUpstreamCooldownMs(upstreamResp.StatusCode, upstreamResp.Header)
 			if cooldownMs > 0 {
 				pendingCooldown = cooldownMs

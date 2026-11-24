@@ -92,6 +92,10 @@ export const PROVIDER_OPTIONS: { value: Provider; label: string }[] = [
   { value: "qwen", label: "Qwen" },
   { value: "bedrock", label: "AWS Bedrock" },
   { value: "vertex", label: "Vertex AI" },
+  { value: "opencode_go", label: "OpenCode" },
+  { value: "command_code", label: "Command Code" },
+  { value: "cline", label: "Cline" },
+  { value: "typesafe", label: "TypeSafe" },
 ];
 
 /* ---------------- Dashboard number formatting ---------------- */

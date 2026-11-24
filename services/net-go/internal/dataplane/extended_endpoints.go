@@ -22,6 +22,7 @@ const (
 	CodecOpenAIAudioTranslation   CodecKind = "openai_audio_translations"
 	CodecOpenAIRerank             CodecKind = "openai_rerank"
 	CodecOpenAIModerations        CodecKind = "openai_moderations"
+	CodecTypeSafeSystemOne        CodecKind = "typesafe_systemone"
 )
 
 func isExtendedEndpoint(path string) bool {
@@ -32,7 +33,8 @@ func isExtendedEndpoint(path string) bool {
 		"/v1/audio/transcriptions",
 		"/v1/audio/translations",
 		"/v1/rerank",
-		"/v1/moderations":
+		"/v1/moderations",
+		TypeSafeSystemOnePath:
 		return true
 	default:
 		return false
@@ -53,6 +55,8 @@ func extendedCodecForPath(path string) CodecKind {
 		return CodecOpenAIRerank
 	case "/v1/moderations":
 		return CodecOpenAIModerations
+	case TypeSafeSystemOnePath:
+		return CodecTypeSafeSystemOne
 	default:
 		return CodecOpenAIChat
 	}
@@ -182,6 +186,17 @@ func parseExtendedIngress(r *http.Request, rawBody []byte) (*CanonicalTurn, erro
 		turn.EstimatedInputTokens = uint64(max(8, (len(txt)+3)/4))
 		turn.BodyExcerpt = txt[:min(len(txt), 8192)]
 		return turn, nil
+
+	case CodecTypeSafeSystemOne:
+		model, err := ValidateSystemOneRequest(rawBody)
+		if err != nil {
+			return nil, err
+		}
+		turn.PublicModel = model
+		turn.Stream = false
+		turn.EstimatedInputTokens = uint64(max(12, (len(rawBody)+3)/4))
+		turn.BodyExcerpt = string(rawBody[:min(len(rawBody), 8192)])
+		return turn, nil
 	}
 
 	return nil, fmt.Errorf("unsupported extended route %s", r.URL.Path)
@@ -205,6 +220,13 @@ func buildExtendedUpstreamRequest(
 	if turn.MultipartContentType != "" {
 		body = turn.RawBody
 		contentType = turn.MultipartContentType
+	} else if egress == CodecTypeSafeSystemOne {
+		effectiveModel := stripPlatformWrapperPrefix(pctx.Provider, upstreamModel)
+		if strings.TrimSpace(effectiveModel) != "" && effectiveModel != turn.PublicModel {
+			body = rewriteJSONModel(turn.RawBody, effectiveModel)
+		} else {
+			body = turn.RawBody
+		}
 	} else {
 		body = rewriteJSONModel(turn.RawBody, upstreamModel)
 	}
@@ -316,6 +338,9 @@ func executeMockExtendedTurn(turn *CanonicalTurn, upstreamModel string) *http.Re
 				},
 			},
 		})
+
+	case CodecTypeSafeSystemOne:
+		return executeMockSystemOneTurn(upstreamModel, turn.EstimatedInputTokens)
 	}
 	return jsonHTTPResponse(http.StatusOK, headers, map[string]any{"ok": true})
 }
@@ -425,6 +450,25 @@ func relayExtendedResponse(
 			metrics.OutputTokens = uint64(max(1, (outChars+3)/4))
 		}
 		return metrics, sc.Err()
+	}
+
+	if egress == CodecTypeSafeSystemOne {
+		decoded, decErr := DecodeSystemOneResponse(resp.Body)
+		if decErr != nil {
+			WriteProtocolError(w, CodecAnthropicMessages, http.StatusBadGateway, "upstream_error", "invalid_systemone_response", decErr.Error())
+			return metrics, decErr
+		}
+		metrics.TTFTMs = elapsedMs(startedAt)
+		if decoded.Usage.InputTokens > 0 {
+			metrics.InputTokens = decoded.Usage.InputTokens
+		} else {
+			metrics.InputTokens = turn.EstimatedInputTokens
+		}
+		metrics.OutputTokens = decoded.Usage.OutputTokens
+		w.Header().Set("Content-Type", systemOneResponseContentType(resp.Header.Get("Content-Type")))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(decoded.Body)
+		return metrics, nil
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))

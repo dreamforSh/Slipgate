@@ -2592,12 +2592,16 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       );
     }
 
+    const groups = await store.listGroups(false);
+    const grp = groups.find((g) => g.id === groupId);
     const builtin = detectBuiltinProvider(publicModel);
-    if (builtin) {
-      const groups = await store.listGroups(false);
-      const grp = groups.find((g) => g.id === groupId);
+    const aggregatorFallback =
+      !builtin &&
+      grp &&
+      (grp.platform === "opencode_go" || grp.platform === "command_code" || grp.platform === "cline");
+    if (builtin || aggregatorFallback) {
       const targetPlatform: Provider =
-        grp && grp.platform !== "composite" ? grp.platform : builtin;
+        grp && grp.platform !== "composite" ? grp.platform : builtin!;
       return c.json(
         RoutePreviewResponseSchema.parse({
           matched: true,

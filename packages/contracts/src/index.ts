@@ -90,6 +90,7 @@ export const RouteEndpointSchema = z.enum([
   "images",
   "videos",
   "gemini",
+  "systemone",
 ]);
 export type RouteEndpoint = z.infer<typeof RouteEndpointSchema>;
 

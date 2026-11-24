@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+  ACCOUNT_TEST_MODELS,
   AccountImportFormatError,
   canonicalCredentialText,
   draftToCreateRequest,
@@ -9,6 +10,8 @@ import {
   parseAccountImportFile,
   parseAccountImportSources,
   parseImportJsonText,
+  PLATFORM_MULTI_PROTOCOL_CATALOG,
+  ProviderSchema,
   resolveTierForPlatform,
   parseCredentialBlock,
   UpdateAccountRequestSchema,
@@ -423,5 +426,83 @@ describe("UpdateAccountRequestSchema lifecycle fields", () => {
     expect(UpdateAccountRequestSchema.safeParse({ expiresAtIso: null, cooldownUntilIso: null }).success).toBe(true);
     expect(UpdateAccountRequestSchema.safeParse({ expiresAtIso: "2026-12-01T00:00:00+08:00" }).success).toBe(true);
     expect(UpdateAccountRequestSchema.safeParse({ cooldownUntilIso: "tomorrow" }).success).toBe(false);
+  });
+});
+
+describe("sub2api migrated platforms and multi-protocol catalog", () => {
+  it("includes opencode_go, typesafe, command_code, and cline across schemas and test models", () => {
+    for (const p of ["opencode_go", "typesafe", "command_code", "cline"] as const) {
+      expect(ProviderSchema.safeParse(p).success).toBe(true);
+      expect(ACCOUNT_TEST_MODELS[p].length).toBeGreaterThan(0);
+    }
+    expect(PLATFORM_MULTI_PROTOCOL_CATALOG.opencode_go?.defaultMode).toBe("go");
+    expect(PLATFORM_MULTI_PROTOCOL_CATALOG.opencode_go?.routing).toBe("by_model");
+    expect(PLATFORM_MULTI_PROTOCOL_CATALOG.command_code?.modelCatalog).toBe(true);
+    expect(PLATFORM_MULTI_PROTOCOL_CATALOG.deepseek?.responsesPath).toBe("/responses");
+    expect(PLATFORM_MULTI_PROTOCOL_CATALOG.glm?.modes.map((m) => m.mode)).toEqual(["payg", "coding"]);
+  });
+
+  it("imports opencode_go, typesafe, command_code, cline, and zhipu coding accounts from sub2api exports", () => {
+    const exported = {
+      type: "sub2api-data",
+      version: 1,
+      accounts: [
+        {
+          name: "oc-zen",
+          platform: "opencode_go",
+          type: "apikey",
+          credentials: {
+            api_key: "oc-key",
+            account_mode: "zen",
+            api_protocol: "adaptive",
+            protocol_rules: [{ pattern: "claude-*", protocol: "anthropic" }],
+          },
+        },
+        {
+          name: "ts-1",
+          platform: "typesafe",
+          type: "apikey",
+          credentials: { api_key: "ts-key" },
+        },
+        {
+          name: "cc-1",
+          platform: "command_code",
+          type: "apikey",
+          credentials: { api_key: "cc-key", api_protocol: "adaptive" },
+        },
+        {
+          name: "cline-1",
+          platform: "cline",
+          type: "apikey",
+          credentials: { api_key: "cl-key" },
+        },
+        {
+          name: "zhipu-coding",
+          platform: "zhipu",
+          type: "apikey",
+          credentials: { api_key: "zp-key", account_mode: "coding", api_protocol: "anthropic" },
+        },
+      ],
+    };
+    const result = parseAccountImportFile(exported);
+    expect(result.skipped).toEqual([]);
+    expect(result.drafts.map((d) => [d.name, d.platform, d.authKind])).toEqual([
+      ["oc-zen", "opencode_go", "api_key"],
+      ["ts-1", "typesafe", "api_key"],
+      ["cc-1", "command_code", "api_key"],
+      ["cline-1", "cline", "api_key"],
+      ["zhipu-coding", "glm", "api_key"],
+    ]);
+    expect(JSON.parse(result.drafts[0]!.credentialSecret)).toMatchObject({
+      account_mode: "zen",
+      protocol_rules: [{ pattern: "claude-*", protocol: "anthropic" }],
+    });
+    expect(JSON.parse(result.drafts[4]!.credentialSecret)).toMatchObject({
+      account_mode: "coding",
+      api_protocol: "anthropic",
+    });
+    for (const draft of result.drafts) {
+      expect(draftToCreateRequest(draft, "grp_x").success).toBe(true);
+    }
   });
 });

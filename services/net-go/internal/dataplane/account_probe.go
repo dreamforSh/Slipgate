@@ -69,6 +69,14 @@ func DefaultProbeModel(provider string) string {
 		return "anthropic.claude-sonnet-4-5-20250929-v1:0"
 	case "vertex":
 		return "gemini-2.5-flash"
+	case "opencode_go":
+		return DefaultOpenCodeGoTestModel
+	case "typesafe":
+		return TypeSafeJevLatestModel
+	case "command_code":
+		return DefaultCommandCodeTestModel
+	case "cline":
+		return DefaultClineTestModel
 	default:
 		return "gpt-4o-mini"
 	}
@@ -96,6 +104,10 @@ func (c *Coordinator) ProbeAccount(ctx context.Context, accountID string, req Pr
 	secret, prepErr = c.prepareCloudProviderSecret(ctx, meta.Platform, secret)
 	if prepErr != nil {
 		emit(ProbeEvent{Type: "error", Code: "cloud_auth_failed", Message: prepErr.Error()})
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(meta.Platform), "typesafe") {
+		c.probeTypeSafeAccount(ctx, accountID, meta, secret, req, emit)
 		return
 	}
 

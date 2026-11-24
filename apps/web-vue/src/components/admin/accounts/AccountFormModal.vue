@@ -5,17 +5,21 @@ import {
   allowedSubscriptionTiersForProvider,
   inspectCredential,
   parseCredentialBlock,
+  PLATFORM_MULTI_PROTOCOL_CATALOG,
   recommendedMaxConcurrencyForTier,
   resolveTierForPlatform,
   type AccountAuthKind,
   type AccountImportResult,
   type AccountInitialStatus,
+  type AccountMode,
   type AccountOAuthProvider,
   type AccountStatus,
+  type ApiProtocol,
   type CreateAccountRequest,
   type ExchangeAccountOAuthResponse,
   type ExecutionMode,
   type GroupItem,
+  type NativeApiProtocol,
   type Provider,
   type StartAccountOAuthResponse,
   type SubscriptionTier,
@@ -183,6 +187,8 @@ const formTier = ref<SubscriptionTier>("max");
 const formSecret = ref("");
 const formBaseUrl = ref("");
 const formApiKey = ref("");
+const formAccountMode = ref<AccountMode>("payg");
+const formApiProtocol = ref<ApiProtocol>("adaptive");
 const formMaxConc = ref(12);
 const formPriority = ref(100);
 const formStatus = ref<AccountStatus>("active");
@@ -311,6 +317,47 @@ const groupPlatform = computed<Provider | null>(() => {
 });
 const platformLocked = computed(() => !!editing.value || groupPlatform.value !== null);
 
+const multiProtoSpec = computed(() => PLATFORM_MULTI_PROTOCOL_CATALOG[formPlatform.value] ?? null);
+const accountModeOptions = computed(() => multiProtoSpec.value?.modes ?? []);
+const selectedModeSpec = computed(() => {
+  const spec = multiProtoSpec.value;
+  if (!spec) return null;
+  return spec.modes.find((m) => m.mode === formAccountMode.value) ?? spec.modes[0] ?? null;
+});
+const supportedNativeProtocols = computed<NativeApiProtocol[]>(() => {
+  const urls = selectedModeSpec.value?.baseUrls;
+  if (!urls) return [];
+  return (["chat_completions", "anthropic", "responses"] as const).filter((p) => Boolean(urls[p]));
+});
+const apiProtocolOptions = computed<ApiProtocol[]>(() => {
+  const native = supportedNativeProtocols.value;
+  if (native.length <= 1) return native;
+  return ["adaptive", ...native];
+});
+const baseUrlPlaceholder = computed(() => {
+  const urls = selectedModeSpec.value?.baseUrls;
+  if (urls) {
+    if (formApiProtocol.value !== "adaptive" && urls[formApiProtocol.value]) {
+      return urls[formApiProtocol.value]!;
+    }
+    return urls.chat_completions ?? urls.anthropic ?? urls.responses ?? "https://";
+  }
+  if (formPlatform.value === "typesafe") return "https://api.typesafe.ai";
+  return "https://";
+});
+
+function syncMultiProtoDefaults() {
+  const spec = multiProtoSpec.value;
+  if (!spec) {
+    formAccountMode.value = "payg";
+    formApiProtocol.value = "adaptive";
+    return;
+  }
+  formAccountMode.value = spec.defaultMode;
+  const native = supportedNativeProtocols.value;
+  formApiProtocol.value = native.length > 1 ? "adaptive" : (native[0] ?? "chat_completions");
+}
+
 function defaultTierFor(platform: Provider): SubscriptionTier {
   if (platform === "anthropic") return "max";
   if (platform === "codex" || platform === "openai") return "pro_5x";
@@ -327,6 +374,7 @@ function applyKind(key: KindKey) {
 
 function setPlatform(platform: Provider) {
   formPlatform.value = platform;
+  syncMultiProtoDefaults();
   applyKind(kindOptions.value[0]!.key);
 }
 
@@ -345,10 +393,25 @@ function onTierChange() {
 
 /* ---------------- Credential helpers ---------------- */
 
-/** `baseUrl|key` is what the data plane vault reads for relays; a bare key uses the default endpoint. */
+/** `baseUrl|key` for simple relays; JSON with account_mode / api_protocol when configured on multi-protocol providers. */
 function apiKeySecret(key: string): string {
   const base = formBaseUrl.value.trim().replace(/\/+$/, "");
-  return base ? `${base}|${key.trim()}` : key.trim();
+  const trimmedKey = key.trim();
+  const spec = multiProtoSpec.value;
+  if (spec && (accountModeOptions.value.length > 1 || apiProtocolOptions.value.length > 1)) {
+    const needsMeta =
+      formAccountMode.value !== spec.defaultMode ||
+      formApiProtocol.value !== "adaptive";
+    if (needsMeta || (base && formApiProtocol.value === "adaptive")) {
+      return JSON.stringify({
+        api_key: trimmedKey,
+        ...(base ? { base_url: base } : {}),
+        account_mode: formAccountMode.value,
+        api_protocol: formApiProtocol.value,
+      });
+    }
+  }
+  return base ? `${base}|${trimmedKey}` : trimmedKey;
 }
 
 const insight = computed(() => (takesJson.value && mode.value === "single" ? inspectCredential(formSecret.value) : null));
@@ -410,6 +473,7 @@ function loadFrom(src: UpstreamAccount, asCopy: boolean) {
   formNotes.value = src.notes;
   formGroupId.value = src.groupId;
   formPlatform.value = src.platform;
+  syncMultiProtoDefaults();
   formKind.value = kindFor(src);
   addMethod.value = src.authKind === "setup_token" ? "setup_token" : "oauth";
   formMode.value = src.executionMode;
@@ -454,6 +518,7 @@ function reset() {
   formCooldownUntil.value = "";
   addMethod.value = "oauth";
   formPlatform.value = groupPlatform.value ?? "anthropic";
+  syncMultiProtoDefaults();
   formTier.value = defaultTierFor(formPlatform.value);
   applyKind(kindOptions.value[0]!.key);
 }
@@ -878,6 +943,29 @@ const credentialPlaceholder = computed(() => {
         </div>
 
         <div v-if="isApiKey" class="space-y-4">
+          <UiAlert v-if="formPlatform === 'typesafe'" tone="info">{{ t("accounts.form.typesafeHint") }}</UiAlert>
+          <div
+            v-if="accountModeOptions.length > 1 || apiProtocolOptions.length > 1"
+            class="grid gap-4"
+            :class="accountModeOptions.length > 1 && apiProtocolOptions.length > 1 ? 'sm:grid-cols-2' : ''"
+          >
+            <div v-if="accountModeOptions.length > 1">
+              <label class="label" for="account-form-acct-mode">{{ t("accounts.form.accountMode") }}</label>
+              <select id="account-form-acct-mode" v-model="formAccountMode" class="select">
+                <option v-for="m in accountModeOptions" :key="m.mode" :value="m.mode">
+                  {{ t(`accounts.form.accountModes.${m.mode}`) }}
+                </option>
+              </select>
+            </div>
+            <div v-if="apiProtocolOptions.length > 1">
+              <label class="label" for="account-form-api-proto">{{ t("accounts.form.apiProtocol") }}</label>
+              <select id="account-form-api-proto" v-model="formApiProtocol" class="select">
+                <option v-for="p in apiProtocolOptions" :key="p" :value="p">
+                  {{ t(`accounts.form.apiProtocols.${p}`) }}
+                </option>
+              </select>
+            </div>
+          </div>
           <div>
             <label class="label" for="account-form-base-url">{{ t("accounts.form.baseUrl") }}</label>
             <input
@@ -886,7 +974,7 @@ const credentialPlaceholder = computed(() => {
               type="url"
               spellcheck="false"
               autocomplete="off"
-              placeholder="https://"
+              :placeholder="baseUrlPlaceholder"
               class="input font-mono text-xs"
             />
             <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.baseUrlHint") }}</p>
