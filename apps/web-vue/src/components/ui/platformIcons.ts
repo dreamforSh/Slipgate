@@ -29,6 +29,16 @@ const MARKS = {
     mode: "stroke",
     body: '<path stroke-linejoin="round" d="M12 3 4.5 7.5v9L12 21l7.5-4.5v-9z"/><path stroke-linecap="round" d="m13.5 13.5 3.5 3.5"/><circle cx="12" cy="12" r="2.6"/>',
   },
+  bedrock: {
+    viewBox: "0 0 24 24",
+    mode: "stroke",
+    body: '<path stroke-linejoin="round" d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3z"/><path stroke-linejoin="round" d="M4 7.5 12 12l8-4.5M12 12v9"/><path stroke-linecap="round" d="M8 9.75v4.5M16 9.75v4.5"/>',
+  },
+  vertex: {
+    viewBox: "0 0 24 24",
+    mode: "stroke",
+    body: '<polygon stroke-linejoin="round" points="12 3 21 19 3 19"/><circle cx="12" cy="14" r="2.2"/>',
+  },
 } satisfies Record<Exclude<GroupPlatform, "codex">, PlatformIconDef>;
 
 const FALLBACK: PlatformIconDef = {

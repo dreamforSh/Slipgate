@@ -95,7 +95,7 @@ func (c *Coordinator) RefreshUpstreamModelCatalog(ctx context.Context, force boo
 			break
 		}
 		prov := strings.ToLower(strings.TrimSpace(meta.Platform))
-		if prov == "" || prov == "antigravity" || prov == "codex" || meta.ExecutionMode == "vm_slot" {
+		if prov == "" || prov == "antigravity" || prov == "codex" || prov == "bedrock" || prov == "vertex" || meta.ExecutionMode == "vm_slot" {
 			continue
 		}
 		if probedProviders[prov] {

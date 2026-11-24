@@ -263,6 +263,8 @@ func ProviderEgressCodecWithPersona(pctx OutboundPersonaContext, secret AccountS
 		return CodecAnthropicMessages
 	case "gemini":
 		return CodecGeminiGenerate
+	case "bedrock":
+		return CodecBedrockConverse
 	default:
 		return CodecOpenAIChat
 	}
@@ -1231,6 +1233,13 @@ func BuildUpstreamHTTPRequestWithPersona(
 		filteredTools = append(filteredTools, t)
 	}
 
+	switch strings.ToLower(strings.TrimSpace(pctx.Provider)) {
+	case "bedrock":
+		return buildBedrockConverseRequest(ctx, upstreamModel, secret, turn, filteredTools)
+	case "vertex":
+		return buildVertexRequest(ctx, pctx, upstreamModel, secret, turn, filteredTools)
+	}
+
 	var (
 		fullURL string
 		bodyRaw []byte
@@ -2081,6 +2090,31 @@ func ExecuteMockTurn(mockTarget, upstreamModel string, egress CodecKind, turn *C
 				},
 			})
 
+		case CodecBedrockConverse:
+			blocks := []map[string]any{{"text": replyText}}
+			stopReason := "end_turn"
+			if leakTools {
+				blocks = append(blocks,
+					map[string]any{"toolUse": map[string]any{"toolUseId": "tooluse_internal_bash", "name": "Bash", "input": map[string]any{"command": "id"}}},
+					map[string]any{"toolUse": map[string]any{"toolUseId": "tooluse_user_fn", "name": "lookup_weather", "input": map[string]any{"city": "Tokyo"}}},
+				)
+				stopReason = "tool_use"
+			}
+			return jsonHTTPResponse(http.StatusOK, headers, map[string]any{
+				"output": map[string]any{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": blocks,
+					},
+				},
+				"stopReason": stopReason,
+				"usage": map[string]any{
+					"inputTokens":  inTok,
+					"outputTokens": outTok,
+					"totalTokens":  inTok + outTok,
+				},
+			})
+
 		default:
 			msg := map[string]any{"role": "assistant", "content": replyText}
 			finishReason := "stop"
@@ -2250,6 +2284,37 @@ func ExecuteMockTurn(mockTarget, upstreamModel string, egress CodecKind, turn *C
 			},
 		})
 
+	case CodecBedrockConverse:
+		headers.Set("Content-Type", "application/vnd.amazon.eventstream")
+		var ev bytes.Buffer
+		p1, _ := json.Marshal(map[string]any{"delta": map[string]any{"text": part1}})
+		p2, _ := json.Marshal(map[string]any{"delta": map[string]any{"text": part2}})
+		ev.Write(encodeBedrockEventFrame("contentBlockDelta", p1))
+		ev.Write(encodeBedrockEventFrame("contentBlockDelta", p2))
+		stopReason := "end_turn"
+		if leakTools {
+			tStart1, _ := json.Marshal(map[string]any{"start": map[string]any{"toolUse": map[string]any{"toolUseId": "tooluse_leak_1", "name": "Read"}}})
+			tIn1, _ := json.Marshal(map[string]any{"delta": map[string]any{"toolUse": map[string]any{"input": `{"file_path":"/etc/passwd"}`}}})
+			tStart2, _ := json.Marshal(map[string]any{"start": map[string]any{"toolUse": map[string]any{"toolUseId": "tooluse_ok_1", "name": "lookup_weather"}}})
+			tIn2, _ := json.Marshal(map[string]any{"delta": map[string]any{"toolUse": map[string]any{"input": `{"city":"Tokyo"}`}}})
+			ev.Write(encodeBedrockEventFrame("contentBlockStart", tStart1))
+			ev.Write(encodeBedrockEventFrame("contentBlockDelta", tIn1))
+			ev.Write(encodeBedrockEventFrame("contentBlockStop", []byte(`{}`)))
+			ev.Write(encodeBedrockEventFrame("contentBlockStart", tStart2))
+			ev.Write(encodeBedrockEventFrame("contentBlockDelta", tIn2))
+			ev.Write(encodeBedrockEventFrame("contentBlockStop", []byte(`{}`)))
+			stopReason = "tool_use"
+		}
+		stopPayload, _ := json.Marshal(map[string]any{"stopReason": stopReason})
+		metaPayload, _ := json.Marshal(map[string]any{"usage": map[string]any{"inputTokens": inTok, "outputTokens": outTok, "totalTokens": inTok + outTok}})
+		ev.Write(encodeBedrockEventFrame("messageStop", stopPayload))
+		ev.Write(encodeBedrockEventFrame("metadata", metaPayload))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     headers,
+			Body:       io.NopCloser(bytes.NewReader(ev.Bytes())),
+		}
+
 	default:
 		writeSSEData(&sse, map[string]any{
 			"id":      "chatcmpl_mock_stream_01",
@@ -2352,6 +2417,10 @@ func resolveProviderBaseURL(provider, custom string) string {
 		return "https://api.minimax.chat/v1"
 	case "qwen":
 		return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+	case "bedrock":
+		return "https://bedrock-runtime.us-east-1.amazonaws.com"
+	case "vertex":
+		return "https://us-central1-aiplatform.googleapis.com"
 	default:
 		return "https://api.openai.com"
 	}

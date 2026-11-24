@@ -252,6 +252,8 @@ type CoordinatorOptions struct {
 	// UpstreamTimeouts bounds the header wait and stream stalls of every AI upstream call (zero
 	// values = unbounded; cmd/slipgate passes SLIPGATE_UPSTREAM_*_TIMEOUT_SEC).
 	UpstreamTimeouts UpstreamTimeouts
+	// GuestToken authenticates host->slipgate-guestd IPC frames (defaults to SLIPGATE_GUEST_TOKEN env).
+	GuestToken string
 }
 
 // Coordinator bridges HTTP AI ingress, L2 Zig hot-path policy/ledger IPC, three-mode outbound execution, and BFF settlement.
@@ -291,6 +293,8 @@ type Coordinator struct {
 	userLimits         userLimitGate  // per-user / per-group caps (user_limits.go)
 	moderation         moderationGate // prompt moderation rules & external gate (moderation.go)
 	oauthRefresher     oauthRefreshDeduper
+	vertexTokens       *VertexTokenCache
+	guestToken         string
 	responsesState     responseStateStore
 	mediaTasks         mediaTaskStore
 	modelCatalog       modelCatalogCache
@@ -315,6 +319,10 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 	if trustedProxies == nil {
 		trustedProxies = netguard.ParseTrustedProxiesFromEnv()
 	}
+	guestToken := strings.TrimSpace(opts.GuestToken)
+	if guestToken == "" {
+		guestToken = strings.TrimSpace(os.Getenv("SLIPGATE_GUEST_TOKEN"))
+	}
 	bffOrigin := strings.TrimRight(strings.TrimSpace(opts.BFFOrigin), "/")
 	if bffOrigin != "" && !strings.HasPrefix(bffOrigin, "http://") && !strings.HasPrefix(bffOrigin, "https://") {
 		bffOrigin = "http://" + bffOrigin
@@ -334,8 +342,10 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		allowPrivateUpstreams: allowPrivate,
 		trustedProxies:        trustedProxies,
 		logger:                logger,
-		accessLogEnabled: opts.AccessLogEnabled,
-		keyByHash:        make(map[string]edgeKeyMeta),
+		accessLogEnabled:      opts.AccessLogEnabled,
+		vertexTokens:          NewVertexTokenCache(),
+		guestToken:            guestToken,
+		keyByHash:             make(map[string]edgeKeyMeta),
 		groupPlatforms:   make(map[string]string),
 		keyIPAllowlists:  make(map[string][]string),
 		keyIPDenylists:   make(map[string][]string),
@@ -958,6 +968,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	isV1BetaModelsReq := r.Method == http.MethodGet && strings.TrimSuffix(r.URL.Path, "/") == "/v1beta/models"
 	isModelsReq := (r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/models")) || isV1BetaModelsReq
 	isMultimodal := r.Method == http.MethodPost && (isEmbeddingsEndpoint(r.URL.Path) || isImagesEndpoint(r.URL.Path) || isVideosPostEndpoint(r.URL.Path))
+	isExtended := r.Method == http.MethodPost && isExtendedEndpoint(r.URL.Path)
 	var turn *CanonicalTurn
 	if isModelsReq {
 		turn = &CanonicalTurn{
@@ -970,6 +981,18 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if isMultimodal {
 		var parseErr error
 		turn, parseErr = parseMultimodalIngress(r, rawBody)
+		if parseErr != nil {
+			c.reportRequestError(buildDirectiveErrorReport(
+				r, requestID, startedAt, nil, "",
+				"ingress", "malformed_json", http.StatusBadRequest, 0,
+				"invalid_request_error", "malformed_json", parseErr.Error(), "", 1, false,
+			))
+			WriteProtocolError(w, ingressCodec, http.StatusBadRequest, "invalid_request_error", "malformed_json", parseErr.Error())
+			return
+		}
+	} else if isExtended {
+		var parseErr error
+		turn, parseErr = parseExtendedIngress(r, rawBody)
 		if parseErr != nil {
 			c.reportRequestError(buildDirectiveErrorReport(
 				r, requestID, startedAt, nil, "",
@@ -1433,14 +1456,30 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 			guestEndpoint := strings.TrimSpace(slot.GuestUDSPath)
 			if guestEndpoint != "" && !strings.HasPrefix(guestEndpoint, "sandbox://") && !strings.HasPrefix(guestEndpoint, "ssh://") {
-				pingCtx, pingCancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
-				pingErr := dpbridge.Ping(pingCtx, guestEndpoint)
-				pingCancel()
-				if pingErr != nil {
+				handoffMeta, _ := json.Marshal(map[string]any{
+					"request_id": requestID,
+					"slot_id":    slot.ID,
+					"provider":   directive.Provider,
+					"model":      directive.UpstreamModel,
+					"stream":     turn.Stream,
+				})
+				handoffCtx, handoffCancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
+				_, liveHandoff, handoffErr := vmslot.HandoffGuestTurn(handoffCtx, guestEndpoint, c.guestToken, slot.Persona.GuestMachineID, handoffMeta)
+				handoffCancel()
+				if handoffErr != nil {
 					releaseVMSeat()
 					settleHold(RelayMetrics{UpstreamStatus: http.StatusServiceUnavailable})
-					WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", "vm_guestd_unreachable", "slipgate-guestd failed health check: "+pingErr.Error())
+					errCode := "vm_guestd_unreachable"
+					errMsg := "slipgate-guestd failed health check: " + handoffErr.Error()
+					if errors.Is(handoffErr, vmslot.ErrGuestMachineIDMismatch) {
+						errCode = "vm_guest_identity_mismatch"
+						errMsg = handoffErr.Error()
+					}
+					WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "overloaded_error", errCode, errMsg)
 					return
+				}
+				if liveHandoff {
+					w.Header().Set("X-Slipgate-Guest-Handoff", "live")
 				}
 			}
 			if strings.TrimSpace(slot.CleanseMode) != "" {
@@ -1456,22 +1495,37 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		execOnce := func(sec AccountSecret) (*http.Response, CodecKind, error) {
+			preparedSec, prepErr := c.prepareCloudProviderSecret(r.Context(), pctx.Provider, sec)
+			if prepErr != nil {
+				return nil, turn.IngressCodec, prepErr
+			}
 			if isMultimodal {
-				if sec.IsMock() {
+				if preparedSec.IsMock() {
 					return executeMockMultimodalTurn(turn, directive.UpstreamModel), turn.IngressCodec, nil
 				}
-				mReq, mCodec, bErr := buildMultimodalUpstreamRequest(r.Context(), r.URL.Path, pctx, directive.UpstreamModel, sec, turn)
+				mReq, mCodec, bErr := buildMultimodalUpstreamRequest(r.Context(), r.URL.Path, pctx, directive.UpstreamModel, preparedSec, turn)
 				if bErr != nil {
 					return nil, mCodec, errRequestTranscode{err: bErr}
 				}
-				resp, dErr := c.executeOutbound(r.Context(), pctx, sec, mReq, directive.UpstreamModel, mCodec, turn)
+				resp, dErr := c.executeOutbound(r.Context(), pctx, preparedSec, mReq, directive.UpstreamModel, mCodec, turn)
 				return resp, mCodec, dErr
 			}
-			uReq, uCodec, bErr := BuildUpstreamHTTPRequestWithPersona(r.Context(), pctx, directive.UpstreamModel, sec, turn)
+			if isExtended {
+				if preparedSec.IsMock() {
+					return executeMockExtendedTurn(turn, directive.UpstreamModel), turn.IngressCodec, nil
+				}
+				eReq, eCodec, bErr := buildExtendedUpstreamRequest(r.Context(), r.URL.Path, pctx, directive.UpstreamModel, preparedSec, turn)
+				if bErr != nil {
+					return nil, eCodec, errRequestTranscode{err: bErr}
+				}
+				resp, dErr := c.executeOutbound(r.Context(), pctx, preparedSec, eReq, directive.UpstreamModel, eCodec, turn)
+				return resp, eCodec, dErr
+			}
+			uReq, uCodec, bErr := BuildUpstreamHTTPRequestWithPersona(r.Context(), pctx, directive.UpstreamModel, preparedSec, turn)
 			if bErr != nil {
 				return nil, uCodec, errRequestTranscode{err: bErr}
 			}
-			resp, dErr := c.executeOutbound(r.Context(), pctx, sec, uReq, directive.UpstreamModel, uCodec, turn)
+			resp, dErr := c.executeOutbound(r.Context(), pctx, preparedSec, uReq, directive.UpstreamModel, uCodec, turn)
 			return resp, uCodec, dErr
 		}
 
@@ -1576,6 +1630,8 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	if isMultimodal {
 		metrics, relayErr = relayMultimodalResponse(w, upstreamResp, egressCodec, turn, &directive, startedAt, &c.mediaTasks)
+	} else if isExtended {
+		metrics, relayErr = relayExtendedResponse(w, upstreamResp, egressCodec, turn, &directive, startedAt)
 	} else {
 		targetWriter := w
 		var respCapturer *responseCaptureWriter
@@ -1730,6 +1786,25 @@ func (c *Coordinator) accountAuthKind(accountID string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.accountAuthKinds[accountID]
+}
+
+func (c *Coordinator) prepareCloudProviderSecret(ctx context.Context, provider string, sec AccountSecret) (AccountSecret, error) {
+	if sec.IsMock() || !strings.EqualFold(strings.TrimSpace(provider), "vertex") {
+		return sec, nil
+	}
+	if strings.TrimSpace(sec.GCPPrivateKey) == "" || strings.TrimSpace(sec.GCPClientEmail) == "" {
+		return sec, nil
+	}
+	cache := c.vertexTokens
+	if cache == nil {
+		cache = defaultVertexTokenCache
+	}
+	tok, err := cache.Resolve(ctx, c.directClient, c.allowPrivateUpstreams, sec)
+	if err != nil {
+		return sec, err
+	}
+	sec.APIKey = tok
+	return sec, nil
 }
 
 func (c *Coordinator) accountTier(accountID string) string {
@@ -1888,6 +1963,9 @@ func isSupportedDataPlaneRoute(method, path string) bool {
 		"/v1/images/edits",
 		"/v1/videos",
 		"/v1/videos/generations":
+		return true
+	}
+	if isExtendedEndpoint(trimmed) {
 		return true
 	}
 	if rest, ok := strings.CutPrefix(path, "/v1beta/models/"); ok {

@@ -12,6 +12,8 @@ export const ProviderSchema = z.enum([
   "kimi",
   "minimax",
   "qwen",
+  "bedrock",
+  "vertex",
 ]);
 export type Provider = z.infer<typeof ProviderSchema>;
 
@@ -398,4 +400,6 @@ export const ACCOUNT_TEST_MODELS: Record<Provider, string[]> = {
   kimi: ["kimi-k2-0905-preview"],
   minimax: ["MiniMax-M2"],
   qwen: ["qwen-plus", "qwen-max"],
+  bedrock: ["anthropic.claude-sonnet-4-5-20250929-v1:0", "anthropic.claude-haiku-4-5-20251001-v1:0"],
+  vertex: ["gemini-2.5-flash", "gemini-2.5-pro", "claude-sonnet-4-5@20250929"],
 };

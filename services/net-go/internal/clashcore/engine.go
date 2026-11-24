@@ -27,6 +27,7 @@ var (
 	ErrRuntimeUnavailable = errors.New("clashcore: runtime disabled or unavailable")
 	errApplyPanicked      = errors.New("clashcore: config apply panicked")
 	engineOpen            atomic.Bool
+	logLevelOnce          sync.Once
 	emptyConfigYAML       = []byte("mode: rule\nlog-level: silent\nallow-lan: false\nprofile:\n  store-selected: false\n  store-fake-ip: false\nrules:\n  - MATCH,REJECT\n")
 	logBurstPerSecond     = 20
 )
@@ -94,7 +95,9 @@ func Open(opts Options) (*Engine, error) {
 		}
 		C.SetHomeDir(opts.HomeDir)
 	}
-	mlog.SetLevel(mlog.SILENT)
+	logLevelOnce.Do(func() {
+		mlog.SetLevel(mlog.SILENT)
+	})
 
 	e := &Engine{
 		opts:    opts,
@@ -141,7 +144,6 @@ func (e *Engine) Apply(_ context.Context, payload []byte) (err error) {
 		}
 	}()
 	executor.ApplyConfig(cfg, true)
-	mlog.SetLevel(mlog.SILENT)
 	return nil
 }
 
@@ -225,12 +227,10 @@ func (e *Engine) Close() error {
 		e.mu.Unlock()
 		return nil
 	}
-	if cfg, err := executor.ParseWithBytes(emptyConfigYAML); err == nil {
-		func() {
-			defer func() { _ = recover() }()
-			executor.ApplyConfig(cfg, true)
-		}()
-	}
+	func() {
+		defer func() { _ = recover() }()
+		executor.Shutdown()
+	}()
 	e.closed = true
 	e.mu.Unlock()
 

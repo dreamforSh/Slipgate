@@ -333,6 +333,10 @@ const SUB2API_PLATFORMS: Record<string, Provider | ((type: string) => Provider)>
   deepseek: "deepseek",
   minimax: "minimax",
   qwen: "qwen",
+  bedrock: "bedrock",
+  aws: "bedrock",
+  vertex: "vertex",
+  "vertex-ai": "vertex",
 };
 
 const SUB2API_TYPES: Record<string, AccountAuthKind> = {
@@ -504,10 +508,11 @@ const CPA_PLATFORMS: Record<string, Provider> = {
   antigravity: "antigravity",
   qwen: "qwen",
   kimi: "kimi",
+  vertex: "vertex",
 };
 
 /** CPA providers without a Slipgate counterpart: reported as unsupported instead of guessed. */
-const CPA_UNSUPPORTED_TYPES = new Set(["iflow", "vertex", "aistudio"]);
+const CPA_UNSUPPORTED_TYPES = new Set(["iflow", "aistudio"]);
 
 /** CPA routing metadata kept out of the stored credential (Slipgate has its own fields for these). */
 const CPA_METADATA_KEYS = new Set(["type", "disabled", "prefix", "proxy_url", "priority", "label"]);

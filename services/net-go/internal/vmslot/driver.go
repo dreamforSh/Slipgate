@@ -264,6 +264,7 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 
 	rp := effectiveRuntimeProfile(slot.RuntimeProfile)
 	guestHome := filepath.Join(slot.RootDir, "home", "runner")
+	guestToken := strings.TrimSpace(os.Getenv("SLIPGATE_GUEST_TOKEN"))
 	cmd := exec.Command(d.guestdBin)
 	cmd.Dir = slot.RootDir
 	cmd.Env = append(os.Environ(),
@@ -279,6 +280,9 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 		"CODEX_HOME="+filepath.Join(guestHome, ".codex"),
 		"ANTIGRAVITY_HOME="+filepath.Join(guestHome, ".antigravity"),
 	)
+	if guestToken != "" {
+		cmd.Env = append(cmd.Env, "SLIPGATE_GUEST_TOKEN="+guestToken)
+	}
 	if err := cmd.Start(); err != nil {
 		return slot, fmt.Errorf("vmslot: spawn slipgate-guestd: %w", err)
 	}
@@ -289,7 +293,7 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 
 	var pingErr error
 	for attempt := 0; attempt < 15; attempt++ {
-		if pingErr = dpbridge.Ping(pingCtx, endpoint); pingErr == nil {
+		if pingErr = dpbridge.PingAuth(pingCtx, endpoint, guestToken); pingErr == nil {
 			break
 		}
 		select {

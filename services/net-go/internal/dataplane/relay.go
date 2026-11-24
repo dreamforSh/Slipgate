@@ -310,7 +310,13 @@ func RelayAndTranscodeResponse(
 	relay := newTurnRelay(sink, turn, cleanseMode, true, startedAt, onVisibleToolDelta)
 
 	var runErr error
-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+	contentTypeLower := strings.ToLower(resp.Header.Get("Content-Type"))
+	if egress == CodecBedrockConverse && strings.Contains(contentTypeLower, "vnd.amazon.eventstream") {
+		runErr = pumpBedrockEventStream(resp.Body, relay)
+		if runErr != nil {
+			relay.Fail(http.StatusBadGateway, "api_error", "bedrock event stream interrupted: "+runErr.Error())
+		}
+	} else if strings.Contains(contentTypeLower, "text/event-stream") {
 		// Also covers upstreams that force SSE (e.g. the ChatGPT Codex backend) for unary callers.
 		runErr = pumpSSE(resp.Body, newUpstreamDecoder(egress, relay))
 		if runErr != nil {
@@ -892,6 +898,8 @@ func parseUnaryUpstream(egress CodecKind, raw []byte) (canonicalResult, error) {
 	res := canonicalResult{ID: fmt.Sprintf("sg%d", time.Now().UnixNano())}
 
 	switch egress {
+	case CodecBedrockConverse:
+		return parseBedrockConverseUnary(raw)
 	case CodecAnthropicMessages:
 		var ant struct {
 			ID           string           `json:"id"`

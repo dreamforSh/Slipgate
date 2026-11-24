@@ -90,6 +90,15 @@ export function detectBuiltinProvider(model: string): Provider | null {
   if (model.startsWith("kimi-") || model.startsWith("moonshot-")) return "kimi";
   if (model.startsWith("minimax-") || model.startsWith("abab")) return "minimax";
   if (model.startsWith("qwen-") || model.startsWith("wanx-")) return "qwen";
+  if (
+    model.startsWith("bedrock/") ||
+    model.startsWith("anthropic.claude") ||
+    model.startsWith("amazon.nova") ||
+    model.startsWith("amazon.titan")
+  ) {
+    return "bedrock";
+  }
+  if (model.startsWith("vertex/") || model.startsWith("vertex_ai/")) return "vertex";
   return null;
 }
 

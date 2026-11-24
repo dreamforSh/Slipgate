@@ -106,6 +106,9 @@ pub fn main() !void {
     const raw_addr = try getEnvOrDefault(allocator, "SLIPGATE_GUEST_ADDR", "127.0.0.1:19090");
     defer allocator.free(raw_addr);
 
+    const guest_token = try getEnvOrDefault(allocator, "SLIPGATE_GUEST_TOKEN", "");
+    defer allocator.free(guest_token);
+
     const parsed = try frame.parseEndpoint(raw_addr, 19090);
     const addr = try std.net.Address.parseIp(parsed.host, parsed.port);
     var server = try addr.listen(.{ .reuse_address = true });
@@ -128,7 +131,7 @@ pub fn main() !void {
             conn.stream.close();
             continue;
         }
-        const thread = std.Thread.spawn(.{}, frame.serveConnectionBounded, .{ allocator, conn, @as([]const u8, directive_json), &active_conns }) catch |err| {
+        const thread = std.Thread.spawn(.{}, frame.serveConnectionAuthBounded, .{ allocator, conn, @as([]const u8, directive_json), @as([]const u8, guest_token), &active_conns }) catch |err| {
             _ = active_conns.fetchSub(1, .release);
             std.log.err("thread spawn error: {s}", .{@errorName(err)});
             conn.stream.close();

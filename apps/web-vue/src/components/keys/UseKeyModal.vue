@@ -55,6 +55,8 @@ const MODEL_BY_PLATFORM: Record<string, string> = {
   kimi: "kimi-k2",
   minimax: "MiniMax-M2",
   qwen: "qwen3-coder-plus",
+  bedrock: "anthropic.claude-sonnet-4-5-20250929-v1:0",
+  vertex: "gemini-2.5-flash",
 };
 
 const CLIENT_ICON: Record<Client, IconName> = {

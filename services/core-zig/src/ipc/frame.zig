@@ -137,6 +137,16 @@ pub fn serveConnectionBounded(
     directive_json: []const u8,
     active_conns: ?*std.atomic.Value(u32),
 ) void {
+    serveConnectionAuthBounded(allocator, conn, directive_json, "", active_conns);
+}
+
+pub fn serveConnectionAuthBounded(
+    allocator: std.mem.Allocator,
+    conn: std.net.Server.Connection,
+    directive_json: []const u8,
+    required_token: []const u8,
+    active_conns: ?*std.atomic.Value(u32),
+) void {
     defer if (active_conns) |ac| {
         _ = ac.fetchSub(1, .release);
     };
@@ -170,7 +180,7 @@ pub fn serveConnectionBounded(
             if (payload_n != hdr.payload_len) return;
         }
 
-        const inner = unwrapAuthenticatedPayload(hdr.flags, payload, "") catch {
+        const inner = unwrapAuthenticatedPayload(hdr.flags, payload, required_token) catch {
             writeFrame(writer, hdr.stream_id, .{
                 .frame_type = .stream_end,
                 .flags = FLAG_END_STREAM | FLAG_ERROR,
@@ -191,6 +201,13 @@ pub fn serveConnectionBounded(
                 writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .dispatch_directive,
                     .flags = FLAG_END_STREAM | FLAG_PASSTHROUGH,
+                    .payload = directive_json,
+                }) catch return;
+            },
+            .exit_health => {
+                writeFrame(writer, hdr.stream_id, .{
+                    .frame_type = .exit_health,
+                    .flags = FLAG_END_STREAM,
                     .payload = directive_json,
                 }) catch return;
             },
@@ -229,4 +246,18 @@ test "frame header rejects oversized payload" {
         .payload_len = MAX_PAYLOAD_LEN + 1,
     };
     try std.testing.expectError(error.PayloadTooLarge, bad.encode());
+}
+
+test "unwrapAuthenticatedPayload enforces required token" {
+    const token = "guest-secret-token";
+    const body = "{\"ok\":true}";
+    var buf: [2 + token.len + body.len]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], @intCast(token.len), .big);
+    @memcpy(buf[2 .. 2 + token.len], token);
+    @memcpy(buf[2 + token.len ..], body);
+
+    const inner = try unwrapAuthenticatedPayload(FLAG_AUTH, &buf, token);
+    try std.testing.expectEqualStrings(body, inner);
+    try std.testing.expectError(error.UnauthorizedIpc, unwrapAuthenticatedPayload(0, body, token));
+    try std.testing.expectError(error.UnauthorizedIpc, unwrapAuthenticatedPayload(FLAG_AUTH, &buf, "wrong-secret-token"));
 }

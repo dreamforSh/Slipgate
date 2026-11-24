@@ -660,8 +660,14 @@ func TestSupportedDataPlaneRoutes(t *testing.T) {
 		{http.MethodDelete, "/v1/responses/resp_123", true},
 		{http.MethodGet, "/v1beta/models", true},
 		{http.MethodPost, "/v1beta/models/gemini-2.5-pro:embedContent", true},
+		{http.MethodPost, "/v1/completions", true},
+		{http.MethodPost, "/v1/audio/speech", true},
+		{http.MethodPost, "/v1/audio/transcriptions", true},
+		{http.MethodPost, "/v1/audio/translations", true},
+		{http.MethodPost, "/v1/rerank", true},
+		{http.MethodPost, "/v1/moderations", true},
 		{http.MethodGet, "/v1/chat/completions", false},
-		{http.MethodPost, "/v1/audio/transcriptions", false},
+		{http.MethodPost, "/v1/files", false},
 	}
 	for _, c := range cases {
 		if got := isSupportedDataPlaneRoute(c.method, c.path); got != c.want {

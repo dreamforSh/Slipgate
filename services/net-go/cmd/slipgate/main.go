@@ -230,6 +230,7 @@ func main() {
 		// On the persistent volume by default, so undelivered settlements survive a restart or redeploy.
 		SettlementSpoolDir: dataplane.ResolveSettlementSpoolDir(filepath.Join(cfg.HotUpdateDir, "settlement-spool")),
 		UpstreamTimeouts:   dataplane.UpstreamTimeouts{Header: cfg.UpstreamHeaderTimeout, Idle: cfg.UpstreamIdleTimeout},
+		GuestToken:         strings.TrimSpace(os.Getenv("SLIPGATE_GUEST_TOKEN")),
 	})
 	sup.SetRestartHook(func(child string) {
 		if child != "core" {

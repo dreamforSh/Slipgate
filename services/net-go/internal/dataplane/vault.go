@@ -37,6 +37,17 @@ type AccountSecret struct {
 	BaseURL          string            `json:"baseUrl,omitempty"`
 	UTLSProfileID    string            `json:"utlsProfileId,omitempty"`
 	Headers          map[string]string `json:"headers,omitempty"`
+	// AWS Bedrock credentials & region.
+	AWSAccessKeyID     string `json:"awsAccessKeyId,omitempty"`
+	AWSSecretAccessKey string `json:"awsSecretAccessKey,omitempty"`
+	AWSSessionToken    string `json:"awsSessionToken,omitempty"`
+	AWSRegion          string `json:"awsRegion,omitempty"`
+	// GCP Vertex AI service account credentials & location.
+	GCPClientEmail  string `json:"clientEmail,omitempty"`
+	GCPPrivateKey   string `json:"privateKey,omitempty"`
+	GCPPrivateKeyID string `json:"privateKeyId,omitempty"`
+	GCPTokenURI     string `json:"tokenUri,omitempty"`
+	GCPLocation     string `json:"location,omitempty"`
 }
 
 // NeedsOAuthRefresh reports whether an OAuth credential has a refresh token and expires within 5 minutes.
@@ -196,6 +207,35 @@ func ParseAccountSecret(raw string) AccountSecret {
 			Scope            string            `json:"scope"`
 			Email            string            `json:"email"`
 			Headers          map[string]string `json:"headers"`
+			// AWS Bedrock / custom endpoint aliases.
+			AltEndpoint          string `json:"endpoint"`
+			AWSAccessKeyID       string `json:"awsAccessKeyId"`
+			AltAWSAccessKeyID    string `json:"aws_access_key_id"`
+			AccessKeyID          string `json:"accessKeyId"`
+			AltAccessKeyID       string `json:"access_key_id"`
+			AWSSecretAccessKey   string `json:"awsSecretAccessKey"`
+			AltAWSSecretKey      string `json:"aws_secret_access_key"`
+			SecretAccessKey      string `json:"secretAccessKey"`
+			AltSecretAccessKey   string `json:"secret_access_key"`
+			AWSSessionToken      string `json:"awsSessionToken"`
+			AltAWSSessionToken   string `json:"aws_session_token"`
+			SessionToken         string `json:"sessionToken"`
+			AltSessionToken      string `json:"session_token"`
+			AWSRegion            string `json:"awsRegion"`
+			AltAWSRegion         string `json:"aws_region"`
+			Region               string `json:"region"`
+			// GCP Vertex AI Service Account fields.
+			ClientEmail          string `json:"clientEmail"`
+			AltClientEmail       string `json:"client_email"`
+			PrivateKey           string `json:"privateKey"`
+			AltPrivateKey        string `json:"private_key"`
+			PrivateKeyID         string `json:"privateKeyId"`
+			AltPrivateKeyID      string `json:"private_key_id"`
+			TokenURI             string `json:"tokenUri"`
+			AltTokenURI          string `json:"token_uri"`
+			Location             string `json:"location"`
+			GCPLocation          string `json:"gcpLocation"`
+			AltGCPLocation       string `json:"gcp_location"`
 			// Direct support for pasted .claude/.credentials.json and .codex/auth.json structures.
 			ClaudeAiOauth *struct {
 				AccessToken      string          `json:"accessToken"`
@@ -251,8 +291,17 @@ func ParseAccountSecret(raw string) AccountSecret {
 			chatgptAcc := firstNonEmpty(envelope.ChatGPTAccountID, envelope.AltChatGPTAccID, codexAcc, envelope.AccountID, envelope.AltAccountID, jwtAccID)
 			proj := firstNonEmpty(envelope.ProjectID, envelope.AltProjectID, envelope.CompanionProject)
 			org := firstNonEmpty(envelope.OrganizationID, envelope.AltOrgID)
-			base := firstNonEmpty(envelope.BaseURL, envelope.AltBaseURL)
+			base := firstNonEmpty(envelope.BaseURL, envelope.AltBaseURL, envelope.AltEndpoint)
 			prof := firstNonEmpty(envelope.UTLSProfileID, envelope.AltProfileID)
+			awsKey := firstNonEmpty(envelope.AWSAccessKeyID, envelope.AltAWSAccessKeyID, envelope.AccessKeyID, envelope.AltAccessKeyID)
+			awsSecret := firstNonEmpty(envelope.AWSSecretAccessKey, envelope.AltAWSSecretKey, envelope.SecretAccessKey, envelope.AltSecretAccessKey)
+			awsSess := firstNonEmpty(envelope.AWSSessionToken, envelope.AltAWSSessionToken, envelope.SessionToken, envelope.AltSessionToken)
+			awsRegion := firstNonEmpty(envelope.AWSRegion, envelope.AltAWSRegion, envelope.Region)
+			gcpEmail := firstNonEmpty(envelope.ClientEmail, envelope.AltClientEmail)
+			gcpPrivKey := firstNonEmpty(envelope.PrivateKey, envelope.AltPrivateKey)
+			gcpKeyID := firstNonEmpty(envelope.PrivateKeyID, envelope.AltPrivateKeyID)
+			gcpTokenURI := firstNonEmpty(envelope.TokenURI, envelope.AltTokenURI)
+			gcpLoc := firstNonEmpty(envelope.Location, envelope.GCPLocation, envelope.AltGCPLocation, envelope.Region)
 			expMs := envelope.ExpiresAtUnixMs
 			if expMs <= 0 {
 				expMs = envelope.AltExpiresAtUnixMs
@@ -287,6 +336,15 @@ func ParseAccountSecret(raw string) AccountSecret {
 				BaseURL:          base,
 				UTLSProfileID:    prof,
 				Headers:          cloneHeaders(envelope.Headers),
+				AWSAccessKeyID:     awsKey,
+				AWSSecretAccessKey: awsSecret,
+				AWSSessionToken:    awsSess,
+				AWSRegion:          awsRegion,
+				GCPClientEmail:     gcpEmail,
+				GCPPrivateKey:      gcpPrivKey,
+				GCPPrivateKeyID:    gcpKeyID,
+				GCPTokenURI:        gcpTokenURI,
+				GCPLocation:        gcpLoc,
 			}
 		}
 	}

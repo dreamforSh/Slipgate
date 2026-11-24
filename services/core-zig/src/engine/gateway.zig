@@ -631,7 +631,7 @@ fn effectiveProvider(group: GroupRecord, route_match: composite.RouteMatch) comp
         return route_match.provider;
     }
     if (std.meta.stringToEnum(composite.Provider, group.platform)) |grp_prov| {
-        if (grp_prov == .antigravity or grp_prov == .codex) return grp_prov;
+        if (grp_prov == .antigravity or grp_prov == .codex or grp_prov == .bedrock or grp_prov == .vertex) return grp_prov;
     }
     return route_match.provider;
 }

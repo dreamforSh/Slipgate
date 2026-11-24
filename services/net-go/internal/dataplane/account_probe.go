@@ -65,6 +65,10 @@ func DefaultProbeModel(provider string) string {
 		return "MiniMax-M2"
 	case "qwen":
 		return "qwen-plus"
+	case "bedrock":
+		return "anthropic.claude-sonnet-4-5-20250929-v1:0"
+	case "vertex":
+		return "gemini-2.5-flash"
 	default:
 		return "gpt-4o-mini"
 	}
@@ -86,6 +90,12 @@ func (c *Coordinator) ProbeAccount(ctx context.Context, accountID string, req Pr
 	secret, ok := c.vault.Get(accountID)
 	if !ok {
 		emit(ProbeEvent{Type: "error", Code: "account_secret_unavailable", Message: "account credentials are not loaded in the vault"})
+		return
+	}
+	var prepErr error
+	secret, prepErr = c.prepareCloudProviderSecret(ctx, meta.Platform, secret)
+	if prepErr != nil {
+		emit(ProbeEvent{Type: "error", Code: "cloud_auth_failed", Message: prepErr.Error()})
 		return
 	}
 

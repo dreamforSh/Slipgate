@@ -12,6 +12,8 @@ pub const Provider = enum {
     kimi,
     minimax,
     qwen,
+    bedrock,
+    vertex,
 };
 
 pub const EndpointKind = enum {
@@ -136,6 +138,9 @@ fn detectBuiltinProvider(model: []const u8) ?Provider {
         std.mem.startsWith(u8, model, "text-embedding-") or
         std.mem.startsWith(u8, model, "dall-e-") or
         std.mem.startsWith(u8, model, "sora-") or
+        std.mem.startsWith(u8, model, "tts-") or
+        std.mem.startsWith(u8, model, "whisper-") or
+        std.mem.startsWith(u8, model, "text-moderation-") or
         std.mem.startsWith(u8, model, "omni-moderation-") or
         std.mem.startsWith(u8, model, "openai/")) return .openai;
     if (std.mem.startsWith(u8, model, "grok-") or std.mem.startsWith(u8, model, "xai/")) return .grok;
@@ -150,6 +155,11 @@ fn detectBuiltinProvider(model: []const u8) ?Provider {
         std.mem.startsWith(u8, model, "qwq-") or
         std.mem.startsWith(u8, model, "wanx-") or
         std.mem.startsWith(u8, model, "qwen/")) return .qwen;
+    if (std.mem.startsWith(u8, model, "bedrock/") or
+        std.mem.startsWith(u8, model, "anthropic.claude") or
+        std.mem.startsWith(u8, model, "amazon.nova") or
+        std.mem.startsWith(u8, model, "amazon.titan")) return .bedrock;
+    if (std.mem.startsWith(u8, model, "vertex/") or std.mem.startsWith(u8, model, "vertex_ai/")) return .vertex;
     return null;
 }
 

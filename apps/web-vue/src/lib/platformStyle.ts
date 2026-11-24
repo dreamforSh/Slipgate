@@ -97,6 +97,20 @@ const STYLES: Record<GroupPlatform, PlatformStyle> = {
     bar: "bg-gradient-to-r from-sky-400 to-indigo-500",
     text: "text-sky-600 dark:text-sky-400",
   },
+  bedrock: {
+    badge: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400",
+    type: "bg-amber-50 text-amber-600 dark:bg-amber-900/20 dark:text-amber-400",
+    border: "border-amber-500/20 hover:border-amber-500/40",
+    bar: "bg-gradient-to-r from-amber-400 to-amber-500",
+    text: "text-amber-600 dark:text-amber-400",
+  },
+  vertex: {
+    badge: "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+    type: "bg-indigo-50 text-indigo-600 dark:bg-indigo-900/20 dark:text-indigo-400",
+    border: "border-indigo-500/20 hover:border-indigo-500/40",
+    bar: "bg-gradient-to-r from-indigo-400 to-indigo-500",
+    text: "text-indigo-600 dark:text-indigo-400",
+  },
   composite: {
     badge: "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400",
     type: "bg-cyan-50 text-cyan-600 dark:bg-cyan-900/20 dark:text-cyan-400",
@@ -131,6 +145,8 @@ const SHORT_LABELS: Record<GroupPlatform, string> = {
   kimi: "Kimi",
   minimax: "MiniMax",
   qwen: "Qwen",
+  bedrock: "Bedrock",
+  vertex: "Vertex AI",
   composite: "Composite",
 };
 

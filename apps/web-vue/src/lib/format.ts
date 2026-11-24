@@ -90,6 +90,8 @@ export const PROVIDER_OPTIONS: { value: Provider; label: string }[] = [
   { value: "kimi", label: "Kimi" },
   { value: "minimax", label: "MiniMax" },
   { value: "qwen", label: "Qwen" },
+  { value: "bedrock", label: "AWS Bedrock" },
+  { value: "vertex", label: "Vertex AI" },
 ];
 
 /* ---------------- Dashboard number formatting ---------------- */

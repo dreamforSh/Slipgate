@@ -60,7 +60,7 @@ const highlights = computed<{ icon: IconName; label: string }[]>(() => [
 ]);
 
 /* ---------------- Provider strip ---------------- */
-const providers = ["anthropic", "openai", "codex", "gemini", "antigravity", "grok", "deepseek", "glm", "kimi", "minimax", "qwen"];
+const providers = ["anthropic", "openai", "codex", "gemini", "antigravity", "grok", "deepseek", "glm", "kimi", "minimax", "qwen", "bedrock", "vertex"];
 
 /* ---------------- Feature visuals ---------------- */
 const endpoints = [
