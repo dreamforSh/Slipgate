@@ -42,7 +42,13 @@ import {
   type RegistrationGuard,
 } from "./auth_guards_store.ts";
 import type { OpsStore } from "./ops_types.ts";
-import { ensureUsageIndexesInBackground, PG_OPS_SCHEMA_SQL, PG_SESSION_SCHEMA_SQL, PostgresOpsStore } from "./postgres_ops.ts";
+import {
+  ensureUsageIndexesInBackground,
+  PG_OAUTH_EXTRAS_SCHEMA_SQL,
+  PG_OPS_SCHEMA_SQL,
+  PG_SESSION_SCHEMA_SQL,
+  PostgresOpsStore,
+} from "./postgres_ops.ts";
 import { PG_ANNOUNCEMENT_TARGETING_SCHEMA_SQL } from "./postgres_announcements.ts";
 import { PG_PAYMENTS_SCHEMA_SQL, pendingAuditSecretScrub, PostgresPaymentsStore } from "./postgres_payments.ts";
 import { PG_PAYMENT_PROVIDERS_SCHEMA_SQL } from "./postgres_payment_providers.ts";
@@ -55,6 +61,7 @@ import { PG_CHANNEL_MONITORS_SCHEMA_SQL, PostgresChannelMonitorStore } from "./p
 import { PG_PLATFORM_QUOTAS_SCHEMA_SQL, PostgresPlatformQuotasStore } from "./postgres_platform_quotas.ts";
 import { PG_USAGE_ROLLUPS_SCHEMA_SQL, PostgresUsageRollupsStore } from "./postgres_usage_rollups.ts";
 import { PG_MODERATION_SCHEMA_SQL, PostgresModerationStore } from "./postgres_moderation.ts";
+import { PG_PASSKEYS_SCHEMA_SQL, PostgresPasskeyStore } from "./postgres_passkeys.ts";
 import {
   PG_SETTLEMENT_SCHEMA_SQL,
   pruneSettlementIds,
@@ -142,6 +149,7 @@ export class PostgresControlStore implements ControlStore {
   readonly platformQuotas: PostgresPlatformQuotasStore;
   readonly usageRollups: PostgresUsageRollupsStore;
   readonly moderation: PostgresModerationStore;
+  readonly passkeys: PostgresPasskeyStore;
   private backgroundMaintenance: Promise<void> = Promise.resolve();
   /** Earliest time of the next opportunistic core.settlement_ids prune (off the settlement tx). */
   private settlementPruneAt = 0;
@@ -164,6 +172,7 @@ export class PostgresControlStore implements ControlStore {
     this.platformQuotas = new PostgresPlatformQuotasStore(this.sql);
     this.usageRollups = new PostgresUsageRollupsStore(this.sql);
     this.moderation = new PostgresModerationStore(this.sql);
+    this.passkeys = new PostgresPasskeyStore(this.sql);
   }
 
   async init(): Promise<void> {
@@ -556,6 +565,8 @@ export class PostgresControlStore implements ControlStore {
     await this.sql.unsafe(PG_PLATFORM_QUOTAS_SCHEMA_SQL);
     await this.sql.unsafe(PG_USAGE_ROLLUPS_SCHEMA_SQL);
     await this.sql.unsafe(PG_MODERATION_SCHEMA_SQL);
+    await this.sql.unsafe(PG_PASSKEYS_SCHEMA_SQL);
+    await this.sql.unsafe(PG_OAUTH_EXTRAS_SCHEMA_SQL);
     // Index builds and the one-time spend backfill must not delay startup or block settlements.
     // So is the one-off pass of the current audit-log redaction over rows older builds stored.
     const auditScrub = await pendingAuditSecretScrub(this.sql);
@@ -619,12 +630,14 @@ export class PostgresControlStore implements ControlStore {
             role: "admin" | "user";
             status: "active" | "suspended";
             totp_enabled: boolean;
+            avatar_url: string;
+            email_verified: boolean;
             created_at: Date;
           }[]
         >`
           INSERT INTO commerce.users (id, email, password_hash, role, status)
           VALUES (${adminId}, ${email}, ${adminPasswordHash}, 'admin', 'active')
-          RETURNING id, email, username, role, status, totp_enabled, created_at
+          RETURNING id, email, username, role, status, totp_enabled, avatar_url, email_verified, created_at
         `;
 
         await tx`
@@ -655,6 +668,8 @@ export class PostgresControlStore implements ControlStore {
           id: row.id,
           email: row.email,
           username: row.username ?? "",
+          avatarUrl: row.avatar_url ?? "",
+          emailVerified: Boolean(row.email_verified),
           role: row.role,
           status: row.status,
           totpEnabled: row.totp_enabled,
@@ -693,12 +708,14 @@ export class PostgresControlStore implements ControlStore {
             role: "admin" | "user";
             status: "active" | "suspended";
             totp_enabled: boolean;
+            avatar_url: string;
+            email_verified: boolean;
             created_at: Date;
           }[]
         >`
           INSERT INTO commerce.users (id, email, password_hash, role, status)
           VALUES (${userId}, ${email.toLowerCase()}, ${passwordHash}, 'user', 'active')
-          RETURNING id, email, username, role, status, totp_enabled, created_at
+          RETURNING id, email, username, role, status, totp_enabled, avatar_url, email_verified, created_at
         `;
         await tx`
           INSERT INTO core.quota_wallets (user_id, balance_nano_usd, held_nano_usd)
@@ -710,6 +727,8 @@ export class PostgresControlStore implements ControlStore {
           id: row.id,
           email: row.email,
           username: row.username ?? "",
+          avatarUrl: row.avatar_url ?? "",
+          emailVerified: Boolean(row.email_verified),
           role: row.role,
           status: row.status,
           totpEnabled: row.totp_enabled,
@@ -737,11 +756,13 @@ export class PostgresControlStore implements ControlStore {
         role: "admin" | "user";
         status: "active" | "suspended";
         totp_enabled: boolean;
+        avatar_url: string;
+        email_verified: boolean;
         created_at: Date;
         token_version: number;
       }[]
     >`
-      SELECT id, email, username, password_hash, role, status, totp_enabled, created_at, token_version
+      SELECT id, email, username, password_hash, role, status, totp_enabled, avatar_url, email_verified, created_at, token_version
       FROM commerce.users
       WHERE LOWER(email) = LOWER(${email})
       LIMIT 1
@@ -752,6 +773,8 @@ export class PostgresControlStore implements ControlStore {
       id: row.id,
       email: row.email,
       username: row.username ?? "",
+      avatarUrl: row.avatar_url ?? "",
+      emailVerified: Boolean(row.email_verified),
       passwordHash: row.password_hash,
       role: row.role,
       status: row.status,
@@ -770,10 +793,12 @@ export class PostgresControlStore implements ControlStore {
         role: "admin" | "user";
         status: "active" | "suspended";
         totp_enabled: boolean;
+        avatar_url: string;
+        email_verified: boolean;
         created_at: Date;
       }[]
     >`
-      SELECT id, email, username, role, status, totp_enabled, created_at
+      SELECT id, email, username, role, status, totp_enabled, avatar_url, email_verified, created_at
       FROM commerce.users
       WHERE id = ${userId}
       LIMIT 1
@@ -784,6 +809,8 @@ export class PostgresControlStore implements ControlStore {
       id: row.id,
       email: row.email,
       username: row.username ?? "",
+      avatarUrl: row.avatar_url ?? "",
+      emailVerified: Boolean(row.email_verified),
       role: row.role,
       status: row.status,
       totpEnabled: row.totp_enabled,
@@ -800,10 +827,12 @@ export class PostgresControlStore implements ControlStore {
         role: "admin" | "user";
         status: "active" | "suspended";
         totp_enabled: boolean;
+        avatar_url: string;
+        email_verified: boolean;
         created_at: Date;
       }[]
     >`
-      SELECT id, email, username, role, status, totp_enabled, created_at
+      SELECT id, email, username, role, status, totp_enabled, avatar_url, email_verified, created_at
       FROM commerce.users
       ORDER BY created_at DESC
     `;
@@ -811,6 +840,8 @@ export class PostgresControlStore implements ControlStore {
       id: row.id,
       email: row.email,
       username: row.username ?? "",
+      avatarUrl: row.avatar_url ?? "",
+      emailVerified: Boolean(row.email_verified),
       role: row.role,
       status: row.status,
       totpEnabled: row.totp_enabled,

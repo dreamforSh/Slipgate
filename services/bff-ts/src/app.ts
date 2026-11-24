@@ -73,11 +73,12 @@ import { PluginRegistry } from "@slipgate/plugin-sdk";
 import { buildAccountUsageStats, buildDashboardStats, dashboardWindow, DASHBOARD_MAX_ROWS } from "./dashboard.ts";
 import { applyEntitlements, cached, detectBuiltinProvider, WindowLimiter } from "./insights.ts";
 import { verifyTotp } from "./security/totp.ts";
-import { totpStepUp } from "./security/step_up.ts";
+import { attachPasskeyStepUpRegistry, totpStepUp } from "./security/step_up.ts";
 import { SessionManager, type AuthEnv } from "./middleware/auth.ts";
 import { clientIp } from "./security/client_ip.ts";
 import { auditMiddleware, registerOpsRoutes } from "./routes/ops.ts";
 import { digestEmailCode, registerMailRoutes, type MailService } from "./routes/mail.ts";
+import { PasskeyStepUpRegistry, registerPasskeyRoutes } from "./routes/passkeys.ts";
 import { registerPaymentRoutes } from "./routes/payments.ts";
 import { registerPricingRoutes, repriceSettlement, snapshotPriceRules, type PricingService } from "./routes/pricing.ts";
 import { CoalescingRunner, KeyedThrottle } from "./settlement_guards.ts";
@@ -521,6 +522,8 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   app.use("/api/*", (c, next) => (c.req.path.startsWith("/api/v1/internal/") ? next() : apiBodyLimit(c, next)));
   const startedAt = Date.now();
   const stepUpGuard = totpStepUp(store, vaultSecret);
+  const passkeyStepUpRegistry = new PasskeyStepUpRegistry();
+  attachPasskeyStepUpRegistry(store, passkeyStepUpRegistry);
   const loginTotpLimiter = stepUpGuard.limiter;
   /** Issues, re-validates (per request) and revokes console sessions; owns the password-attempt limits. */
   const sessions = new SessionManager(store, jwtSecret);
@@ -2717,10 +2720,17 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     vaultSecret,
     syncDataPlane: syncDataPlaneBestEffort,
     mailReady: () => mail.ready(),
+    mailService: () => mail,
     pricingRules: () => pricing.rules(),
     discoveredModels: discoveredModelsCache,
     sessions,
     publicCaptcha: () => guards.publicCaptcha(),
+  });
+  registerPasskeyRoutes(app, {
+    store,
+    sessions,
+    guards,
+    stepUpRegistry: passkeyStepUpRegistry,
   });
   registerAccountOAuthRoutes(app, { store, fetchImpl: options.oauthFetch });
   registerUserLimitRoutes(app, { store, sessions, syncDataPlane: syncDataPlaneBestEffort, internalToken });

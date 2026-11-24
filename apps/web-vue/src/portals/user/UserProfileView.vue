@@ -8,6 +8,7 @@ import PasswordStrength from "../../components/me/PasswordStrength.vue";
 import LinkedAccountsCard from "../../components/me/LinkedAccountsCard.vue";
 import SessionsCard from "../../components/me/SessionsCard.vue";
 import TotpCard from "../../components/me/TotpCard.vue";
+import PasskeysPanel from "../../components/profile/PasskeysPanel.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
 import UiBadge from "../../components/ui/UiBadge.vue";
 import UiCard from "../../components/ui/UiCard.vue";
@@ -15,10 +16,12 @@ import UiIcon from "../../components/ui/UiIcon.vue";
 import { ApiError, apiJson, errorText } from "../../lib/api";
 import { formatDateShort, formatRelative, formatUsd } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import { usePortalStore } from "../../stores/portal";
 import { useToastStore } from "../../stores/toast";
 
 const { t } = useI18n();
 const auth = useAuthStore();
+const portal = usePortalStore();
 const toast = useToastStore();
 
 /* ---------------- Identity ---------------- */
@@ -27,6 +30,8 @@ const user = computed(() => auth.user);
 const emailLocal = computed(() => (user.value?.email ?? "").split("@")[0] ?? "");
 const displayName = computed(() => user.value?.username?.trim() || emailLocal.value || "—");
 const initial = computed(() => Array.from(displayName.value)[0]?.toUpperCase() ?? "?");
+const isPlaceholderEmail = computed(() => Boolean(user.value?.email?.toLowerCase().endsWith("@users.noreply.slipgate")));
+const emailVerificationNeeded = computed(() => Boolean(portal.settings?.emailVerificationRequired));
 const balance = computed(() =>
   auth.wallet ? auth.wallet.formattedAvailableUsd || formatUsd(auth.wallet.availableNanoUsd) : "—",
 );
@@ -45,19 +50,25 @@ onMounted(async () => {
   }
 });
 
-/* ---------------- Display name ---------------- */
+/* ---------------- Display name & avatar ---------------- */
 
 const nameDraft = ref(user.value?.username ?? "");
+const avatarDraft = ref(user.value?.avatarUrl ?? "");
 const savingName = ref(false);
 
 watch(
-  () => user.value?.username,
-  (next) => {
-    if (!savingName.value) nameDraft.value = next ?? "";
+  () => [user.value?.username, user.value?.avatarUrl] as const,
+  ([nextName, nextAvatar]) => {
+    if (!savingName.value) {
+      nameDraft.value = nextName ?? "";
+      avatarDraft.value = nextAvatar ?? "";
+    }
   },
 );
 
-const nameChanged = computed(() => nameDraft.value.trim() !== (user.value?.username ?? ""));
+const nameChanged = computed(
+  () => nameDraft.value.trim() !== (user.value?.username ?? "") || avatarDraft.value.trim() !== (user.value?.avatarUrl ?? ""),
+);
 const nameTooLong = computed(() => nameDraft.value.trim().length > 64);
 const namePreview = computed(() => nameDraft.value.trim() || emailLocal.value);
 
@@ -67,15 +78,62 @@ async function saveName() {
   try {
     const res = await apiJson<{ user: UserProfile }>("/api/v1/user/profile", {
       method: "PATCH",
-      body: { username: nameDraft.value.trim() },
+      body: { username: nameDraft.value.trim(), avatarUrl: avatarDraft.value.trim() },
     });
     auth.user = res.user;
     nameDraft.value = res.user.username;
+    avatarDraft.value = res.user.avatarUrl ?? "";
     toast.success(t("profile.name.saved"));
   } catch (err) {
     toast.error(errorText(err, t("profile.name.failed")));
   } finally {
     savingName.value = false;
+  }
+}
+
+/* ---------------- Bind real email (OAuth placeholder accounts) ---------------- */
+
+const bindEmail = reactive({ address: "", code: "", sendingCode: false, saving: false, sentTo: "" });
+
+async function sendBindEmailCode() {
+  const email = bindEmail.address.trim();
+  if (!email || bindEmail.sendingCode) return;
+  bindEmail.sendingCode = true;
+  try {
+    await apiJson("/api/v1/user/profile/bind-email/code", {
+      method: "POST",
+      body: { email },
+    });
+    bindEmail.sentTo = email;
+    toast.success(t("profile.bindEmail.codeSent"));
+  } catch (err) {
+    toast.error(errorText(err, t("profile.bindEmail.sendCodeFailed")));
+  } finally {
+    bindEmail.sendingCode = false;
+  }
+}
+
+async function submitBindEmail() {
+  const email = bindEmail.address.trim();
+  if (!email || bindEmail.saving) return;
+  bindEmail.saving = true;
+  try {
+    const res = await apiJson<{ user: UserProfile }>("/api/v1/user/profile/bind-email", {
+      method: "POST",
+      body: {
+        email,
+        ...(bindEmail.code.trim() ? { emailCode: bindEmail.code.trim() } : {}),
+      },
+    });
+    auth.user = res.user;
+    bindEmail.address = "";
+    bindEmail.code = "";
+    bindEmail.sentTo = "";
+    toast.success(t("profile.bindEmail.saved"));
+  } catch (err) {
+    toast.error(errorText(err, t("profile.bindEmail.failed")));
+  } finally {
+    bindEmail.saving = false;
   }
 }
 
@@ -140,7 +198,14 @@ const stagger = (i: number) => ({ animationDelay: `${i * 70}ms`, animationFillMo
           <div class="absolute inset-0 bg-grid" />
         </div>
         <div class="relative -mt-10 px-5 pb-5">
+          <img
+            v-if="user?.avatarUrl"
+            :src="user.avatarUrl"
+            alt=""
+            class="h-20 w-20 rounded-2xl bg-surface object-cover shadow-glow ring-4 ring-surface"
+          />
           <span
+            v-else
             class="inline-flex h-20 w-20 select-none items-center justify-center rounded-2xl text-3xl font-bold text-accent-fg shadow-glow ring-4 ring-surface"
             :style="avatarStyle"
             aria-hidden="true"
@@ -234,11 +299,71 @@ const stagger = (i: number) => ({ animationDelay: `${i * 70}ms`, animationFillMo
                 {{ savingName ? t("common.saving") : t("common.save") }}
               </button>
             </div>
+            <div>
+              <label for="profile-avatar" class="label">{{ t("profile.avatar.label") }}</label>
+              <input
+                id="profile-avatar"
+                v-model="avatarDraft"
+                type="url"
+                maxlength="512"
+                class="input font-mono text-xs"
+                :placeholder="t('profile.avatar.placeholder')"
+              />
+            </div>
             <p class="flex flex-wrap items-center gap-1.5 text-xs text-fg-subtle">
               <UiIcon name="info" :size="12" />
               {{ t("profile.name.hint") }}
               <span class="font-medium text-fg-muted">{{ t("profile.name.preview", { name: namePreview }) }}</span>
             </p>
+          </form>
+        </UiCard>
+
+        <!-- Bind real email for placeholder OAuth accounts -->
+        <UiCard
+          v-if="isPlaceholderEmail"
+          class="animate-slide-up motion-reduce:animate-none"
+          :style="stagger(2)"
+          icon="mail"
+          :title="t('profile.bindEmail.title')"
+        >
+          <form class="space-y-3" @submit.prevent="submitBindEmail">
+            <p class="text-sm text-fg-subtle">{{ t("profile.bindEmail.desc") }}</p>
+            <div class="flex flex-col gap-2 sm:flex-row">
+              <input
+                v-model="bindEmail.address"
+                type="email"
+                required
+                maxlength="254"
+                class="input sm:flex-1"
+                :placeholder="t('profile.bindEmail.placeholder')"
+              />
+              <button
+                v-if="emailVerificationNeeded"
+                type="button"
+                class="btn btn-secondary shrink-0"
+                :disabled="!bindEmail.address.trim() || bindEmail.sendingCode"
+                @click="sendBindEmailCode"
+              >
+                <UiIcon v-if="bindEmail.sendingCode" name="loader" :size="14" spin />
+                {{ t("profile.bindEmail.sendCode") }}
+              </button>
+            </div>
+            <div v-if="emailVerificationNeeded || bindEmail.sentTo" class="flex flex-col gap-2 sm:flex-row">
+              <input
+                v-model="bindEmail.code"
+                type="text"
+                maxlength="12"
+                autocomplete="one-time-code"
+                class="input font-mono sm:flex-1"
+                :placeholder="t('profile.bindEmail.codePlaceholder')"
+              />
+            </div>
+            <div class="flex justify-end">
+              <button type="submit" class="btn btn-primary" :disabled="!bindEmail.address.trim() || bindEmail.saving">
+                <UiIcon :name="bindEmail.saving ? 'loader' : 'check'" :size="15" :spin="bindEmail.saving" />
+                {{ bindEmail.saving ? t("common.submitting") : t("profile.bindEmail.submit") }}
+              </button>
+            </div>
           </form>
         </UiCard>
 
@@ -306,11 +431,14 @@ const stagger = (i: number) => ({ animationDelay: `${i * 70}ms`, animationFillMo
         <!-- Two-factor sign-in -->
         <TotpCard class="animate-slide-up motion-reduce:animate-none" :style="stagger(3)" />
 
+        <!-- WebAuthn Passkeys -->
+        <PasskeysPanel class="animate-slide-up motion-reduce:animate-none" :style="stagger(4)" />
+
         <!-- Third-party sign-in identities (renders nothing when no provider is enabled) -->
-        <LinkedAccountsCard class="animate-slide-up motion-reduce:animate-none" :style="stagger(4)" />
+        <LinkedAccountsCard class="animate-slide-up motion-reduce:animate-none" :style="stagger(5)" />
 
         <!-- Sessions: this device, sign out other / all devices -->
-        <SessionsCard class="animate-slide-up motion-reduce:animate-none" :style="stagger(5)" />
+        <SessionsCard class="animate-slide-up motion-reduce:animate-none" :style="stagger(6)" />
       </div>
     </div>
   </div>

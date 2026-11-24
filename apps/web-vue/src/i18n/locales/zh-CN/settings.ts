@@ -240,6 +240,8 @@ export default {
         github: "GitHub OAuth App",
         google: "Google OAuth 2.0",
         linuxdo: "LINUX DO Connect",
+        wechat: "微信开放平台",
+        dingtalk: "钉钉开放平台",
         oidc: "自定义 OpenID Connect",
       },
       status: {

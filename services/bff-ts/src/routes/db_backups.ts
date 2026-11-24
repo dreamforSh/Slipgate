@@ -18,6 +18,7 @@ import { WindowLimiter } from "../insights.ts";
 import type { AuthEnv, SessionManager } from "../middleware/auth.ts";
 import { clientIp } from "../security/client_ip.ts";
 import { decryptSecret } from "../security/crypto.ts";
+import { totpStepUp } from "../security/step_up.ts";
 import { verifyTotp } from "../security/totp.ts";
 import { StoreError, type ControlStore } from "../store/types.ts";
 
@@ -177,6 +178,12 @@ export function registerDbBackupRoutes(app: Hono<AuthEnv>, ctx: DbBackupRouteCon
   /** null when the admin passed; otherwise the refusal to send. */
   async function stepUp(c: Context<AuthEnv>, req: BackupStepUpRequest): Promise<Response | null> {
     const claims = c.get("authUser");
+    if (req.passkeyStepUpToken) {
+      return totpStepUp(store, vaultSecret).confirmAdmin(c, sessions, claims.sub, req);
+    }
+    if (!req.password) {
+      return c.json({ error: "step_up_required", message: "Confirm this change with your password or passkey" }, 403);
+    }
     const check = await sessions.confirmPassword(claims.sub, clientIp(c), req.password);
     if (!check.ok) {
       if (check.retryAfterSeconds !== null) {

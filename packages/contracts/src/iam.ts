@@ -54,6 +54,8 @@ export const UserProfileSchema = z.object({
   email: z.string().email(),
   /** Display name; empty falls back to the email's local part in the UI. */
   username: z.string().max(64).default(""),
+  avatarUrl: z.string().max(512).optional(),
+  emailVerified: z.boolean().optional(),
   role: UserRoleSchema,
   status: UserStatusSchema,
   totpEnabled: z.boolean(),

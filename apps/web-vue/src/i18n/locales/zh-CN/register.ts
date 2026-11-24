@@ -131,5 +131,17 @@ export default {
       rateLimited: "请求过于频繁，请稍后再试",
       invalid: "验证码错误或已过期，请重新输入",
     },
+    oauthContinue: {
+      title: "完善账号信息",
+      subtitle: "已通过 {name} 授权",
+      username: "显示名称",
+      usernamePlaceholder: "可选昵称",
+      submit: "完成注册",
+    },
+    passkey: {
+      signIn: "使用 Passkey 登录",
+      verifying: "正在验证 Passkey…",
+      failed: "Passkey 登录失败",
+    },
   },
 };

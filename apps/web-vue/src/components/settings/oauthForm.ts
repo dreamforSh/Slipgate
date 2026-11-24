@@ -57,6 +57,8 @@ export const OAUTH_DEFAULT_NAMES: Record<OAuthProviderId, string> = {
   github: "GitHub",
   google: "Google",
   linuxdo: "LINUX DO",
+  wechat: "WeChat",
+  dingtalk: "DingTalk",
   oidc: "SSO",
 };
 
@@ -65,6 +67,8 @@ export const OAUTH_CONSOLE_URLS: Partial<Record<OAuthProviderId, string>> = {
   github: "https://github.com/settings/developers",
   google: "https://console.cloud.google.com/apis/credentials",
   linuxdo: "https://connect.linux.do",
+  wechat: "https://open.weixin.qq.com",
+  dingtalk: "https://open-dev.dingtalk.com",
 };
 
 export const OAUTH_LIMITS: Record<Exclude<OAuthFieldKey, "enabled" | "allowSignup">, number> = {

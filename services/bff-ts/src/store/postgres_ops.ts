@@ -15,6 +15,7 @@ import {
   type BalanceLedgerItem,
   type CreatePromoCodeRequest,
   type GenerateRedeemCodesRequest,
+  type OAuthProviderId,
   type PortalSettings,
   type PromoCodeCheckResponse,
   type PromoCodeItem,
@@ -55,7 +56,9 @@ import type {
   AdminUserCreateInput,
   AdminUserUpdateInput,
   AuditLogInput,
+  CreatePendingOAuthSignupInput,
   OpsStore,
+  PendingOAuthSignupRecord,
   RegistrationExtras,
   RegistrationOutcome,
   SessionState,
@@ -272,6 +275,32 @@ export const PG_SESSION_SCHEMA_SQL = `
 `;
 
 /**
+ * OAuth extras: user avatar_url/email_verified + pending invite-required continuation tokens.
+ * Mirrored by migrations/commerce/0015_oauth_extras.sql.
+ */
+export const PG_OAUTH_EXTRAS_SCHEMA_SQL = `
+  ALTER TABLE commerce.users
+      ADD COLUMN IF NOT EXISTS avatar_url TEXT NOT NULL DEFAULT '',
+      ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+
+  CREATE TABLE IF NOT EXISTS commerce.oauth_pending_signups (
+      token_hash         TEXT PRIMARY KEY,
+      provider           TEXT NOT NULL,
+      subject            TEXT NOT NULL,
+      suggested_email    TEXT NOT NULL DEFAULT '',
+      suggested_username TEXT NOT NULL DEFAULT '',
+      avatar_url         TEXT NOT NULL DEFAULT '',
+      binding_hash       TEXT NOT NULL,
+      redirect_path      TEXT NOT NULL DEFAULT '/dashboard',
+      expires_at         TIMESTAMPTZ NOT NULL,
+      created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_commerce_oauth_pending_expires
+      ON commerce.oauth_pending_signups (expires_at);
+`;
+
+/**
  * Transaction-scoped advisory lock serialising every change that can remove an active
  * administrator. Without it two admins demoting (or deleting) each other concurrently each see the
  * other still active under READ COMMITTED and both commit (write skew), leaving no admin. Taken
@@ -445,6 +474,8 @@ interface AdminUserRow {
   id: string;
   email: string;
   username: string;
+  avatar_url: string;
+  email_verified: boolean;
   role: UserRole;
   status: "active" | "suspended";
   totp_enabled: boolean;
@@ -573,6 +604,89 @@ export class PostgresOpsStore implements OpsStore {
       SELECT provider, subject, created_at FROM commerce.auth_identities WHERE user_id = ${userId} ORDER BY created_at
     `;
     return rows.map((r) => ({ provider: r.provider, subject: r.subject, createdAtIso: iso(r.created_at) }));
+  }
+
+  async createPendingOAuthSignup(input: CreatePendingOAuthSignupInput): Promise<void> {
+    await this.sql`DELETE FROM commerce.oauth_pending_signups WHERE expires_at <= NOW()`;
+    await this.sql`
+      INSERT INTO commerce.oauth_pending_signups (
+        token_hash, provider, subject, suggested_email, suggested_username, avatar_url, binding_hash, redirect_path, expires_at
+      )
+      VALUES (
+        ${input.tokenHash},
+        ${input.provider},
+        ${input.subject},
+        ${input.suggestedEmail},
+        ${input.suggestedUsername},
+        ${input.avatarUrl},
+        ${input.bindingHash},
+        ${input.redirectPath || "/dashboard"},
+        ${new Date(input.expiresAtIso)}
+      )
+    `;
+  }
+
+  async getPendingOAuthSignup(tokenHash: string): Promise<PendingOAuthSignupRecord | null> {
+    const rows = await this.sql<{
+      token_hash: string;
+      provider: OAuthProviderId;
+      subject: string;
+      suggested_email: string;
+      suggested_username: string;
+      avatar_url: string;
+      binding_hash: string;
+      redirect_path: string;
+      expires_at: Date;
+    }[]>`
+      SELECT token_hash, provider, subject, suggested_email, suggested_username, avatar_url, binding_hash, redirect_path, expires_at
+      FROM commerce.oauth_pending_signups
+      WHERE token_hash = ${tokenHash} AND expires_at > NOW()
+      LIMIT 1
+    `;
+    const r = rows[0];
+    if (!r) return null;
+    return {
+      tokenHash: r.token_hash,
+      provider: r.provider,
+      subject: r.subject,
+      suggestedEmail: r.suggested_email,
+      suggestedUsername: r.suggested_username,
+      avatarUrl: r.avatar_url,
+      bindingHash: r.binding_hash,
+      redirectPath: r.redirect_path,
+      expiresAtIso: iso(r.expires_at),
+    };
+  }
+
+  async consumePendingOAuthSignup(tokenHash: string): Promise<PendingOAuthSignupRecord | null> {
+    const rows = await this.sql<{
+      token_hash: string;
+      provider: OAuthProviderId;
+      subject: string;
+      suggested_email: string;
+      suggested_username: string;
+      avatar_url: string;
+      binding_hash: string;
+      redirect_path: string;
+      expires_at: Date;
+    }[]>`
+      DELETE FROM commerce.oauth_pending_signups
+      WHERE token_hash = ${tokenHash} AND expires_at > NOW()
+      RETURNING token_hash, provider, subject, suggested_email, suggested_username, avatar_url, binding_hash, redirect_path, expires_at
+    `;
+    const r = rows[0];
+    if (!r) return null;
+    return {
+      tokenHash: r.token_hash,
+      provider: r.provider,
+      subject: r.subject,
+      suggestedEmail: r.suggested_email,
+      suggestedUsername: r.suggested_username,
+      avatarUrl: r.avatar_url,
+      bindingHash: r.binding_hash,
+      redirectPath: r.redirect_path,
+      expiresAtIso: iso(r.expires_at),
+    };
   }
 
   /* ---------------- Blobs, email codes, password resets ---------------- */
@@ -741,7 +855,7 @@ export class PostgresOpsStore implements OpsStore {
 
   private adminUserSelect(where: Fragment): Fragment {
     return this.sql`
-      SELECT u.id, u.email, u.username, u.role, u.status, u.totp_enabled, u.created_at,
+      SELECT u.id, u.email, u.username, u.avatar_url, u.email_verified, u.role, u.status, u.totp_enabled, u.created_at,
              u.notes, u.allowed_group_ids, u.invite_code, u.referrer_id, r.email AS referrer_email,
              u.last_login_at,
              COALESCE(w.balance_nano_usd, 0)::text AS balance,
@@ -761,6 +875,8 @@ export class PostgresOpsStore implements OpsStore {
       id: r.id,
       email: r.email,
       username: r.username ?? "",
+      avatarUrl: r.avatar_url ?? "",
+      emailVerified: Boolean(r.email_verified),
       role: r.role,
       status: r.status,
       totpEnabled: r.totp_enabled,
@@ -841,9 +957,9 @@ export class PostgresOpsStore implements OpsStore {
       await this.sql.begin(async (txRaw) => {
         const tx = txRaw as unknown as Sql;
         await tx`
-          INSERT INTO commerce.users (id, email, username, password_hash, role, status, notes, allowed_group_ids)
-          VALUES (${id}, ${input.email.toLowerCase()}, ${input.username}, ${input.passwordHash}, ${input.role},
-                  'active', ${input.notes}, ${tx.json([...new Set(input.allowedGroupIds)])})
+          INSERT INTO commerce.users (id, email, username, avatar_url, email_verified, password_hash, role, status, notes, allowed_group_ids)
+          VALUES (${id}, ${input.email.toLowerCase()}, ${input.username}, ${input.avatarUrl ?? ""}, ${Boolean(input.emailVerified)},
+                  ${input.passwordHash}, ${input.role}, 'active', ${input.notes}, ${tx.json([...new Set(input.allowedGroupIds)])})
         `;
         await tx`
           INSERT INTO core.quota_wallets (user_id, balance_nano_usd, held_nano_usd)
@@ -1030,12 +1146,26 @@ export class PostgresOpsStore implements OpsStore {
     await this.sql`UPDATE commerce.users SET last_login_at = NOW() WHERE id = ${userId}`;
   }
 
-  async updateOwnProfile(userId: string, username: string): Promise<UserProfile> {
+  async updateOwnProfile(userId: string, username: string, avatarUrl?: string): Promise<UserProfile> {
     const rows = await this.sql<
-      { id: string; email: string; username: string; role: UserRole; status: "active" | "suspended"; totp_enabled: boolean; created_at: Date }[]
+      {
+        id: string;
+        email: string;
+        username: string;
+        avatar_url: string;
+        email_verified: boolean;
+        role: UserRole;
+        status: "active" | "suspended";
+        totp_enabled: boolean;
+        created_at: Date;
+      }[]
     >`
-      UPDATE commerce.users SET username = ${username}, updated_at = NOW() WHERE id = ${userId}
-      RETURNING id, email, username, role, status, totp_enabled, created_at
+      UPDATE commerce.users
+         SET username = ${username},
+             avatar_url = COALESCE(${avatarUrl ?? null}, avatar_url),
+             updated_at = NOW()
+       WHERE id = ${userId}
+      RETURNING id, email, username, avatar_url, email_verified, role, status, totp_enabled, created_at
     `;
     const r = rows[0];
     if (!r) throw new StoreError("not_found", `User ${userId} not found`);
@@ -1043,11 +1173,59 @@ export class PostgresOpsStore implements OpsStore {
       id: r.id,
       email: r.email,
       username: r.username,
+      avatarUrl: r.avatar_url ?? "",
+      emailVerified: Boolean(r.email_verified),
       role: r.role,
       status: r.status,
       totpEnabled: r.totp_enabled,
       createdAtIso: iso(r.created_at),
     };
+  }
+
+  async bindPlaceholderEmail(userId: string, email: string, emailVerified: boolean): Promise<UserProfile> {
+    const normalized = email.trim().toLowerCase();
+    try {
+      const existing = await this.sql<{ email: string }[]>`SELECT email FROM commerce.users WHERE id = ${userId} LIMIT 1`;
+      if (!existing[0]) throw new StoreError("not_found", `User ${userId} not found`);
+      if (!existing[0].email.toLowerCase().endsWith("@users.noreply.slipgate")) {
+        throw new StoreError("conflict", "Only placeholder OAuth accounts can bind a new email address");
+      }
+      const rows = await this.sql<
+        {
+          id: string;
+          email: string;
+          username: string;
+          avatar_url: string;
+          email_verified: boolean;
+          role: UserRole;
+          status: "active" | "suspended";
+          totp_enabled: boolean;
+          created_at: Date;
+        }[]
+      >`
+        UPDATE commerce.users
+           SET email = ${normalized},
+               email_verified = ${emailVerified},
+               updated_at = NOW()
+         WHERE id = ${userId}
+        RETURNING id, email, username, avatar_url, email_verified, role, status, totp_enabled, created_at
+      `;
+      const r = rows[0]!;
+      return {
+        id: r.id,
+        email: r.email,
+        username: r.username,
+        avatarUrl: r.avatar_url ?? "",
+        emailVerified: Boolean(r.email_verified),
+        role: r.role,
+        status: r.status,
+        totpEnabled: r.totp_enabled,
+        createdAtIso: iso(r.created_at),
+      };
+    } catch (err) {
+      if (err instanceof StoreError) throw err;
+      mapConflict(err, "Email is already registered");
+    }
   }
 
   async getPasswordHash(userId: string): Promise<string | null> {

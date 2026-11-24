@@ -86,7 +86,23 @@ export type AuditLogInput = Omit<AuditLogItem, "id" | "createdAtIso">;
 export interface AdminUserCreateInput extends Omit<AdminCreateUserRequest, "password" | "initialBalanceUsd"> {
   passwordHash: string;
   initialBalanceNano: bigint;
+  avatarUrl?: string;
+  emailVerified?: boolean;
 }
+
+export interface PendingOAuthSignupRecord {
+  tokenHash: string;
+  provider: import("@slipgate/contracts").OAuthProviderId;
+  subject: string;
+  suggestedEmail: string;
+  suggestedUsername: string;
+  avatarUrl: string;
+  bindingHash: string;
+  redirectPath: string;
+  expiresAtIso: string;
+}
+
+export type CreatePendingOAuthSignupInput = PendingOAuthSignupRecord;
 
 export interface AdminUserUpdateInput extends Omit<AdminUpdateUserRequest, "password"> {
   passwordHash?: string;
@@ -173,6 +189,9 @@ export interface OpsStore {
   linkIdentity(userId: string, provider: string, subject: string): Promise<void>;
   unlinkIdentity(userId: string, provider: string): Promise<void>;
   listIdentities(userId: string): Promise<LinkedIdentity[]>;
+  createPendingOAuthSignup(input: CreatePendingOAuthSignupInput): Promise<void>;
+  getPendingOAuthSignup(tokenHash: string): Promise<PendingOAuthSignupRecord | null>;
+  consumePendingOAuthSignup(tokenHash: string): Promise<PendingOAuthSignupRecord | null>;
 
   /* ---- Sessions ---- */
   /** Role, status and token version of the user, and whether token id `jti` was signed out. */
@@ -212,7 +231,8 @@ export interface OpsStore {
   countAdmins(): Promise<number>;
   listUserAccess(): Promise<UserAccessRecord[]>;
   touchLastLogin(userId: string): Promise<void>;
-  updateOwnProfile(userId: string, username: string): Promise<UserProfile>;
+  updateOwnProfile(userId: string, username: string, avatarUrl?: string): Promise<UserProfile>;
+  bindPlaceholderEmail(userId: string, email: string, emailVerified: boolean): Promise<UserProfile>;
   getPasswordHash(userId: string): Promise<string | null>;
   /** Two-factor state; the secret is the vault-encrypted base32 text (pending while disabled). */
   getTotp(userId: string): Promise<{ secretEnc: Uint8Array | null; enabled: boolean } | null>;

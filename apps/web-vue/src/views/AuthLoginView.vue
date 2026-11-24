@@ -29,6 +29,7 @@ import UiAlert from "../components/ui/UiAlert.vue";
 import UiIcon, { type IconName } from "../components/ui/UiIcon.vue";
 import { ApiError, publicJson } from "../lib/api";
 import { formatUsd } from "../lib/format";
+import { getPasskeyAssertion, isWebAuthnSupported, type ServerRequestOptions } from "../lib/webauthn";
 import { useAuthStore } from "../stores/auth";
 import { usePortalStore } from "../stores/portal";
 
@@ -531,6 +532,58 @@ const REGISTER_ERRORS: Record<string, string> = {
   invalid_request: "register.errors.invalid_request",
 };
 
+const passkeySupported = isWebAuthnSupported();
+const passkeyPending = ref(false);
+
+async function handlePasskeyLogin() {
+  if (!passkeySupported || passkeyPending.value || submitting.value) return;
+  if (agreementBlocked.value) {
+    nudgeAgreement();
+    return;
+  }
+  errorMessage.value = null;
+  oauthErrorCode.value = null;
+  passkeyPending.value = true;
+  try {
+    const targetEmail = EMAIL_RE.test(email.value.trim()) ? email.value.trim() : undefined;
+    const optRes = await fetch("/api/v1/auth/passkey/login/options", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(targetEmail ? { email: targetEmail } : {}),
+    });
+    const optData = (await optRes.json().catch(() => ({}))) as {
+      challengeToken?: string;
+      options?: ServerRequestOptions;
+      message?: string;
+    };
+    if (!optRes.ok || !optData.challengeToken || !optData.options) {
+      errorMessage.value = optData.message || t("register.passkey.failed");
+      return;
+    }
+    const credential = await getPasskeyAssertion(optData.options);
+    const verifyRes = await fetch("/api/v1/auth/passkey/login/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ challengeToken: optData.challengeToken, credential }),
+    });
+    const data = (await verifyRes.json().catch(() => ({}))) as Partial<AuthSessionResponse> & {
+      error?: string;
+      message?: string;
+    };
+    if (!verifyRes.ok || !data.accessToken || !data.user) {
+      errorMessage.value = data.message || data.error || t("register.passkey.failed");
+      return;
+    }
+    auth.setSession(data as AuthSessionResponse);
+    await auth.hydrateSession();
+    await router.replace(safeRedirect() ?? (data.user.role === "admin" ? "/admin" : "/dashboard"));
+  } catch (err) {
+    errorMessage.value = err instanceof Error ? err.message : t("register.passkey.failed");
+  } finally {
+    passkeyPending.value = false;
+  }
+}
+
 function registerBody(proof?: CaptchaProof): AuthRegisterRequest {
   const body: AuthRegisterRequest = { email: email.value, password: password.value };
   if (proof) body.captcha = proof;
@@ -1029,6 +1082,18 @@ const exploreLinks = computed(() => {
             {{ submitting ? t("common.submitting") : mode === "login" ? t("auth.submitLogin") : t("auth.submitRegister") }}
           </button>
         </form>
+
+        <div v-if="mode === 'login' && passkeySupported" class="mt-3">
+          <button
+            type="button"
+            class="btn btn-secondary h-10 w-full"
+            :disabled="passkeyPending || submitting"
+            @click="handlePasskeyLogin"
+          >
+            <UiIcon :name="passkeyPending ? 'loader' : 'fingerprint'" :size="16" :spin="passkeyPending" />
+            {{ passkeyPending ? t("register.passkey.verifying") : t("register.passkey.signIn") }}
+          </button>
+        </div>
 
         <!-- Third-party sign-in (full-page navigation through the BFF) -->
         <div v-if="oauthProviders.length" class="mt-6 animate-fade-in motion-reduce:animate-none">

@@ -133,6 +133,18 @@ const en: typeof zh = {
       rateLimited: "Too many requests. Please try again later",
       invalid: "The code is wrong or has expired",
     },
+    oauthContinue: {
+      title: "Finish setting up your account",
+      subtitle: "Signed in with {name}",
+      username: "Display name",
+      usernamePlaceholder: "Optional display name",
+      submit: "Complete registration",
+    },
+    passkey: {
+      signIn: "Sign in with Passkey",
+      verifying: "Verifying Passkey…",
+      failed: "Passkey sign-in failed",
+    },
   },
 };
 

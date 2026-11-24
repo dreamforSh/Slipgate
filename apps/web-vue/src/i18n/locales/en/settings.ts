@@ -241,6 +241,8 @@ const en: typeof zh = {
         github: "GitHub OAuth App",
         google: "Google OAuth 2.0",
         linuxdo: "LINUX DO Connect",
+        wechat: "WeChat Open Platform",
+        dingtalk: "DingTalk Enterprise",
         oidc: "Custom OpenID Connect",
       },
       status: {

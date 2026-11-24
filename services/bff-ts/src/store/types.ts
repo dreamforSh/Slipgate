@@ -35,6 +35,7 @@ import type { ChannelMonitorStore } from "./channel_monitors_types.ts";
 import type { PlatformQuotasStore } from "./platform_quotas_types.ts";
 import type { UsageRollupsStore } from "./usage_rollups_types.ts";
 import type { ModerationStore } from "./moderation_types.ts";
+import type { PasskeyStore } from "./passkeys_types.ts";
 
 export type StoreErrorCode = "conflict" | "not_found" | "forbidden" | "bad_request";
 
@@ -147,6 +148,8 @@ export interface ControlStore {
   readonly usageRollups: UsageRollupsStore;
   /** Prompt moderation rules, settings, and events (lane O5). */
   readonly moderation: ModerationStore;
+  /** WebAuthn passkeys (lane A2). */
+  readonly passkeys: PasskeyStore;
 
   init(): Promise<void>;
   close(): Promise<void>;

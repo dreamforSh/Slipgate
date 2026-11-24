@@ -192,6 +192,15 @@ export type BalanceLedgerItem = z.infer<typeof BalanceLedgerItemSchema>;
 
 export const UpdateProfileRequestSchema = z.object({
   username: z.string().trim().max(64),
+  avatarUrl: z
+    .string()
+    .trim()
+    .max(512)
+    .refine(
+      (v) => v === "" || /^https?:\/\//i.test(v) || (v.startsWith("/") && !v.startsWith("//")),
+      "Avatar URL must use http(s):// or a site-relative path",
+    )
+    .optional(),
 });
 export type UpdateProfileRequest = z.infer<typeof UpdateProfileRequestSchema>;
 
@@ -944,7 +953,7 @@ export type ResetPasswordRequest = z.infer<typeof ResetPasswordRequestSchema>;
 /* Third-party sign-in (OAuth 2.0 / OIDC)                                                     */
 /* ------------------------------------------------------------------------------------------ */
 
-export const OAuthProviderIdSchema = z.enum(["github", "google", "linuxdo", "oidc"]);
+export const OAuthProviderIdSchema = z.enum(["github", "google", "linuxdo", "wechat", "dingtalk", "oidc"]);
 export type OAuthProviderId = z.infer<typeof OAuthProviderIdSchema>;
 
 const OAuthUrlSchema = z

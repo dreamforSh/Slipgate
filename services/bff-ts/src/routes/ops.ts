@@ -1,5 +1,5 @@
 import type { Context, Hono, MiddlewareHandler } from "hono";
-import type { z } from "zod";
+import { z } from "zod";
 import {
   AdminAdjustBalanceRequestSchema,
   AdminBatchUserStatusRequestSchema,
@@ -14,6 +14,7 @@ import {
   AuditClearResponseSchema,
   AuditLogQuerySchema,
   auditRetentionShortens,
+  BindUserEmailRequestSchema,
   BulkSubscriptionActionRequestSchema,
   ChangePasswordRequestSchema,
   PasswordChangedResponseSchema,
@@ -80,6 +81,7 @@ import { generateTotpSecret, otpauthUrl, verifyTotp } from "../security/totp.ts"
 import { generateRedeemCodeText, randomCode } from "../store/ops_shared.ts";
 import { StoreError, type ControlStore } from "../store/types.ts";
 import { requireTargetingGroups } from "./announcements.ts";
+import { digestEmailCode, renderEmail, type MailService } from "./mail.ts";
 import { applyUserCaps, decorateAdminUsers, prepareUserLimitFields } from "./user_limits.ts";
 
 export interface OpsRouteContext {
@@ -88,6 +90,8 @@ export interface OpsRouteContext {
   vaultSecret: string;
   /** Whether outgoing mail is configured (public settings flags). */
   mailReady: () => Promise<boolean>;
+  /** Optional mail service accessor for self-service verification flows (e.g. bind-email). */
+  mailService?: () => MailService;
   /** Admin model price rules (model plaza shows them instead of built-in rates). */
   pricingRules: () => Promise<ModelPricingRule[]>;
   /** SWR-discovered upstream model IDs per provider from slipgate-net. */
@@ -450,8 +454,85 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
   /* ======================================================================================== */
 
   app.patch("/api/v1/user/profile", async (c) => {
-    const { username } = await body(c, UpdateProfileRequestSchema);
-    const user = await ops.updateOwnProfile(c.get("authUser").sub, username);
+    const { username, avatarUrl } = await body(c, UpdateProfileRequestSchema);
+    const user = await ops.updateOwnProfile(c.get("authUser").sub, username, avatarUrl);
+    return c.json({ user });
+  });
+
+  app.post("/api/v1/user/profile/bind-email/code", async (c) => {
+    const userId = c.get("authUser").sub;
+    const req = await body(c, z.object({ email: z.string().trim().email().max(254) }));
+    const mail = ctx.mailService?.();
+    if (!mail || !(await mail.ready())) {
+      throw new StoreError("bad_request", "Outgoing mail is not configured");
+    }
+    const current = await store.getUserById(userId);
+    if (!current) throw new StoreError("not_found", "User no longer exists");
+    if (!current.email.toLowerCase().endsWith("@users.noreply.slipgate")) {
+      throw new StoreError("conflict", "Only placeholder OAuth accounts can bind a new email address");
+    }
+    if (isReservedEmail(req.email)) {
+      return c.json({ error: "email_reserved", message: "This email domain is reserved and can't be used" }, 400);
+    }
+    if (await store.findUserByEmail(req.email)) {
+      throw new StoreError("conflict", "Email is already registered");
+    }
+    const last = await ops.lastEmailCodeAt(req.email, "bind_email");
+    if (last && Date.now() - Date.parse(last) < 60_000) {
+      throw new StoreError("conflict", "A code was just sent; wait a minute before asking again");
+    }
+    const code = String(crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000).padStart(6, "0");
+    await ops.saveEmailCode(
+      req.email,
+      "bind_email",
+      await digestEmailCode(req.email, code),
+      new Date(Date.now() + 10 * 60_000).toISOString(),
+    );
+    const site = await mail.siteName();
+    const zh = (c.req.header("accept-language") ?? "").toLowerCase().startsWith("zh");
+    await mail.deliver({
+      to: req.email,
+      subject: zh ? `${site} 绑定邮箱验证码：${code}` : `${site} email binding code: ${code}`,
+      html: renderEmail(
+        site,
+        zh ? "绑定邮箱验证" : "Verify email binding",
+        [zh ? "请在个人资料页面输入以下验证码，10 分钟内有效。" : "Enter this code on your profile page. It expires in 10 minutes."],
+        undefined,
+        code,
+      ),
+    });
+    return c.json({ sent: true, cooldownSeconds: 60 });
+  });
+
+  app.post("/api/v1/user/profile/bind-email", async (c) => {
+    const userId = c.get("authUser").sub;
+    const req = await body(c, BindUserEmailRequestSchema);
+    const current = await store.getUserById(userId);
+    if (!current) throw new StoreError("not_found", "User no longer exists");
+    if (!current.email.toLowerCase().endsWith("@users.noreply.slipgate")) {
+      throw new StoreError("conflict", "Only placeholder OAuth accounts can bind a new email address");
+    }
+    if (isReservedEmail(req.email)) {
+      return c.json({ error: "email_reserved", message: "This email domain is reserved and can't be used" }, 400);
+    }
+    if (await store.findUserByEmail(req.email)) {
+      throw new StoreError("conflict", "Email is already registered");
+    }
+    const settings = await ops.getSettings();
+    let verified = false;
+    if (settings.emailVerificationRequired && (await ctx.mailReady())) {
+      const code = req.emailCode?.trim() ?? "";
+      if (!/^\d{6}$/.test(code) || !(await ops.consumeEmailCode(req.email, "bind_email", await digestEmailCode(req.email, code)))) {
+        return c.json({ error: "email_code_invalid", message: "The email verification code is invalid or expired" }, 400);
+      }
+      verified = true;
+    } else if (req.emailCode?.trim()) {
+      const code = req.emailCode.trim();
+      if (/^\d{6}$/.test(code) && (await ops.consumeEmailCode(req.email, "bind_email", await digestEmailCode(req.email, code)))) {
+        verified = true;
+      }
+    }
+    const user = await ops.bindPlaceholderEmail(userId, req.email, verified);
     return c.json({ user });
   });
 

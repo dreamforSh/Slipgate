@@ -16,6 +16,7 @@ import {
   type CreatePromoCodeRequest,
   type GenerateRedeemCodesRequest,
   type GroupItem,
+  type OAuthProviderId,
   type PortalSettings,
   type PromoCodeCheckResponse,
   type PromoCodeItem,
@@ -65,7 +66,9 @@ import type {
   AdminUserCreateInput,
   AdminUserUpdateInput,
   AuditLogInput,
+  CreatePendingOAuthSignupInput,
   OpsStore,
+  PendingOAuthSignupRecord,
   RegistrationExtras,
   RegistrationOutcome,
   SessionState,
@@ -265,6 +268,7 @@ export class MemoryOpsStore implements OpsStore {
   private readonly blobLocks = new Map<string, Promise<void>>();
   private settingsLock: Promise<void> = Promise.resolve();
   private readonly identities: { userId: string; provider: string; subject: string; createdAtIso: string }[] = [];
+  private readonly pendingOAuthSignups = new Map<string, PendingOAuthSignupRecord>();
 
   async findUserIdByIdentity(provider: string, subject: string): Promise<string | null> {
     const hit = this.identities.find((i) => i.provider === provider && i.subject === subject);
@@ -293,6 +297,32 @@ export class MemoryOpsStore implements OpsStore {
     return this.identities
       .filter((i) => i.userId === userId)
       .map(({ provider, subject, createdAtIso }) => ({ provider, subject, createdAtIso }));
+  }
+
+  async createPendingOAuthSignup(input: CreatePendingOAuthSignupInput): Promise<void> {
+    const now = Date.now();
+    for (const [k, v] of this.pendingOAuthSignups) {
+      if (Date.parse(v.expiresAtIso) <= now) this.pendingOAuthSignups.delete(k);
+    }
+    this.pendingOAuthSignups.set(input.tokenHash, { ...input });
+  }
+
+  async getPendingOAuthSignup(tokenHash: string): Promise<PendingOAuthSignupRecord | null> {
+    const rec = this.pendingOAuthSignups.get(tokenHash);
+    if (!rec) return null;
+    if (Date.parse(rec.expiresAtIso) <= Date.now()) {
+      this.pendingOAuthSignups.delete(tokenHash);
+      return null;
+    }
+    return { ...rec };
+  }
+
+  async consumePendingOAuthSignup(tokenHash: string): Promise<PendingOAuthSignupRecord | null> {
+    const rec = this.pendingOAuthSignups.get(tokenHash);
+    if (!rec) return null;
+    this.pendingOAuthSignups.delete(tokenHash);
+    if (Date.parse(rec.expiresAtIso) <= Date.now()) return null;
+    return { ...rec };
   }
   private readonly emailCodes = new Map<string, { codeHash: string; expiresAtIso: string; attempts: number; createdAtIso: string }>();
   private readonly resets = new Map<string, { userId: string; expiresAtIso: string; used: boolean }>();
@@ -567,6 +597,8 @@ export class MemoryOpsStore implements OpsStore {
       id,
       email: input.email.toLowerCase(),
       username: input.username,
+      avatarUrl: input.avatarUrl ?? "",
+      emailVerified: Boolean(input.emailVerified),
       passwordHash: input.passwordHash,
       role: input.role,
       status: "active",
@@ -709,9 +741,23 @@ export class MemoryOpsStore implements OpsStore {
     if (this.core.users.has(userId)) this.metaOf(userId).lastLoginAtIso = new Date().toISOString();
   }
 
-  async updateOwnProfile(userId: string, username: string): Promise<UserProfile> {
+  async updateOwnProfile(userId: string, username: string, avatarUrl?: string): Promise<UserProfile> {
     const u = this.requireUser(userId);
     u.username = username;
+    if (avatarUrl !== undefined) u.avatarUrl = avatarUrl;
+    const { passwordHash: _, ...profile } = u;
+    return profile;
+  }
+
+  async bindPlaceholderEmail(userId: string, email: string, emailVerified: boolean): Promise<UserProfile> {
+    const u = this.requireUser(userId);
+    if (!u.email.toLowerCase().endsWith("@users.noreply.slipgate")) {
+      throw new StoreError("conflict", "Only placeholder OAuth accounts can bind a new email address");
+    }
+    const normalized = email.trim().toLowerCase();
+    this.assertEmailFree(normalized, userId);
+    u.email = normalized;
+    u.emailVerified = emailVerified;
     const { passwordHash: _, ...profile } = u;
     return profile;
   }

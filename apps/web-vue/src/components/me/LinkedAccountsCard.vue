@@ -91,6 +91,8 @@ const CHIP: Record<OAuthProviderId, string> = {
   github: "bg-fg text-bg",
   google: "icon-chip-info",
   linuxdo: "icon-chip-warning",
+  wechat: "icon-chip-success",
+  dingtalk: "icon-chip-info",
   oidc: "icon-chip-accent",
 };
 

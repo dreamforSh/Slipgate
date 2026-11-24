@@ -29,6 +29,7 @@ export * from "./alerts.ts";
 export * from "./channel_monitors.ts";
 export * from "./usage_rollups.ts";
 export * from "./moderation.ts";
+export * from "./passkeys.ts";
 export * from "./platform_quotas.ts";
 export * from "./affiliate.ts";
 

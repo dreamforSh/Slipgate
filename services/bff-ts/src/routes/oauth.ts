@@ -2,6 +2,8 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { Context, Hono } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
 import {
+  OAuthContinueSignupRequestSchema,
+  OAuthPendingSignupSummarySchema,
   OAuthProviderConfigSchema,
   OAuthProviderIdSchema,
   UpdateOAuthProviderRequestSchema,
@@ -32,6 +34,8 @@ import type { AuthGuards } from "../auth_guards.ts";
 const BLOB_KEY = "oauth_providers";
 const STATE_TTL_MS = 10 * 60_000;
 const LINK_TICKET_TTL_MS = 5 * 60_000;
+/** Pending invite-required OAuth signups wait up to 10 minutes before expiring. */
+const PENDING_SIGNUP_TTL_MS = 10 * 60_000;
 /** The landing page redeems its hand-off code as soon as it loads. */
 const HANDOFF_TTL_MS = 2 * 60_000;
 /** Hard caps on the in-memory flow records; once full, the oldest records are dropped first. */
@@ -84,6 +88,26 @@ const PRESETS: Record<OAuthProviderId, Preset> = {
     idField: "id",
     emailField: "email",
     nameField: "username",
+  },
+  wechat: {
+    displayName: "WeChat",
+    authorizeUrl: "https://open.weixin.qq.com/connect/qrconnect",
+    tokenUrl: "https://api.weixin.qq.com/sns/oauth2/access_token",
+    userinfoUrl: "https://api.weixin.qq.com/sns/userinfo",
+    scopes: "snsapi_login",
+    idField: "unionid",
+    emailField: "email",
+    nameField: "nickname",
+  },
+  dingtalk: {
+    displayName: "DingTalk",
+    authorizeUrl: "https://login.dingtalk.com/oauth2/auth",
+    tokenUrl: "https://api.dingtalk.com/v1.0/oauth2/userAccessToken",
+    userinfoUrl: "https://api.dingtalk.com/v1.0/contact/users/me",
+    scopes: "openid",
+    idField: "unionId",
+    emailField: "email",
+    nameField: "nick",
   },
   oidc: {
     displayName: "SSO",
@@ -145,6 +169,16 @@ function assertsVerified(claim: unknown): boolean {
 function normalizeEmail(raw: unknown): string {
   const email = typeof raw === "string" ? raw.trim().toLowerCase() : "";
   return email.length <= 254 && EMAIL_RE.test(email) ? email : "";
+}
+
+function extractAvatarUrl(profile: unknown): string {
+  for (const field of ["avatar_url", "picture", "headimgurl", "avatarUrl"]) {
+    const raw = pick(profile, field);
+    if (typeof raw !== "string") continue;
+    const trimmed = raw.trim();
+    if (trimmed.length <= 512 && /^https?:\/\//i.test(trimmed)) return trimmed;
+  }
+  return "";
 }
 
 /**
@@ -441,9 +475,11 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
     });
     const url = new URL(cfg.authorizeUrl);
     url.searchParams.set("client_id", cfg.clientId);
+    if (id === "wechat") url.searchParams.set("appid", cfg.clientId);
     url.searchParams.set("redirect_uri", `${base}/api/v1/auth/oauth/${id}/callback`);
     url.searchParams.set("response_type", "code");
     if (cfg.scopes) url.searchParams.set("scope", cfg.scopes);
+    if (id === "dingtalk") url.searchParams.set("prompt", "consent");
     url.searchParams.set("state", state);
     url.searchParams.set("code_challenge", challenge);
     url.searchParams.set("code_challenge_method", "S256");
@@ -470,25 +506,59 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
     const secret = secrets.get(id.data) ?? "";
     if (!usable(cfg, secret)) return fail("disabled");
 
-    // Exchange the code (form-encoded, JSON answer; GitHub needs the Accept header).
+    // Exchange the code (form-encoded, JSON answer; WeChat & DingTalk use provider params).
     let accessToken = "";
+    let providerOpenId = "";
     try {
-      const tokenInit: RequestInit = {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: `${base}/api/v1/auth/oauth/${id.data}/callback`,
-          client_id: cfg.clientId,
-          client_secret: secret,
-          code_verifier: entry.verifier,
-        }).toString(),
-        signal: AbortSignal.timeout(15_000),
+      let tokenTarget = cfg.tokenUrl;
+      let tokenInit: RequestInit;
+      if (id.data === "wechat") {
+        const u = new URL(cfg.tokenUrl);
+        u.searchParams.set("appid", cfg.clientId);
+        u.searchParams.set("secret", secret);
+        u.searchParams.set("code", code);
+        u.searchParams.set("grant_type", "authorization_code");
+        tokenTarget = u.toString();
+        tokenInit = {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(15_000),
+        };
+      } else if (id.data === "dingtalk") {
+        tokenInit = {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({
+            clientId: cfg.clientId,
+            clientSecret: secret,
+            code,
+            grantType: "authorization_code",
+          }),
+          signal: AbortSignal.timeout(15_000),
+        };
+      } else {
+        tokenInit = {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: `${base}/api/v1/auth/oauth/${id.data}/callback`,
+            client_id: cfg.clientId,
+            client_secret: secret,
+            code_verifier: entry.verifier,
+          }).toString(),
+          signal: AbortSignal.timeout(15_000),
+        };
+      }
+      const tokenRes = doFetch === fetch ? await ssrfSafeFetch(tokenTarget, tokenInit, doFetch) : await doFetch(tokenTarget, tokenInit);
+      const tokenJson = (await tokenRes.json().catch(() => ({}))) as {
+        access_token?: string;
+        accessToken?: string;
+        openid?: string;
       };
-      const tokenRes = doFetch === fetch ? await ssrfSafeFetch(cfg.tokenUrl, tokenInit, doFetch) : await doFetch(cfg.tokenUrl, tokenInit);
-      const tokenJson = (await tokenRes.json().catch(() => ({}))) as { access_token?: string };
-      accessToken = tokenJson.access_token ?? "";
+      accessToken = tokenJson.access_token ?? tokenJson.accessToken ?? "";
+      providerOpenId = tokenJson.openid ?? "";
     } catch {
       return fail("token_failed");
     }
@@ -496,17 +566,31 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
 
     let profile: unknown;
     try {
-      const infoInit: RequestInit = {
-        headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json", "User-Agent": "Slipgate" },
-        signal: AbortSignal.timeout(15_000),
+      let infoTarget = cfg.userinfoUrl;
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+        "User-Agent": "Slipgate",
       };
-      const infoRes = doFetch === fetch ? await ssrfSafeFetch(cfg.userinfoUrl, infoInit, doFetch) : await doFetch(cfg.userinfoUrl, infoInit);
+      if (id.data === "wechat") {
+        const u = new URL(cfg.userinfoUrl);
+        if (!u.searchParams.has("access_token")) u.searchParams.set("access_token", accessToken);
+        if (providerOpenId && !u.searchParams.has("openid")) u.searchParams.set("openid", providerOpenId);
+        if (!u.searchParams.has("lang")) u.searchParams.set("lang", "zh_CN");
+        infoTarget = u.toString();
+      } else if (id.data === "dingtalk") {
+        headers["x-acs-dingtalk-access-token"] = accessToken;
+      }
+      const infoInit: RequestInit = { headers, signal: AbortSignal.timeout(15_000) };
+      const infoRes = doFetch === fetch ? await ssrfSafeFetch(infoTarget, infoInit, doFetch) : await doFetch(infoTarget, infoInit);
       if (!infoRes.ok) return fail("userinfo_failed");
       profile = await infoRes.json();
     } catch {
       return fail("userinfo_failed");
     }
-    const subject = String(pick(profile, cfg.idField) ?? "").trim();
+    let subject = String(pick(profile, cfg.idField) ?? "").trim();
+    if (!subject && id.data === "wechat") subject = String(pick(profile, "openid") ?? providerOpenId).trim();
+    if (!subject && id.data === "dingtalk") subject = String(pick(profile, "openId") ?? "").trim();
     if (!subject) return fail("userinfo_failed");
 
     // Linking from the profile page.
@@ -523,6 +607,7 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
     if (!userId) {
       let email = normalizeEmail(pick(profile, cfg.emailField));
       const name = String(pick(profile, cfg.nameField) ?? "").trim().slice(0, 64);
+      const avatarUrl = extractAvatarUrl(profile);
       // Verified only on an explicit assertion. A missing claim, "false" or anything else is not one.
       let emailVerified = false;
       if (id.data === "github") {
@@ -541,18 +626,38 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
       // links the provider from the profile page instead.
       if (email && (await store.findUserByEmail(email))) return fail("email_registered");
       const settings = await store.ops.getSettings();
-      if (!cfg.allowSignup || !settings.allowRegistration || settings.inviteRequired) return fail("signup_closed");
+      if (!cfg.allowSignup || !settings.allowRegistration) return fail("signup_closed");
       // Only a provider-verified address becomes the account email: an unproven one could claim (and
       // later reset the password of) a mailbox that belongs to someone else.
       const trusted = email && emailVerified ? email : "";
       // Backend mode, reserved domain, allowlist / per-domain quota and an account of the same inbox.
       const refusal = ctx.guards ? await ctx.guards.oauthSignupRefusal(trusted, settings) : null;
       if (refusal) return fail(refusal);
+
+      if (settings.inviteRequired) {
+        const continueToken = b64url(crypto.getRandomValues(new Uint8Array(32)));
+        const tokenHash = createHash("sha256").update(continueToken).digest("hex");
+        await store.ops.createPendingOAuthSignup({
+          tokenHash,
+          provider: id.data,
+          subject,
+          suggestedEmail: trusted,
+          suggestedUsername: name,
+          avatarUrl,
+          bindingHash: entry.binding,
+          redirectPath: entry.redirect || "/dashboard",
+          expiresAtIso: new Date(Date.now() + PENDING_SIGNUP_TTL_MS).toISOString(),
+        });
+        return c.redirect(`${base}/oauth/complete#${new URLSearchParams({ continue: continueToken }).toString()}`, 302);
+      }
+
       for (let attempt = 0; !userId; attempt++) {
         try {
           const created = await store.ops.createUser({
             email: trusted || placeholderEmail(id.data, subject, attempt ? toHex(crypto.getRandomValues(new Uint8Array(4))) : ""),
             username: name,
+            avatarUrl,
+            emailVerified: Boolean(trusted),
             role: "user",
             notes: `Signed up with ${cfg.displayName || id.data}`,
             allowedGroupIds: [],
@@ -618,6 +723,139 @@ export function registerOAuthRoutes(app: Hono<AuthEnv>, ctx: OAuthRouteContext) 
     // Same token as a password sign-in: carries the user's token version, so it can be revoked.
     const { token } = await issueAccessToken(store, jwtSecret, user);
     return c.json({ accessToken: token, redirect: entry.redirect });
+  });
+
+  app.get("/api/v1/auth/oauth/pending/:token", async (c) => {
+    const rawToken = c.req.param("token");
+    if (!rawToken || rawToken.length > 256) {
+      return c.json({ error: "state_invalid", message: "The sign-up continuation request expired" }, 400);
+    }
+    const tokenHash = createHash("sha256").update(rawToken).digest("hex");
+    const rec = await store.ops.getPendingOAuthSignup(tokenHash);
+    if (!rec) {
+      return c.json({ error: "state_invalid", message: "The sign-up continuation request expired" }, 400);
+    }
+    if (!sameBinding(rec.bindingHash, readBinding(c, await baseUrl(c)))) {
+      return c.json({ error: "browser_mismatch", message: "Sign-up must finish in the browser that started it" }, 403);
+    }
+    const [{ configs }, settings] = await Promise.all([loadAll(), store.ops.getSettings()]);
+    const cfg = configs.find((p) => p.id === rec.provider);
+    const summary = OAuthPendingSignupSummarySchema.parse({
+      provider: rec.provider,
+      displayName: cfg?.displayName || PRESETS[rec.provider].displayName,
+      suggestedUsername: rec.suggestedUsername,
+      avatarUrl: rec.avatarUrl,
+      inviteRequired: settings.inviteRequired,
+      promoCodeEnabled: settings.promoCodeEnabled,
+    });
+    return c.json(summary);
+  });
+
+  app.post("/api/v1/auth/oauth/continue", async (c) => {
+    const rawBody = await c.req.json().catch(() => null);
+    const parsed = OAuthContinueSignupRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", message: "Invalid continuation parameters" }, 400);
+    }
+    const req = parsed.data;
+    const tokenHash = createHash("sha256").update(req.token).digest("hex");
+    const pendingRec = await store.ops.getPendingOAuthSignup(tokenHash);
+    if (!pendingRec) {
+      return c.json({ error: "state_invalid", message: "The sign-up continuation request expired" }, 400);
+    }
+    if (!sameBinding(pendingRec.bindingHash, readBinding(c, await baseUrl(c)))) {
+      return c.json({ error: "browser_mismatch", message: "Sign-up must finish in the browser that started it" }, 403);
+    }
+    const settings = await store.ops.getSettings();
+    if (!settings.allowRegistration) {
+      return c.json({ error: "signup_closed", message: "Registration is disabled" }, 403);
+    }
+    if (await ctx.guards?.backendMode()) {
+      return c.json({ error: "backend_mode", message: "Backend mode is on: only administrators can sign in" }, 403);
+    }
+    if (settings.inviteRequired) {
+      if (!req.inviteCode || !(await store.ops.isInvitationCodeUsable(req.inviteCode))) {
+        return c.json({ error: "invite_required", message: "A valid invitation code is required to register" }, 400);
+      }
+    }
+    const promoCode = settings.promoCodeEnabled && req.promoCode ? req.promoCode : undefined;
+    if (promoCode) {
+      const check = await store.ops.checkPromoCode(promoCode);
+      if (!check.valid) {
+        return c.json({ error: "invalid_promo_code", message: `Promo code is ${check.reason.replace("_", " ")}` }, 400);
+      }
+    }
+    const existingByIdentity = await store.ops.findUserIdByIdentity(pendingRec.provider, pendingRec.subject);
+    if (existingByIdentity) {
+      await store.ops.consumePendingOAuthSignup(tokenHash);
+      const existingUser = await store.getUserById(existingByIdentity);
+      if (!existingUser || existingUser.status !== "active") {
+        return c.json({ error: "signup_failed", message: "Could not complete sign-in" }, 400);
+      }
+      if (existingUser.totpEnabled) {
+        return c.json({ error: "totp_required", message: "Sign in with email, password and two-factor code" }, 403);
+      }
+      await store.ops.touchLastLogin(existingUser.id);
+      const { token } = await issueAccessToken(store, jwtSecret, existingUser);
+      return c.json({ accessToken: token, redirect: pendingRec.redirectPath });
+    }
+    const trusted = pendingRec.suggestedEmail;
+    if (trusted && (await store.findUserByEmail(trusted))) {
+      return c.json({ error: "email_registered", message: "An account with that email already exists" }, 409);
+    }
+    const refusal = ctx.guards ? await ctx.guards.oauthSignupRefusal(trusted, settings) : null;
+    if (refusal) {
+      return c.json({ error: refusal, message: "Sign-up is not permitted for this address" }, 403);
+    }
+
+    const consumed = await store.ops.consumePendingOAuthSignup(tokenHash);
+    if (!consumed) {
+      return c.json({ error: "state_invalid", message: "The sign-up continuation request expired" }, 400);
+    }
+
+    const { configs } = await loadAll();
+    const cfg = configs.find((p) => p.id === consumed.provider);
+    const username = req.username?.trim() || consumed.suggestedUsername;
+
+    const createAccount = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          return await store.ops.createUser({
+            email: trusted || placeholderEmail(consumed.provider, consumed.subject, attempt ? toHex(crypto.getRandomValues(new Uint8Array(4))) : ""),
+            username,
+            avatarUrl: consumed.avatarUrl,
+            emailVerified: Boolean(trusted),
+            role: "user",
+            notes: `Signed up with ${cfg?.displayName || PRESETS[consumed.provider].displayName}`,
+            allowedGroupIds: [],
+            passwordHash: await hashPassword(toHex(crypto.getRandomValues(new Uint8Array(24)))),
+            initialBalanceNano: BigInt(settings.defaultBalanceNanoUsd),
+          });
+        } catch (err) {
+          const isConflict = err instanceof StoreError && err.code === "conflict";
+          if ((isConflict && trusted) || !isConflict || attempt >= 2) throw err;
+        }
+      }
+      throw new StoreError("conflict", "Could not allocate account");
+    };
+
+    const created = settings.inviteRequired
+      ? await store.ops.registerWithInvitation(req.inviteCode ?? "", createAccount)
+      : await createAccount();
+    if (!created) {
+      return c.json({ error: "invite_required", message: "A valid invitation code is required to register" }, 400);
+    }
+
+    await store.ops.applyRegistrationExtras(created.id, {
+      username,
+      promoCode,
+      affCode: settings.affiliateEnabled ? req.affCode : undefined,
+    });
+    await store.ops.linkIdentity(created.id, consumed.provider, consumed.subject).catch(() => undefined);
+    await store.ops.touchLastLogin(created.id);
+    const finalUser = (await store.getUserById(created.id)) ?? created;
+    const { token } = await issueAccessToken(store, jwtSecret, finalUser);
+    return c.json({ accessToken: token, redirect: consumed.redirectPath });
   });
 
   /* ---------------- Self-service linking ---------------- */

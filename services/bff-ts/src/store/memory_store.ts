@@ -48,6 +48,7 @@ import { MemoryChannelMonitorStore } from "./memory_channel_monitors.ts";
 import { MemoryPlatformQuotasStore } from "./memory_platform_quotas.ts";
 import { MemoryUsageRollupsStore } from "./memory_usage_rollups.ts";
 import { MemoryModerationStore } from "./memory_moderation.ts";
+import { MemoryPasskeyStore } from "./memory_passkeys.ts";
 import type { OpsStore } from "./ops_types.ts";
 import type { PaymentsStore } from "./payments_types.ts";
 import {
@@ -187,6 +188,7 @@ export class MemoryControlStore implements ControlStore {
   });
 
   readonly moderation = new MemoryModerationStore();
+  readonly passkeys = new MemoryPasskeyStore();
 
   readonly payments: PaymentsStore = new MemoryPaymentsStore(
     {
@@ -226,6 +228,8 @@ export class MemoryControlStore implements ControlStore {
       id: adminId,
       email: normalizedEmail,
       username: "",
+      avatarUrl: "",
+      emailVerified: false,
       passwordHash: adminPasswordHash,
       role: "admin",
       status: "active",
@@ -291,6 +295,8 @@ export class MemoryControlStore implements ControlStore {
       id: userId,
       email: normalizedEmail,
       username: "",
+      avatarUrl: "",
+      emailVerified: false,
       passwordHash,
       role: "user",
       status: "active",

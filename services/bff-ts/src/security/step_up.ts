@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import type { AdminStepUp, AuditStepUpError } from "@slipgate/contracts";
 import { WindowLimiter } from "../insights.ts";
 import type { SessionManager } from "../middleware/auth.ts";
+import type { PasskeyStepUpRegistry } from "../routes/passkeys.ts";
 import type { ControlStore } from "../store/types.ts";
 import { clientIp } from "./client_ip.ts";
 import { decryptSecret } from "./crypto.ts";
@@ -72,7 +73,17 @@ export class TotpStepUp {
    * sign-in is on. A stolen session token alone is not enough for any of them.
    */
   async confirmAdmin(c: Context, sessions: SessionManager, userId: string, confirm: AdminStepUp | undefined): Promise<Response | null> {
-    if (!confirm) return c.json({ error: "step_up_required", message: "Confirm this change with your password" }, 403);
+    if (!confirm) return c.json({ error: "step_up_required", message: "Confirm this change with your password or passkey" }, 403);
+    if (confirm.passkeyStepUpToken) {
+      const registry = passkeyRegistries.get(this.store);
+      if (registry && registry.consume(confirm.passkeyStepUpToken, userId)) {
+        return null;
+      }
+      return c.json({ error: "invalid_passkey_step_up", message: "Passkey verification expired or invalid" }, 403);
+    }
+    if (!confirm.password) {
+      return c.json({ error: "step_up_required", message: "Confirm this change with your password or passkey" }, 403);
+    }
     const check = await sessions.confirmPassword(userId, clientIp(c), confirm.password);
     if (!check.ok) {
       if (check.retryAfterSeconds !== null) {
@@ -88,6 +99,11 @@ export class TotpStepUp {
 }
 
 const guards = new WeakMap<ControlStore, Map<string, TotpStepUp>>();
+const passkeyRegistries = new WeakMap<ControlStore, PasskeyStepUpRegistry>();
+
+export function attachPasskeyStepUpRegistry(store: ControlStore, registry: PasskeyStepUpRegistry): void {
+  passkeyRegistries.set(store, registry);
+}
 
 /**
  * The step-up guard of one app (store + vault secret): every route asking for a code shares its

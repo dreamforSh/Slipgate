@@ -5,12 +5,13 @@ import { z } from "zod";
  * its data: the account password, plus a fresh authenticator code when two-factor sign-in is on.
  */
 export const AdminStepUpSchema = z.object({
-  password: z.string().min(1).max(256),
+  password: z.string().min(1).max(256).optional(),
   totpCode: z
     .string()
     .trim()
     .regex(/^\d{6}$/, "Enter the 6-digit code")
     .optional(),
+  passkeyStepUpToken: z.string().trim().min(1).max(512).optional(),
 });
 export type AdminStepUp = z.infer<typeof AdminStepUpSchema>;
 
