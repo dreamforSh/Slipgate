@@ -13,7 +13,7 @@ import { apiJson } from "../../lib/api";
 import type { Tone } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 import { nanoToUsdInput } from "../admin/users/money";
-import type { IconName } from "../ui/UiIcon.vue";
+import type { IconName } from "../ui/icons";
 
 export { STAGGER_CLASS, stagger, useDebounced } from "../admin/ops/opsUtil";
 
