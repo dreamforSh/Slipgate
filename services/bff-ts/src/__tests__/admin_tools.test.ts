@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { ConfigBackupFile, ConfigImportResult, GroupItem } from "@slipgate/contracts";
 import { createBffApp } from "../app.ts";
 import type { ControlStore } from "../store/types.ts";
+import { allowPrivateUpstreamsInSuite } from "./private_upstreams.ts";
 
 /** Postgres-backed runs inject a store factory through a test preload; default is in-memory. */
 const storeFactory = (globalThis as { __slipgateTestStoreFactory?: () => Promise<ControlStore> }).__slipgateTestStoreFactory;
@@ -29,6 +30,8 @@ async function instance(siteName: string) {
 }
 
 describe("plugin management", () => {
+  allowPrivateUpstreamsInSuite();
+
   it("lists the built-in webhook plugin, stores secrets encrypted and delivers a signed test event", async () => {
     const { call, admin } = await instance("Plugins");
     const list = await call<{ items: { name: string; enabled: boolean; hooks: string[] }[] }>("GET", "/api/v1/admin/plugins", admin);

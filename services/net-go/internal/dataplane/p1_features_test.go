@@ -142,6 +142,7 @@ func TestOAuthRefreshProactiveAndReactive401(t *testing.T) {
 		Accounts: []SyncAccountInput{
 			{ID: "acc_oauth", GroupID: "g1", Platform: "openai", ExecutionMode: "direct_api", AuthKind: "oauth", CredentialsEncHex: encCred, MaxConcurrency: 4, Status: "active"},
 		},
+		APIKeys: []SyncApiKeyInput{{ID: "key_1", UserID: "u1", GroupID: "g1", KeyHashHex: sha256HexOf("sk-sg-0123456789abcdef0123456789abcdef01234567"), Enabled: true}},
 	}); err != nil {
 		t.Fatalf("SyncSnapshot: %v", err)
 	}
@@ -276,6 +277,7 @@ func TestPreFirstByteFailoverCooldownAndStickySession(t *testing.T) {
 			{ID: "acc_429", GroupID: "g1", Platform: "openai", ExecutionMode: "direct_api", AuthKind: "api_key", CredentialsEncHex: enc429, MaxConcurrency: 4, Status: "active"},
 			{ID: "acc_ok", GroupID: "g1", Platform: "openai", ExecutionMode: "direct_api", AuthKind: "api_key", CredentialsEncHex: encOK, MaxConcurrency: 4, Status: "active"},
 		},
+		APIKeys: []SyncApiKeyInput{{ID: "key_1", UserID: "u1", GroupID: "g1", KeyHashHex: sha256HexOf("sk-sg-0123456789abcdef0123456789abcdef01234567"), Enabled: true}},
 	})
 
 	rec := httptest.NewRecorder()
@@ -408,6 +410,10 @@ func TestMultimodalEndpointsStatefulResponsesAndModelDiscovery(t *testing.T) {
 		Accounts: []SyncAccountInput{
 			{ID: "acc_mock", GroupID: "g1", Platform: "openai", ExecutionMode: "direct_api", AuthKind: "api_key", CredentialsEncHex: encMock, MaxConcurrency: 8, Status: "active"},
 			{ID: "acc_disc", GroupID: "g1", Platform: "openai", ExecutionMode: "direct_api", AuthKind: "api_key", CredentialsEncHex: encDisc, MaxConcurrency: 4, Status: "active"},
+		},
+		APIKeys: []SyncApiKeyInput{
+			{ID: "key_a", UserID: "u1", GroupID: "g1", KeyHashHex: sha256HexOf(keyA), Enabled: true},
+			{ID: "key_b", UserID: "u2", GroupID: "g1", KeyHashHex: sha256HexOf(keyB), Enabled: true},
 		},
 	})
 

@@ -1,4 +1,5 @@
 import { Hono, type Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import {
   AccountBatchDeleteRequestSchema,
@@ -21,6 +22,7 @@ import {
   ClashExitNodeSchema,
   ClashOutboundTestRequestSchema,
   ClashProbeRequestSchema,
+  coerceTurnSettlementInput,
   CreateAccountRequestSchema,
   CreateApiKeyRequestSchema,
   CreateClashSubscriptionRequestSchema,
@@ -481,6 +483,12 @@ async function forwardNetInternal(
 /** Push the real balance once an under-valued wallet can pay for fewer than this many such turns. */
 const LOW_BALANCE_TURNS = 32n;
 
+/** Largest request body accepted on /api/* outside the internal data-plane callbacks. */
+export const API_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
+
+/** Bun's ceiling for any request body (internal callbacks carry persisted response state). */
+export const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+
 export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   const store = options.store ?? new MemoryControlStore();
   const jwtSecret = options.jwtSecret ?? process.env.SLIPGATE_JWT_SECRET ?? "slipgate-dev-jwt-secret-change-in-prod";
@@ -492,6 +500,13 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   const app = new Hono<AuthEnv>();
   // First middleware: request ids, the logging context and 5xx / access entries wrap every route.
   const systemLogs = mountSystemLogging(app, store, options.startSchedulers === true);
+  // Console and API bodies are JSON well under this, imports included. The token-checked
+  // data-plane callbacks (persisted response state) are bounded by Bun's ceiling (index.ts) only.
+  const apiBodyLimit = bodyLimit({
+    maxSize: API_BODY_LIMIT_BYTES,
+    onError: (c) => c.json({ error: "payload_too_large", message: `Request body exceeds ${API_BODY_LIMIT_BYTES >> 20} MiB` }, 413),
+  });
+  app.use("/api/*", (c, next) => (c.req.path.startsWith("/api/v1/internal/") ? next() : apiBodyLimit(c, next)));
   const startedAt = Date.now();
   const stepUpGuard = totpStepUp(store, vaultSecret);
   const loginTotpLimiter = stepUpGuard.limiter;
@@ -1065,7 +1080,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "forbidden", message: "Invalid internal supervisor token" }, 403);
     }
     const raw = await readJsonBody(c.req.raw);
-    const parsed = TurnSettlementEventSchema.safeParse(raw);
+    const parsed = TurnSettlementEventSchema.safeParse(coerceTurnSettlementInput(raw));
     if (!parsed.success) {
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
@@ -1081,6 +1096,9 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
     // Idempotent per settlement id: net-go redelivers until it gets a 2xx.
     const { settlementId, duplicate, walletBalanceAfterNanoUsd, ...item } = await store.recordTurnSettlement(event);
+    // Committed by now (a duplicate earlier): snapshots read from here on carry this debit, which
+    // net-go relays to slipgate-core so it stops subtracting its local copy.
+    const appliedAtUnixMs = Date.now();
     if (!duplicate && BigInt(item.costNanoUsd) > 0n) {
       try {
         // The core held and debited its local wallet at its own valuation. When the bill came out
@@ -1108,7 +1126,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
         // The settlement is recorded; the periodic snapshot pull still converges.
       }
     }
-    return c.json({ ok: true, settlementId, duplicate, item });
+    return c.json({ ok: true, settlementId, duplicate, item, appliedAtUnixMs });
   });
 
   app.post("/api/v1/internal/dataplane/risk-events", async (c) => {
@@ -2572,11 +2590,42 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
   });
 
+  // Settlements this BFF rejected (or that aged out undelivered) wait in slipgate-net's dead-letter
+  // spool: each is a turn still owed, replayed once the cause is fixed (settlement ids dedupe).
+  app.get("/api/v1/admin/ops/settlement-dead-letters", async (c) => {
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/dataplane/settlements/dead-letter", { timeoutMs: 10_000 });
+      if (!forwarded.configured) return c.json({ count: 0, mode: "standalone" });
+      return c.json(forwarded.payload, forwarded.status);
+    } catch (err) {
+      return c.json(
+        { error: "net_supervisor_unreachable", message: err instanceof Error ? err.message : String(err) },
+        502,
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/ops/settlement-dead-letters/replay", async (c) => {
+    try {
+      const forwarded = await forwardNetInternal("/internal/net/dataplane/settlements/dead-letter/replay", {
+        method: "POST",
+        timeoutMs: 30_000,
+      });
+      if (!forwarded.configured) return c.json({ replayed: 0, mode: "standalone" });
+      return c.json(forwarded.payload, forwarded.status);
+    } catch (err) {
+      return c.json(
+        { error: "net_supervisor_unreachable", message: err instanceof Error ? err.message : String(err) },
+        502,
+      );
+    }
+  });
+
   // Before the ops routes: its public-page guards and settings-write hook wrap their handlers.
   registerAuthGuardRoutes(app, guards);
   const discoveredModelsCache = cached(30_000, async (): Promise<Record<string, readonly string[]>> => {
     try {
-      const forwarded = await forwardNetInternal("/internal/net/models/catalog", { timeoutMs: 3_000 });
+      const forwarded = await forwardNetInternal("/internal/net/models/discovered", { timeoutMs: 3_000 });
       if (!forwarded.configured || forwarded.status !== 200) return {};
       const map = forwarded.payload.models;
       if (!map || typeof map !== "object") return {};

@@ -12,9 +12,11 @@ import {
   type BackupS3ConfigView,
   type BackupSchedule,
   type BackupScheduleView,
+  type AdminStepUp,
   type TestBackupS3Response,
   type UpdateBackupS3ConfigRequest,
 } from "@slipgate/contracts";
+import AdminStepUpModal from "../AdminStepUpModal.vue";
 import SecretInput from "../../payments/SecretInput.vue";
 import SettingField from "../../settings/SettingField.vue";
 import SettingSwitchRow from "../../settings/SettingSwitchRow.vue";
@@ -267,12 +269,26 @@ const invalid = computed(() => (s3Keys.value.length > 0 && s3Invalid.value) || (
 
 /* ---------------- Save ---------------- */
 
+/** Refusals of the password / code re-check, which the confirmation dialog shows on its fields. */
+const STEP_UP_CODES = new Set(["step_up_required", "invalid_password", "totp_required", "invalid_totp", "too_many_attempts"]);
+
+const stepUpOpen = ref(false);
+
 async function save() {
   if (saving.value || !dirtyCount.value) return;
   if (invalid.value) {
     toast.error(t("settings.saveBar.invalid"));
     return;
   }
+  // Every future full-database dump goes to the S3 target: changing it needs the password (and code).
+  if (s3Keys.value.length) {
+    stepUpOpen.value = true;
+    return;
+  }
+  await persist();
+}
+
+async function persist(confirm?: AdminStepUp) {
   saving.value = true;
   let ok = true;
   let changed = false;
@@ -281,7 +297,7 @@ async function save() {
       try {
         const view = await apiJson<BackupS3ConfigView>(`${DB_BACKUP_API}/s3-config`, {
           method: "PUT",
-          body: s3Body.value,
+          body: confirm ? { ...s3Body.value, confirm } : s3Body.value,
           fallbackError: t("dbBackups.settings.saveFailed"),
         });
         s3Orig.value = view;
@@ -289,6 +305,7 @@ async function save() {
         testResult.value = null;
         changed = true;
       } catch (err) {
+        if (err instanceof ApiError && err.code && STEP_UP_CODES.has(err.code)) throw err;
         ok = false;
         toast.error(backupErrorText(err, t("dbBackups.settings.saveFailed")));
       }
@@ -800,5 +817,6 @@ const errorRing = "!border-danger focus:!ring-danger/20";
     </template>
 
     <BackupS3GuideModal v-model:open="guideOpen" />
+    <AdminStepUpModal v-model:open="stepUpOpen" :title="t('security.stepUp.titles.backupTarget')" :action="persist" />
   </div>
 </template>

@@ -665,9 +665,10 @@ export function registerPaymentRoutes(app: App, ctx: PaymentRouteContext): Payme
         const order = await payments.getOrder(str(tx.out_trade_no));
         if (order && order.provider === "wxpay" && order.providerInstanceId === m.id && str(tx.mchid) === creds.mchId) {
           const amount = (tx.amount ?? {}) as Record<string, unknown>;
+          // out_refund_no is the id this side records for refunds it starts (wxpayRefund).
           await service.reconcileExternalRefund(order.id, {
             deltaRefundMinor: Number(amount.refund ?? 0),
-            providerRefundId: str(tx.refund_id) || null,
+            providerRefundId: str(tx.out_refund_no) || str(tx.refund_id) || null,
           });
         }
         return c.body(null, 204);

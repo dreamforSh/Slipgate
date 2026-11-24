@@ -49,6 +49,8 @@ interface OrderRecord extends Omit<OrderInput, "creditNano" | "providerInstanceI
   refundReason: string | null;
   refundError: string | null;
   providerRefundId: string | null;
+  /** Provider refund ids completeRefund has applied (see PaymentsStore.getRefundLedger). */
+  appliedRefundIds: string[];
   refundReclaim: boolean;
   refundForce: boolean;
   refundReclaimedNano: bigint;
@@ -315,6 +317,7 @@ export class MemoryPaymentsStore implements PaymentsStore {
         refundReason: null,
         refundError: null,
         providerRefundId: null,
+        appliedRefundIds: [],
         refundReclaim: false,
         refundForce: false,
         refundReclaimedNano: 0n,
@@ -549,7 +552,10 @@ export class MemoryPaymentsStore implements PaymentsStore {
   async completeRefund(id: string, providerRefundId: string | null) {
     return this.locked(id, async () => {
       const o = this.require(id);
-      if (o.status !== "refund_pending") throw new StoreError("conflict", "The refund is no longer pending");
+      if (o.status !== "refund_pending") {
+        if (providerRefundId && o.appliedRefundIds.includes(providerRefundId)) return this.toOrder(o);
+        throw new StoreError("conflict", "The refund is no longer pending");
+      }
       const part = o.refundAmountMinor;
       const priorMinor = o.priorRefundAmountMinor;
       const totalRefundedMinor = priorMinor + part;
@@ -595,10 +601,20 @@ export class MemoryPaymentsStore implements PaymentsStore {
       o.refundedAtIso = new Date().toISOString();
       o.refundReclaimedNano += reclaimed;
       o.refundError = null;
-      if (providerRefundId) o.providerRefundId = providerRefundId;
+      if (providerRefundId) {
+        o.providerRefundId = providerRefundId;
+        if (!o.appliedRefundIds.includes(providerRefundId)) o.appliedRefundIds.push(providerRefundId);
+      }
       this.touch(o);
       return this.toOrder(o);
     });
+  }
+
+  async getRefundLedger(id: string) {
+    const o = this.orders.get(id);
+    if (!o) return null;
+    const committedMinor = o.status === "refunded" || o.status === "partially_refunded" ? o.refundAmountMinor : o.priorRefundAmountMinor;
+    return { committedMinor, appliedRefundIds: [...o.appliedRefundIds] };
   }
 
   async failRefund(id: string, error: string) {

@@ -160,6 +160,12 @@ type CanonicalTurn struct {
 	AnthropicBeta    string
 	// NativePassthrough is set by BuildUpstreamHTTPRequestWithPersona when RawBody was forwarded.
 	NativePassthrough bool
+	// UpstreamServiceTier is the service tier the upstream request actually carries (set by
+	// BuildUpstreamHTTPRequestWithPersona); only that tier is billed.
+	UpstreamServiceTier string
+	// AnthropicServerTools are the caller's Anthropic-defined tool declarations (web_search, bash,
+	// code_execution, ...) verbatim: replayed to Anthropic, which runs them, and dropped elsewhere.
+	AnthropicServerTools []json.RawMessage
 
 	MCPMethod string
 	MCPID     json.RawMessage
@@ -385,7 +391,7 @@ func parseOpenAIChat(raw []byte, turn *CanonicalTurn) error {
 	turn.ParallelToolCalls = payload.ParallelToolCalls
 	turn.ResponseFormat = parseOpenAIResponseFormat(payload.ResponseFormat)
 	turn.ReasoningEffort = normalizeReasoningEffort(payload.ReasoningEffort)
-	turn.ServiceTier = strings.ToLower(strings.TrimSpace(payload.ServiceTier))
+	turn.ServiceTier = normalizeServiceTier(payload.ServiceTier)
 	turn.SessionHint = firstNonEmpty(payload.PromptCacheKey, payload.User)
 
 	var sysParts []string
@@ -497,7 +503,7 @@ func parseOpenAIResponses(raw []byte, turn *CanonicalTurn) error {
 	turn.Temperature = payload.Temperature
 	turn.TopP = payload.TopP
 	turn.PreviousResponseID = strings.TrimSpace(payload.PreviousResponseID)
-	turn.ServiceTier = strings.ToLower(strings.TrimSpace(payload.ServiceTier))
+	turn.ServiceTier = normalizeServiceTier(payload.ServiceTier)
 	turn.SessionHint = firstNonEmpty(payload.PromptCacheKey, payload.PreviousResponseID)
 	turn.ToolChoice = parseOpenAIToolChoice(payload.ToolChoice)
 	turn.ParallelToolCalls = payload.ParallelToolCalls
@@ -613,12 +619,7 @@ func parseAnthropicMessages(raw []byte, turn *CanonicalTurn) error {
 			Role    string          `json:"role"`
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
-		Tools []struct {
-			Type        string          `json:"type"`
-			Name        string          `json:"name"`
-			Description string          `json:"description"`
-			InputSchema json.RawMessage `json:"input_schema"`
-		} `json:"tools"`
+		Tools      []json.RawMessage `json:"tools"`
 		ToolChoice *struct {
 			Type                   string `json:"type"`
 			Name                   string `json:"name"`
@@ -659,7 +660,7 @@ func parseAnthropicMessages(raw []byte, turn *CanonicalTurn) error {
 	turn.TopP = payload.TopP
 	turn.TopK = payload.TopK
 	turn.StopSequences = payload.StopSequences
-	turn.ServiceTier = strings.ToLower(strings.TrimSpace(payload.ServiceTier))
+	turn.ServiceTier = normalizeServiceTier(payload.ServiceTier)
 	if payload.Metadata != nil {
 		turn.SessionHint = strings.TrimSpace(payload.Metadata.UserID)
 	}
@@ -696,14 +697,22 @@ func parseAnthropicMessages(raw []byte, turn *CanonicalTurn) error {
 			turn.Messages = append(turn.Messages, CanonicalMessage{Role: role, Content: str})
 			continue
 		}
-		var blocks []anthropicBlock
-		if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		var rawBlocks []json.RawMessage
+		if err := json.Unmarshal(m.Content, &rawBlocks); err != nil {
 			continue
 		}
 		msg := CanonicalMessage{Role: role}
 		var parts []CanonicalPart
 		var toolResults []CanonicalMessage
-		for _, b := range blocks {
+		for _, rawBlock := range rawBlocks {
+			var b anthropicBlock
+			if json.Unmarshal(rawBlock, &b) != nil {
+				continue
+			}
+			if isAnthropicServerBlock(b.Type) {
+				parts = append(parts, CanonicalPart{Type: partAnthropicBlock, Data: string(rawBlock)})
+				continue
+			}
 			switch b.Type {
 			case "text", "image", "document":
 				if p, ok := canonicalPartFromBlock(contentBlock{Type: b.Type, Text: b.Text, Source: b.Source}); ok {
@@ -740,12 +749,23 @@ func parseAnthropicMessages(raw []byte, turn *CanonicalTurn) error {
 		}
 	}
 
-	for _, t := range payload.Tools {
+	for _, rawTool := range payload.Tools {
+		var t struct {
+			Type        string          `json:"type"`
+			Name        string          `json:"name"`
+			Description string          `json:"description"`
+			InputSchema json.RawMessage `json:"input_schema"`
+		}
+		if json.Unmarshal(rawTool, &t) != nil {
+			continue
+		}
 		if t.Type != "" && t.Type != "custom" {
-			// Anthropic-defined tools (web_search, bash, text_editor, ...) have no portable schema.
+			// Anthropic-defined tools (web_search, bash, text_editor, ...) have no portable schema:
+			// kept verbatim for Anthropic upstreams.
 			if name := strings.TrimSpace(t.Name); name != "" {
 				turn.CallerDeclaredTools[name] = true
 			}
+			turn.AnthropicServerTools = append(turn.AnthropicServerTools, rawTool)
 			continue
 		}
 		addCallerTool(turn, t.Name, t.Description, t.InputSchema)
@@ -1054,6 +1074,16 @@ func normalizeReasoningEffort(effort string) string {
 	return ""
 }
 
+// normalizeServiceTier drops tiers no upstream protocol defines: the value travels into the core
+// hold, the price and the settlement record, so it must never be an arbitrary caller string.
+func normalizeServiceTier(tier string) string {
+	switch t := strings.ToLower(strings.TrimSpace(tier)); t {
+	case "auto", "default", "flex", "priority", "scale", "fast", "standard_only":
+		return t
+	}
+	return ""
+}
+
 func parseMCPJSONRPC(raw []byte, turn *CanonicalTurn) error {
 	var rpc struct {
 		JSONRPC string          `json:"jsonrpc"`
@@ -1253,6 +1283,7 @@ func BuildUpstreamHTTPRequestWithPersona(
 	if err != nil {
 		return nil, egress, err
 	}
+	turn.UpstreamServiceTier = upstreamServiceTier(pctx, secret, turn, egress)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(bodyRaw))
 	if err != nil {
@@ -1269,7 +1300,7 @@ func BuildUpstreamHTTPRequestWithPersona(
 	switch egress {
 	case CodecAnthropicMessages, CodecAnthropicCountTokens:
 		if isClaudeSub {
-			ApplyClaudeSubscriptionHeaders(req, secret)
+			ApplyClaudeSubscriptionHeaders(req, secret, turn.AnthropicBeta)
 		} else {
 			if secret.APIKey != "" {
 				req.Header.Set("x-api-key", secret.APIKey)
@@ -1411,8 +1442,8 @@ func encodeAnthropicRequestBody(
 	_, thinkingOn := payload["thinking"]
 	payload["messages"] = encodeAnthropicMessages(turn.Messages, thinkingOn)
 
-	if len(tools) > 0 {
-		antTools := make([]map[string]any, 0, len(tools))
+	if len(tools) > 0 || len(turn.AnthropicServerTools) > 0 {
+		antTools := make([]any, 0, len(tools)+len(turn.AnthropicServerTools))
 		for _, t := range tools {
 			antTools = append(antTools, map[string]any{
 				"name":         t.Name,
@@ -1420,12 +1451,66 @@ func encodeAnthropicRequestBody(
 				"input_schema": ensureSchema(t.Parameters),
 			})
 		}
+		for _, raw := range turn.AnthropicServerTools {
+			antTools = append(antTools, raw)
+		}
 		payload["tools"] = antTools
 		if choice := anthropicToolChoice(turn); choice != nil {
 			payload["tool_choice"] = choice
 		}
 	}
+	if tier := anthropicServiceTier(turn.ServiceTier); tier != "" && includeMaxTokens && !isClaudeSub {
+		payload["service_tier"] = tier
+	}
 	return json.Marshal(payload)
+}
+
+// anthropicServiceTier is the caller's tier when Anthropic defines it ("" otherwise).
+func anthropicServiceTier(tier string) string {
+	switch tier {
+	case "auto", "standard_only":
+		return tier
+	}
+	return ""
+}
+
+// openAIServiceTier is the caller's tier in OpenAI's terms ("fast" is Codex CLI's name for
+// priority; "" when OpenAI defines no such tier).
+func openAIServiceTier(tier string) string {
+	switch tier {
+	case "auto", "default", "flex", "priority", "scale":
+		return tier
+	case "fast":
+		return "priority"
+	}
+	return ""
+}
+
+// billedServiceTier is the tier slipgate-core settles at: the one sent upstream. A requested tier
+// that never left the edge settles as "default", since an empty value falls back to the hold's.
+func billedServiceTier(turn *CanonicalTurn) string {
+	if turn.UpstreamServiceTier == "" && turn.ServiceTier != "" {
+		return "default"
+	}
+	return turn.UpstreamServiceTier
+}
+
+// upstreamServiceTier is the tier the upstream request carries: the caller's own when its body is
+// forwarded verbatim, else what the egress encoder wrote. Only that tier may be billed.
+func upstreamServiceTier(pctx OutboundPersonaContext, secret AccountSecret, turn *CanonicalTurn, egress CodecKind) string {
+	switch {
+	case turn.ServiceTier == "":
+		return ""
+	case turn.NativePassthrough:
+		return turn.ServiceTier
+	case egress == CodecOpenAIResponses:
+		return openAIServiceTier(turn.ServiceTier)
+	case egress == CodecOpenAIChat && strings.EqualFold(strings.TrimSpace(pctx.Provider), "openai"):
+		return openAIServiceTier(turn.ServiceTier)
+	case egress == CodecAnthropicMessages && !IsClaudeSubscription(pctx, secret):
+		return anthropicServiceTier(turn.ServiceTier)
+	}
+	return ""
 }
 
 // encodeAnthropicMessages renders canonical messages as Anthropic turns. Consecutive same-role
@@ -1696,6 +1781,9 @@ func encodeOpenAIChatRequestBody(provider, model string, turn *CanonicalTurn, to
 		} else {
 			payload["max_tokens"] = turn.MaxTokens
 		}
+	}
+	if tier := openAIServiceTier(turn.ServiceTier); tier != "" && isOpenAI {
+		payload["service_tier"] = tier
 	}
 	if reasoningModel {
 		if effort := firstNonEmpty(turn.ReasoningEffort, reasoningEffortForBudget(turn.ThinkingBudget)); effort != "" {

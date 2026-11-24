@@ -309,8 +309,17 @@ describe("per-user group rates and RPM overrides", () => {
     const plainKey = await key(plain.headers, g.id);
     await call("PUT", `/api/v1/admin/groups/${g.id}/rate-multipliers`, admin, { entries: [{ userId: payer.id, rateMultiplier: 2.5 }] });
 
-    // No price rule: the core's group-rate cost is scaled to the user's rate.
-    expect((await settle({ userId: payer.id, apiKeyId: payerKey.id, groupId: g.id, costNanoUsd: "1000000" })).costNanoUsd).toBe("2500000");
+    // No price rule: a core that priced at the group rate (the custom rate had not synced yet) is
+    // scaled to the user's rate; one that already used the user's rate is billed as it charged.
+    expect(
+      (await settle({ userId: payer.id, apiKeyId: payerKey.id, groupId: g.id, costNanoUsd: "1000000", coreRateMultiplierMicros: 1_000_000 }))
+        .costNanoUsd,
+    ).toBe("2500000");
+    expect(
+      (await settle({ userId: payer.id, apiKeyId: payerKey.id, groupId: g.id, costNanoUsd: "2500000", coreRateMultiplierMicros: 2_500_000 }))
+        .costNanoUsd,
+    ).toBe("2500000");
+    expect((await settle({ userId: payer.id, apiKeyId: payerKey.id, groupId: g.id, costNanoUsd: "2500000" })).costNanoUsd).toBe("2500000");
     expect((await settle({ userId: plain.id, apiKeyId: plainKey.id, groupId: g.id, costNanoUsd: "1000000" })).costNanoUsd).toBe("1000000");
     // A failed or free turn stays free.
     expect((await settle({ userId: payer.id, apiKeyId: payerKey.id, groupId: g.id, costNanoUsd: "0", statusCode: 529 })).costNanoUsd).toBe("0");
@@ -573,9 +582,13 @@ describe("pure helpers", () => {
       statusCode: 200,
     } as TurnSettlementEvent;
     expect(repriceForUser(ev, [], 2, null)).toBe(ev);
-    expect(repriceForUser(ev, [], 2, 0.5).costNanoUsd).toBe("250");
-    expect(repriceForUser(ev, [], 3, 1).costNanoUsd).toBe("334"); // rounds up, never under-bills
-    expect(repriceForUser({ ...ev, statusCode: 500 }, [], 1, 5).costNanoUsd).toBe("1000");
+    // The core already applied the user's rate: billed as charged, never multiplied again.
+    expect(repriceForUser(ev, [], 2, 0.5)).toBe(ev);
+    expect(repriceForUser({ ...ev, coreRateMultiplierMicros: 500_000 }, [], 2, 0.5).costNanoUsd).toBe("1000");
+    // The core priced at another rate (the custom one changed after the hold): only the difference.
+    expect(repriceForUser({ ...ev, coreRateMultiplierMicros: 2_000_000 }, [], 2, 0.5).costNanoUsd).toBe("250");
+    expect(repriceForUser({ ...ev, coreRateMultiplierMicros: 3_000_000 }, [], 3, 1).costNanoUsd).toBe("334"); // rounds up, never under-bills
+    expect(repriceForUser({ ...ev, statusCode: 500, coreRateMultiplierMicros: 1_000_000 }, [], 1, 5).costNanoUsd).toBe("1000");
   });
 
   it("computes the viewer's local midnight", () => {

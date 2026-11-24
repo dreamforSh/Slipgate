@@ -34,13 +34,18 @@ func WeakSecretReason(value string) string {
 }
 
 // SecretProblems lists every weak secret in cfg, e.g. "SLIPGATE_JWT_SECRET is not set".
-// An empty result means both secrets are safe to run with.
+// An empty result means every secret is safe to run with. An unset SLIPGATE_INTERNAL_TOKEN is
+// fine (LoadFromEnv generates one); an operator-chosen one must be as strong as the others.
 func (c Config) SecretProblems() []string {
 	var problems []string
-	for _, item := range []struct{ name, value string }{
+	items := []struct{ name, value string }{
 		{"SLIPGATE_JWT_SECRET", c.JWTSecret},
 		{"SLIPGATE_VAULT_SECRET", c.VaultSecret},
-	} {
+	}
+	if c.InternalToken != "" {
+		items = append(items, struct{ name, value string }{"SLIPGATE_INTERNAL_TOKEN", c.InternalToken})
+	}
+	for _, item := range items {
 		if reason := WeakSecretReason(item.value); reason != "" {
 			problems = append(problems, item.name+" "+reason)
 		}

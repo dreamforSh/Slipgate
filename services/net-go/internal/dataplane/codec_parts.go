@@ -11,7 +11,31 @@ const (
 	partText     = "text"
 	partImage    = "image"
 	partDocument = "document"
+	// partAnthropicBlock holds an Anthropic-only content block (server tool use and its result)
+	// as raw JSON in Data: replayed verbatim to Anthropic, skipped by every other protocol.
+	partAnthropicBlock = "anthropic_block"
 )
+
+// isAnthropicServerBlock reports content blocks that only Anthropic understands and that must be
+// replayed as they are: server tool calls and results (web search, code execution, MCP, ...).
+func isAnthropicServerBlock(blockType string) bool {
+	switch blockType {
+	case "server_tool_use", "mcp_tool_use", "container_upload":
+		return true
+	}
+	return blockType != "tool_result" && strings.HasSuffix(blockType, "_tool_result")
+}
+
+// rawJSONObject decodes a JSON object keeping numbers exact, for blocks replayed verbatim.
+func rawJSONObject(data string) map[string]any {
+	dec := json.NewDecoder(strings.NewReader(data))
+	dec.UseNumber()
+	var obj map[string]any
+	if dec.Decode(&obj) != nil {
+		return nil
+	}
+	return obj
+}
 
 // mediaSource is Anthropic's image/document source: base64, url, or (documents only) plain text.
 type mediaSource struct {
@@ -210,6 +234,9 @@ func openAIChatContent(m CanonicalMessage) any {
 			}
 		}
 	}
+	if len(out) == 0 {
+		return m.Content // only Anthropic-only blocks, which OpenAI cannot take
+	}
 	return out
 }
 
@@ -234,6 +261,10 @@ func anthropicContentBlocks(parts []CanonicalPart) []map[string]any {
 				source = map[string]any{"type": "url", "url": p.URL}
 			}
 			out = append(out, map[string]any{"type": p.Type, "source": source})
+		case partAnthropicBlock:
+			if block := rawJSONObject(p.Data); len(block) > 0 {
+				out = append(out, block)
+			}
 		}
 	}
 	return out

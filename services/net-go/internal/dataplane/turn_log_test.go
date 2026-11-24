@@ -95,6 +95,7 @@ func TestTurnWarningsAndAccessLinesCarryCorrelationFields(t *testing.T) {
 	enc, _ := coord.Vault().EncryptHex("mock://ok")
 	if _, err := coord.SyncSnapshot(context.Background(), SyncSnapshot{
 		Accounts: []SyncAccountInput{{ID: "acc_mock", GroupID: "grp_1", Platform: "anthropic", ExecutionMode: "direct_api", CredentialsEncHex: enc, MaxConcurrency: 4, Status: "active"}},
+		APIKeys:  testSnapshotKeys,
 	}); err != nil {
 		t.Fatalf("sync: %v", err)
 	}

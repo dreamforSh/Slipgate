@@ -9,19 +9,23 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds runtime settings for slipgate-net and its built-in process supervisor.
 type Config struct {
-	ListenAddr    string
-	CoreIPC       string
-	BFFAddr       string
-	Supervise     bool
-	AllowDegraded bool
-	CoreBin       string
-	BFFBin        string
-	DatabaseURL   string
-	VaultSecret   string
+	ListenAddr string
+	// InternalListenAddr serves the token-authenticated /internal/* routes slipgate-bff calls; the
+	// public ListenAddr never does, so a reverse proxy in front of the edge cannot reach them.
+	InternalListenAddr string
+	CoreIPC            string
+	BFFAddr            string
+	Supervise          bool
+	AllowDegraded      bool
+	CoreBin            string
+	BFFBin             string
+	DatabaseURL        string
+	VaultSecret        string
 	// JWTSecret is only validated here; slipgate-bff reads SLIPGATE_JWT_SECRET itself.
 	JWTSecret string
 	// AllowInsecureSecrets (SLIPGATE_ALLOW_INSECURE_SECRETS) lets weak secrets through with a
@@ -50,6 +54,11 @@ type Config struct {
 	InternalToken         string
 	TrustedProxies        string
 	AllowPrivateUpstreams bool
+	// UpstreamHeaderTimeout / UpstreamIdleTimeout bound an AI upstream's wait for response headers
+	// and each stall of its response stream (SLIPGATE_UPSTREAM_HEADER_TIMEOUT_SEC, default 600;
+	// SLIPGATE_UPSTREAM_IDLE_TIMEOUT_SEC, default 300; 0 = unbounded).
+	UpstreamHeaderTimeout time.Duration
+	UpstreamIdleTimeout   time.Duration
 }
 
 // LoadFromEnv loads configuration from SLIPGATE_* environment variables with safe defaults.
@@ -99,6 +108,7 @@ func LoadFromEnv() Config {
 
 	return Config{
 		ListenAddr:            envString("SLIPGATE_LISTEN_ADDR", ":8080"),
+		InternalListenAddr:    envString("SLIPGATE_INTERNAL_LISTEN_ADDR", "127.0.0.1:19083"),
 		CoreIPC:               envString("SLIPGATE_CORE_IPC", "127.0.0.1:19081"),
 		BFFAddr:               envString("SLIPGATE_BFF_ADDR", "127.0.0.1:19082"),
 		Supervise:             envBool("SLIPGATE_SUPERVISE", true),
@@ -132,7 +142,18 @@ func LoadFromEnv() Config {
 		InternalToken:         internalToken,
 		TrustedProxies:        strings.TrimSpace(os.Getenv("SLIPGATE_TRUSTED_PROXIES")),
 		AllowPrivateUpstreams: envBool("SLIPGATE_ALLOW_PRIVATE_UPSTREAMS", false),
+		UpstreamHeaderTimeout: envSeconds("SLIPGATE_UPSTREAM_HEADER_TIMEOUT_SEC", 600),
+		UpstreamIdleTimeout:   envSeconds("SLIPGATE_UPSTREAM_IDLE_TIMEOUT_SEC", 300),
 	}
+}
+
+// envSeconds reads a non-negative number of seconds (0 = disabled); anything else is the fallback.
+func envSeconds(key string, fallback int) time.Duration {
+	sec := envInt(key, fallback)
+	if sec < 0 {
+		sec = fallback
+	}
+	return time.Duration(sec) * time.Second
 }
 
 // LoopbackOrigin derives an internal loopback HTTP URL for slipgate-bff to call back into slipgate-net.
@@ -146,6 +167,19 @@ func LoopbackOrigin(listenAddr string) string {
 		return "http://127.0.0.1:8080"
 	}
 	return "http://127.0.0.1:" + port
+}
+
+// InternalOrigin is the URL slipgate-bff calls the internal listener at: its own host, or loopback
+// when it listens on every interface.
+func InternalOrigin(internalListenAddr string) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(internalListenAddr))
+	if err != nil || port == "" || port == "0" {
+		return "http://127.0.0.1:19083"
+	}
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 func generateInternalToken() string {

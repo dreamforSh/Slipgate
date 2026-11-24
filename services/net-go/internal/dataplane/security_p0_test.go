@@ -193,6 +193,7 @@ func TestDirectAPISSRFBlockedByDefaultAndVMSlotSandboxWorks(t *testing.T) {
 		Accounts: []SyncAccountInput{
 			{ID: "acc_vm_ssh", GroupID: "g1", Platform: "anthropic", ExecutionMode: "vm_slot", AuthKind: "oauth", CredentialsEncHex: encMock, MaxConcurrency: 2, Status: "active"},
 		},
+		APIKeys: []SyncApiKeyInput{{ID: "key_vm", UserID: "u1", GroupID: "g1", KeyHashHex: sha256HexOf("my-custom-api-key-123456"), Enabled: true}},
 	}); err != nil {
 		t.Fatalf("SyncSnapshot: %v", err)
 	}

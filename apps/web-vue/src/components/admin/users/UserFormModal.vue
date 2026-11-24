@@ -3,6 +3,7 @@ import { computed, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import type {
   AdminCreateUserRequest,
+  AdminStepUp,
   AdminUpdateUserRequest,
   AdminUserItem,
   GroupItem,
@@ -10,12 +11,13 @@ import type {
   UserRole,
   UserStatus,
 } from "@slipgate/contracts";
+import AdminStepUpModal from "../AdminStepUpModal.vue";
 import FormField from "../../ui/FormField.vue";
 import SegmentedControl from "../../ui/SegmentedControl.vue";
 import UiAlert from "../../ui/UiAlert.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UiModal from "../../ui/UiModal.vue";
-import { apiJson, errorText } from "../../../lib/api";
+import { ApiError, apiJson, errorText } from "../../../lib/api";
 import { useToastStore } from "../../../stores/toast";
 import GroupPicker from "./GroupPicker.vue";
 import UserCapField from "./UserCapField.vue";
@@ -144,47 +146,77 @@ function buildPatch(u: AdminUserItem): AdminUpdateUserRequest {
   return patch;
 }
 
+/** Mirrors the server: changes that could take an account over need the admin's re-confirmation. */
+function needsStepUp(u: AdminUserItem | null, patch: AdminUpdateUserRequest | null): boolean {
+  if (!u) return form.role === "admin";
+  if (!patch) return false;
+  const otherAdmin = u.role === "admin" && !isSelf.value;
+  return (
+    (patch.role === "admin" && u.role !== "admin") ||
+    patch.password !== undefined ||
+    (otherAdmin && (patch.email !== undefined || patch.role !== undefined || patch.status !== undefined))
+  );
+}
+
+const stepUpOpen = ref(false);
+const stepUpTitle = computed(() =>
+  props.user ? t("security.stepUp.titles.accountChange") : t("security.stepUp.titles.createAdmin"),
+);
+
+/** Saves the form; throws so the re-confirmation dialog can show what went wrong. */
+async function persist(confirm?: AdminStepUp) {
+  const u = props.user;
+  if (u) {
+    const patch = buildPatch(u);
+    const res = await apiJson<{ user: AdminUserItem }>(`/api/v1/admin/users/${encodeURIComponent(u.id)}`, {
+      method: "PATCH",
+      body: confirm ? { ...patch, confirm } : patch,
+      fallbackError: t("adminUsers.errors.save"),
+    });
+    emit("saved", res.user, false);
+  } else {
+    const balance = form.initialBalance.trim() ? normalizeUsdInput(form.initialBalance) : null;
+    const body: AdminCreateUserRequest = {
+      email: form.email.trim(),
+      password: form.password,
+      username: form.username.trim(),
+      role: form.role,
+      notes: form.notes.trim(),
+      allowedGroupIds: [...form.allowedGroupIds],
+      ...(balance !== null ? { initialBalanceUsd: balance } : {}),
+      ...(form.rpmLimit !== null ? { rpmLimit: form.rpmLimit } : {}),
+      ...(form.concurrencyLimit !== null ? { concurrencyLimit: form.concurrencyLimit } : {}),
+      ...(confirm ? { confirm } : {}),
+    };
+    const res = await apiJson<{ user: AdminUserItem }>("/api/v1/admin/users", {
+      method: "POST",
+      body,
+      fallbackError: t("adminUsers.errors.create"),
+    });
+    emit("saved", res.user, true);
+  }
+  open.value = false;
+}
+
 async function submit() {
   if (saving.value || balanceInvalid.value || rpmInvalid.value || concInvalid.value) return;
   error.value = null;
+  const u = props.user;
+  const patch = u ? buildPatch(u) : null;
+  if (u && patch && Object.keys(patch).length === 0) {
+    open.value = false;
+    return;
+  }
+  if (needsStepUp(u, patch)) {
+    stepUpOpen.value = true;
+    return;
+  }
   saving.value = true;
   try {
-    const u = props.user;
-    if (u) {
-      const patch = buildPatch(u);
-      if (Object.keys(patch).length === 0) {
-        open.value = false;
-        return;
-      }
-      const res = await apiJson<{ user: AdminUserItem }>(`/api/v1/admin/users/${encodeURIComponent(u.id)}`, {
-        method: "PATCH",
-        body: patch,
-        fallbackError: t("adminUsers.errors.save"),
-      });
-      emit("saved", res.user, false);
-    } else {
-      const balance = form.initialBalance.trim() ? normalizeUsdInput(form.initialBalance) : null;
-      const body: AdminCreateUserRequest = {
-        email: form.email.trim(),
-        password: form.password,
-        username: form.username.trim(),
-        role: form.role,
-        notes: form.notes.trim(),
-        allowedGroupIds: [...form.allowedGroupIds],
-        ...(balance !== null ? { initialBalanceUsd: balance } : {}),
-        ...(form.rpmLimit !== null ? { rpmLimit: form.rpmLimit } : {}),
-        ...(form.concurrencyLimit !== null ? { concurrencyLimit: form.concurrencyLimit } : {}),
-      };
-      const res = await apiJson<{ user: AdminUserItem }>("/api/v1/admin/users", {
-        method: "POST",
-        body,
-        fallbackError: t("adminUsers.errors.create"),
-      });
-      emit("saved", res.user, true);
-    }
-    open.value = false;
+    await persist();
   } catch (err) {
-    error.value = errorText(err, isEdit.value ? t("adminUsers.errors.save") : t("adminUsers.errors.create"));
+    if (err instanceof ApiError && err.code === "step_up_required") stepUpOpen.value = true;
+    else error.value = errorText(err, isEdit.value ? t("adminUsers.errors.save") : t("adminUsers.errors.create"));
   } finally {
     saving.value = false;
   }
@@ -360,4 +392,5 @@ async function submit() {
       </button>
     </template>
   </UiModal>
+  <AdminStepUpModal v-model:open="stepUpOpen" :title="stepUpTitle" :action="persist" />
 </template>

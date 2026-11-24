@@ -310,7 +310,7 @@ export async function refundPayment(
       return wxpayRefund(wxpayCreds(m), order.id, refundRequestNo(order.id, amountMinor), amountMinor, order.amountMinor, reason, fetchImpl);
     case "airwallex":
       if (!order.providerTradeNo) throw new GatewayError("The order has no Airwallex payment intent to refund", true);
-      return airwallexRefund(airwallexCreds(m), order.providerTradeNo, amountMinor, reason, fetchImpl);
+      return airwallexRefund(airwallexCreds(m), order.id, order.providerTradeNo, amountMinor, reason, fetchImpl);
   }
 }
 

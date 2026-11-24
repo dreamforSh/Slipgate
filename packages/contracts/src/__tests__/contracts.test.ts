@@ -3,6 +3,7 @@ import {
   BindAccountExitRequestSchema,
   ClashExitNodeSchema,
   ClusterNodeSchema,
+  coerceTurnSettlementInput,
   CreateAccountRequestSchema,
   CreateApiKeyRequestSchema,
   CreateClashSubscriptionRequestSchema,
@@ -36,6 +37,54 @@ describe("nano-USD fixed-point helpers", () => {
 
   it("rejects excessive decimal precision", () => {
     expect(() => parseUsdToNano("1.0000000001")).toThrow();
+  });
+});
+
+describe("coerceTurnSettlementInput", () => {
+  const settled = {
+    requestId: "req_1",
+    userId: "usr_1",
+    apiKeyId: "key_1",
+    accountId: "acc_1",
+    groupId: "grp_1",
+    platform: "anthropic",
+    publicModel: "m",
+    upstreamModel: "m",
+    ingressCodec: "anthropic_messages",
+    egressCodec: "anthropic_messages",
+    inputTokens: 10,
+    outputTokens: 5,
+    costNanoUsd: "100",
+    statusCode: 200,
+  };
+
+  it("keeps a turn billable when its optional dimensions or metrics are out of range", () => {
+    const strict = TurnSettlementEventSchema.safeParse({ ...settled, serviceTier: "x".repeat(33) });
+    expect(strict.success).toBe(false);
+
+    const parsed = TurnSettlementEventSchema.parse(
+      coerceTurnSettlementInput({
+        ...settled,
+        serviceTier: "x".repeat(33),
+        reasoningEffort: 42,
+        window5hUsedBps: 12_000.7,
+        window7dUsedBps: -3,
+        statusCode: 777,
+      }),
+    );
+    expect(parsed.serviceTier).toBeUndefined();
+    expect(parsed.reasoningEffort).toBeUndefined();
+    expect(parsed.window5hUsedBps).toBe(10_000);
+    expect(parsed.window7dUsedBps).toBe(0);
+    expect(parsed.statusCode).toBe(502);
+    expect(parsed.costNanoUsd).toBe("100");
+  });
+
+  it("leaves valid reports and non-objects untouched", () => {
+    const ev = { ...settled, serviceTier: "priority", reasoningEffort: "high", window5hUsedBps: 9500 };
+    expect(coerceTurnSettlementInput(ev)).toEqual(ev);
+    expect(coerceTurnSettlementInput(null)).toBeNull();
+    expect(coerceTurnSettlementInput("x")).toBe("x");
   });
 });
 

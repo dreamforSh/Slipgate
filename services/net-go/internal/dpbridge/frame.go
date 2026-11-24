@@ -31,6 +31,7 @@ const (
 	FrameStreamEnd         FrameType = 0x14
 	FrameSettleReport      FrameType = 0x15
 	FrameSettleAck         FrameType = 0x16
+	FrameSettleConfirm     FrameType = 0x17
 	FrameExitHealth        FrameType = 0x20
 	FrameSyncState         FrameType = 0x30
 	FrameSyncAck           FrameType = 0x31

@@ -121,6 +121,7 @@ const refundStatus = (s: string): ProviderRefundResult["status"] => (s === "SETT
 
 export async function airwallexRefund(
   c: AirwallexCredentials,
+  orderId: string,
   intentId: string,
   amountMinor: number,
   reason: string,
@@ -131,7 +132,14 @@ export async function airwallexRefund(
     c,
     "POST",
     "/pa/refunds/create",
-    { request_id: deterministicUuid("refund", intentId, amount), payment_intent_id: intentId, amount: Number(amount), reason: reason.slice(0, 120) || "refund" },
+    {
+      request_id: deterministicUuid("refund", intentId, amount),
+      payment_intent_id: intentId,
+      amount: Number(amount),
+      reason: reason.slice(0, 120) || "refund",
+      // refund.settled names the order only through this (a refund carries no merchant_order_id).
+      metadata: { order_id: orderId },
+    },
     fetchImpl,
   );
   const id = str(data.id);

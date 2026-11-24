@@ -1,5 +1,5 @@
 import { PluginRegistry } from "@slipgate/plugin-sdk";
-import { createBffApp } from "./app.ts";
+import { createBffApp, MAX_REQUEST_BODY_BYTES } from "./app.ts";
 import { stopAuditRetentionSweepers } from "./audit_retention.ts";
 import { installCrashLogging } from "./logging/crash.ts";
 import { installConsoleCapture } from "./logging/logger.ts";
@@ -72,6 +72,7 @@ const app = createBffApp({ store, registry, startSchedulers: true });
 const server = Bun.serve({
   hostname,
   port,
+  maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
   fetch: app.fetch,
 });
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -94,6 +95,8 @@ func NewServer(cfg config.Config, version string, pool *clashpool.Manager, sup *
 			pr.SetURL(bffURL)
 			pr.Out.Host = pr.In.Host
 			trustedProxies.SanitizeForwardedHeaders(pr.In, pr.Out)
+			// Only slipgate-net itself talks to the BFF with the internal token.
+			pr.Out.Header.Del("X-Slipgate-Internal-Token")
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
@@ -146,11 +149,16 @@ func (s *Server) Handler() http.Handler {
 	s.registerVmInternalRoutes(mux)
 	s.registerAccountInternalRoutes(mux)
 	s.registerUserLimitInternalRoutes(mux)
+	s.registerSettlementInternalRoutes(mux)
 
 	// DataPlane AI hot paths strictly bypass the TypeScript BFF.
 	mux.HandleFunc("/v1/", s.handleDataPlane)
 	mux.HandleFunc("/v1beta/", s.handleDataPlane)
+	mux.HandleFunc("/mcp", s.handleDataPlane)
 	mux.HandleFunc("/mcp/", s.handleDataPlane)
+	for _, pattern := range dataPlaneAliasPatterns {
+		mux.HandleFunc(pattern, s.handleDataPlaneAlias)
+	}
 
 	// ControlPlane management & commerce endpoints proxy to Bun BFF.
 	mux.Handle("/api/", s.bffProxy)
@@ -163,6 +171,30 @@ func (s *Server) Handler() http.Handler {
 	// Embedded Vue SPA (or Vite HMR dev server).
 	mux.Handle("/", s.uiHandler)
 	return mux
+}
+
+// PublicHandler is Handler without the internal routes: what the public listener serves. Those
+// routes (and the BFF's /api/v1/internal/*) are only reachable on the internal listener, so a
+// reverse proxy on the same host cannot carry outside traffic to them.
+func (s *Server) PublicHandler() http.Handler {
+	full := s.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isInternalPath(r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
+		full.ServeHTTP(w, r)
+	})
+}
+
+func isInternalPath(p string) bool {
+	clean := path.Clean("/" + p)
+	for _, prefix := range []string{"/internal", "/api/v1/internal"} {
+		if clean == prefix || strings.HasPrefix(clean, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -320,6 +352,50 @@ func (s *Server) handleInternalDataPlaneSync(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, ack)
+}
+
+// dataPlaneAliasPatterns are the routes SDKs reach when their base URL omits /v1, plus Codex CLI
+// pointed at a ChatGPT-backend style base URL (.../backend-api/codex).
+var dataPlaneAliasPatterns = []string{
+	"/chat/completions", "/responses", "/responses/", "/messages", "/messages/", "/models", "/models/",
+	"/embeddings", "/images/", "/videos", "/videos/", "/backend-api/codex/",
+}
+
+// dataPlaneAliasPath maps an alias onto its /v1 data-plane route.
+func dataPlaneAliasPath(p string) (string, bool) {
+	if rest, ok := strings.CutPrefix(p, "/backend-api/codex"); ok {
+		for _, root := range []string{"/responses", "/models"} {
+			if rest == root || strings.HasPrefix(rest, root+"/") {
+				return "/v1" + rest, true
+			}
+		}
+		return "", false
+	}
+	for _, root := range []string{"/chat/completions", "/responses", "/messages", "/models", "/embeddings", "/images", "/videos"} {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return "/v1" + p, true
+		}
+	}
+	return "", false
+}
+
+// handleDataPlaneAlias serves an alias as its /v1 route. A GET without API credentials is a
+// browser navigating the console (its /models page), so it keeps getting the SPA.
+func (s *Server) handleDataPlaneAlias(w http.ResponseWriter, r *http.Request) {
+	target, ok := dataPlaneAliasPath(r.URL.Path)
+	readOnly := r.Method == http.MethodGet || r.Method == http.MethodHead
+	if !ok || (readOnly && !carriesAPICredentials(r)) {
+		s.uiHandler.ServeHTTP(w, r)
+		return
+	}
+	aliased := r.Clone(r.Context())
+	aliased.URL.Path = target
+	aliased.URL.RawPath = ""
+	s.handleDataPlane(w, aliased)
+}
+
+func carriesAPICredentials(r *http.Request) bool {
+	return r.Header.Get("Authorization") != "" || r.Header.Get("x-api-key") != "" || r.Header.Get("x-goog-api-key") != ""
 }
 
 func (s *Server) handleDataPlane(w http.ResponseWriter, r *http.Request) {

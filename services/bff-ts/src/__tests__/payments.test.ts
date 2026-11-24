@@ -237,20 +237,20 @@ describe("payments", () => {
   it("fulfils Stripe orders only for correctly signed, matching events", async () => {
     const factory = (globalThis as { __slipgateTestStoreFactory?: StoreFactory }).__slipgateTestStoreFactory;
     const { createBffApp: create } = await import("../app.ts");
-    const app = create({
-      store: factory ? await factory() : undefined,
-      jwtSecret: "payments-test-jwt-secret-32-bytes-min",
-      vaultSecret: "payments-test-vault-secret-32-bytes-min",
-    });
-    const realFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const stripeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).startsWith("https://api.stripe.com/")) {
         expect(String(init?.body)).toContain("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D=2000");
         return new Response(JSON.stringify({ id: "cs_test_1", url: "https://checkout.stripe.test/cs_test_1" }), { status: 200 });
       }
-      return realFetch(input as RequestInfo, init);
+      return new Response("not stubbed", { status: 599 });
     }) as typeof fetch;
-    try {
+    const app = create({
+      store: factory ? await factory() : undefined,
+      jwtSecret: "payments-test-jwt-secret-32-bytes-min",
+      vaultSecret: "payments-test-vault-secret-32-bytes-min",
+      paymentFetch: stripeFetch,
+    });
+    {
       const call = async <T>(method: string, path: string, headers: Record<string, string> = JSON_HEADERS, body?: unknown) => {
         const res = await app.request(path, { method, headers, body: typeof body === "string" ? body : body === undefined ? undefined : JSON.stringify(body) });
         const text = await res.text();
@@ -321,8 +321,6 @@ describe("payments", () => {
       const paid = await call<{ order: PaymentOrderItem }>("GET", `/api/v1/user/orders/${order.body.order.id}`, user);
       expect(paid.body.order.status).toBe("paid");
       expect(paid.body.order.providerTradeNo).toBe("pi_123");
-    } finally {
-      globalThis.fetch = realFetch;
     }
   });
 });

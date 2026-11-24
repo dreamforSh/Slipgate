@@ -51,6 +51,16 @@ func TestSecretProblemsNamesEachWeakSecret(t *testing.T) {
 	}
 }
 
+func TestSecretProblemsChecksAnOperatorChosenInternalToken(t *testing.T) {
+	weak := Config{JWTSecret: strongSecret, VaultSecret: strongSecret, InternalToken: "internal"}.SecretProblems()
+	if len(weak) != 1 || !strings.HasPrefix(weak[0], "SLIPGATE_INTERNAL_TOKEN ") {
+		t.Fatalf("a short internal token must be refused, got %v", weak)
+	}
+	if got := (Config{JWTSecret: strongSecret, VaultSecret: strongSecret, InternalToken: strongSecret}).SecretProblems(); len(got) != 0 {
+		t.Fatalf("a strong internal token should pass, got %v", got)
+	}
+}
+
 func TestLoadFromEnvReadsSecretSettings(t *testing.T) {
 	t.Setenv("SLIPGATE_JWT_SECRET", "  "+strongSecret+"  ")
 	t.Setenv("SLIPGATE_VAULT_SECRET", "")

@@ -181,10 +181,42 @@ export const TurnSettlementEventSchema = z.object({
   imageCount: z.number().int().nonnegative().optional(),
   videoSeconds: z.number().nonnegative().optional(),
   statusCode: z.number().int().min(100).max(599),
+  /**
+   * Rate multiplier (x1e6) slipgate-core priced costNanoUsd at: the user's custom group rate when
+   * it had synced, else the group's. Absent: the core's cost already carries the user's rate.
+   */
+  coreRateMultiplierMicros: z.number().int().positive().optional(),
 });
 export type TurnSettlementEvent = z.infer<typeof TurnSettlementEventSchema>;
 
-export const UsageLogItemSchema = TurnSettlementEventSchema.omit({ settlementId: true, coreSettled: true }).extend({
+const SETTLEMENT_DIMENSION_MAX = 32;
+
+/**
+ * Settlement reports are turns that already ran and must be billed: a malformed optional pricing
+ * dimension or an out-of-range metric is dropped or clamped here rather than failing
+ * TurnSettlementEventSchema, because a rejected settlement is a turn nobody pays for.
+ */
+export function coerceTurnSettlementInput(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const ev: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
+  for (const key of ["serviceTier", "reasoningEffort"]) {
+    const v = ev[key];
+    if (v !== undefined && (typeof v !== "string" || v.length > SETTLEMENT_DIMENSION_MAX)) delete ev[key];
+  }
+  for (const key of ["window5hUsedBps", "window7dUsedBps"]) {
+    const v = ev[key];
+    if (typeof v === "number" && Number.isFinite(v)) ev[key] = Math.min(10_000, Math.max(0, Math.trunc(v)));
+  }
+  const status = ev.statusCode;
+  if (typeof status === "number" && Number.isInteger(status) && (status < 100 || status > 599)) ev.statusCode = 502;
+  return ev;
+}
+
+export const UsageLogItemSchema = TurnSettlementEventSchema.omit({
+  settlementId: true,
+  coreSettled: true,
+  coreRateMultiplierMicros: true,
+}).extend({
   id: z.string().min(1),
   formattedCostUsd: z.string(),
   createdAtIso: z.string(),

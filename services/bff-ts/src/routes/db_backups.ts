@@ -208,12 +208,22 @@ export function registerDbBackupRoutes(app: Hono<AuthEnv>, ctx: DbBackupRouteCon
 
   app.put(
     "/api/v1/admin/db-backups/s3-config",
-    guarded(async (c) => c.json(await service.updateS3Config(await body(c, UpdateBackupS3ConfigRequestSchema)))),
+    guarded(async (c) => {
+      const { confirm, ...cfg } = await body(c, UpdateBackupS3ConfigRequestSchema);
+      // The target receives every future full-database dump: a stolen session must not repoint it.
+      if (!confirm) return c.json({ error: "step_up_required", message: "Confirm this change with your password" }, 403);
+      const refused = await stepUp(c, confirm);
+      if (refused) return refused;
+      return c.json(await service.updateS3Config(cfg));
+    }),
   );
 
   app.post(
     "/api/v1/admin/db-backups/s3-config/test",
-    guarded(async (c) => c.json(await service.testS3(await body(c, TestBackupS3RequestSchema)))),
+    guarded(async (c) => {
+      const { confirm: _confirm, ...cfg } = await body(c, TestBackupS3RequestSchema);
+      return c.json(await service.testS3(cfg));
+    }),
   );
 
   app.get("/api/v1/admin/db-backups/schedule", guarded(async (c) => c.json(await service.getSchedule())));

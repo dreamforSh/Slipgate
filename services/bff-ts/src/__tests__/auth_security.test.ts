@@ -23,6 +23,8 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
 const JWT_SECRET = "auth-security-jwt-secret-32-bytes-min";
 const ADMIN_PASSWORD = "AdminPassword123!";
 const USER_PASSWORD = "UserPassword123!";
+/** The acting (root) administrator's re-confirmation for account-takeover-grade changes. */
+const CONFIRM = { password: ADMIN_PASSWORD };
 
 /** The socket peer as Bun.serve reports it (requests from app.request() have none otherwise). */
 const fromPeer = (address: string) => ({ requestIP: () => ({ address, family: "IPv4", port: 40000 }) });
@@ -69,7 +71,7 @@ async function bootstrap(opts: { mail?: MailMessage[] } = {}) {
   const createAdmin = async (email: string) => {
     const res = await call<{ user: { id: string } }>("POST", "/api/v1/admin/users", {
       token: admin,
-      body: { email, password: ADMIN_PASSWORD, role: "admin" },
+      body: { email, password: ADMIN_PASSWORD, role: "admin", confirm: { password: ADMIN_PASSWORD } },
     });
     expect(res.status).toBe(201);
     const session = await login(email, ADMIN_PASSWORD);
@@ -124,7 +126,7 @@ describe("per-request session validation (F04)", () => {
     const b = await t.createAdmin("b@auth.test");
     expect((await t.call("GET", "/api/v1/admin/users", { token: b.token })).status).toBe(200);
 
-    expect((await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: t.admin, body: { status: "suspended" } })).status).toBe(200);
+    expect((await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: t.admin, body: { status: "suspended", confirm: CONFIRM } })).status).toBe(200);
     const refused = await t.call<{ error: string }>("GET", "/api/v1/admin/users", { token: b.token });
     expect(refused.status).toBe(401);
     // The self-restore of the finding: B's old token can no longer reach the admin API.
@@ -134,7 +136,7 @@ describe("per-request session validation (F04)", () => {
     expect((await t.call("GET", "/api/v1/user/wallet", { token: b.token })).status).toBe(401);
 
     // Reactivation does not revive tokens issued before the suspension.
-    await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: t.admin, body: { status: "active" } });
+    await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: t.admin, body: { status: "active", confirm: CONFIRM } });
     expect((await t.call("GET", "/api/v1/admin/users", { token: b.token })).status).toBe(401);
     expect((await t.login("b@auth.test", ADMIN_PASSWORD)).status).toBe(200);
   });
@@ -142,7 +144,7 @@ describe("per-request session validation (F04)", () => {
   it("a demoted admin loses the admin API at once, and a deleted admin can create nobody", async () => {
     const t = await bootstrap();
     const b = await t.createAdmin("b@auth.test");
-    await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: t.admin, body: { role: "user" } });
+    await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: t.admin, body: { role: "user", confirm: CONFIRM } });
     expect((await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: b.token, body: { role: "admin" } })).status).toBe(401);
     const relogin = await t.login("b@auth.test", ADMIN_PASSWORD);
     // A fresh session takes the role from the store: user, so the admin API answers 403.
@@ -157,6 +159,33 @@ describe("per-request session validation (F04)", () => {
     expect(await t.me(c.token)).toBe(401);
   });
 
+  it("an admin session alone cannot mint administrators or take over accounts (step-up)", async () => {
+    const t = await bootstrap();
+    const ana = await t.register("ana@auth.test");
+    const fresh = { email: "evil@auth.test", password: ADMIN_PASSWORD, role: "admin" };
+    const refusals = [
+      await t.call<{ error: string }>("POST", "/api/v1/admin/users", { token: t.admin, body: fresh }),
+      await t.call<{ error: string }>("PATCH", `/api/v1/admin/users/${ana.user.id}`, { token: t.admin, body: { role: "admin" } }),
+      await t.call<{ error: string }>("PATCH", `/api/v1/admin/users/${ana.user.id}`, { token: t.admin, body: { password: "Hijacked12345" } }),
+      await t.call<{ error: string }>("POST", `/api/v1/admin/users/${ana.user.id}/totp/reset`, { token: t.admin }),
+    ];
+    for (const r of refusals) {
+      expect(r.status).toBe(403);
+      expect(r.body.error).toBe("step_up_required");
+    }
+    const wrong = await t.call<{ error: string }>("POST", "/api/v1/admin/users", { token: t.admin, body: { ...fresh, confirm: { password: "not-mine" } } });
+    expect(wrong.body.error).toBe("invalid_password");
+    expect((await t.login("evil@auth.test", ADMIN_PASSWORD)).status).toBe(401);
+    expect((await t.login("ana@auth.test", USER_PASSWORD)).body.user.role).toBe("user");
+
+    // Another administrator's email or role is guarded too; ordinary edits of plain users are not.
+    const b = await t.createAdmin("b@auth.test");
+    expect((await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: t.admin, body: { email: "b2@auth.test" } })).status).toBe(403);
+    expect((await t.call("PATCH", `/api/v1/admin/users/${b.id}`, { token: t.admin, body: { notes: "on call" } })).status).toBe(200);
+    expect((await t.call("PATCH", `/api/v1/admin/users/${ana.user.id}`, { token: t.admin, body: { notes: "vip", status: "suspended" } })).status).toBe(200);
+    expect((await t.call("POST", `/api/v1/admin/users/${ana.user.id}/totp/reset`, { token: t.admin, body: { confirm: CONFIRM } })).status).toBe(200);
+  });
+
   it("bulk suspension and an admin password reset end the user's sessions; other edits do not", async () => {
     const t = await bootstrap();
     const alice = await t.register("alice@auth.test");
@@ -164,7 +193,7 @@ describe("per-request session validation (F04)", () => {
     await t.call("PATCH", `/api/v1/admin/users/${alice.user.id}`, { token: t.admin, body: { notes: "vip", username: "Alice" } });
     expect(await t.me(alice.accessToken)).toBe(200);
 
-    await t.call("PATCH", `/api/v1/admin/users/${alice.user.id}`, { token: t.admin, body: { password: "ResetByAdmin123" } });
+    await t.call("PATCH", `/api/v1/admin/users/${alice.user.id}`, { token: t.admin, body: { password: "ResetByAdmin123", confirm: CONFIRM } });
     expect(await t.me(alice.accessToken)).toBe(401);
 
     const batch = await t.call<{ changed: number }>("POST", "/api/v1/admin/users/batch-status", {
@@ -358,7 +387,7 @@ describe("password attempt limits (F15)", () => {
     expect((await t.login("nia@auth.test", USER_PASSWORD, { peer: home })).status).toBe(200);
 
     // An administrator setting a new password lifts every sign-in limit on the account.
-    expect((await t.call("PATCH", `/api/v1/admin/users/${nia.user.id}`, { token: t.admin, body: { password: "AdminReset123!" } })).status).toBe(200);
+    expect((await t.call("PATCH", `/api/v1/admin/users/${nia.user.id}`, { token: t.admin, body: { password: "AdminReset123!", confirm: CONFIRM } })).status).toBe(200);
     expect((await t.login("nia@auth.test", "AdminReset123!", { peer: "198.51.100.150" })).status).toBe(200);
     expect((await t.login("nia@auth.test", "AdminReset123!", { peer: "203.0.113.1" })).status).toBe(200);
   }, 60_000);
@@ -665,7 +694,7 @@ describe("last administrator guard (F35, outcome checks)", () => {
     const adminId = (await t.call<{ user: { id: string } }>("GET", "/api/v1/auth/me", { token: t.admin })).body.user.id;
     const [one, two] = await Promise.all([
       t.call("DELETE", `/api/v1/admin/users/${b.id}`, { token: t.admin }),
-      t.call("PATCH", `/api/v1/admin/users/${adminId}`, { token: b.token, body: { role: "user" } }),
+      t.call("PATCH", `/api/v1/admin/users/${adminId}`, { token: b.token, body: { role: "user", confirm: CONFIRM } }),
     ]);
     expect([one.status, two.status].filter((s) => s === 200)).toHaveLength(1);
     expect(await t.store.ops.countAdmins()).toBe(1);

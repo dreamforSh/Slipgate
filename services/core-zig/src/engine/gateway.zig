@@ -165,10 +165,17 @@ pub const TurnEvalRequest = struct {
     reasoningEffort: []const u8 = "",
     imageCount: u32 = 0,
     videoSeconds: u32 = 0,
+    /// Random per-evaluation token from the edge: if the edge never receives this directive (IPC
+    /// timeout), it releases the hold by this nonce instead of a hold id it does not know.
+    turnNonce: []const u8 = "",
 };
 
 pub const TurnSettleRequest = struct {
-    holdId: u64,
+    /// 0 when the edge only knows the turnNonce of the evaluation that created the hold.
+    holdId: u64 = 0,
+    turnNonce: []const u8 = "",
+    /// Give the hold back without charging (the edge lost the turn; the BFF prices it if it ran).
+    releaseOnly: bool = false,
     /// Key the hold was issued to (empty from older edges): a mismatch means the hold id is stale.
     apiKeyId: []const u8 = "",
     upstreamStatus: u16 = 200,
@@ -224,6 +231,19 @@ pub const SettleAckResponse = struct {
     settledCostNanoUsd: []const u8,
     balanceAfterNanoUsd: []const u8,
     ordinaryUpstream400Exempted: bool,
+    /// Rate the cost was computed at (the user's custom group rate, else the group's), so the BFF
+    /// only adjusts for a rate that changed after the hold instead of applying it a second time.
+    rateMultiplierMicros: u64 = 0,
+};
+
+/// The BFF committed the settlement of `holdId` by `appliedAtUnixMs` (BFF clock).
+pub const SettleConfirmJson = struct {
+    holdId: u64,
+    appliedAtUnixMs: i64 = 0,
+};
+
+pub const SettleConfirmBatch = struct {
+    confirms: []const SettleConfirmJson = &.{},
 };
 
 const GroupRecord = struct {
@@ -320,11 +340,34 @@ const ActiveHold = struct {
     public_model: []u8,
     service_tier: []u8,
     reasoning_effort: []u8,
+    turn_nonce: []u8,
+    created_ms: i64,
     held_nano: i128,
     rate_multiplier_micros: u64,
     is_balance_group: bool,
     /// Free endpoints (token counting) settle at zero cost whatever usage is reported.
     is_free: bool = false,
+};
+
+/// No turn runs this long: an older hold is one the edge lost (it never got the directive, or its
+/// settle failed). Reclaiming frees the key/account slots and the held funds; a late settle for it
+/// misses and the BFF prices that turn itself.
+const HOLD_TTL_MS: i64 = 2 * 60 * 60 * 1000;
+const HOLD_SWEEP_INTERVAL_MS: i64 = 60 * 1000;
+/// Unconfirmed debits are forgotten once the edge's settlement outbox would have given up (24h).
+const PENDING_DEBIT_MAX_AGE_MS: i64 = 25 * 60 * 60 * 1000;
+/// Past this many, new debits are not tracked: the next snapshot overwrites them as it used to.
+const MAX_PENDING_DEBITS: u32 = 1_000_000;
+const MAX_TURN_NONCE_LEN: usize = 64;
+
+/// A local wallet debit not yet visible in the BFF's snapshots. `user_id` borrows the key of the
+/// wallets map, whose entries are never removed.
+const PendingDebit = struct {
+    user_id: []const u8,
+    cost_nano: i128,
+    settled_ms: i64,
+    /// BFF clock at which the BFF had committed the settlement (0 until the edge confirms it).
+    applied_at_ms: i64 = 0,
 };
 
 const ModelRate = struct {
@@ -629,7 +672,7 @@ pub const GatewayEngine = struct {
     last_sync_revision_ms: i64 = 0,
 
     wallets: std.StringHashMap(fixed_point.Wallet),
-    wallet_dirty_ms: std.StringHashMap(i64),
+    pending_debits: std.AutoHashMap(u64, PendingDebit),
     key_rates: std.StringHashMap(KeyRateState),
     account_inflight: std.StringHashMap(u32),
     account_cooldown_until: std.StringHashMap(i64),
@@ -637,13 +680,14 @@ pub const GatewayEngine = struct {
     bans: std.StringHashMap(BanRecord),
     holds: std.AutoHashMap(u64, ActiveHold),
     next_hold_id: u64 = 1,
+    last_hold_sweep_ms: i64 = 0,
 
     pub fn init(backing: std.mem.Allocator) GatewayEngine {
         return .{
             .backing = backing,
             .catalog_arena = std.heap.ArenaAllocator.init(backing),
             .wallets = std.StringHashMap(fixed_point.Wallet).init(backing),
-            .wallet_dirty_ms = std.StringHashMap(i64).init(backing),
+            .pending_debits = std.AutoHashMap(u64, PendingDebit).init(backing),
             .key_rates = std.StringHashMap(KeyRateState).init(backing),
             .account_inflight = std.StringHashMap(u32).init(backing),
             .account_cooldown_until = std.StringHashMap(i64).init(backing),
@@ -664,13 +708,11 @@ pub const GatewayEngine = struct {
     }
 
     pub fn deinit(self: *GatewayEngine) void {
+        self.pending_debits.deinit();
+
         var w_it = self.wallets.keyIterator();
         while (w_it.next()) |k| self.backing.free(k.*);
         self.wallets.deinit();
-
-        var wd_it = self.wallet_dirty_ms.keyIterator();
-        while (wd_it.next()) |k| self.backing.free(k.*);
-        self.wallet_dirty_ms.deinit();
 
         var kr_it = self.key_rates.keyIterator();
         while (kr_it.next()) |k| self.backing.free(k.*);
@@ -711,6 +753,7 @@ pub const GatewayEngine = struct {
         self.backing.free(h.public_model);
         self.backing.free(h.service_tier);
         self.backing.free(h.reasoning_effort);
+        self.backing.free(h.turn_nonce);
     }
 
     pub fn applySyncJson(self: *GatewayEngine, turn_alloc: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
@@ -721,7 +764,9 @@ pub const GatewayEngine = struct {
         const in = parsed.value;
 
         var next_arena = std.heap.ArenaAllocator.init(self.backing);
-        errdefer next_arena.deinit();
+        // Once installed as the live catalog the arena belongs to the engine.
+        var catalog_installed = false;
+        errdefer if (!catalog_installed) next_arena.deinit();
         const cat = next_arena.allocator();
 
         var next_groups = std.ArrayList(GroupRecord).init(cat);
@@ -856,6 +901,7 @@ pub const GatewayEngine = struct {
 
         var old_arena = self.catalog_arena;
         self.catalog_arena = next_arena;
+        catalog_installed = true;
         self.groups = next_groups.items;
         self.routes = next_routes.items;
         self.accounts = next_accounts.items;
@@ -868,26 +914,35 @@ pub const GatewayEngine = struct {
         }
         old_arena.deinit();
 
+        // Snapshot balances are read after revisionUnixMs, so they include every settlement the BFF
+        // had committed by then. Local debits it committed later (or not yet) are still owed on top.
+        var reflected = std.ArrayList(u64).init(turn_alloc);
+        var pd_it = self.pending_debits.iterator();
+        while (pd_it.next()) |entry| {
+            const d = entry.value_ptr.*;
+            const committed_before = d.applied_at_ms > 0 and in.revisionUnixMs > 0 and d.applied_at_ms <= in.revisionUnixMs;
+            const given_up = in.revisionUnixMs > 0 and in.revisionUnixMs -| d.settled_ms > PENDING_DEBIT_MAX_AGE_MS;
+            if (committed_before or given_up) try reflected.append(entry.key_ptr.*);
+        }
+        for (reflected.items) |id| _ = self.pending_debits.remove(id);
+        var owed_by_user = std.StringHashMap(i128).init(turn_alloc);
+        var owed_it = self.pending_debits.valueIterator();
+        while (owed_it.next()) |d| {
+            const gop = try owed_by_user.getOrPut(d.user_id);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* +|= d.cost_nano;
+        }
+
         for (in.wallets) |w| {
             const parsed_bal = std.fmt.parseInt(i128, w.balanceNanoUsd, 10) catch 0;
+            const balance = parsed_bal -| (owed_by_user.get(w.userId) orelse 0);
             if (self.wallets.getPtr(w.userId)) |existing| {
-                const dirty_ms = self.wallet_dirty_ms.get(w.userId) orelse 0;
-                // Avoid clobbering un-flushed local deductions when an older snapshot arrives.
-                if (in.revisionUnixMs == 0 or in.revisionUnixMs >= dirty_ms) {
-                    existing.balance_nano = parsed_bal;
-                    if (dirty_ms > 0) {
-                        if (self.wallet_dirty_ms.fetchRemove(w.userId)) |removed| {
-                            self.backing.free(removed.key);
-                        }
-                    }
-                } else if (parsed_bal < existing.balance_nano) {
-                    existing.balance_nano = parsed_bal;
-                }
+                existing.balance_nano = balance;
             } else {
                 const owned_id = try self.backing.dupe(u8, w.userId);
                 errdefer self.backing.free(owned_id);
                 try self.wallets.put(owned_id, .{
-                    .balance_nano = parsed_bal,
+                    .balance_nano = balance,
                     .held_nano = 0,
                 });
             }
@@ -954,6 +1009,11 @@ pub const GatewayEngine = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (now_ms -| self.last_hold_sweep_ms >= HOLD_SWEEP_INTERVAL_MS) {
+            self.last_hold_sweep_ms = now_ms;
+            self.reclaimExpiredHoldsLocked(turn_alloc, now_ms);
+        }
 
         // 1. Authenticate sk-sg-* digest.
         var matched_key: ?ApiKeyRecord = null;
@@ -1334,6 +1394,8 @@ pub const GatewayEngine = struct {
         errdefer self.backing.free(st_copy);
         const re_copy = try self.backing.dupe(u8, req.reasoningEffort);
         errdefer self.backing.free(re_copy);
+        const nonce_copy = try self.backing.dupe(u8, req.turnNonce[0..@min(req.turnNonce.len, MAX_TURN_NONCE_LEN)]);
+        errdefer self.backing.free(nonce_copy);
 
         // Finalize previous hold retirement if this was a failover rebind.
         if (rebind_hold != null) {
@@ -1355,6 +1417,8 @@ pub const GatewayEngine = struct {
             .public_model = pm_copy,
             .service_tier = st_copy,
             .reasoning_effort = re_copy,
+            .turn_nonce = nonce_copy,
+            .created_ms = now_ms,
             .held_nano = hold_nano,
             .rate_multiplier_micros = effective_rate_micros,
             .is_balance_group = is_balance,
@@ -1390,26 +1454,38 @@ pub const GatewayEngine = struct {
             .balanceAfterNanoUsd = "0",
             .ordinaryUpstream400Exempted = false,
         };
+        const hold_id = if (req.holdId > 0) req.holdId else self.findHoldByNonceLocked(req.turnNonce) orelse {
+            return std.json.stringifyAlloc(turn_alloc, not_settled, .{});
+        };
         // A report naming another key's hold is stale (issued before a restart): leave that live
         // hold alone and answer ok:false, so the BFF prices this turn itself.
         if (req.apiKeyId.len > 0) {
-            if (self.holds.get(req.holdId)) |live| {
+            if (self.holds.get(hold_id)) |live| {
                 if (!std.mem.eql(u8, live.api_key_id, req.apiKeyId)) {
                     return std.json.stringifyAlloc(turn_alloc, not_settled, .{});
                 }
             }
         }
-        const kv = self.holds.fetchRemove(req.holdId) orelse {
+        const kv = self.holds.fetchRemove(hold_id) orelse {
             return std.json.stringifyAlloc(turn_alloc, not_settled, .{});
         };
         const hold = kv.value;
         defer self.freeHoldStrings(hold);
+        self.releaseHoldSlotsLocked(hold);
 
-        if (self.key_rates.getPtr(hold.api_key_id)) |kr| {
-            if (kr.active_inflight > 0) kr.active_inflight -= 1;
-        }
-        if (self.account_inflight.getPtr(hold.account_id)) |inf| {
-            if (inf.* > 0) inf.* -= 1;
+        if (req.releaseOnly) {
+            var released_balance: i128 = 0;
+            if (self.wallets.getPtr(hold.user_id)) |wp| {
+                if (hold.is_balance_group) wp.release(hold.held_nano) catch {};
+                released_balance = wp.balance_nano;
+            }
+            const released_bal_str = try std.fmt.allocPrint(turn_alloc, "{d}", .{released_balance});
+            return std.json.stringifyAlloc(turn_alloc, SettleAckResponse{
+                .ok = true,
+                .settledCostNanoUsd = "0",
+                .balanceAfterNanoUsd = released_bal_str,
+                .ordinaryUpstream400Exempted = false,
+            }, .{});
         }
         const now_ms = if (req.nowUnixMs > 0) req.nowUnixMs else std.time.milliTimestamp();
         if (req.cooldownDurationMs > 0) {
@@ -1485,7 +1561,7 @@ pub const GatewayEngine = struct {
             } else {
                 wallet_ptr.settle(hold.held_nano, settled_cost) catch {};
                 if (settled_cost > 0) {
-                    self.markWalletDirtyLocked(hold.user_id, now_ms) catch {};
+                    self.recordPendingDebitLocked(hold.hold_id, hold.user_id, settled_cost, now_ms);
                 }
             }
             balance_after = wallet_ptr.balance_nano;
@@ -1498,6 +1574,7 @@ pub const GatewayEngine = struct {
             .settledCostNanoUsd = cost_str,
             .balanceAfterNanoUsd = bal_str,
             .ordinaryUpstream400Exempted = is_ordinary_400,
+            .rateMultiplierMicros = hold.rate_multiplier_micros,
         }, .{});
     }
 
@@ -1555,14 +1632,71 @@ pub const GatewayEngine = struct {
         try self.account_cooldown_until.put(owned, deadline);
     }
 
-    fn markWalletDirtyLocked(self: *GatewayEngine, user_id: []const u8, now_ms: i64) !void {
-        if (self.wallet_dirty_ms.getPtr(user_id)) |ptr| {
-            if (now_ms > ptr.*) ptr.* = now_ms;
-            return;
+    fn recordPendingDebitLocked(self: *GatewayEngine, hold_id: u64, user_id: []const u8, cost_nano: i128, now_ms: i64) void {
+        if (self.pending_debits.count() >= MAX_PENDING_DEBITS) return;
+        const user_key = self.wallets.getKey(user_id) orelse return;
+        self.pending_debits.put(hold_id, .{
+            .user_id = user_key,
+            .cost_nano = cost_nano,
+            .settled_ms = now_ms,
+        }) catch {};
+    }
+
+    /// Records that the BFF committed these settlements: the next snapshot read after that time
+    /// carries them in its balances, so their local debits stop being subtracted from it.
+    pub fn confirmSettlementsJson(self: *GatewayEngine, turn_alloc: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
+        const parsed = try std.json.parseFromSlice(SettleConfirmBatch, turn_alloc, raw_json, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var confirmed: usize = 0;
+        for (parsed.value.confirms) |c| {
+            if (c.appliedAtUnixMs <= 0) continue;
+            const d = self.pending_debits.getPtr(c.holdId) orelse continue;
+            // Any confirmation bounds the commit time; a redelivery's later one adds nothing.
+            if (d.applied_at_ms == 0 or c.appliedAtUnixMs < d.applied_at_ms) d.applied_at_ms = c.appliedAtUnixMs;
+            confirmed += 1;
         }
-        const owned = try self.backing.dupe(u8, user_id);
-        errdefer self.backing.free(owned);
-        try self.wallet_dirty_ms.put(owned, now_ms);
+        return std.fmt.allocPrint(turn_alloc, "{{\"ok\":true,\"confirmed\":{d}}}", .{confirmed});
+    }
+
+    fn findHoldByNonceLocked(self: *GatewayEngine, nonce: []const u8) ?u64 {
+        if (nonce.len == 0) return null;
+        var it = self.holds.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.turn_nonce, nonce)) return entry.key_ptr.*;
+        }
+        return null;
+    }
+
+    /// Gives back the key and account concurrency slots a hold occupied.
+    fn releaseHoldSlotsLocked(self: *GatewayEngine, hold: ActiveHold) void {
+        if (self.key_rates.getPtr(hold.api_key_id)) |kr| {
+            if (kr.active_inflight > 0) kr.active_inflight -= 1;
+        }
+        if (self.account_inflight.getPtr(hold.account_id)) |inf| {
+            if (inf.* > 0) inf.* -= 1;
+        }
+    }
+
+    fn reclaimExpiredHoldsLocked(self: *GatewayEngine, turn_alloc: std.mem.Allocator, now_ms: i64) void {
+        var expired = std.ArrayList(u64).init(turn_alloc);
+        var it = self.holds.iterator();
+        while (it.next()) |entry| {
+            if (now_ms -| entry.value_ptr.created_ms > HOLD_TTL_MS) expired.append(entry.key_ptr.*) catch break;
+        }
+        for (expired.items) |id| {
+            const kv = self.holds.fetchRemove(id) orelse continue;
+            self.releaseHoldSlotsLocked(kv.value);
+            if (kv.value.is_balance_group) {
+                if (self.wallets.getPtr(kv.value.user_id)) |wp| wp.release(kv.value.held_nano) catch {};
+            }
+            self.freeHoldStrings(kv.value);
+        }
     }
 
     fn bindStickySessionLocked(self: *GatewayEngine, key: []const u8, account_id: []const u8, expires_ms: i64) !void {
@@ -1801,6 +1935,14 @@ pub fn serveEngineConnectionAuth(
             },
             .settle_report => {
                 const ack = engine.settleTurnJson(arena, inner_payload) catch "{\"ok\":false}";
+                frame.writeFrame(writer, hdr.stream_id, .{
+                    .frame_type = .settle_ack,
+                    .flags = frame.FLAG_END_STREAM,
+                    .payload = ack,
+                }) catch return;
+            },
+            .settle_confirm => {
+                const ack = engine.confirmSettlementsJson(arena, inner_payload) catch "{\"ok\":false}";
                 frame.writeFrame(writer, hdr.stream_id, .{
                     .frame_type = .settle_ack,
                     .flags = frame.FLAG_END_STREAM,
@@ -2125,6 +2267,111 @@ test "rate limit rejections carry a retry-after hint" {
     const second = try engine.evaluateTurnJson(arena, req);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"status\":429") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"retryAfterMs\":40000") != null);
+}
+
+fn testSyncAt(engine: *GatewayEngine, arena: std.mem.Allocator, raw_key: []const u8, catalog: []const u8, revision_ms: i64, balance_nano: i128) !void {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw_key, &digest, .{});
+    const hex_buf = std.fmt.bytesToHex(digest, .lower);
+    const sync_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"revisionUnixMs\":{d},{s},\"apiKeys\":[{{\"id\":\"key_m\",\"userId\":\"usr_m\",\"groupId\":\"grp_m\",\"keyHashHex\":\"{s}\",\"rpmLimit\":60,\"concurrencyLimit\":2,\"enabled\":true}}]," ++
+            "\"wallets\":[{{\"userId\":\"usr_m\",\"balanceNanoUsd\":\"{d}\"}}]}}",
+        .{ revision_ms, catalog, &hex_buf, balance_nano },
+    );
+    const ack = try engine.applySyncJson(arena, sync_json);
+    try std.testing.expect(std.mem.indexOf(u8, ack, "\"ok\":true") != null);
+}
+
+const test_balance_catalog = "\"groups\":[{\"id\":\"grp_m\",\"platform\":\"composite\",\"subscriptionType\":\"balance\",\"rateMultiplierMicros\":1000000,\"enabled\":true}]," ++
+    "\"accounts\":[{\"id\":\"acc_a\",\"groupId\":\"grp_m\",\"platform\":\"anthropic\",\"maxConcurrency\":5,\"status\":\"active\"}]";
+
+fn testDispatch(engine: *GatewayEngine, arena: std.mem.Allocator, raw_key: []const u8, now_ms: i64, nonce: []const u8) !std.json.Parsed(DispatchResponse) {
+    const req = try std.fmt.allocPrint(
+        arena,
+        "{{\"method\":\"POST\",\"path\":\"/v1/messages\",\"apiKey\":\"{s}\",\"model\":\"claude-sonnet-4-5\",\"maxTokens\":64,\"nowUnixMs\":{d},\"turnNonce\":\"{s}\"}}",
+        .{ raw_key, now_ms, nonce },
+    );
+    return std.json.parseFromSlice(DispatchResponse, arena, try engine.evaluateTurnJson(arena, req), .{ .ignore_unknown_fields = true });
+}
+
+test "a snapshot read before the BFF committed a local debit does not hand the money back" {
+    var engine = GatewayEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw_key = "sk-sg-debit0123456789abcdef0123456789abcdef012";
+    const t0: i64 = 1_700_000_000_000;
+    try testSyncAt(&engine, arena, raw_key, test_balance_catalog, t0 - 1000, 1_000_000_000);
+
+    const disp = try testDispatch(&engine, arena, raw_key, t0, "n-debit");
+    try std.testing.expectEqualStrings("dispatch", disp.value.action);
+    const settle = try std.fmt.allocPrint(arena, "{{\"holdId\":{d},\"upstreamStatus\":200,\"inputTokens\":100,\"outputTokens\":50,\"nowUnixMs\":{d}}}", .{ disp.value.holdId, t0 + 1000 });
+    _ = try engine.settleTurnJson(arena, settle);
+    const after_turn = engine.wallets.get("usr_m").?.balance_nano;
+    const cost = 1_000_000_000 - after_turn;
+    try std.testing.expect(cost > 0);
+
+    // The BFF has not committed the settlement yet: a newer snapshot still has the old balance.
+    try testSyncAt(&engine, arena, raw_key, test_balance_catalog, t0 + 2000, 1_000_000_000);
+    try std.testing.expectEqual(after_turn, engine.wallets.get("usr_m").?.balance_nano);
+
+    // Committed at t0+3000: a snapshot read before that still lacks it, one read after has it.
+    const confirm = try std.fmt.allocPrint(arena, "{{\"confirms\":[{{\"holdId\":{d},\"appliedAtUnixMs\":{d}}},{{\"holdId\":42,\"appliedAtUnixMs\":{d}}}]}}", .{ disp.value.holdId, t0 + 3000, t0 + 3000 });
+    const confirm_ack = try engine.confirmSettlementsJson(arena, confirm);
+    try std.testing.expect(std.mem.indexOf(u8, confirm_ack, "\"confirmed\":1") != null);
+    try testSyncAt(&engine, arena, raw_key, test_balance_catalog, t0 + 2500, 1_000_000_000);
+    try std.testing.expectEqual(after_turn, engine.wallets.get("usr_m").?.balance_nano);
+    try testSyncAt(&engine, arena, raw_key, test_balance_catalog, t0 + 4000, after_turn);
+    try std.testing.expectEqual(after_turn, engine.wallets.get("usr_m").?.balance_nano);
+    try std.testing.expectEqual(@as(u32, 0), engine.pending_debits.count());
+
+    // Once reflected, the snapshot is authoritative again: a top-up lands in full.
+    try testSyncAt(&engine, arena, raw_key, test_balance_catalog, t0 + 5000, after_turn + 500_000_000);
+    try std.testing.expectEqual(after_turn + 500_000_000, engine.wallets.get("usr_m").?.balance_nano);
+}
+
+test "holds the edge lost are released by turn nonce or reclaimed after the TTL" {
+    var engine = GatewayEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw_key = "sk-sg-holds0123456789abcdef0123456789abcdef012";
+    const t0: i64 = 1_700_000_000_000;
+    try testSyncAt(&engine, arena, raw_key, test_balance_catalog, t0 - 1000, 1_000_000_000);
+
+    // The edge never received this directive: it gives the hold back by nonce, free of charge.
+    const lost = try testDispatch(&engine, arena, raw_key, t0, "n-lost");
+    try std.testing.expectEqualStrings("dispatch", lost.value.action);
+    try std.testing.expect(engine.wallets.get("usr_m").?.held_nano > 0);
+    const release = try engine.settleTurnJson(arena, "{\"turnNonce\":\"n-lost\",\"releaseOnly\":true}");
+    try std.testing.expect(std.mem.indexOf(u8, release, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, release, "\"settledCostNanoUsd\":\"0\"") != null);
+    try std.testing.expectEqual(@as(i128, 0), engine.wallets.get("usr_m").?.held_nano);
+    try std.testing.expectEqual(@as(i128, 1_000_000_000), engine.wallets.get("usr_m").?.balance_nano);
+    try std.testing.expectEqual(@as(u32, 0), engine.key_rates.get("key_m").?.active_inflight);
+    const again = try engine.settleTurnJson(arena, "{\"turnNonce\":\"n-lost\",\"releaseOnly\":true}");
+    try std.testing.expect(std.mem.indexOf(u8, again, "\"ok\":false") != null);
+
+    // Holds nobody settles fill the key's two concurrency slots...
+    const a = try testDispatch(&engine, arena, raw_key, t0, "n-a");
+    _ = try testDispatch(&engine, arena, raw_key, t0, "n-b");
+    const blocked = try testDispatch(&engine, arena, raw_key, t0, "n-c");
+    try std.testing.expectEqual(@as(u16, 429), blocked.value.status);
+
+    // ...until they age out: the slots and the held funds come back.
+    const later = try testDispatch(&engine, arena, raw_key, t0 + HOLD_TTL_MS + HOLD_SWEEP_INTERVAL_MS, "n-d");
+    try std.testing.expectEqualStrings("dispatch", later.value.action);
+    try std.testing.expectEqual(@as(u32, 1), engine.holds.count());
+    try std.testing.expectEqual(try std.fmt.parseInt(i128, later.value.holdNanoUsd, 10), engine.wallets.get("usr_m").?.held_nano);
+
+    // A late settle for a reclaimed hold misses; the BFF prices that turn itself.
+    const late = try std.fmt.allocPrint(arena, "{{\"holdId\":{d},\"upstreamStatus\":200,\"inputTokens\":10}}", .{a.value.holdId});
+    try std.testing.expect(std.mem.indexOf(u8, try engine.settleTurnJson(arena, late), "\"ok\":false") != null);
 }
 
 test "endpoint inference anchors on the path prefix" {

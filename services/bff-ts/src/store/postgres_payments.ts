@@ -49,7 +49,8 @@ const PG_PAYMENTS_INTEGRITY_SQL = `
   ALTER TABLE commerce.payment_orders
       ADD COLUMN IF NOT EXISTS subscription_id TEXT,
       ADD COLUMN IF NOT EXISTS delivery_error TEXT,
-      ADD COLUMN IF NOT EXISTS prior_refund_amount_minor INTEGER NOT NULL DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS prior_refund_amount_minor INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS applied_refund_ids TEXT[] NOT NULL DEFAULT '{}';
   ALTER TABLE commerce.affiliate_commissions ADD COLUMN IF NOT EXISTS reversed_at TIMESTAMPTZ;
   CREATE INDEX IF NOT EXISTS idx_commerce_affiliate_commissions_order ON commerce.affiliate_commissions (source_order_id);
   DO $$
@@ -288,6 +289,7 @@ interface RefundOrderRow {
   prior_refund_amount_minor: number;
   refund_reclaim: boolean;
   refund_request_reason: string | null;
+  applied_refund_ids: string[];
   updated_at: Date;
 }
 
@@ -674,7 +676,8 @@ export class PostgresPaymentsStore implements PaymentsStore {
   private async lockRefundRow(tx: Sql, id: string): Promise<RefundOrderRow> {
     const rows = await tx<RefundOrderRow[]>`
       SELECT user_id, kind, status, amount_nano_usd::text AS credit, amount_minor, group_id, validity_days, subscription_id,
-             delivery_error, refund_amount_minor, prior_refund_amount_minor, refund_reclaim, refund_request_reason, updated_at
+             delivery_error, refund_amount_minor, prior_refund_amount_minor, refund_reclaim, refund_request_reason,
+             applied_refund_ids, updated_at
         FROM commerce.payment_orders WHERE id = ${id} FOR UPDATE
     `;
     if (!rows[0]) throw new StoreError("not_found", "Order not found");
@@ -800,7 +803,10 @@ export class PostgresPaymentsStore implements PaymentsStore {
     await this.sql.begin(async (txRaw) => {
       const tx = txRaw as unknown as Sql;
       const o = await this.lockRefundRow(tx, id);
-      if (o.status !== "refund_pending") throw new StoreError("conflict", "The refund is no longer pending");
+      if (o.status !== "refund_pending") {
+        if (providerRefundId && o.applied_refund_ids.includes(providerRefundId)) return;
+        throw new StoreError("conflict", "The refund is no longer pending");
+      }
       const part = o.refund_amount_minor;
       const priorMinor = o.prior_refund_amount_minor;
       const totalRefundedMinor = priorMinor + part;
@@ -849,11 +855,25 @@ export class PostgresPaymentsStore implements PaymentsStore {
                refund_reclaimed_nano_usd = refund_reclaimed_nano_usd + ${reclaimed.toString()}::numeric,
                refund_error = NULL,
                provider_refund_id = COALESCE(${providerRefundId}, provider_refund_id),
+               applied_refund_ids = CASE
+                 WHEN ${providerRefundId}::text IS NULL OR ${providerRefundId}::text = ANY(applied_refund_ids) THEN applied_refund_ids
+                 ELSE array_append(applied_refund_ids, ${providerRefundId}::text)
+               END,
                updated_at = NOW()
          WHERE id = ${id}
       `;
     });
     return (await this.getOrder(id))!;
+  }
+
+  async getRefundLedger(id: string) {
+    const rows = await this.sql<{ status: string; refund_amount_minor: number; prior_refund_amount_minor: number; applied_refund_ids: string[] }[]>`
+      SELECT status, refund_amount_minor, prior_refund_amount_minor, applied_refund_ids FROM commerce.payment_orders WHERE id = ${id}
+    `;
+    const o = rows[0];
+    if (!o) return null;
+    const committedMinor = o.status === "refunded" || o.status === "partially_refunded" ? o.refund_amount_minor : o.prior_refund_amount_minor;
+    return { committedMinor, appliedRefundIds: o.applied_refund_ids ?? [] };
   }
 
   async failRefund(id: string, error: string) {

@@ -392,7 +392,7 @@ func applyUpstreamAuthHeaders(req *http.Request, pctx OutboundPersonaContext, se
 		}
 	case "anthropic":
 		if IsClaudeSubscription(pctx, secret) {
-			ApplyClaudeSubscriptionHeaders(req, secret)
+			ApplyClaudeSubscriptionHeaders(req, secret, "")
 		} else if secret.APIKey != "" {
 			req.Header.Set("x-api-key", secret.APIKey)
 			req.Header.Set("anthropic-version", "2023-06-01")

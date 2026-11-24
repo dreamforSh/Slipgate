@@ -89,9 +89,12 @@ export class PaymentService {
     return this.deps.store;
   }
 
-  /** The fetch every gateway call uses (resolved per call so tests may swap the global). */
+  /**
+   * The fetch every gateway call uses. Without an injected one this must be the global `fetch`
+   * itself: gatewayFetch only routes that one through the SSRF guard.
+   */
   get fetch(): typeof fetch {
-    return this.deps.fetchImpl ?? (((input, init) => globalThis.fetch(input, init)) as typeof fetch);
+    return this.deps.fetchImpl ?? fetch;
   }
 
   /* ---------------- Secrets ---------------- */
@@ -527,8 +530,11 @@ export class PaymentService {
   }
 
   /**
-   * Reconciles a provider-initiated refund notification (Stripe charge.refunded, WeChat Pay
-   * REFUND.SUCCESS, Airwallex refund.settled) idempotently against local wallet/rebate state.
+   * Reconciles a provider refund notification (Stripe charge.refunded, WeChat Pay REFUND.SUCCESS,
+   * Airwallex refund.settled) idempotently against local wallet/rebate state. A cumulative
+   * notification (Stripe) applies what goes beyond the committed refunds; a delta notification is
+   * one provider refund and is applied once per refund id, since providers redeliver and a refund
+   * started here is also completed by its own gateway answer or the sweeper.
    */
   async reconcileExternalRefund(
     orderId: string,
@@ -538,6 +544,10 @@ export class PaymentService {
     const order = await payments.getOrder(orderId);
     if (!order) return null;
     if (order.status === "refunded") return order;
+    const ledger = await payments.getRefundLedger(orderId);
+    if (!ledger) return null;
+    const delta = opts.cumulativeRefundedMinor === undefined;
+    if (delta && opts.providerRefundId && ledger.appliedRefundIds.includes(opts.providerRefundId)) return order;
     if (order.status === "refund_pending") {
       const done = await payments.completeRefund(order.id, opts.providerRefundId ?? null);
       await this.deps.syncDataPlane();
@@ -551,11 +561,10 @@ export class PaymentService {
     ) {
       return order;
     }
-    const already = order.status === "partially_refunded" ? order.refundAmountMinor : 0;
+    const already = ledger.committedMinor;
     const remaining = order.amountMinor - already;
     if (remaining <= 0) return order;
-    const rawDelta =
-      opts.cumulativeRefundedMinor !== undefined ? opts.cumulativeRefundedMinor - already : (opts.deltaRefundMinor ?? 0);
+    const rawDelta = delta ? (opts.deltaRefundMinor ?? 0) : opts.cumulativeRefundedMinor! - already;
     if (!Number.isFinite(rawDelta) || rawDelta <= 0) return order;
     const amountMinor = Math.min(Math.round(rawDelta), remaining);
     await payments.beginRefund(order.id, {

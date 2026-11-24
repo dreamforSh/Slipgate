@@ -50,7 +50,13 @@ const (
 	// slipgate-net restarts (one small JSON file each, removed once the BFF accepts it).
 	// "off" disables the spool (in-memory retry queue only).
 	SettlementSpoolDirEnv = "SLIPGATE_SETTLEMENT_SPOOL_DIR"
+
+	// settlementDeadLetterDir (inside the spool) keeps settlements that left the retry queue
+	// undelivered. refill never reads subdirectories, so they wait there until replayed.
+	settlementDeadLetterDir = "dead-letter"
 )
+
+var errSettlementSpoolOff = errors.New("the settlement spool is off (" + SettlementSpoolDirEnv + ")")
 
 // ResolveSettlementSpoolDir returns SLIPGATE_SETTLEMENT_SPOOL_DIR when it is set (including "off"),
 // else fallback. cmd/slipgate passes a directory on its persistent volume as the fallback, so
@@ -169,10 +175,11 @@ type settlementOutbox struct {
 	sleepUntil time.Time
 	wake       chan struct{}
 
-	delivered atomic.Uint64
-	dropped   atomic.Uint64
-	wakeups   atomic.Uint64 // worker loop iterations (tests, diagnostics)
-	logAt     sync.Map      // log key -> time.Time of its last line (rate limiting)
+	delivered    atomic.Uint64
+	dropped      atomic.Uint64
+	deadLettered atomic.Uint64 // dropped events parked in the dead-letter directory
+	wakeups      atomic.Uint64 // worker loop iterations (tests, diagnostics)
+	logAt        sync.Map      // log key -> time.Time of its last line (rate limiting)
 }
 
 func newSettlementOutbox(post func(ctx context.Context, body []byte) (int, error), logger *log.Logger, spoolDir string) *settlementOutbox {
@@ -232,8 +239,7 @@ func (o *settlementOutbox) deliver(id string, body []byte) <-chan struct{} {
 			o.delivered.Add(1)
 			o.finishFirstAttempt(item)
 		case permanent:
-			o.dropped.Add(1)
-			o.logger.Printf("[dataplane] error: settlement %s rejected by BFF (%s); dropped", id, reason)
+			o.deadLetter(item, "rejected by BFF ("+reason+")")
 			o.finishFirstAttempt(item)
 		default:
 			o.logLimited("queued", "[dataplane] warning: settlement %s delivery failed (%s); queued for retry", id, reason)
@@ -415,9 +421,8 @@ func (o *settlementOutbox) drain(due []*outboxItem) {
 			o.delivered.Add(1)
 			o.remove(it)
 		case permanent:
-			o.dropped.Add(1)
+			o.deadLetter(it, "rejected by BFF ("+reason+")")
 			o.remove(it)
-			o.logger.Printf("[dataplane] error: settlement %s rejected by BFF (%s); dropped", it.id, reason)
 		default:
 			n := consecutive.Add(1)
 			o.mu.Lock()
@@ -436,9 +441,8 @@ func (o *settlementOutbox) drain(due []*outboxItem) {
 	var requeue []*outboxItem
 	for _, it := range due {
 		if time.Since(it.firstAt) > o.maxAge {
+			o.deadLetter(it, fmt.Sprintf("undeliverable for %s after %d attempts", o.maxAge, it.attempts))
 			o.remove(it)
-			o.dropped.Add(1)
-			o.logger.Printf("[dataplane] error: settlement %s undeliverable for %s after %d attempts; dropped", it.id, o.maxAge, it.attempts)
 			continue
 		}
 		if stop.Load() {
@@ -567,10 +571,10 @@ func (o *settlementOutbox) writeSpool(it *outboxItem) bool {
 	if o.spoolDir == "" || !isSettlementID(it.id) {
 		return false
 	}
-	err := os.WriteFile(o.spoolPath(it.id), it.body, 0o600)
+	err := writeFileSynced(o.spoolPath(it.id), it.body)
 	if errors.Is(err, os.ErrNotExist) {
 		if mkErr := os.MkdirAll(o.spoolDir, 0o700); mkErr == nil {
-			err = os.WriteFile(o.spoolPath(it.id), it.body, 0o600)
+			err = writeFileSynced(o.spoolPath(it.id), it.body)
 		}
 	}
 	if err != nil {
@@ -578,6 +582,22 @@ func (o *settlementOutbox) writeSpool(it *outboxItem) bool {
 		return false
 	}
 	return true
+}
+
+// writeFileSynced is os.WriteFile (mode 0600) plus fsync, so a spooled settlement survives a power
+// cut and not only a process crash. Spool writes run on the delivery goroutine, not the turn.
+func writeFileSynced(name string, data []byte) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func (o *settlementOutbox) deleteSpool(id string) {
@@ -694,12 +714,6 @@ func (o *settlementOutbox) readSpoolItem(e os.DirEntry, id string, now time.Time
 		return nil // removed meanwhile (delivered by another path)
 	}
 	firstAt := info.ModTime()
-	if now.Sub(firstAt) > o.maxAge {
-		o.dropped.Add(1)
-		o.logger.Printf("[dataplane] error: spooled settlement %s is older than %s; dropped", id, o.maxAge)
-		o.deleteSpool(id)
-		return nil
-	}
 	body, readErr := os.ReadFile(filepath.Join(o.spoolDir, e.Name()))
 	if readErr != nil {
 		return nil
@@ -711,5 +725,93 @@ func (o *settlementOutbox) readSpoolItem(e os.DirEntry, id string, now time.Time
 		o.deleteSpool(id)
 		return nil
 	}
-	return &outboxItem{id: id, body: body, firstAt: firstAt, nextAt: now, onDisk: true, index: -1}
+	item := &outboxItem{id: id, body: body, firstAt: firstAt, nextAt: now, onDisk: true, index: -1}
+	if now.Sub(firstAt) > o.maxAge {
+		o.deadLetter(item, fmt.Sprintf("spooled for longer than %s", o.maxAge))
+		o.deleteSpool(id)
+		return nil
+	}
+	return item
+}
+
+func (o *settlementOutbox) deadLetterDir() string {
+	return filepath.Join(o.spoolDir, settlementDeadLetterDir)
+}
+
+// deadLetter records a settlement that leaves the retry queue undelivered. It is still a turn
+// somebody owes, so with a spool it is parked for replayDeadLetters instead of being deleted. The
+// caller removes the spool file afterwards, so a crash in between redelivers rather than loses it.
+func (o *settlementOutbox) deadLetter(it *outboxItem, reason string) {
+	o.dropped.Add(1)
+	if o.spoolDir == "" || !isSettlementID(it.id) {
+		o.logLimited("dead-letter", "[dataplane] error: settlement %s %s; lost: %v", it.id, reason, errSettlementSpoolOff)
+		return
+	}
+	dir := o.deadLetterDir()
+	err := os.MkdirAll(dir, 0o700)
+	if err == nil {
+		err = writeFileSynced(filepath.Join(dir, it.id+".json"), it.body)
+	}
+	if err != nil {
+		o.logger.Printf("[dataplane] error: settlement %s %s; dead-letter write failed, lost: %v", it.id, reason, err)
+		return
+	}
+	n := o.deadLettered.Add(1)
+	o.logLimited("dead-letter", "[dataplane] error: settlement %s %s; parked in %s for replay (%d parked since start)", it.id, reason, dir, n)
+}
+
+// deadLetterCount is the number of settlements waiting in the dead-letter directory.
+func (o *settlementOutbox) deadLetterCount() int {
+	if o.spoolDir == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(o.deadLetterDir())
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		if id, isJSON := strings.CutSuffix(e.Name(), ".json"); isJSON && !e.IsDir() && isSettlementID(id) {
+			n++
+		}
+	}
+	return n
+}
+
+// replayDeadLetters moves parked settlements back into the spool and queues them for delivery.
+// Their age restarts at the replay, so maxAge does not park them again straight away; the BFF still
+// dedupes on the settlement id, so replaying an event it did accept charges nothing twice.
+func (o *settlementOutbox) replayDeadLetters() (int, error) {
+	if o.spoolDir == "" {
+		return 0, errSettlementSpoolOff
+	}
+	dir := o.deadLetterDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	now := time.Now()
+	moved := 0
+	for _, e := range entries {
+		id, isJSON := strings.CutSuffix(e.Name(), ".json")
+		if e.IsDir() || !isJSON || !isSettlementID(id) {
+			continue
+		}
+		dst := o.spoolPath(id)
+		if err := os.Rename(filepath.Join(dir, e.Name()), dst); err != nil {
+			o.logLimited("dead-letter-replay", "[dataplane] warning: dead-lettered settlement %s not replayed: %v", id, err)
+			continue
+		}
+		if err := os.Chtimes(dst, now, now); err != nil {
+			o.logLimited("dead-letter-replay", "[dataplane] warning: replayed settlement %s keeps its old age: %v", id, err)
+		}
+		moved++
+	}
+	if moved > 0 {
+		o.loadSpool()
+	}
+	return moved, nil
 }

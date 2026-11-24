@@ -168,6 +168,13 @@ export interface PaymentsStore {
    * days is taken back. Status becomes refunded or partially_refunded.
    */
   completeRefund(id: string, providerRefundId: string | null): Promise<PaymentOrderItem>;
+  /**
+   * What a provider refund notification reconciles against: the refunded total committed so far
+   * (a pending or failed attempt not included) and the provider refund ids already applied.
+   * completeRefund records its providerRefundId there, and completing an already applied refund
+   * again (its notification and its own gateway answer, or a redelivery) is a no-op.
+   */
+  getRefundLedger(id: string): Promise<{ committedMinor: number; appliedRefundIds: string[] } | null>;
   /** refund_pending → refund_failed with the gateway's error; nothing was taken back. */
   failRefund(id: string, error: string): Promise<PaymentOrderItem>;
 

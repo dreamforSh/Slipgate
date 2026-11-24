@@ -1823,6 +1823,9 @@ export class PostgresControlStore implements ControlStore {
   }
 
   async exportDataPlaneSnapshot(): Promise<DataPlaneSyncSnapshot> {
+    // Taken before the reads: every settlement committed before this instant is in the balances,
+    // which is what slipgate-core compares its confirmed local debits against.
+    const revisionUnixMs = Date.now();
     const [groups, routes, accRows, keyRows, walletRows, banRows] = await Promise.all([
       this.listGroups(false),
       this.listCompositeRoutes(),
@@ -1924,7 +1927,7 @@ export class PostgresControlStore implements ControlStore {
 
     const nowMs = Date.now();
     return {
-      revisionUnixMs: nowMs,
+      revisionUnixMs,
       groups: groups.map((g) => ({
         id: g.id,
         platform: g.platform,

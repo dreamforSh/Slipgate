@@ -519,7 +519,8 @@ describe("two-factor authentication", () => {
     expect(ok.body.accessToken).toBeTruthy();
     expect((await login({ totpCode: current })).status).toBe(401);
 
-    await call("POST", `/api/v1/admin/users/${jack.id}/totp/reset`, admin);
+    expect((await call("POST", `/api/v1/admin/users/${jack.id}/totp/reset`, admin)).status).toBe(403);
+    await call("POST", `/api/v1/admin/users/${jack.id}/totp/reset`, admin, { confirm: { password: "AdminPassword123!" } });
     // Resetting 2FA bumps token_version so any session issued before the reset is revoked.
     expect((await call("GET", "/api/v1/user/totp", jack.headers)).status).toBe(401);
     const relogin = await login();
@@ -561,5 +562,37 @@ describe("model pricing rules", () => {
     const list = await call<{ items: { id: string }[] }>("GET", "/api/v1/admin/pricing", admin);
     expect(list.body.items).toHaveLength(2);
     expect((await call("DELETE", `/api/v1/admin/pricing/${created.body.item.id}`, admin)).status).toBe(200);
+  });
+});
+
+describe("discovered upstream models", () => {
+  it("lists the models slipgate-net discovered in the model plaza", async () => {
+    const paths: string[] = [];
+    const net = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const path = new URL(req.url).pathname;
+        paths.push(path);
+        if (path === "/internal/net/models/discovered") return Response.json({ models: { anthropic: ["claude-discovered-probe"] } });
+        return Response.json({ error: "not_found" }, { status: 404 });
+      },
+    });
+    const prev = { url: process.env.SLIPGATE_NET_INTERNAL_URL, token: process.env.SLIPGATE_INTERNAL_TOKEN };
+    process.env.SLIPGATE_NET_INTERNAL_URL = `http://127.0.0.1:${net.port}`;
+    process.env.SLIPGATE_INTERNAL_TOKEN = INTERNAL;
+    try {
+      const { call } = await bootstrap();
+      const plaza = await call<{ groups: { id: string; models: { id: string; source: string }[] }[] }>("GET", "/api/v1/public/models");
+      const models = plaza.body.groups.find((g) => g.id === "grp_default")?.models ?? [];
+      expect(models.find((m) => m.id === "claude-discovered-probe")?.source).toBe("discovered");
+      expect(paths).toContain("/internal/net/models/discovered");
+    } finally {
+      for (const [key, value] of [["SLIPGATE_NET_INTERNAL_URL", prev.url], ["SLIPGATE_INTERNAL_TOKEN", prev.token]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      net.stop(true);
+    }
   });
 });

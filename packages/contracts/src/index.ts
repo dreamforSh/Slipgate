@@ -23,6 +23,7 @@ export * from "./db_backups.ts";
 export * from "./user_limits.ts";
 export * from "./system_logs.ts";
 export * from "./account_oauth.ts";
+export * from "./step_up.ts";
 
 export const NANO_PER_USD = 1_000_000_000n;
 

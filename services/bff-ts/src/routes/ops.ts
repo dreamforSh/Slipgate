@@ -4,6 +4,7 @@ import {
   AdminAdjustBalanceRequestSchema,
   AdminBatchUserStatusRequestSchema,
   AdminCreateUserRequestSchema,
+  AdminTotpResetRequestSchema,
   AdminUpdateUserRequestSchema,
   AdminUserListQuerySchema,
   AssignSubscriptionRequestSchema,
@@ -734,6 +735,10 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
     const req = await body(c, AdminCreateUserRequestSchema);
     // Placeholder addresses of provider sign-ups (users.noreply.slipgate) are never handed out.
     if (isReservedEmail(req.email)) return c.json({ error: "email_reserved", message: "This email domain is reserved and can't be used" }, 400);
+    if (req.role === "admin") {
+      const refused = await stepUp.confirmAdmin(c, sessions, c.get("authUser").sub, req.confirm);
+      if (refused) return refused;
+    }
     const settings = await ops.getSettings();
     const initial = req.initialBalanceUsd !== undefined ? usd(req.initialBalanceUsd) : BigInt(settings.defaultBalanceNanoUsd);
     const user = await ops.createUser({
@@ -770,12 +775,24 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
   app.patch("/api/v1/admin/users/:userId", async (c) => {
     const userId = c.req.param("userId");
     const req = await body(c, AdminUpdateUserRequestSchema);
-    if (userId === c.get("authUser").sub && (req.role === "user" || req.status === "suspended")) {
+    const self = c.get("authUser").sub;
+    if (userId === self && (req.role === "user" || req.status === "suspended")) {
       throw new StoreError("forbidden", "You cannot demote or suspend your own account");
+    }
+    const target = await ops.getAdminUser(userId);
+    if (!target) throw new StoreError("not_found", "User not found");
+    // Ways to take an account over: a new administrator, a password set by someone else, or another
+    // administrator's email (then a password reset), role or status.
+    const promotes = req.role === "admin" && target.role !== "admin";
+    const touchesOtherAdmin =
+      target.role === "admin" && userId !== self && (req.email !== undefined || req.role !== undefined || req.status !== undefined);
+    if (promotes || touchesOtherAdmin || req.password) {
+      const refused = await stepUp.confirmAdmin(c, sessions, self, req.confirm);
+      if (refused) return refused;
     }
     // Caps and per-group rates are validated before anything is saved, written after the user.
     const applyLimits = await prepareUserLimitFields(store, req);
-    const { password, ...rest } = req;
+    const { password, confirm: _confirm, ...rest } = req;
     // A role, status or password change bumps the user's token version (ends their sessions).
     const user = await ops.updateUser(userId, {
       ...rest,
@@ -816,6 +833,11 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
 
   app.post("/api/v1/admin/users/:userId/totp/reset", async (c) => {
     const userId = c.req.param("userId");
+    // Turning off someone's second factor is half of taking their account over.
+    const parsed = AdminTotpResetRequestSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) bad(parsed.error.issues);
+    const refused = await stepUp.confirmAdmin(c, sessions, c.get("authUser").sub, parsed.data.confirm);
+    if (refused) return refused;
     await ops.setTotp(userId, null, false);
     await ops.bumpTokenVersion(userId);
     sessions.invalidate(userId);

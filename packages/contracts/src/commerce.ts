@@ -3,6 +3,7 @@ import { UserProfileSchema, UserRoleSchema, UserStatusSchema } from "./iam.ts";
 import { LimitValueSchema, UserCapSchema, UserRateMultiplierSchema } from "./user_limits.ts";
 import { AnnouncementTargetingInputSchema, AnnouncementTargetingSchema } from "./announcements.ts";
 import { AUDIT_LOG_RETENTION_DEFAULT_DAYS, AuditLogRetentionDaysSchema } from "./audit.ts";
+import { AdminStepUpSchema } from "./step_up.ts";
 import {
   CaptchaProofSchema,
   DISABLED_PUBLIC_CAPTCHA,
@@ -128,6 +129,8 @@ export const AdminCreateUserRequestSchema = z.object({
   /** Request caps; omitted or null = the portal default, 0 = unlimited. */
   rpmLimit: UserCapSchema.optional(),
   concurrencyLimit: UserCapSchema.optional(),
+  /** The acting administrator's re-confirmation; required to create an administrator. */
+  confirm: AdminStepUpSchema.optional(),
 });
 export type AdminCreateUserRequest = z.infer<typeof AdminCreateUserRequestSchema>;
 
@@ -148,6 +151,11 @@ export const AdminUpdateUserRequestSchema = z.object({
    * clears it). Only the listed groups change; unknown groups are refused before anything is saved.
    */
   groupRates: z.record(z.string().min(1), UserRateMultiplierSchema.nullable()).optional(),
+  /**
+   * The acting administrator's re-confirmation; required to promote someone to administrator, to
+   * set a password, or to change another administrator's account.
+   */
+  confirm: AdminStepUpSchema.optional(),
 });
 export type AdminUpdateUserRequest = z.infer<typeof AdminUpdateUserRequestSchema>;
 

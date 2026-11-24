@@ -1,7 +1,9 @@
 import type { Context } from "hono";
-import type { AuditStepUpError } from "@slipgate/contracts";
+import type { AdminStepUp, AuditStepUpError } from "@slipgate/contracts";
 import { WindowLimiter } from "../insights.ts";
+import type { SessionManager } from "../middleware/auth.ts";
 import type { ControlStore } from "../store/types.ts";
+import { clientIp } from "./client_ip.ts";
 import { decryptSecret } from "./crypto.ts";
 import { verifyTotp } from "./totp.ts";
 
@@ -61,6 +63,27 @@ export class TotpStepUp {
     if (!failure) return null;
     if (failure.status === 429) c.header("Retry-After", String(STEP_UP_WINDOW_MS / 1000));
     return c.json({ error: failure.error, message: failure.message }, failure.status);
+  }
+
+  /**
+   * Re-confirms the administrator behind a session before an action that could hand over the
+   * deployment or its data (an administrator account, another user's sign-in, the backup target):
+   * the account password through the per-user attempt limit, plus a fresh code when two-factor
+   * sign-in is on. A stolen session token alone is not enough for any of them.
+   */
+  async confirmAdmin(c: Context, sessions: SessionManager, userId: string, confirm: AdminStepUp | undefined): Promise<Response | null> {
+    if (!confirm) return c.json({ error: "step_up_required", message: "Confirm this change with your password" }, 403);
+    const check = await sessions.confirmPassword(userId, clientIp(c), confirm.password);
+    if (!check.ok) {
+      if (check.retryAfterSeconds !== null) {
+        c.header("Retry-After", String(check.retryAfterSeconds));
+        return c.json({ error: "too_many_attempts", message: "Too many wrong passwords, try again later" }, 429);
+      }
+      return c.json({ error: "invalid_password", message: "Password confirmation failed" }, 403);
+    }
+    const totp = await this.store.ops.getTotp(userId);
+    if (!totp?.enabled) return null;
+    return this.require(c, userId, confirm.totpCode);
   }
 }
 

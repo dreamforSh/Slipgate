@@ -104,14 +104,16 @@ func StripAntigravityModelPrefix(model string) string {
 	return trimmed
 }
 
-// ApplyClaudeSubscriptionHeaders sets official Claude Code 2.1 CLI + Stainless headers and removes x-api-key.
-func ApplyClaudeSubscriptionHeaders(req *http.Request, secret AccountSecret) {
+// ApplyClaudeSubscriptionHeaders sets official Claude Code 2.1 CLI + Stainless headers and removes
+// x-api-key. callerBeta is the caller's own anthropic-beta: its opt-ins (1M context, files, ...)
+// follow the Claude Code set, since the request body may depend on them.
+func ApplyClaudeSubscriptionHeaders(req *http.Request, secret AccountSecret, callerBeta string) {
 	req.Header.Del("x-api-key")
 	if secret.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+secret.APIKey)
 	}
 	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("anthropic-beta", claudeCodeBetaHeader)
+	req.Header.Set("anthropic-beta", mergeHeaderTokens(claudeCodeBetaHeader, sanitizeHeaderToken(callerBeta)))
 	req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
 	req.Header.Set("x-app", "cli")
 	req.Header.Set("User-Agent", claudeCLIUserAgent)
@@ -122,6 +124,23 @@ func ApplyClaudeSubscriptionHeaders(req *http.Request, secret AccountSecret) {
 	req.Header.Set("X-Stainless-Runtime", "bun")
 	req.Header.Set("X-Stainless-Runtime-Version", "1.2.9")
 	req.Header.Set("X-Stainless-Retry-Count", "0")
+}
+
+// mergeHeaderTokens joins comma-separated token lists, keeping the first occurrence of each token
+// (case-insensitively) in order.
+func mergeHeaderTokens(lists ...string) string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, list := range lists {
+		for _, tok := range strings.Split(list, ",") {
+			tok = strings.TrimSpace(tok)
+			if key := strings.ToLower(tok); tok != "" && !seen[key] {
+				seen[key] = true
+				out = append(out, tok)
+			}
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 // ApplyCodexSubscriptionHeaders sets official OpenAI Codex CLI Rust headers (`originator`, `session_id`, `chatgpt-account-id`).
@@ -210,11 +229,9 @@ func EncodeCodexResponsesRequestBody(model string, turn *CanonicalTurn, tools []
 			}
 		default:
 			inputItems = append(inputItems, map[string]any{
-				"type": "message",
-				"role": "user",
-				"content": []map[string]any{
-					{"type": "input_text", "text": m.Content},
-				},
+				"type":    "message",
+				"role":    "user",
+				"content": codexInputContent(m),
 			})
 		}
 	}
@@ -239,6 +256,23 @@ func EncodeCodexResponsesRequestBody(model string, turn *CanonicalTurn, tools []
 	if turn.Temperature != nil {
 		payload["temperature"] = *turn.Temperature
 	}
+	// Codex CLI asks for reasoning summaries and, with store=false, the encrypted reasoning that
+	// lets a stateless conversation continue. Non-reasoning models reject the parameter.
+	if effort := codexReasoningEffort(turn); effort != "" && (forceStream || isOpenAIReasoningModel(model)) {
+		reasoning := map[string]any{"effort": effort}
+		if effort != "none" {
+			reasoning["summary"] = "auto"
+		}
+		payload["reasoning"] = reasoning
+		payload["include"] = []string{"reasoning.encrypted_content"}
+	}
+	if tier := openAIServiceTier(turn.ServiceTier); tier != "" {
+		payload["service_tier"] = tier
+	}
+	// The caller's session keeps hitting one prompt cache; derived, so its own identifiers stay here.
+	if hint := strings.TrimSpace(turn.SessionHint); hint != "" {
+		payload["prompt_cache_key"] = DeterministicUUID("slipgate-codex-cache", hint)
+	}
 	if len(tools) > 0 {
 		respTools := make([]map[string]any, 0, len(tools))
 		for _, t := range tools {
@@ -253,6 +287,43 @@ func EncodeCodexResponsesRequestBody(model string, turn *CanonicalTurn, tools []
 		payload["tool_choice"] = "auto"
 	}
 	return json.Marshal(payload)
+}
+
+// codexReasoningEffort is the caller's reasoning effort in Responses terms ("max" is xhigh there),
+// or the one its thinking budget implies; "" leaves the upstream default.
+func codexReasoningEffort(turn *CanonicalTurn) string {
+	switch e := firstNonEmpty(turn.ReasoningEffort, reasoningEffortForBudget(turn.ThinkingBudget)); e {
+	case "max":
+		return "xhigh"
+	default:
+		return e
+	}
+}
+
+// codexInputContent renders a user message as Responses input parts, images and files included.
+func codexInputContent(m CanonicalMessage) []map[string]any {
+	if !hasMediaParts(m.Parts) {
+		return []map[string]any{{"type": "input_text", "text": m.Content}}
+	}
+	out := make([]map[string]any, 0, len(m.Parts))
+	for _, p := range m.Parts {
+		switch p.Type {
+		case partText:
+			out = append(out, map[string]any{"type": "input_text", "text": p.Text})
+		case partImage:
+			out = append(out, map[string]any{"type": "input_image", "image_url": partDataURL(p)})
+		case partDocument:
+			if p.Data != "" {
+				out = append(out, map[string]any{"type": "input_file", "filename": "document.pdf", "file_data": partDataURL(p)})
+			} else {
+				out = append(out, map[string]any{"type": "input_text", "text": "[document: " + p.URL + "]"})
+			}
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, map[string]any{"type": "input_text", "text": m.Content})
+	}
+	return out
 }
 
 // EncodeAntigravityRequestBody wraps a Gemini request payload inside Antigravity Cloud Code's v1internal envelope.

@@ -219,6 +219,9 @@ EnvironmentFile=/etc/slipgate/slipgate.env
 Environment=SLIPGATE_CORE_BIN=${PREFIX}/slipgate-core
 Environment=SLIPGATE_BFF_BIN=${PREFIX}/slipgate-bff
 Environment=SLIPGATE_HOTUPDATE_DIR=/var/run/slipgate/hotupdate
+# Undelivered settlements are money owed: keep them under StateDirectory, which (unlike the
+# RuntimeDirectory above) survives a service restart and a reboot.
+Environment=SLIPGATE_SETTLEMENT_SPOOL_DIR=/var/lib/slipgate/settlement-spool
 ExecStart=${PREFIX}/slipgate
 Restart=always
 RestartSec=3

@@ -132,9 +132,10 @@ function micros(rate: number): bigint {
 }
 
 /**
- * repriceSettlement at the user's custom rate. A turn the core charged with no BFF price rule to
- * re-price it (built-in rates) is scaled from the group rate the core used to the user's rate,
- * rounding up, so a custom rate is billed whatever slipgate-core held.
+ * repriceSettlement at the user's custom rate. slipgate-core already prices with the user's rate
+ * once it has synced, so a turn it charged with no BFF price rule (built-in rates) is only scaled
+ * from the rate it reports having used (coreRateMultiplierMicros) to the user's current rate,
+ * rounding up. Without that report the core's cost already carries the user's rate.
  */
 export function repriceForUser(
   ev: TurnSettlementEvent,
@@ -143,11 +144,11 @@ export function repriceForUser(
   userRate: number | null,
 ): TurnSettlementEvent {
   const repriced = repriceSettlement(ev, rules, userRate ?? groupRate);
-  if (userRate === null || repriced !== ev) return repriced;
+  if (userRate === null || repriced !== ev || ev.coreRateMultiplierMicros === undefined) return repriced;
   const cost = BigInt(ev.costNanoUsd);
   if (cost <= 0n || ev.statusCode >= 400) return ev;
   const num = cost * micros(userRate);
-  const den = micros(groupRate);
+  const den = BigInt(ev.coreRateMultiplierMicros);
   const scaled = (num + den - 1n) / den;
   return scaled === cost ? ev : { ...ev, costNanoUsd: scaled.toString() };
 }

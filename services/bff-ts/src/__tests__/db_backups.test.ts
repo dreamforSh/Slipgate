@@ -20,6 +20,7 @@ import { verifyDownloadTicket } from "../routes/db_backups.ts";
 import { totpAt, TOTP_STEP_SECONDS } from "../security/totp.ts";
 import { MemoryControlStore } from "../store/memory_store.ts";
 import type { ControlStore } from "../store/types.ts";
+import { allowPrivateUpstreamsInSuite, withPrivateUpstreams } from "./private_upstreams.ts";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const PASSWORD = "AdminPassword123!";
@@ -181,6 +182,7 @@ async function bootstrap(opts: { runner?: DbDumpRunner | null; splitPartSizeByte
       secretAccessKey: SECRET_KEY,
       prefix: "/nightly/",
       forcePathStyle: true,
+      confirm: { password: PASSWORD },
     });
   const svc = () => {
     if (!service) throw new Error("service not exposed");
@@ -293,8 +295,13 @@ describe("pg tool helpers", () => {
       endpoint: "https://bkt.acc.r2.cloudflarestorage.com",
       virtualHostedStyle: true,
     });
-    // IP endpoints can only be addressed path-style.
-    expect(s3ClientOptions({ ...base, endpoint: "http://10.0.0.5:9000", forcePathStyle: false })).toMatchObject({ endpoint: "http://10.0.0.5:9000", virtualHostedStyle: false });
+    // A private endpoint (a MinIO on the LAN) is refused unless the operator opts in...
+    expect(() => s3ClientOptions({ ...base, endpoint: "http://10.0.0.5:9000", forcePathStyle: false })).toThrow(/restricted/);
+    // ...and IP endpoints can only be addressed path-style.
+    expect(withPrivateUpstreams(() => s3ClientOptions({ ...base, endpoint: "http://10.0.0.5:9000", forcePathStyle: false }))).toMatchObject({
+      endpoint: "http://10.0.0.5:9000",
+      virtualHostedStyle: false,
+    });
   });
 });
 
@@ -303,6 +310,8 @@ describe("pg tool helpers", () => {
 /* ------------------------------------------------------------------------------------------ */
 
 describe("database backups API", () => {
+  allowPrivateUpstreamsInSuite();
+
   it("reports the in-memory store as unsupported", async () => {
     const { call, admin } = await bootstrap({ runner: null, memoryOnly: true });
     const status = await call<BackupSystemStatus>("GET", `${BASE}/status`, admin);
@@ -326,6 +335,15 @@ describe("database backups API", () => {
     const empty = await call<BackupS3ConfigView>("GET", `${BASE}/s3-config`, admin);
     expect(empty.body).toMatchObject({ configured: false, secretAccessKeySet: false, bucket: "" });
 
+    // Every future dump goes to this target: an admin session alone cannot repoint it.
+    const target = { endpoint: s3.endpoint, region: "us-east-1", bucket: BUCKET, accessKeyId: ACCESS_KEY, secretAccessKey: SECRET_KEY, prefix: "nightly", forcePathStyle: true };
+    const unconfirmed = await call<{ error: string }>("PUT", `${BASE}/s3-config`, admin, target);
+    expect(unconfirmed.status).toBe(403);
+    expect(unconfirmed.body.error).toBe("step_up_required");
+    const wrongPassword = await call<{ error: string }>("PUT", `${BASE}/s3-config`, admin, { ...target, confirm: { password: "not-it" } });
+    expect(wrongPassword.body.error).toBe("invalid_password");
+    expect((await call<BackupS3ConfigView>("GET", `${BASE}/s3-config`, admin)).body.configured).toBe(false);
+
     const saved = await configureS3();
     expect(saved.status).toBe(200);
     expect(saved.body).toMatchObject({ configured: true, secretAccessKeySet: true, prefix: "nightly", bucket: BUCKET });
@@ -335,7 +353,7 @@ describe("database backups API", () => {
     expect(Buffer.from(stored.s3!.secretEnc!).toString("latin1")).not.toContain(SECRET_KEY);
 
     // Omitted secret: kept (same ciphertext); "" clears it.
-    const renamed = await call<BackupS3ConfigView>("PUT", `${BASE}/s3-config`, admin, { ...saved.body, region: "auto" });
+    const renamed = await call<BackupS3ConfigView>("PUT", `${BASE}/s3-config`, admin, { ...saved.body, region: "auto", confirm: { password: PASSWORD } });
     expect(renamed.body.secretAccessKeySet).toBe(true);
     expect(Buffer.from((await store.dbBackups.getConfig()).s3!.secretEnc!).equals(Buffer.from(stored.s3!.secretEnc!))).toBe(true);
 
@@ -343,6 +361,8 @@ describe("database backups API", () => {
     const bodies = audit.body.items.map((i) => i.requestBody ?? "").join("\n");
     expect(bodies).toContain('"secretAccessKey":"[redacted]"');
     expect(bodies).not.toContain(SECRET_KEY);
+    expect(bodies).toContain('"confirm":{"password":"[redacted]"}');
+    expect(bodies).not.toContain(PASSWORD);
 
     const ok = await call<TestBackupS3Response>("POST", `${BASE}/s3-config/test`, admin, { ...saved.body });
     expect(ok.body).toEqual({ ok: true, message: "Connection successful" });
@@ -359,7 +379,7 @@ describe("database backups API", () => {
     const bad = await call<{ error: string }>("PUT", `${BASE}/s3-config`, admin, { ...saved.body, endpoint: "ftp://x", prefix: "../up" });
     expect(bad.status).toBe(400);
 
-    const cleared = await call<BackupS3ConfigView>("PUT", `${BASE}/s3-config`, admin, { ...saved.body, secretAccessKey: "" });
+    const cleared = await call<BackupS3ConfigView>("PUT", `${BASE}/s3-config`, admin, { ...saved.body, secretAccessKey: "", confirm: { password: PASSWORD } });
     expect(cleared.body).toMatchObject({ secretAccessKeySet: false, configured: false });
     const refused = await call<{ error: string }>("POST", BASE, admin, {});
     expect(refused.status).toBe(400);

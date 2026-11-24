@@ -183,6 +183,11 @@ type TurnSettlementEvent struct {
 	TTFTMs                uint32  `json:"ttftMs"`
 	DurationMs            uint32  `json:"durationMs"`
 	StatusCode            int     `json:"statusCode"`
+	// CoreHoldID is read back by the edge once the BFF accepts the settlement, to tell
+	// slipgate-core that this hold's local debit is now committed (the BFF ignores it).
+	CoreHoldID uint64 `json:"coreHoldId,omitempty"`
+	// CoreRateMultiplierMicros is the rate slipgate-core priced CostNanoUSD at (settled turns only).
+	CoreRateMultiplierMicros uint64 `json:"coreRateMultiplierMicros,omitempty"`
 }
 
 // RiskBanEventPayload matches RecordRiskBanInputSchema posted back to slipgate-bff.
@@ -241,6 +246,9 @@ type CoordinatorOptions struct {
 	// SLIPGATE_SETTLEMENT_SPOOL_DIR environment variable; empty or "off" = in-memory retry queue
 	// only). cmd/slipgate always passes one (see ResolveSettlementSpoolDir).
 	SettlementSpoolDir string
+	// UpstreamTimeouts bounds the header wait and stream stalls of every AI upstream call (zero
+	// values = unbounded; cmd/slipgate passes SLIPGATE_UPSTREAM_*_TIMEOUT_SEC).
+	UpstreamTimeouts UpstreamTimeouts
 }
 
 // Coordinator bridges HTTP AI ingress, L2 Zig hot-path policy/ledger IPC, three-mode outbound execution, and BFF settlement.
@@ -253,12 +261,15 @@ type Coordinator struct {
 	stealth               *stealth.AccountDialer
 	vmSlots               *vmslot.Manager
 	directClient          *http.Client
+	upstreamTimeouts      UpstreamTimeouts
 	bffClient             *http.Client
 	allowPrivateUpstreams bool
 	trustedProxies        *netguard.TrustedProxies
 	logger                *log.Logger
 	streamSeq             atomic.Uint32
 	settlements           *settlementOutbox
+	confirmOnce           sync.Once
+	confirms              chan settleConfirm
 
 	// accessLogEnabled gates the per-turn http.access line (turn_log.go).
 	accessLogEnabled func() bool
@@ -277,6 +288,9 @@ type Coordinator struct {
 	responsesState     responseStateStore
 	mediaTasks         mediaTaskStore
 	modelCatalog       modelCatalogCache
+
+	// snapshotApplied: keyByHash holds the same key set slipgate-core authenticates against.
+	snapshotApplied bool
 }
 
 // NewCoordinator constructs a DataPlane Coordinator.
@@ -288,7 +302,8 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 	allowPrivate := opts.AllowPrivateUpstreams || netguard.AllowPrivateUpstreamsFromEnv()
 	directClient := opts.DirectClient
 	if directClient == nil {
-		directClient = netguard.NewSafeHTTPClient(120*time.Second, allowPrivate)
+		// No whole-request deadline: UpstreamTimeouts bounds the header wait and stream stalls.
+		directClient = netguard.NewSafeHTTPClient(0, allowPrivate)
 	}
 	trustedProxies := opts.TrustedProxies
 	if trustedProxies == nil {
@@ -308,6 +323,7 @@ func NewCoordinator(opts CoordinatorOptions) *Coordinator {
 		stealth:               opts.StealthDialer,
 		vmSlots:               opts.VMSlots,
 		directClient:          directClient,
+		upstreamTimeouts:      opts.UpstreamTimeouts,
 		bffClient:             &http.Client{Timeout: 5 * time.Second},
 		allowPrivateUpstreams: allowPrivate,
 		trustedProxies:        trustedProxies,
@@ -356,6 +372,18 @@ func (c *Coordinator) FlushSettlements(ctx context.Context) {
 	c.logger.Printf("[dataplane] error: %d undelivered settlement(s) lost at shutdown: the settlement spool is off (%s)", left, SettlementSpoolDirEnv)
 }
 
+// SettlementDeadLetters reports how many settlements the BFF rejected or that aged out undelivered
+// are parked in the spool's dead-letter directory.
+func (c *Coordinator) SettlementDeadLetters() int {
+	return c.settlements.deadLetterCount()
+}
+
+// ReplaySettlementDeadLetters queues every parked settlement for delivery again (after the cause
+// of the rejection is fixed) and returns how many were queued.
+func (c *Coordinator) ReplaySettlementDeadLetters() (int, error) {
+	return c.settlements.replayDeadLetters()
+}
+
 // postSettlementOnce makes one settlement POST and reports the BFF's status code.
 func (c *Coordinator) postSettlementOnce(ctx context.Context, body []byte) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.bffOrigin+"/api/v1/internal/dataplane/settlement", bytes.NewReader(body))
@@ -368,9 +396,12 @@ func (c *Coordinator) postSettlementOnce(ctx context.Context, body []byte) (int,
 	if err != nil {
 		return 0, err
 	}
-	// Drain so the keep-alive connection is reused.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	// Read fully so the keep-alive connection is reused.
+	answer, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		c.confirmDeliveredSettlement(body, answer)
+	}
 	return resp.StatusCode, nil
 }
 
@@ -617,6 +648,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	c.accountMetas = nextMetas
 	c.lastCoreSyncJSON = corePayload
 	c.lastRevisionUnixMs = snap.RevisionUnixMs
+	c.snapshotApplied = true
 	c.mu.Unlock()
 	c.userLimits.apply(snap.UserLimits)
 
@@ -783,6 +815,8 @@ type coreTurnEvalRequest struct {
 	ReasoningEffort         string   `json:"reasoningEffort,omitempty"`
 	ImageCount              uint32   `json:"imageCount,omitempty"`
 	VideoSeconds            uint32   `json:"videoSeconds,omitempty"`
+	// TurnNonce lets the edge release the hold this evaluation creates if the reply never arrives.
+	TurnNonce string `json:"turnNonce,omitempty"`
 }
 
 type coreDispatchDirective struct {
@@ -817,6 +851,10 @@ type coreDispatchDirective struct {
 
 type coreSettleReport struct {
 	HoldID uint64 `json:"holdId"`
+	// TurnNonce names the hold by the evaluation that created it when HoldID is 0.
+	TurnNonce string `json:"turnNonce,omitempty"`
+	// ReleaseOnly gives the hold back uncharged (the BFF prices the turn if it ran).
+	ReleaseOnly bool `json:"releaseOnly,omitempty"`
 	// APIKeyID lets the core refuse a report whose hold id now names another turn's hold.
 	APIKeyID              string `json:"apiKeyId,omitempty"`
 	UpstreamStatus        uint16 `json:"upstreamStatus"`
@@ -841,6 +879,7 @@ type coreSettleAck struct {
 	SettledCostNanoUSD          string `json:"settledCostNanoUsd"`
 	BalanceAfterNanoUSD         string `json:"balanceAfterNanoUsd"`
 	OrdinaryUpstream400Exempted bool   `json:"ordinaryUpstream400Exempted"`
+	RateMultiplierMicros        uint64 `json:"rateMultiplierMicros"`
 	// settled is true only when slipgate-core acknowledged settling this hold; otherwise the
 	// reported cost is not the core's valuation and the BFF must price the turn.
 	settled bool
@@ -873,6 +912,13 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/videos/") {
 		c.handleGetVideoTask(w, r, requestID, startedAt)
+		return
+	}
+
+	apiKey := extractAPIKey(r)
+	// Refuse keys slipgate-core is certain to refuse before reading a body of up to 16 MiB for them.
+	if msg := c.upfrontKeyRejection(apiKey); msg != "" {
+		WriteProtocolError(w, ingressCodec, http.StatusUnauthorized, "authentication_error", "invalid_api_key", msg)
 		return
 	}
 
@@ -921,7 +967,6 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	access.setTurn(turn)
 
-	apiKey := extractAPIKey(r)
 	clientIP := c.clientIPFromRequest(r)
 	// [M-06] Enforce IP allowlist/denylist and pre-check user/group caps BEFORE calling slipgate-core
 	// so unauthorized client IPs or throttled users cannot burn legitimate per-key RPM in core-zig.
@@ -957,6 +1002,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		ReasoningEffort:      turn.ReasoningEffort,
 		ImageCount:           turn.ImageCount,
 		VideoSeconds:         turn.VideoSeconds,
+		TurnNonce:            newTurnNonce(),
 	}
 	evalPayload, _ := json.Marshal(baseEvalReq)
 
@@ -969,6 +1015,10 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	ipcCancel()
 	if ipcErr != nil {
+		if !isModelsReq {
+			// The core may have created a hold before the reply was lost.
+			c.releaseCoreHold(0, baseEvalReq.TurnNonce, "")
+		}
 		c.logTurn("error", "slipgate-core dataplane unreachable: "+ipcErr.Error(), requestID, nil, turn.PublicModel)
 		WriteProtocolError(w, turn.IngressCodec, http.StatusServiceUnavailable, "core_unavailable", "core_unreachable", "slipgate-core dataplane unreachable: "+ipcErr.Error())
 		return
@@ -1071,7 +1121,7 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			Window5hResetAtUnixMs: metrics.Window5hResetAtUnixMs,
 			Window7dResetAtUnixMs: metrics.Window7dResetAtUnixMs,
 			CooldownDurationMs:    metrics.CooldownDurationMs,
-			ServiceTier:           turn.ServiceTier,
+			ServiceTier:           billedServiceTier(turn),
 			ReasoningEffort:       turn.ReasoningEffort,
 			ImageCount:            metrics.ImageCount,
 			VideoSeconds:          metrics.VideoSeconds,
@@ -1102,6 +1152,8 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			c.logTurn("warn", fmt.Sprintf("hold %d settle IPC failed: %v", directive.HoldID, err), requestID, &directive, turn.PublicModel,
 				"hold_id", fmtUint(directive.HoldID))
+			// The BFF prices this turn (coreSettled=false); the core must not keep the hold's slots.
+			c.releaseCoreHold(directive.HoldID, "", directive.APIKeyID)
 			return coreSettleAck{SettledCostNanoUSD: "0"}
 		}
 		var ack coreSettleAck
@@ -1396,37 +1448,52 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ack := settleHold(metrics)
 	durationMs := elapsedMs(startedAt)
+	var coreRate uint64
+	if ack.settled {
+		coreRate = ack.RateMultiplierMicros
+	}
 
 	c.postSettlementBounded(TurnSettlementEvent{
-		SettlementID:          newSettlementID(),
-		CoreSettled:           ack.settled,
-		RequestID:             requestID,
-		UserID:                directive.UserID,
-		APIKeyID:              directive.APIKeyID,
-		AccountID:             directive.AccountID,
-		GroupID:               directive.GroupID,
-		Platform:              directive.Provider,
-		PublicModel:           directive.PublicModel,
-		UpstreamModel:         directive.UpstreamModel,
-		IngressCodec:          string(turn.IngressCodec),
-		EgressCodec:           string(egressCodec),
-		InputTokens:           metrics.InputTokens,
-		OutputTokens:          metrics.OutputTokens,
-		CacheReadTokens:       metrics.CacheReadTokens,
-		CacheWriteTokens:      metrics.CacheWriteTokens,
-		CostNanoUSD:           firstNonEmpty(ack.SettledCostNanoUSD, "0"),
-		Window5hUsedBps:       metrics.Window5hUsedBps,
-		Window7dUsedBps:       metrics.Window7dUsedBps,
-		Window5hResetAtUnixMs: metrics.Window5hResetAtUnixMs,
-		Window7dResetAtUnixMs: metrics.Window7dResetAtUnixMs,
-		ServiceTier:           turn.ServiceTier,
-		ReasoningEffort:       turn.ReasoningEffort,
-		ImageCount:            metrics.ImageCount,
-		VideoSeconds:          float64(metrics.VideoSeconds),
-		TTFTMs:                metrics.TTFTMs,
-		DurationMs:            durationMs,
-		StatusCode:            metrics.UpstreamStatus,
+		SettlementID:             newSettlementID(),
+		CoreSettled:              ack.settled,
+		RequestID:                requestID,
+		UserID:                   directive.UserID,
+		APIKeyID:                 directive.APIKeyID,
+		AccountID:                directive.AccountID,
+		GroupID:                  directive.GroupID,
+		Platform:                 directive.Provider,
+		PublicModel:              directive.PublicModel,
+		UpstreamModel:            directive.UpstreamModel,
+		IngressCodec:             string(turn.IngressCodec),
+		EgressCodec:              string(egressCodec),
+		InputTokens:              metrics.InputTokens,
+		OutputTokens:             metrics.OutputTokens,
+		CacheReadTokens:          metrics.CacheReadTokens,
+		CacheWriteTokens:         metrics.CacheWriteTokens,
+		CostNanoUSD:              firstNonEmpty(ack.SettledCostNanoUSD, "0"),
+		Window5hUsedBps:          metrics.Window5hUsedBps,
+		Window7dUsedBps:          metrics.Window7dUsedBps,
+		Window5hResetAtUnixMs:    metrics.Window5hResetAtUnixMs,
+		Window7dResetAtUnixMs:    metrics.Window7dResetAtUnixMs,
+		ServiceTier:              turn.UpstreamServiceTier,
+		ReasoningEffort:          turn.ReasoningEffort,
+		ImageCount:               metrics.ImageCount,
+		VideoSeconds:             float64(metrics.VideoSeconds),
+		TTFTMs:                   metrics.TTFTMs,
+		DurationMs:               durationMs,
+		StatusCode:               settlementStatusCode(metrics.UpstreamStatus),
+		CoreHoldID:               directive.HoldID,
+		CoreRateMultiplierMicros: coreRate,
 	})
+}
+
+// settlementStatusCode keeps the recorded status inside the HTTP range the BFF accepts: an upstream
+// answering with a non-standard code is still a turn that has to be settled.
+func settlementStatusCode(status int) int {
+	if status < 100 || status > 599 {
+		return http.StatusBadGateway
+	}
+	return status
 }
 
 func (c *Coordinator) executeOutbound(
@@ -1461,11 +1528,13 @@ func (c *Coordinator) executeOutbound(
 		if utlsProfileID == "" {
 			utlsProfileID = stealth.DefaultProfileForProvider(pctx.Provider, pctx.AuthKind)
 		}
-		out, err := c.stealth.DoAccountRequest(ctx, pctx.AccountID, utlsProfileID, req)
-		if err != nil {
-			return nil, err
-		}
-		return out.Response, nil
+		return c.upstreamTimeouts.do(req.WithContext(ctx), func(out *http.Request) (*http.Response, error) {
+			res, err := c.stealth.DoAccountRequest(out.Context(), pctx.AccountID, utlsProfileID, out)
+			if err != nil {
+				return nil, err
+			}
+			return res.Response, nil
+		})
 
 	default:
 		if secret.IsMock() {
@@ -1474,7 +1543,7 @@ func (c *Coordinator) executeOutbound(
 		if err := netguard.ValidateOutboundURL(req.URL.String(), c.allowPrivateUpstreams); err != nil {
 			return nil, err
 		}
-		return c.directClient.Do(req)
+		return c.upstreamTimeouts.do(req, c.directClient.Do)
 	}
 }
 
@@ -1711,6 +1780,7 @@ func (c *Coordinator) tryRebindFailover(
 	req.RebindCooldownAccountID = cooldownAccID
 	req.RebindCooldownMs = cooldownMs
 	req.NowUnixMs = time.Now().UnixMilli()
+	req.TurnNonce = newTurnNonce()
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return coreDispatchDirective{}, false
@@ -1724,6 +1794,8 @@ func (c *Coordinator) tryRebindFailover(
 		Payload:  payload,
 	})
 	if err != nil {
+		// A core that did rebind retired the old hold and created one the edge never learnt about.
+		c.releaseCoreHold(0, req.TurnNonce, "")
 		return coreDispatchDirective{}, false
 	}
 	var next coreDispatchDirective
@@ -1981,6 +2053,22 @@ type edgeKeyMeta struct {
 	UserID  string
 	GroupID string
 	Enabled bool
+}
+
+// upfrontKeyRejection is slipgate-core's 401 message for a key it is certain to refuse: a missing
+// or malformed one, or (once a snapshot is applied) one the snapshot does not contain. "" = let
+// the core decide (disabled keys, quotas, ...).
+func (c *Coordinator) upfrontKeyRejection(apiKey string) string {
+	if apiKey == "" || len(apiKey) > 512 {
+		return "Missing or malformed API key"
+	}
+	c.mu.RLock()
+	synced := c.snapshotApplied
+	c.mu.RUnlock()
+	if _, known := c.lookupKeyByPlaintext(apiKey); synced && !known {
+		return "Invalid or revoked sk-sg-* API key"
+	}
+	return ""
 }
 
 func (c *Coordinator) lookupKeyByPlaintext(apiKey string) (edgeKeyMeta, bool) {

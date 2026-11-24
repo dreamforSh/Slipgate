@@ -24,10 +24,15 @@ export function weakSecretReason(value: string | undefined): string | null {
   return null;
 }
 
-/** Every weak secret in `env`, e.g. `SLIPGATE_JWT_SECRET is not set`. */
+/**
+ * Every weak secret in `env`, e.g. `SLIPGATE_JWT_SECRET is not set`. An unset
+ * SLIPGATE_INTERNAL_TOKEN is fine (slipgate-net generates one); a chosen one must be strong.
+ */
 export function secretProblems(env: Env): string[] {
   const problems: string[] = [];
-  for (const name of ["SLIPGATE_JWT_SECRET", "SLIPGATE_VAULT_SECRET"] as const) {
+  const names: string[] = ["SLIPGATE_JWT_SECRET", "SLIPGATE_VAULT_SECRET"];
+  if ((env.SLIPGATE_INTERNAL_TOKEN ?? "").trim() !== "") names.push("SLIPGATE_INTERNAL_TOKEN");
+  for (const name of names) {
     const reason = weakSecretReason(env[name]);
     if (reason) problems.push(`${name} ${reason}`);
   }

@@ -64,6 +64,19 @@ const en: typeof zh = {
       tooMany: "Too many attempts. Try again later",
       required: "Enter the 6-digit code",
     },
+    stepUp: {
+      titles: {
+        createAdmin: "Confirm creating an administrator",
+        accountChange: "Confirm this account change",
+        totpReset: "Confirm resetting two-factor sign-in",
+        adminStatus: "Confirm changing an administrator's status",
+        backupTarget: "Confirm the backup target",
+      },
+      intro: "This change could hand the site or its data to someone else. Enter your password{totp} to confirm it's you.",
+      introTotp: " and two-factor code",
+      confirm: "Confirm and continue",
+      working: "Submitting…",
+    },
     ops: {
       liveStates: {
         live: "Live",

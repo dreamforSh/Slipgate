@@ -235,15 +235,15 @@ func TestUserLimitGateConcurrentAdmissionsNeverExceedCap(t *testing.T) {
 }
 
 // TestCoordinatorEnforcesUserLimitsAtTheEdge drives HandleHTTP against a fake slipgate-core:
-// the snapshot's userLimits refuse the second turn of a user capped at 1 RPM with a 429, after
-// releasing the core hold, and the live stats report the admitted turn.
+// the snapshot's userLimits refuse the second turn of a user capped at 1 RPM with a 429 before it
+// reaches the core (so no hold is taken), and the live stats report the admitted turn.
 func TestCoordinatorEnforcesUserLimitsAtTheEdge(t *testing.T) {
 	coreLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("core listen failed: %v", err)
 	}
 	defer coreLn.Close()
-	var settles atomic.Int32
+	var settles, evals atomic.Int32
 	var lastSyncPayload atomic.Value
 	go func() {
 		for {
@@ -263,6 +263,7 @@ func TestCoordinatorEnforcesUserLimitsAtTheEdge(t *testing.T) {
 					lastSyncPayload.Store(string(req.Payload))
 					reply.Type, reply.Payload = dpbridge.FrameSyncAck, []byte(`{"ok":true}`)
 				case dpbridge.FrameReqHeaders:
+					evals.Add(1)
 					raw, _ := json.Marshal(coreDispatchDirective{
 						Action: "dispatch", Status: 200, HoldID: 7, UserID: "usr_cap", APIKeyID: "key_cap",
 						GroupID: "grp_1", AccountID: "acc_missing", Provider: "anthropic", ExecutionMode: "direct_http",
@@ -288,6 +289,7 @@ func TestCoordinatorEnforcesUserLimitsAtTheEdge(t *testing.T) {
 	if err := json.Unmarshal([]byte(snapshot), &snap); err != nil {
 		t.Fatalf("decode snapshot: %v", err)
 	}
+	snap.APIKeys = []SyncApiKeyInput{{ID: "key_cap", UserID: "usr_cap", GroupID: "grp_1", KeyHashHex: sha256HexOf("sk-sg-test"), Enabled: true}}
 	if _, err := coord.SyncSnapshot(context.Background(), snap); err != nil {
 		t.Fatalf("SyncSnapshot: %v", err)
 	}
@@ -309,6 +311,7 @@ func TestCoordinatorEnforcesUserLimitsAtTheEdge(t *testing.T) {
 	if first.Code != http.StatusServiceUnavailable || !strings.Contains(first.Body.String(), "account_secret_unavailable") {
 		t.Fatalf("first turn: %d %s", first.Code, first.Body.String())
 	}
+	evalsAfterFirst := evals.Load()
 	second := send()
 	if second.Code != http.StatusTooManyRequests || !strings.Contains(second.Body.String(), "user_rpm_exceeded") {
 		t.Fatalf("second turn: %d %s", second.Code, second.Body.String())
@@ -316,8 +319,11 @@ func TestCoordinatorEnforcesUserLimitsAtTheEdge(t *testing.T) {
 	if second.Header().Get("Retry-After") == "" {
 		t.Fatalf("a refused turn carries Retry-After")
 	}
-	if got := settles.Load(); got != 2 {
-		t.Fatalf("both holds must be released at slipgate-core, got %d settle reports", got)
+	if got := evals.Load(); got != evalsAfterFirst {
+		t.Fatalf("the refused turn must not reach slipgate-core, got %d more evaluations", got-evalsAfterFirst)
+	}
+	if got := settles.Load(); got < 1 {
+		t.Fatalf("the admitted turn's hold must be released at slipgate-core, got %d settle reports", got)
 	}
 	stats := coord.UserLimitStats([]string{"usr_cap", "usr_none"})
 	if len(stats) != 2 || stats[0].RPMUsed != 1 || stats[0].InFlight != 0 || stats[1].RPMUsed != 0 {

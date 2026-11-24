@@ -82,7 +82,7 @@ async function bootstrap() {
     return res.body.item;
   };
   const settle = async (ev: Record<string, unknown>) =>
-    call<{ ok: boolean; duplicate: boolean; settlementId: string; item: { id: string; costNanoUsd: string } }>(
+    call<{ ok: boolean; duplicate: boolean; settlementId: string; appliedAtUnixMs: number; item: { id: string; costNanoUsd: string } }>(
       "POST",
       "/api/v1/internal/dataplane/settlement",
       INTERNAL_HEADERS,
@@ -194,6 +194,75 @@ describe("settlement idempotency (F00/F06)", () => {
     expect(new Set(results.map((r) => r.body.item.id)).size).toBe(1);
     expect(await wallet(fay.headers)).toBe(1_000_000_000n - 7_000_000n);
     expect((await usage(fay.headers)).filter((r) => r.requestId === "race")).toHaveLength(1);
+  });
+
+  it("bills a turn whose optional pricing dimensions are malformed instead of rejecting it", async () => {
+    const { register, createKey, settle, wallet, usage } = await bootstrap();
+    const gus = await register("gus@settle.test", "1");
+    const key = await createKey(gus.headers);
+    const before = Date.now();
+    const res = await settle({
+      settlementId: "stl_malformed_01",
+      requestId: "malformed",
+      userId: gus.id,
+      apiKeyId: key.id,
+      costNanoUsd: "3000000",
+      serviceTier: "x".repeat(64),
+      reasoningEffort: "y".repeat(64),
+      window5hUsedBps: 12_000,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.duplicate).toBe(false);
+    // net-go relays this to slipgate-core: snapshots read from then on carry the debit.
+    expect(res.body.appliedAtUnixMs).toBeGreaterThanOrEqual(before);
+    expect(await wallet(gus.headers)).toBe(1_000_000_000n - 3_000_000n);
+    expect((await usage(gus.headers)).filter((r) => r.requestId === "malformed")).toHaveLength(1);
+  });
+
+  it("shows and replays slipgate-net's dead-lettered settlements for administrators only", async () => {
+    const { call, admin, register } = await bootstrap();
+    const seen: { path: string; method: string; token: string | null }[] = [];
+    let parked = 2;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const path = new URL(req.url).pathname;
+        seen.push({ path, method: req.method, token: req.headers.get("X-Slipgate-Internal-Token") });
+        if (path === "/internal/net/dataplane/settlements/dead-letter") return Response.json({ count: parked });
+        if (path === "/internal/net/dataplane/settlements/dead-letter/replay") {
+          const replayed = parked;
+          parked = 0;
+          return Response.json({ replayed });
+        }
+        return Response.json({ error: "not_found" }, { status: 404 });
+      },
+    });
+    const prev = { url: process.env.SLIPGATE_NET_INTERNAL_URL, token: process.env.SLIPGATE_INTERNAL_TOKEN };
+    process.env.SLIPGATE_NET_INTERNAL_URL = `http://127.0.0.1:${server.port}`;
+    process.env.SLIPGATE_INTERNAL_TOKEN = "dead-letter-token";
+    stopNet = () => {
+      for (const [key, value] of [["SLIPGATE_NET_INTERNAL_URL", prev.url], ["SLIPGATE_INTERNAL_TOKEN", prev.token]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      server.stop(true);
+    };
+
+    const deadLetterCalls = () => seen.filter((s) => s.path.includes("/dead-letter"));
+    const member = await register("ida@settle.test");
+    expect((await call("GET", "/api/v1/admin/ops/settlement-dead-letters", member.headers)).status).toBe(403);
+    expect(deadLetterCalls()).toHaveLength(0);
+
+    const listed = await call<{ count: number }>("GET", "/api/v1/admin/ops/settlement-dead-letters", admin);
+    expect(listed.status).toBe(200);
+    expect(listed.body.count).toBe(2);
+    const replay = await call<{ replayed: number }>("POST", "/api/v1/admin/ops/settlement-dead-letters/replay", admin);
+    expect(replay.status).toBe(200);
+    expect(replay.body.replayed).toBe(2);
+    expect((await call<{ count: number }>("GET", "/api/v1/admin/ops/settlement-dead-letters", admin)).body.count).toBe(0);
+    expect(deadLetterCalls().every((s) => s.token === "dead-letter-token")).toBe(true);
+    expect(deadLetterCalls().map((s) => `${s.method} ${s.path}`)).toContain("POST /internal/net/dataplane/settlements/dead-letter/replay");
   });
 
   it("still bills a turn whose upstream account was deleted while it was in flight", async () => {

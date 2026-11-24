@@ -41,6 +41,12 @@ describe("secretProblems", () => {
 
   test("passes strong secrets", () => {
     expect(secretProblems({ SLIPGATE_JWT_SECRET: STRONG, SLIPGATE_VAULT_SECRET: STRONG })).toEqual([]);
+    expect(secretProblems({ SLIPGATE_JWT_SECRET: STRONG, SLIPGATE_VAULT_SECRET: STRONG, SLIPGATE_INTERNAL_TOKEN: STRONG })).toEqual([]);
+  });
+
+  test("holds an operator-chosen internal token to the same bar", () => {
+    const problems = secretProblems({ SLIPGATE_JWT_SECRET: STRONG, SLIPGATE_VAULT_SECRET: STRONG, SLIPGATE_INTERNAL_TOKEN: "changeme" });
+    expect(problems).toEqual(["SLIPGATE_INTERNAL_TOKEN is still the .env.example placeholder"]);
   });
 });
 

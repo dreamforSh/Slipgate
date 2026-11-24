@@ -389,6 +389,10 @@ func newHTTP2AdaptiveTransport(
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			return dialTLS(ctx, network, addr, false)
 		},
+		// Ping a connection that has been silent for ReadIdleTimeout and drop it when the ping goes
+		// unanswered, so a dead exit node fails the streams on it instead of hanging them.
+		ReadIdleTimeout: 30 * time.Second,
+		PingTimeout:     15 * time.Second,
 	}
 	t.h1Transport = &http.Transport{
 		Proxy:               nil,

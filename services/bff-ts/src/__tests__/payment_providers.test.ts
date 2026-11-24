@@ -105,10 +105,16 @@ function easypayGateway(gw: ReturnType<typeof fakeGateway>, base: string, opts: 
   });
 }
 
-async function bootstrap(gw = fakeGateway()) {
+/** `injectFetch: false` wires payments like production (the global fetch behind the SSRF guard). */
+async function bootstrap(gw = fakeGateway(), opts: { injectFetch?: boolean } = {}) {
   const factory = (globalThis as { __slipgateTestStoreFactory?: StoreFactory }).__slipgateTestStoreFactory;
   const store: ControlStore = factory ? await factory() : new MemoryControlStore();
-  const app = createBffApp({ store, jwtSecret: "providers-test-jwt-secret-32-bytes-min", vaultSecret: VAULT, paymentFetch: gw.fetchImpl });
+  const app = createBffApp({
+    store,
+    jwtSecret: "providers-test-jwt-secret-32-bytes-min",
+    vaultSecret: VAULT,
+    paymentFetch: opts.injectFetch === false ? undefined : gw.fetchImpl,
+  });
   const call = async <T>(method: string, path: string, headers: Record<string, string> = JSON_HEADERS, body?: unknown) => {
     const res = await app.request(path, { method, headers, body: typeof body === "string" ? body : body === undefined ? undefined : JSON.stringify(body) });
     const text = await res.text();
@@ -480,8 +486,16 @@ describe("gateway refunds and refund requests", () => {
     expect(await t.balance(referrer.headers)).toBe(rebate - (rebate * 1000n) / 3000n);
     const refAff = await call<{ rebateTotalNanoUsd: string }>("GET", "/api/v1/user/affiliate", referrer.headers);
     expect(refAff.body.rebateTotalNanoUsd).toBe((rebate - (rebate * 1000n) / 3000n).toString());
-    expect((await refund(part.id, { amount: "5" })).status).toBe(409);
-    expect((await refund(part.id, { amount: "31" })).status).toBe(409);
+    // Partial refunds add up: the gateway is asked for this refund only, the order keeps the total.
+    const rebateAfterFirst = rebate - (rebate * 1000n) / 3000n;
+    const r2b = await refund(part.id, { amount: "5" });
+    expect(r2b.status).toBe(200);
+    expect(r2b.body.order).toMatchObject({ status: "partially_refunded", refundAmountMinor: 1500 });
+    expect(t.gw.form(lastCall(t.gw.calls, (cl) => cl.url.includes("act=refund"))!.body)).toMatchObject({ out_trade_no: part.id, money: "5.00" });
+    expect(await t.balance(buyer.headers)).toBe(credit - (credit * 1000n) / 3000n - (credit * 500n) / 3000n);
+    expect(await t.balance(referrer.headers)).toBe(rebateAfterFirst - (rebateAfterFirst * 500n) / 2000n);
+    // More than what is left (15.00) is refused.
+    expect((await refund(part.id, { amount: "16" })).status).toBe(400);
 
     // The gateway refuses: refund_failed, nothing taken back; a retry succeeds.
     const refused = await payOrder();
@@ -565,9 +579,9 @@ describe("gateway refunds and refund requests", () => {
     const dash = await call<{ totals: { refundedOrders: number; paidOrders: number; revenueMinor: number } }>("GET", "/api/v1/admin/payments/dashboard?days=7", admin);
     // refunded: full, refused (retried), spent, req, recorded = 5, partially: part = 1.
     expect(dash.body.totals.refundedOrders).toBe(6);
-    // Still earning: part (¥20 kept), spent2, blocked.
+    // Still earning: part (¥15 kept after ¥10 + ¥5 refunds), spent2, blocked.
     expect(dash.body.totals.paidOrders).toBe(3);
-    expect(dash.body.totals.revenueMinor).toBe(2000 + 3000 + 3000);
+    expect(dash.body.totals.revenueMinor).toBe(1500 + 3000 + 3000);
   });
 
   it("settles pending Stripe refunds by query and refunds subscription days in proportion", async () => {
@@ -909,6 +923,72 @@ describe("official WeChat Pay", () => {
     const cancelled = await call<{ order: PaymentOrderItem }>("POST", `/api/v1/user/orders/${jsapi.order.id}/cancel`, buyer.headers);
     expect(cancelled.body.order.status).toBe("cancelled");
     expect(t.gw.calls.some((cl) => cl.url.endsWith(`/v3/pay/transactions/out-trade-no/${jsapi.order.id}/close`))).toBe(true);
+
+    // REFUND.SUCCESS is applied once per refund: the one for a refund started here (its
+    // out_refund_no) changes nothing, a console refund counts once however often it is delivered.
+    const refundNotify = (o: PaymentOrderItem, outRefundNo: string, refundMinor: number) => {
+      const tx = JSON.stringify({
+        mchid: "1900000001",
+        out_trade_no: o.id,
+        out_refund_no: outRefundNo,
+        refund_id: `50300${outRefundNo}`,
+        refund_status: "SUCCESS",
+        amount: { refund: refundMinor, total: 3000, payer_refund: refundMinor },
+      });
+      const iv = randomBytes(6).toString("hex");
+      const cipher = createCipheriv("aes-256-gcm", Buffer.from(WX_APIV3), Buffer.from(iv));
+      cipher.setAAD(Buffer.from("refund"));
+      const ct = Buffer.concat([cipher.update(tx, "utf8"), cipher.final(), cipher.getAuthTag()]).toString("base64");
+      const text = JSON.stringify({ id: `EV-${outRefundNo}`, event_type: "REFUND.SUCCESS", resource_type: "encrypt-resource", resource: { algorithm: "AEAD_AES_256_GCM", ciphertext: ct, nonce: iv, associated_data: "refund" } });
+      const ts = String(Math.floor(Date.now() / 1000));
+      const nonce = randomBytes(8).toString("hex");
+      return call("POST", "/webhooks/payment/wxpay", {
+        "Content-Type": "application/json",
+        "Wechatpay-Timestamp": ts,
+        "Wechatpay-Nonce": nonce,
+        "Wechatpay-Serial": publicKeyId,
+        "Wechatpay-Signature": rsaSign(`${ts}\n${nonce}\n${text}\n`, WX_PLATFORM.privateKey),
+      }, text);
+    };
+    const credit = (3000n * NANO) / 700n;
+    expect((await notify(h5.order)).status).toBe(204);
+    const part = await refund(h5.order.id, { amount: "10" });
+    expect(part.body.order).toMatchObject({ status: "partially_refunded", refundAmountMinor: 1000 });
+    const afterPart = await t.balance(buyer.headers);
+    expect((await refundNotify(h5.order, `${h5.order.id}R1000`, 1000)).status).toBe(204);
+    expect((await t.getOrder(buyer.headers, h5.order.id)).refundAmountMinor).toBe(1000);
+    expect(await t.balance(buyer.headers)).toBe(afterPart);
+    for (let i = 0; i < 2; i++) expect((await refundNotify(h5.order, "console-refund-1", 500)).status).toBe(204);
+    expect(await t.getOrder(buyer.headers, h5.order.id)).toMatchObject({ status: "partially_refunded", refundAmountMinor: 1500 });
+    expect(await t.balance(buyer.headers)).toBe(afterPart - (credit * 500n) / 3000n);
+  });
+});
+
+describe("payment gateway egress", () => {
+  it("routes gateway calls through the SSRF guard when no fetch is injected", async () => {
+    const hits: string[] = [];
+    const sink = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        hits.push(new URL(req.url).pathname);
+        return json({ code: 1, trade_no: "T1", qrcode: "/qr/x", payurl: "http://127.0.0.1/pay" });
+      },
+    });
+    try {
+      const t = await bootstrap(fakeGateway(), { injectFetch: false });
+      await t.instance({ provider: "easypay", name: "Local", config: { apiUrl: `http://127.0.0.1:${sink.port}`, pid: "5001" }, secrets: { key: "k5001" } });
+      await t.config({ minorPerUsd: 700 });
+      const buyer = await t.register("egress@prov.test");
+      const created = await t.order(buyer.headers, { amount: "30", provider: "easypay", method: "alipay" });
+      // Verifying asks the gateway server-side (api.php): a loopback gateway is never reached.
+      const verified = await t.call<{ status?: string }>("POST", `/api/v1/admin/payments/orders/${created.order.id}/verify`, t.admin);
+      expect(hits).toHaveLength(0);
+      expect((await t.getOrder(buyer.headers, created.order.id)).status).toBe("pending");
+      expect(verified.status).not.toBe(500);
+    } finally {
+      sink.stop(true);
+    }
   });
 });
 

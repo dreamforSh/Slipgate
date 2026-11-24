@@ -13,6 +13,7 @@ pub const FrameType = enum(u8) {
     stream_end = 0x14,
     settle_report = 0x15,
     settle_ack = 0x16,
+    settle_confirm = 0x17,
     exit_health = 0x20,
     sync_state = 0x30,
     sync_ack = 0x31,

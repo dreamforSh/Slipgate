@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { AdminStepUpSchema } from "./step_up.ts";
 
 /*
  * Full database backups to S3-compatible storage (admin only): S3 target, cron schedule with
@@ -53,6 +54,8 @@ export const DEFAULT_BACKUP_S3_CONFIG: BackupS3ConfigView = {
  */
 export const UpdateBackupS3ConfigRequestSchema = BackupS3ConfigSchema.extend({
   secretAccessKey: z.string().max(512).optional(),
+  /** Required to save (not to test): the target receives every future full-database dump. */
+  confirm: AdminStepUpSchema.optional(),
 }).superRefine((v, ctx) => {
   if (v.endpoint && !/^https?:\/\/[^\s/?#]+(?:\/[^\s?#]*)?$/i.test(v.endpoint)) {
     ctx.addIssue({ code: "custom", path: ["endpoint"], message: "Expected an http(s) URL" });
@@ -232,14 +235,7 @@ export const CreateBackupRequestSchema = z.object({
 export type CreateBackupRequest = z.infer<typeof CreateBackupRequestSchema>;
 
 /** Re-authentication for download and restore: the admin's password, plus the 2FA code when 2FA is on. */
-export const BackupStepUpRequestSchema = z.object({
-  password: z.string().min(1).max(256),
-  totpCode: z
-    .string()
-    .trim()
-    .regex(/^\d{6}$/, "Enter the 6-digit code")
-    .optional(),
-});
+export const BackupStepUpRequestSchema = AdminStepUpSchema;
 export type BackupStepUpRequest = z.infer<typeof BackupStepUpRequestSchema>;
 
 export const BackupDownloadRequestSchema = BackupStepUpRequestSchema;

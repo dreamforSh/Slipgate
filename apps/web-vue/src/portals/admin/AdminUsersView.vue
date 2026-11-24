@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import {
   USER_USAGE_TOTAL_WINDOW_DAYS,
+  type AdminStepUp,
   type AdminUserItem,
   type AdminUserListResponse,
   type AdminUserLiveStatsResponse,
@@ -14,6 +15,7 @@ import {
   type UserRole,
   type UserStatus,
 } from "@slipgate/contracts";
+import AdminStepUpModal from "../../components/admin/AdminStepUpModal.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
 import PageHeader from "../../components/ui/PageHeader.vue";
 import StatCard from "../../components/ui/StatCard.vue";
@@ -362,23 +364,42 @@ function setBusy(id: string, busy: boolean) {
   busyIds.value = next;
 }
 
+/* Changes that could take an account over ask for the admin's password (and code) first. */
+const stepUpOpen = ref(false);
+const stepUpTitle = ref("");
+let stepUpAction: (confirm: AdminStepUp) => Promise<void> = async () => undefined;
+function askStepUp(title: string, action: (confirm: AdminStepUp) => Promise<void>) {
+  stepUpTitle.value = title;
+  stepUpAction = action;
+  stepUpOpen.value = true;
+}
+function runStepUp(confirm: AdminStepUp) {
+  return stepUpAction(confirm);
+}
+
+async function applyStatus(u: AdminUserItem, status: UserStatus, confirm?: AdminStepUp) {
+  await apiJson(`/api/v1/admin/users/${encodeURIComponent(u.id)}`, {
+    method: "PATCH",
+    body: confirm ? { status, confirm } : { status },
+    fallbackError: t("adminUsers.errors.status"),
+  });
+  notice.value =
+    status === "active" ? t("adminUsers.notice.activated", { email: u.email }) : t("adminUsers.notice.suspended", { email: u.email });
+  await load();
+}
+
 async function toggleStatus(u: AdminUserItem) {
   if (u.id === selfId.value) return;
   const status: UserStatus = u.status === "active" ? "suspended" : "active";
   errorMessage.value = null;
   notice.value = null;
+  if (u.role === "admin") {
+    askStepUp(t("security.stepUp.titles.adminStatus"), (confirm) => applyStatus(u, status, confirm));
+    return;
+  }
   setBusy(u.id, true);
   try {
-    await apiJson(`/api/v1/admin/users/${encodeURIComponent(u.id)}`, {
-      method: "PATCH",
-      body: { status },
-      fallbackError: t("adminUsers.errors.status"),
-    });
-    notice.value =
-      status === "active"
-        ? t("adminUsers.notice.activated", { email: u.email })
-        : t("adminUsers.notice.suspended", { email: u.email });
-    await load();
+    await applyStatus(u, status);
   } catch (err) {
     errorMessage.value = errorText(err, t("adminUsers.errors.status"));
   } finally {
@@ -405,24 +426,20 @@ async function deleteUser(u: AdminUserItem) {
   }
 }
 
-async function resetTotp(u: AdminUserItem) {
+function resetTotp(u: AdminUserItem) {
   if (!u.totpEnabled) return;
   errorMessage.value = null;
   notice.value = null;
-  setBusy(u.id, true);
-  try {
+  askStepUp(t("security.stepUp.titles.totpReset"), async (confirm) => {
     await apiJson(`/api/v1/admin/users/${encodeURIComponent(u.id)}/totp/reset`, {
       method: "POST",
+      body: { confirm },
       fallbackError: t("adminUsers.errors.totpReset"),
     });
     notice.value = t("adminUsers.notice.totpReset", { email: u.email });
     if (u.id === selfId.value && auth.user) auth.user.totpEnabled = false;
     await load();
-  } catch (err) {
-    errorMessage.value = errorText(err, t("adminUsers.errors.totpReset"));
-  } finally {
-    setBusy(u.id, false);
-  }
+  });
 }
 
 function viewUsage(u: AdminUserItem) {
@@ -971,6 +988,7 @@ onMounted(() => {
     <ReplaceGroupModal v-model:open="replaceOpen" :user="replaceUser" :groups="allGroups" @done="onReplaced" />
     <BulkUserLimitsModal v-model:open="bulkLimitsOpen" :user-ids="[...selected]" :total-users="stats?.total ?? total" @done="onBulkLimits" />
     <BulkDeleteUsersModal v-model:open="bulkDeleteOpen" :users="selectedUsers" :self-id="selfId" @done="onBulkDeleted" />
+    <AdminStepUpModal v-model:open="stepUpOpen" :title="stepUpTitle" :action="runStepUp" />
   </div>
 </template>
 

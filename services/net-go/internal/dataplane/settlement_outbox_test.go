@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -409,6 +410,126 @@ func TestSettlementOutboxSkipsTornSpoolFiles(t *testing.T) {
 	}
 }
 
+func spooledSettlements(t *testing.T, dir string) []string {
+	t.Helper()
+	var names []string
+	for _, name := range spoolFiles(t, dir) {
+		if strings.HasSuffix(name, ".json") {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func TestSettlementOutboxParksRejectedSettlementsForReplay(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	var accepted atomic.Bool
+	var calls atomic.Int32
+	o := fastOutbox(func(context.Context, []byte) (int, error) {
+		calls.Add(1)
+		if accepted.Load() {
+			return http.StatusOK, nil
+		}
+		return http.StatusBadRequest, nil
+	}, dir)
+	id := newSettlementID()
+	body := []byte(`{"settlementId":"` + id + `","costNanoUsd":"42"}`)
+	<-o.deliver(id, body)
+	if calls.Load() != 1 || o.pendingCount() != 0 || o.deadLetterCount() != 1 {
+		t.Fatalf("a rejected settlement must be parked, not retried: calls=%d pending=%d parked=%d", calls.Load(), o.pendingCount(), o.deadLetterCount())
+	}
+	if names := spooledSettlements(t, dir); len(names) != 0 {
+		t.Fatalf("a parked settlement must leave the retry spool: %v", names)
+	}
+	parked, err := os.ReadFile(filepath.Join(dir, settlementDeadLetterDir, id+".json"))
+	if err != nil || !bytes.Equal(parked, body) {
+		t.Fatalf("parked body differs from the original: %v %s", err, parked)
+	}
+
+	// After the cause is fixed, a replay delivers the identical body and empties the dead letters.
+	accepted.Store(true)
+	if n, err := o.replayDeadLetters(); err != nil || n != 1 {
+		t.Fatalf("replay = %d, %v", n, err)
+	}
+	waitFor(t, "replayed delivery", func() bool { return o.delivered.Load() == 1 })
+	waitFor(t, "spool emptied", func() bool { return o.deadLetterCount() == 0 && len(spooledSettlements(t, dir)) == 0 })
+}
+
+func TestSettlementOutboxParksAgedOutSettlements(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	o := fastOutbox(func(context.Context, []byte) (int, error) { return 0, errors.New("down") }, dir)
+	o.maxAge = 60 * time.Millisecond
+	id := newSettlementID()
+	<-o.deliver(id, []byte(`{"settlementId":"`+id+`"}`))
+	waitFor(t, "age-out", func() bool { return o.pendingCount() == 0 })
+	if o.deadLetterCount() != 1 || o.deadLettered.Load() != 1 {
+		t.Fatalf("an aged-out settlement must be parked, parked=%d", o.deadLetterCount())
+	}
+
+	// A spooled settlement found at start that is already too old is parked, not re-queued.
+	stale := newSettlementID()
+	path := filepath.Join(dir, stale+".json")
+	if err := os.WriteFile(path, []byte(`{"settlementId":"`+stale+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if n := o.loadSpool(); n != 0 {
+		t.Fatalf("a stale spooled settlement must not be re-queued, loaded %d", n)
+	}
+	if o.deadLetterCount() != 2 || len(spooledSettlements(t, dir)) != 0 {
+		t.Fatalf("expected both settlements parked, parked=%d spooled=%v", o.deadLetterCount(), spooledSettlements(t, dir))
+	}
+}
+
+func TestSettlementOutboxReplayNeedsASpool(t *testing.T) {
+	t.Parallel()
+	o := fastOutbox(func(context.Context, []byte) (int, error) { return http.StatusBadRequest, nil }, "")
+	<-o.deliver(newSettlementID(), []byte(`{}`))
+	if o.dropped.Load() != 1 || o.deadLetterCount() != 0 {
+		t.Fatalf("without a spool a rejected settlement cannot be parked: dropped=%d", o.dropped.Load())
+	}
+	if _, err := o.replayDeadLetters(); !errors.Is(err, errSettlementSpoolOff) {
+		t.Fatalf("expected errSettlementSpoolOff, got %v", err)
+	}
+}
+
+func TestSettlementStatusCodeStaysInTheHTTPRange(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[int]int{0: 502, 99: 502, 100: 100, 200: 200, 429: 429, 599: 599, 600: 502, 999: 502} {
+		if got := settlementStatusCode(in); got != want {
+			t.Fatalf("settlementStatusCode(%d) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+// The service tier is billed on and recorded with the settlement; a caller-chosen string (which the
+// BFF used to reject, dropping the whole settlement) must not survive parsing on any protocol.
+func TestIngressServiceTierIsNormalizedOnEveryProtocol(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("x", 64)
+	cases := map[string]string{
+		"/v1/chat/completions": `{"model":"m","messages":[{"role":"user","content":"hi"}],"service_tier":%q}`,
+		"/v1/responses":        `{"model":"m","input":"hi","service_tier":%q}`,
+		"/v1/messages":         `{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"service_tier":%q}`,
+	}
+	for path, tmpl := range cases {
+		for tier, want := range map[string]string{long: "", "Priority ": "priority", "flex": "flex", "standard_only": "standard_only"} {
+			turn, err := ParseIngressRequest(path, "", []byte(fmt.Sprintf(tmpl, tier)))
+			if err != nil {
+				t.Fatalf("%s: %v", path, err)
+			}
+			if turn.ServiceTier != want {
+				t.Fatalf("%s: service_tier %q parsed as %q, want %q", path, tier, turn.ServiceTier, want)
+			}
+		}
+	}
+}
+
 func TestSettlementSpoolDirResolution(t *testing.T) {
 	t.Setenv(SettlementSpoolDirEnv, "")
 	if got := ResolveSettlementSpoolDir("/var/run/slipgate/hotupdate/settlement-spool"); got != "/var/run/slipgate/hotupdate/settlement-spool" {
@@ -513,6 +634,7 @@ func TestSettlementUsesServerMintedIDAndFlagsUnsettledTurns(t *testing.T) {
 	enc, _ := coord.Vault().EncryptHex("mock://ok")
 	if _, err := coord.SyncSnapshot(context.Background(), SyncSnapshot{
 		Accounts: []SyncAccountInput{{ID: "acc_mock", GroupID: "grp_default", Platform: "anthropic", ExecutionMode: "direct_api", CredentialsEncHex: enc, MaxConcurrency: 4, Status: "active"}},
+		APIKeys:  testSnapshotKeys,
 	}); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
@@ -574,6 +696,7 @@ func TestSettlementReportsCoreSettledWhenTheCoreAcks(t *testing.T) {
 	enc, _ := coord.Vault().EncryptHex("mock://ok")
 	_, _ = coord.SyncSnapshot(context.Background(), SyncSnapshot{
 		Accounts: []SyncAccountInput{{ID: "acc_mock", GroupID: "grp_default", Platform: "anthropic", ExecutionMode: "direct_api", CredentialsEncHex: enc, MaxConcurrency: 4, Status: "active"}},
+		APIKeys:  testSnapshotKeys,
 	})
 	edge := httptest.NewServer(http.HandlerFunc(coord.HandleHTTP))
 	defer edge.Close()

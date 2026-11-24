@@ -63,6 +63,19 @@ export default {
       tooMany: "尝试次数过多，请稍后再试",
       required: "请输入 6 位验证码",
     },
+    stepUp: {
+      titles: {
+        createAdmin: "确认创建管理员",
+        accountChange: "确认修改账号",
+        totpReset: "确认重置两步验证",
+        adminStatus: "确认修改管理员状态",
+        backupTarget: "确认备份存储位置",
+      },
+      intro: "这项操作可能让他人接管站点或数据。请输入你的登录密码{totp}以确认是你本人操作。",
+      introTotp: "和两步验证码",
+      confirm: "确认并继续",
+      working: "正在提交…",
+    },
     ops: {
       liveStates: {
         live: "实时",

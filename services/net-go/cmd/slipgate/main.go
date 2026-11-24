@@ -166,7 +166,7 @@ func main() {
 	sup.SetLineHook(logFwd.ChildLineHook("core", "bff"))
 	logFwd.SetTarget(cfg.BFFAddr, cfg.InternalToken)
 	go logFwd.Run(rootCtx)
-	internalURL := config.LoopbackOrigin(cfg.ListenAddr)
+	internalURL := config.InternalOrigin(cfg.InternalListenAddr)
 
 	if cfg.Supervise {
 		specs := []supervisor.ChildSpec{
@@ -229,6 +229,7 @@ func main() {
 		AccessLogEnabled: logFwd.AccessLogsEnabled,
 		// On the persistent volume by default, so undelivered settlements survive a restart or redeploy.
 		SettlementSpoolDir: dataplane.ResolveSettlementSpoolDir(filepath.Join(cfg.HotUpdateDir, "settlement-spool")),
+		UpstreamTimeouts:   dataplane.UpstreamTimeouts{Header: cfg.UpstreamHeaderTimeout, Idle: cfg.UpstreamIdleTimeout},
 	})
 	sup.SetRestartHook(func(child string) {
 		if child != "core" {
@@ -266,8 +267,15 @@ func main() {
 	edge.WithHotUpdater(updater)
 	updater.StartAutoSync(rootCtx)
 
-	httpSrv := ingress.NewHTTPServer(cfg.ListenAddr, edge.Handler())
-	errCh := make(chan error, 1)
+	httpSrv := ingress.NewHTTPServer(cfg.ListenAddr, edge.PublicHandler())
+	internalSrv := ingress.NewHTTPServer(cfg.InternalListenAddr, edge.Handler())
+	errCh := make(chan error, 2)
+	go func() {
+		logger.Printf("[net] internal listener (slipgate-bff callbacks) on %s", cfg.InternalListenAddr)
+		if serveErr := internalSrv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("internal listener: %w", serveErr)
+		}
+	}()
 	go func() {
 		logger.Printf(
 			"[net] Slipgate unified edge listening on %s (mode=%s version=%s commit=%s core=%s bff=%s)",
@@ -292,6 +300,9 @@ func main() {
 		defer cancel()
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 			logger.Printf("[net] http shutdown error: %v", err)
+		}
+		if err := internalSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Printf("[net] internal listener shutdown error: %v", err)
 		}
 	case serveErr := <-errCh:
 		if serveErr != nil {
