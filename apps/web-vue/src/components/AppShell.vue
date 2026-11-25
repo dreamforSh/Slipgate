@@ -406,7 +406,7 @@ async function handleLogout() {
                 <Transition name="collapse">
                   <div v-if="!rail && isGroupExpanded(item)">
                     <ul class="ml-[1.35rem] space-y-0.5 border-l border-line/80 py-1 pl-2">
-                      <li v-for="(child, ci) in item.children" :key="child.to" class="nav-child" :style="{ '--i': ci }">
+                      <li v-for="(child, ci) in item.children" :key="child.to" class="nav-child" :style="{ animationDelay: `${ci * 35 + 40}ms` }">
                         <RouterLink
                           :to="child.to"
                           class="nav-link nav-link-child"
@@ -717,10 +717,9 @@ async function handleLogout() {
 .nav-link-rail:hover > svg {
   transform: scale(1.12);
 }
-/* Children of a group cascade in as it expands. */
+/* Children of a group cascade in as it expands (per-item delay is an inline style). */
 .collapse-enter-active .nav-child {
   animation: nav-child-in 320ms var(--ease-out) backwards;
-  animation-delay: calc(var(--i, 0) * 35ms + 40ms);
 }
 @keyframes nav-child-in {
   from {
