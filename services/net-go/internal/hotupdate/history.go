@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
 )
 
@@ -19,6 +20,7 @@ type persistedConfig struct {
 	AutoSyncEnabled        bool   `json:"autoSyncEnabled"`
 	IntervalSeconds        int    `json:"intervalSeconds"`
 	AutoRestartAfterUpdate *bool  `json:"autoRestartAfterUpdate,omitempty"`
+	DrainTimeoutSeconds    int    `json:"drainTimeoutSeconds,omitempty"`
 	Strategy               string `json:"strategy"`
 }
 
@@ -85,8 +87,16 @@ func (m *Manager) loadPersistedState() {
 			if pc.AutoRestartAfterUpdate != nil {
 				m.status.AutoRestartAfterUpdate = *pc.AutoRestartAfterUpdate
 			}
+			if pc.DrainTimeoutSeconds >= config.MinDrainTimeoutSec && pc.DrainTimeoutSeconds <= config.MaxDrainTimeoutSec {
+				m.status.DrainTimeoutSeconds = pc.DrainTimeoutSeconds
+			}
 		}
 	}
+
+	if marker, ok := LoadRestartMarker(m.cfg.HotUpdateDir); ok {
+		m.bootMarker = marker
+	}
+	m.status.LastRestart = loadLastRestart(m.cfg.HotUpdateDir)
 
 	histPath := filepath.Join(m.cfg.HotUpdateDir, "history.json")
 	if raw, err := os.ReadFile(histPath); err == nil {
@@ -97,7 +107,14 @@ func (m *Manager) loadPersistedState() {
 		}
 	}
 
-	if active, ok := LoadActiveRelease(m.cfg.HotUpdateDir); ok {
+	active, hasActive := LoadActiveRelease(m.cfg.HotUpdateDir)
+	if hasActive && strings.TrimSpace(active.InstallExe) != "" {
+		m.installExe = active.InstallExe
+	} else if !hasActive {
+		// No hot-update release is active, so this process is the installed binary.
+		m.installExe = m.currentExePath()
+	}
+	if hasActive {
 		validBundle := bundleDirExists(active.BundleDir)
 		if validBundle || active.Version != "" || active.Commit != "" {
 			if strings.TrimSpace(active.Version) != "" {
@@ -148,6 +165,7 @@ func (m *Manager) savePersistedConfigLocked() error {
 		AutoSyncEnabled:        m.status.AutoSyncEnabled,
 		IntervalSeconds:        m.status.IntervalSeconds,
 		AutoRestartAfterUpdate: &autoRestart,
+		DrainTimeoutSeconds:    m.status.DrainTimeoutSeconds,
 		Strategy:               m.cfg.DevSyncMode,
 	}
 	return writeJSONAtomic(filepath.Join(m.cfg.HotUpdateDir, "config.json"), payload)
@@ -191,6 +209,7 @@ func (m *Manager) UpdateConfig(patch ConfigPatch) (StatusSnapshot, error) {
 	nextAutoSync := m.status.AutoSyncEnabled
 	nextInterval := m.status.IntervalSeconds
 	nextAutoRestart := m.status.AutoRestartAfterUpdate
+	nextDrain := m.status.DrainTimeoutSeconds
 	nextStrategy := m.cfg.DevSyncMode
 
 	if patch.Channel != nil {
@@ -215,6 +234,15 @@ func (m *Manager) UpdateConfig(patch ConfigPatch) (StatusSnapshot, error) {
 	if patch.AutoRestartAfterUpdate != nil {
 		nextAutoRestart = *patch.AutoRestartAfterUpdate
 	}
+	if patch.DrainTimeoutSeconds != nil {
+		sec := *patch.DrainTimeoutSeconds
+		if sec < config.MinDrainTimeoutSec || sec > config.MaxDrainTimeoutSec {
+			m.mu.Unlock()
+			return m.Status(), fmt.Errorf("%w: drainTimeoutSeconds must be between %d and %d",
+				ErrInvalidUpdateConfig, config.MinDrainTimeoutSec, config.MaxDrainTimeoutSec)
+		}
+		nextDrain = sec
+	}
 	if patch.Strategy != nil {
 		st := strings.ToLower(strings.TrimSpace(*patch.Strategy))
 		if st != "auto" && st != "release" && st != "git" {
@@ -233,6 +261,8 @@ func (m *Manager) UpdateConfig(patch ConfigPatch) (StatusSnapshot, error) {
 	m.status.AutoSyncEnabled = nextAutoSync
 	m.status.IntervalSeconds = nextInterval
 	m.status.AutoRestartAfterUpdate = nextAutoRestart
+	m.status.DrainTimeoutSeconds = nextDrain
+	m.cfg.DrainTimeoutSec = nextDrain
 	m.cfg.DevSyncIntervalSec = nextInterval
 	m.cfg.DevSyncMode = nextStrategy
 	m.cfg.AutoRestartAfterUpdate = nextAutoRestart
@@ -296,6 +326,8 @@ func (m *Manager) captureBaselineLocked() {
 }
 
 func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleRequest) (bool, error) {
+	prevActive, _ := LoadActiveRelease(m.cfg.HotUpdateDir)
+
 	m.mu.Lock()
 	m.captureBaselineLocked()
 	prevSnap := rollbackPlaneSnapshot{
@@ -306,6 +338,8 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 		prevSnap.PrevBFFBin, prevSnap.HasBFF = m.sup.ChildBinary("bff")
 	}
 	autoRestartEnabled := m.status.AutoRestartAfterUpdate
+	plan := m.rollbackPlanLocked(prevActive)
+	installExe := m.installExeLocked(prevActive)
 	m.mu.Unlock()
 
 	ext := exeExt()
@@ -314,25 +348,20 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	edgeBin := filepath.Join(req.BundleRoot, "slipgate"+ext)
 	guestdBin := filepath.Join(req.BundleRoot, "slipgate-guestd"+ext)
 
+	// The new edge stays inside its (persistent) bundle directory and is started through the
+	// active.json handoff; the installed binary is never overwritten, so the previous release
+	// and the baseline remain bootable for rollback.
 	edgeStaged := false
 	var edgeStagedPtr *string
-	var restartTarget string
+	newEdge := ""
 	if info, err := os.Stat(edgeBin); err == nil && !info.IsDir() {
-		_ = os.Chmod(edgeBin, 0o755)
-		if m.onEdgeRestart != nil || m.validateEdgeBin != nil {
-			stagedPath, valErr := prepareAndStageEdgeBinary(ctx, m.currentExePath(), edgeBin, m.validateEdgeBin)
-			if valErr != nil {
-				return false, valErr
-			}
-			edgeStaged = true
-			p := stagedPath
-			edgeStagedPtr = &p
-			restartTarget = stagedPath
-		} else {
-			edgeStaged = true
-			p := edgeBin
-			edgeStagedPtr = &p
+		if err := validateStagedEdgeBinary(ctx, edgeBin, m.validateEdgeBin); err != nil {
+			return false, err
 		}
+		edgeStaged = true
+		p := edgeBin
+		edgeStagedPtr = &p
+		newEdge = edgeBin
 	}
 
 	webDir := filepath.Join(req.BundleRoot, "webui")
@@ -362,14 +391,18 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	}
 
 	activeCoreBin := prevSnap.PrevCoreBin
+	coreChanged := false
 	if info, err := os.Stat(coreBin); err == nil && !info.IsDir() {
 		_ = os.Chmod(coreBin, 0o755)
 		activeCoreBin = coreBin
+		coreChanged = true
 	}
 	activeBFFBin := prevSnap.PrevBFFBin
+	bffChanged := false
 	if info, err := os.Stat(bffBin); err == nil && !info.IsDir() {
 		_ = os.Chmod(bffBin, 0o755)
 		activeBFFBin = bffBin
+		bffChanged = true
 	}
 	activeWebDir := prevSnap.PrevWebUIDir
 	if webOverridden {
@@ -381,15 +414,27 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	if guestdUpdated {
 		activeGuestd = stagedGuestdPath
 	}
+	// A bundle without an edge binary keeps whichever edge the previous release ran.
+	activeEdge := newEdge
+	if activeEdge == "" && prevActive != nil {
+		activeEdge = prevActive.EdgeBin
+	}
+	// BaseVersion/BaseCommit describe the installed binary (not the hot-updated edge running
+	// now), so carry them forward: main compares them to detect an external upgrade.
+	baseVersion, baseCommit := m.baseVersion, m.baseCommit
+	if prevActive != nil && strings.TrimSpace(prevActive.BaseCommit) != "" {
+		baseVersion, baseCommit = prevActive.BaseVersion, prevActive.BaseCommit
+	}
 
 	if err := saveActiveRelease(m.cfg.HotUpdateDir, &ActiveRelease{
 		Version:     req.NewVersion,
 		Commit:      req.NewCommit,
 		Tag:         req.Tag,
-		BaseVersion: m.baseVersion,
-		BaseCommit:  m.baseCommit,
+		BaseVersion: baseVersion,
+		BaseCommit:  baseCommit,
+		InstallExe:  installExe,
 		BundleDir:   req.BundleRoot,
-		EdgeBin:     restartTarget,
+		EdgeBin:     activeEdge,
 		CoreBin:     activeCoreBin,
 		BFFBin:      activeBFFBin,
 		GuestdBin:   activeGuestd,
@@ -399,18 +444,36 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 		return false, fmt.Errorf("persist active release: %w", err)
 	}
 
-	willAutoRestartEdge := m.onEdgeRestart != nil && autoRestartEnabled && restartTarget != ""
+	// Any changed binary means a full-service restart (edge re-exec + every supervised plane)
+	// when automatic restarts are on; a web-UI-only bundle is swapped live.
+	binariesChanged := newEdge != "" || coreChanged || bffChanged || guestdUpdated
+	fullRestart := m.onEdgeRestart != nil && autoRestartEnabled && binariesChanged
+	restartTarget := newEdge
+	if restartTarget == "" {
+		restartTarget = m.currentExePath()
+	}
+	restart := restartRequest{
+		Target:      restartTarget,
+		Async:       req.AsyncRestart,
+		Reason:      restartReasonFor(req.Action),
+		FromVersion: req.FromVersion,
+		FromCommit:  req.FromCommit,
+		ToVersion:   req.NewVersion,
+		ToCommit:    req.NewCommit,
+		Rollback:    plan,
+	}
+
 	reloaded := false
-	if willAutoRestartEdge {
+	if fullRestart {
 		reloaded = true
 	} else if m.sup != nil {
 		updatedChild := false
-		if activeCoreBin != "" && activeCoreBin == coreBin {
+		if coreChanged {
 			if err := m.sup.UpdateChildBinary("core", coreBin); err == nil {
 				updatedChild = true
 			}
 		}
-		if activeBFFBin != "" && activeBFFBin == bffBin {
+		if bffChanged {
 			if err := m.sup.UpdateChildBinary("bff", bffBin); err == nil {
 				updatedChild = true
 			}
@@ -474,10 +537,13 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	if reloaded || webOverridden {
 		m.status.ReloadCount++
 	}
-	if willAutoRestartEdge {
+	if fullRestart {
 		m.status.RestartScheduled = true
 		m.status.State = StateRestarting
 		m.status.LastError = nil
+	} else if edgeStaged {
+		pending := restart
+		m.pendingRestart = &pending
 	}
 	m.activeBundleDir = req.BundleRoot
 	m.activeTag = req.Tag
@@ -487,8 +553,8 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	_ = m.savePersistedHistoryLocked()
 	m.mu.Unlock()
 
-	if willAutoRestartEdge {
-		m.triggerEdgeRestart(restartTarget, req.AsyncRestart)
+	if fullRestart {
+		m.triggerEdgeRestart(restart)
 	}
 
 	return true, nil
@@ -606,28 +672,41 @@ func (m *Manager) restoreBaseline(
 	fromCommit string,
 	channel string,
 ) error {
+	prevActive, _ := LoadActiveRelease(m.cfg.HotUpdateDir)
+
 	m.mu.RLock()
 	autoRestartEnabled := m.status.AutoRestartAfterUpdate
+	plan := m.rollbackPlanLocked(prevActive)
+	installExe := m.installExeLocked(prevActive)
 	m.mu.RUnlock()
 
+	// Prefer the installed binary itself (its siblings are the baseline planes); fall back to the
+	// copy captured before the first update.
 	var (
 		edgeStaged    bool
 		edgeStagedPtr *string
 		restartTarget string
 	)
-	if base.EdgeBin != "" {
-		if info, err := os.Stat(base.EdgeBin); err == nil && !info.IsDir() {
-			if m.onEdgeRestart != nil || m.validateEdgeBin != nil {
-				stagedPath, valErr := prepareAndStageEdgeBinary(ctx, m.currentExePath(), base.EdgeBin, m.validateEdgeBin)
-				if valErr != nil {
-					return valErr
-				}
+	for _, candidate := range []string{installExe, base.EdgeBin} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if info, err := os.Stat(candidate); err != nil || info.IsDir() {
+			continue
+		}
+		if m.onEdgeRestart != nil || m.validateEdgeBin != nil {
+			if err := validateStagedEdgeBinary(ctx, candidate, m.validateEdgeBin); err != nil {
+				return err
+			}
+			restartTarget = candidate
+			if !SameExecutablePath(candidate, m.currentExePath()) {
 				edgeStaged = true
-				p := stagedPath
+				p := candidate
 				edgeStagedPtr = &p
-				restartTarget = stagedPath
 			}
 		}
+		break
 	}
 
 	if err := ClearActiveRelease(m.cfg.HotUpdateDir); err != nil {
@@ -641,9 +720,19 @@ func (m *Manager) restoreBaseline(
 		m.onGuestdBin(base.GuestdBin)
 	}
 
-	willAutoRestartEdge := m.onEdgeRestart != nil && autoRestartEnabled && restartTarget != ""
+	fullRestart := m.onEdgeRestart != nil && autoRestartEnabled && restartTarget != ""
+	restart := restartRequest{
+		Target:      restartTarget,
+		Async:       asyncRestart,
+		Reason:      RestartReasonRollback,
+		FromVersion: fromVersion,
+		FromCommit:  fromCommit,
+		ToVersion:   base.Version,
+		ToCommit:    base.Commit,
+		Rollback:    plan,
+	}
 	reloaded := false
-	if willAutoRestartEdge {
+	if fullRestart {
 		reloaded = true
 	} else if m.sup != nil {
 		updated := false
@@ -699,10 +788,13 @@ func (m *Manager) restoreBaseline(
 	if reloaded {
 		m.status.ReloadCount++
 	}
-	if willAutoRestartEdge {
+	if fullRestart {
 		m.status.RestartScheduled = true
 		m.status.State = StateRestarting
 		m.status.LastError = nil
+	} else if edgeStaged {
+		pending := restart
+		m.pendingRestart = &pending
 	}
 	m.appendHistoryLocked(buildHistoryEntry(applyBundleRequest{
 		NewCommit:   base.Commit,
@@ -717,14 +809,16 @@ func (m *Manager) restoreBaseline(
 	_ = m.savePersistedHistoryLocked()
 	m.mu.Unlock()
 
-	if willAutoRestartEdge {
-		m.triggerEdgeRestart(restartTarget, asyncRestart)
+	if fullRestart {
+		m.triggerEdgeRestart(restart)
 	}
 	return nil
 }
 
 // TriggerRestart validates any staged edge binary (or the current executable) and schedules a
-// graceful edge drain and self-restart so updated or rolled-back edge binaries take effect immediately.
+// graceful full-service restart: drain in-flight requests, stop every plane, re-exec the edge.
+// A restart that activates a staged update keeps that update's rollback plan, so the boot guard
+// can still undo it if the new version never becomes healthy.
 func (m *Manager) TriggerRestart(ctx context.Context, async bool) (StatusSnapshot, error) {
 	if m.onEdgeRestart == nil {
 		return m.Status(), ErrRestartUnavailable
@@ -739,6 +833,11 @@ func (m *Manager) TriggerRestart(ctx context.Context, async bool) (StatusSnapsho
 	stagedPath := ""
 	if m.status.EdgeBinaryPath != nil {
 		stagedPath = strings.TrimSpace(*m.status.EdgeBinaryPath)
+	}
+	var pending *restartRequest
+	if m.pendingRestart != nil {
+		cp := *m.pendingRestart
+		pending = &cp
 	}
 	m.mu.RUnlock()
 
@@ -758,15 +857,14 @@ func (m *Manager) TriggerRestart(ctx context.Context, async bool) (StatusSnapsho
 		}
 	}
 
-	m.mu.Lock()
-	m.status.RestartScheduled = true
-	m.status.State = StateRestarting
-	m.status.LastError = nil
-	snap := m.snapshotLocked()
-	m.mu.Unlock()
-
-	m.triggerEdgeRestart(target, async)
-	return snap, nil
+	req := restartRequest{Target: target, Async: async, Reason: RestartReasonManual}
+	if pending != nil {
+		req = *pending
+		req.Target = target
+		req.Async = async
+	}
+	m.triggerEdgeRestart(req)
+	return m.Status(), nil
 }
 
 type rollbackTarget struct {
@@ -913,6 +1011,16 @@ func (m *Manager) snapshotLocked() StatusSnapshot {
 		out.Progress = &p
 	}
 	out.EdgeBinaryPath = cloneStrPtr(m.status.EdgeBinaryPath)
+	if m.status.RestartProgress != nil {
+		prog := *m.status.RestartProgress
+		prog.DrainDeadlineIso = cloneStrPtr(m.status.RestartProgress.DrainDeadlineIso)
+		out.RestartProgress = &prog
+	}
+	if m.status.LastRestart != nil {
+		last := *m.status.LastRestart
+		last.Message = cloneStrPtr(m.status.LastRestart.Message)
+		out.LastRestart = &last
+	}
 	out.LastCheckedAtIso = cloneStrPtr(m.status.LastCheckedAtIso)
 	out.LastUpdatedAtIso = cloneStrPtr(m.status.LastUpdatedAtIso)
 	out.LastError = cloneStrPtr(m.status.LastError)

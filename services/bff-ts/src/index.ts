@@ -81,7 +81,13 @@ const server = Bun.serve({
 
 console.log(`slipgate-bff ${VERSION} listening on http://${server.hostname}:${server.port}`);
 
+let shuttingDown = false;
 const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // Let requests already in flight finish (the edge has drained public traffic before it stops
+  // this process), then cut whatever is still open so the supervisor's grace period is honoured.
+  await Promise.race([server.stop(false), Bun.sleep(5_000)]).catch(() => undefined);
   server.stop(true);
   stopAuditRetentionSweepers();
   stopAlertServices();

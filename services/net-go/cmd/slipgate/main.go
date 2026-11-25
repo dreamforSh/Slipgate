@@ -6,12 +6,15 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -19,8 +22,10 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/config"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dataplane"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/ingress"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/lifecycle"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/netguard"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/stealth"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
@@ -38,10 +43,16 @@ func main() {
 	standalone := flag.Bool("standalone", false, "run slipgate-net without spawning child processes")
 	allowDegraded := flag.Bool("allow-degraded", false, "continue running even if core or bff binaries are unavailable")
 	devMode := flag.Bool("dev", false, "enable dev mode with repo-synced hot updates")
+	showCapabilities := flag.Bool("capabilities", false, "print graceful-restart capabilities and exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("slipgate %s (%s)\n", version, commit)
+		return
+	}
+	if *showCapabilities {
+		// A restarting edge asks its successor this before passing listening sockets to it.
+		fmt.Println(lifecycle.HandoffCapability)
 		return
 	}
 
@@ -73,6 +84,11 @@ func main() {
 		logger.Printf("[security] WARNING: running with weak secrets because SLIPGATE_ALLOW_INSECURE_SECRETS=true: %s. "+
 			"Never expose this instance.", summary)
 	}
+
+	// Boot guard: a cold boot (crash restart by Docker/systemd, not an exec handoff) while a
+	// restart is still unconfirmed counts against the new release; after repeated failures
+	// active.json is restored to the previous release before the handoff below reads it.
+	hotupdate.PrepareBoot(cfg.HotUpdateDir, os.Getenv("SLIPGATE_REEXEC_GUARD") == "", logger)
 
 	if active, ok := hotupdate.LoadActiveRelease(cfg.HotUpdateDir); ok {
 		baseMismatch := active.BaseCommit != "" &&
@@ -123,15 +139,97 @@ func main() {
 		}
 	}
 	_ = os.Unsetenv("SLIPGATE_REEXEC_GUARD")
+	// Listening sockets passed by the previous process (taken after the handoff above, which
+	// forwards them untouched to the active release's edge).
+	inherited := lifecycle.TakeInherited()
 
-	restartTarget, err := run(cfg, logFwd, logger)
+	res, err := run(cfg, logFwd, logger, inherited)
 	if err != nil {
 		logger.Fatalf("%v", err)
 	}
-	if restartTarget != "" {
-		logger.Printf("[hotupdate] executing edge restart -> %s", restartTarget)
-		if execErr := execSelf(restartTarget); execErr != nil {
-			logger.Fatalf("[hotupdate] edge restart failed (%s): %v", restartTarget, execErr)
+	if res.target != "" {
+		var extraEnv []string
+		if env := res.handoff.Env(); env != "" {
+			extraEnv = append(extraEnv, env)
+		}
+		logger.Printf("[hotupdate] executing edge restart -> %s (listener handoff: %v)", res.target, len(extraEnv) > 0)
+		if execErr := execSelf(res.target, extraEnv...); execErr != nil {
+			res.handoff.Close()
+			logger.Fatalf("[hotupdate] edge restart failed (%s): %v", res.target, execErr)
+		}
+	}
+}
+
+// restartResult is what run hands back to main when the edge should re-exec.
+type restartResult struct {
+	target  string
+	handoff *lifecycle.Handoff
+}
+
+// drainExempt lists public requests still served while draining: the liveness probe and the
+// admin status poll that renders restart progress.
+func drainExempt(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	switch r.URL.Path {
+	case "/healthz", "/api/v1/admin/system/update":
+		return true
+	}
+	return false
+}
+
+// edgeSupportsHandoff asks a restart target whether it understands inherited listeners; older
+// releases would fail to bind ports the inherited sockets still hold.
+func edgeSupportsHandoff(target string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, target, "-capabilities").Output()
+	return err == nil && strings.Contains(string(out), lifecycle.HandoffCapability)
+}
+
+// waitPlanesReady polls until slipgate-core answers, slipgate-bff is healthy and the DataPlane
+// holds a ControlPlane snapshot, or ctx ends.
+func waitPlanesReady(ctx context.Context, cfg config.Config, dp *dataplane.Coordinator) bool {
+	if !cfg.Supervise {
+		return true
+	}
+	bffOrigin := strings.TrimSpace(cfg.BFFAddr)
+	if !strings.HasPrefix(bffOrigin, "http://") && !strings.HasPrefix(bffOrigin, "https://") {
+		bffOrigin = "http://" + bffOrigin
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	probe := func() bool {
+		pingCtx, cancel := context.WithTimeout(ctx, time.Second)
+		coreOK := dpbridge.PingAuth(pingCtx, cfg.CoreIPC, cfg.InternalToken) == nil
+		cancel()
+		if !coreOK {
+			return false
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, bffOrigin+"/api/v1/health", nil)
+		if err != nil {
+			return false
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return false
+		}
+		return dp == nil || dp.SnapshotApplied()
+	}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if probe() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
 		}
 	}
 }
@@ -147,9 +245,37 @@ func withEnv(base []string, key, val string) []string {
 	return append(out, prefix+val)
 }
 
-func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (string, error) {
+func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inherited lifecycle.Inherited) (restartResult, error) {
 	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+
+	// Bind (or adopt) both listeners first: after a graceful restart the kernel has been queueing
+	// connections on the inherited sockets, and they are served once the planes are ready.
+	publicLn, publicInherited, err := inherited.Listen("public", cfg.ListenAddr)
+	if err != nil {
+		inherited.CloseUnused()
+		return restartResult{}, fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
+	}
+	internalLn, _, err := inherited.Listen("internal", cfg.InternalListenAddr)
+	if err != nil {
+		_ = publicLn.Close()
+		inherited.CloseUnused()
+		return restartResult{}, fmt.Errorf("internal listen on %s: %w", cfg.InternalListenAddr, err)
+	}
+	inherited.CloseUnused()
+	var publicServing, internalServing bool
+	defer func() {
+		// Listeners never handed to Serve are not closed by Shutdown.
+		if !publicServing {
+			_ = publicLn.Close()
+		}
+		if !internalServing {
+			_ = internalLn.Close()
+		}
+	}()
+	if publicInherited {
+		logger.Printf("[lifecycle] adopted listening sockets from the previous process; queued connections are served once the planes are ready")
+	}
 
 	pool := clashpool.NewManager(cfg.ClashPortMin, cfg.ClashPortMax, cfg.MaxAccountsPerExit)
 
@@ -163,7 +289,7 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 		})
 		if openErr != nil {
 			if !cfg.AllowDegraded {
-				return "", fmt.Errorf("failed to start embedded mihomo core: %w", openErr)
+				return restartResult{}, fmt.Errorf("failed to start embedded mihomo core: %w", openErr)
 			}
 			logger.Printf("[clash] embedded mihomo degraded (continuing): %v", openErr)
 		} else {
@@ -180,7 +306,7 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 	if cfg.DatabaseURL != "" {
 		pgStore, pgErr := clashpool.NewPostgresNetStore(cfg.DatabaseURL, cfg.VaultSecret)
 		if pgErr != nil {
-			return "", fmt.Errorf("failed to initialize net postgres store: %w", pgErr)
+			return restartResult{}, fmt.Errorf("failed to initialize net postgres store: %w", pgErr)
 		}
 		netStore = pgStore
 	} else {
@@ -202,7 +328,7 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 	})
 	if err := clashCoord.Bootstrap(rootCtx); err != nil {
 		if !cfg.AllowDegraded {
-			return "", fmt.Errorf("failed to bootstrap Clash/uTLS pool: %w", err)
+			return restartResult{}, fmt.Errorf("failed to bootstrap Clash/uTLS pool: %w", err)
 		}
 		logger.Printf("[clash] bootstrap degraded (continuing): %v", err)
 	}
@@ -213,7 +339,7 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 	if cfg.DatabaseURL != "" {
 		pgVmStore, pgErr := vmslot.NewPostgresVmStore(cfg.DatabaseURL, cfg.VaultSecret)
 		if pgErr != nil {
-			return "", fmt.Errorf("failed to initialize vm postgres store: %w", pgErr)
+			return restartResult{}, fmt.Errorf("failed to initialize vm postgres store: %w", pgErr)
 		}
 		vmStore = pgVmStore
 	} else {
@@ -231,7 +357,7 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 	})
 	if err := vmCoord.Bootstrap(rootCtx); err != nil {
 		if !cfg.AllowDegraded {
-			return "", fmt.Errorf("failed to bootstrap VM fleet coordinator: %w", err)
+			return restartResult{}, fmt.Errorf("failed to bootstrap VM fleet coordinator: %w", err)
 		}
 		logger.Printf("[vmslot] bootstrap degraded (continuing): %v", err)
 	}
@@ -280,7 +406,7 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 		childCtx, cancelChildren := context.WithCancel(context.Background())
 		defer cancelChildren()
 		if err := sup.StartAll(childCtx, specs); err != nil {
-			return "", fmt.Errorf("failed to start supervised planes: %w", err)
+			return restartResult{}, fmt.Errorf("failed to start supervised planes: %w", err)
 		}
 		defer func() {
 			if err := sup.Stop(10 * time.Second); err != nil {
@@ -319,7 +445,7 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 
 	edge, err := ingress.NewServer(cfg, version, pool, sup)
 	if err != nil {
-		return "", fmt.Errorf("failed to initialize edge ingress: %w", err)
+		return restartResult{}, fmt.Errorf("failed to initialize edge ingress: %w", err)
 	}
 	edge.WithCommit(commit)
 	edge.WithClashCoordinator(clashCoord)
@@ -355,15 +481,46 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 	edge.WithHotUpdater(updater)
 	updater.StartAutoSync(rootCtx)
 
-	httpSrv := ingress.NewHTTPServer(cfg.ListenAddr, edge.PublicHandler())
+	drainer := lifecycle.NewDrainer(drainExempt)
+	edge.WithDrainer(drainer)
+	httpSrv := ingress.NewHTTPServer(cfg.ListenAddr, drainer.Middleware(edge.PublicHandler()))
 	internalSrv := ingress.NewHTTPServer(cfg.InternalListenAddr, edge.Handler())
 	errCh := make(chan error, 2)
+
+	// The internal listener serves at once: slipgate-bff pushes its first snapshot through it,
+	// which is part of what the readiness gate below waits for.
+	internalServing = true
 	go func() {
 		logger.Printf("[net] internal listener (slipgate-bff callbacks) on %s", cfg.InternalListenAddr)
-		if serveErr := internalSrv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		if serveErr := internalSrv.Serve(internalLn); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("internal listener: %w", serveErr)
 		}
 	}()
+
+	// After a graceful restart, hold the queued public connections until the planes are ready
+	// (bounded), so clients see a short delay instead of 502/503 while core and BFF boot.
+	bootStarted := time.Now()
+	pendingBoot := updater.HasPendingBoot()
+	planesReady := !cfg.Supervise
+	if (pendingBoot || publicInherited) && cfg.Supervise && cfg.StartupReadyTimeoutSec > 0 {
+		readyCtx, cancelReady := context.WithTimeout(rootCtx, time.Duration(cfg.StartupReadyTimeoutSec)*time.Second)
+		planesReady = waitPlanesReady(readyCtx, cfg, dpCoord)
+		cancelReady()
+		if planesReady {
+			logger.Printf("[lifecycle] planes ready after %s; serving public traffic", time.Since(bootStarted).Round(time.Millisecond))
+		} else if rootCtx.Err() == nil {
+			logger.Printf("[lifecycle] planes not ready after %ds; serving public traffic degraded", cfg.StartupReadyTimeoutSec)
+		}
+	}
+
+	// A restart whose planes are already ready is confirmed before public traffic flows, so the
+	// first status a reconnecting console sees already carries the restart outcome.
+	if pendingBoot && planesReady && rootCtx.Err() == nil {
+		updater.CompleteBoot(rootCtx, true)
+		pendingBoot = false
+	}
+
+	publicServing = true
 	go func() {
 		logger.Printf(
 			"[net] Slipgate unified edge listening on %s (mode=%s version=%s commit=%s core=%s bff=%s)",
@@ -374,29 +531,111 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 			cfg.CoreIPC,
 			cfg.BFFAddr,
 		)
-		if serveErr := httpSrv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		if serveErr := httpSrv.Serve(publicLn); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			errCh <- serveErr
 			return
 		}
 		errCh <- nil
 	}()
 
+	// Settle the restart that led to this boot: a release that never becomes healthy within
+	// RestartHealthTimeoutSec is rolled back by the update manager.
+	if pendingBoot {
+		go func() {
+			remaining := time.Duration(cfg.RestartHealthTimeoutSec)*time.Second - time.Since(bootStarted)
+			healthCtx, cancelHealth := context.WithTimeout(rootCtx, max(remaining, time.Second))
+			ready := waitPlanesReady(healthCtx, cfg, dpCoord)
+			cancelHealth()
+			if rootCtx.Err() != nil {
+				return // shutting down: leave the marker for the next boot to settle
+			}
+			updater.CompleteBoot(rootCtx, ready)
+		}()
+	}
+
 	select {
 	case <-rootCtx.Done():
-		logger.Printf("[net] shutdown signal received, draining connections...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-			logger.Printf("[net] http shutdown error: %v", err)
-		}
-		if err := internalSrv.Shutdown(shutdownCtx); err != nil {
-			logger.Printf("[net] internal listener shutdown error: %v", err)
-		}
 	case serveErr := <-errCh:
 		if serveErr != nil {
-			return "", fmt.Errorf("[net] http server stopped unexpectedly: %w", serveErr)
+			return restartResult{}, fmt.Errorf("[net] http server stopped unexpectedly: %w", serveErr)
 		}
 	}
+
+	restartMu.Lock()
+	target := restartTarget
+	restartMu.Unlock()
+
+	// Drain: new public requests get 503 + Retry-After while in-flight ones (streams included)
+	// finish, bounded by the drain timeout. A second stop signal cuts the wait short.
+	drainTimeout := updater.DrainTimeout()
+	if target != "" {
+		logger.Printf("[lifecycle] graceful restart: draining public traffic (up to %s, %d in flight)", drainTimeout, drainer.Inflight())
+	} else {
+		logger.Printf("[net] shutdown signal received, draining in-flight requests (up to %s)...", drainTimeout)
+	}
+	drainDeadline := time.Now().Add(drainTimeout)
+	drainer.BeginDrain(drainTimeout)
+	drainCtx, cancelDrain := context.WithDeadline(context.Background(), drainDeadline)
+	stopCh := make(chan os.Signal, 1)
+	signal.Notify(stopCh, os.Interrupt, syscall.SIGTERM)
+	var stopRequested atomic.Bool
+	go func() {
+		select {
+		case <-stopCh:
+			stopRequested.Store(true)
+			logger.Printf("[lifecycle] stop signal received while draining; cutting the drain short")
+			cancelDrain()
+		case <-drainCtx.Done():
+		}
+	}()
+	remaining := drainer.Wait(drainCtx, func(inflight int) {
+		if target != "" {
+			updater.SetRestartProgress(hotupdate.RestartPhaseDraining, inflight, drainDeadline)
+		}
+	})
+	cancelDrain()
+	signal.Stop(stopCh)
+	if remaining > 0 {
+		logger.Printf("[lifecycle] drain ended with %d request(s) still in flight; closing them", remaining)
+	}
+	if target != "" && stopRequested.Load() {
+		logger.Printf("[lifecycle] restart to %s aborted by a stop signal; exiting instead", target)
+		target = ""
+	}
+
+	// Keep the listening sockets alive across exec so the successor adopts them; connections
+	// arriving in between wait in the kernel backlog instead of being refused.
+	var handoff *lifecycle.Handoff
+	if target != "" && lifecycle.HandoffSupported() {
+		if edgeSupportsHandoff(target) {
+			h, handoffErr := lifecycle.PrepareHandoff(map[string]net.Listener{"public": publicLn, "internal": internalLn})
+			if handoffErr != nil {
+				logger.Printf("[lifecycle] listener handoff unavailable (%v); restarting with fresh sockets", handoffErr)
+			} else {
+				handoff = h
+			}
+		} else {
+			logger.Printf("[lifecycle] %s predates listener handoff; restarting with fresh sockets", target)
+		}
+	}
+	if target != "" {
+		updater.SetRestartProgress(hotupdate.RestartPhaseStopping, remaining, time.Time{})
+	}
+
+	shutdownGrace := 5 * time.Second
+	if remaining > 0 {
+		shutdownGrace = 2 * time.Second
+	}
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownGrace)
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Printf("[net] http shutdown: %v; closing remaining connections", err)
+		_ = httpSrv.Close()
+	}
+	if err := internalSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Printf("[net] internal listener shutdown: %v; closing remaining connections", err)
+		_ = internalSrv.Close()
+	}
+	cancelShutdown()
 
 	// No more turns: hand the last settlements to the BFF before the deferred sup.Stop stops it.
 	// Anything still undelivered is in the settlement spool for the next start.
@@ -405,8 +644,5 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger) (st
 	dpCoord.FlushRequestErrors(flushCtx)
 	cancelFlush()
 
-	restartMu.Lock()
-	target := restartTarget
-	restartMu.Unlock()
-	return target, nil
+	return restartResult{target: target, handoff: handoff}, nil
 }

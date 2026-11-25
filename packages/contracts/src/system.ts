@@ -77,6 +77,36 @@ export const SystemUpdatePreviousReleaseSchema = z.object({
 });
 export type SystemUpdatePreviousRelease = z.infer<typeof SystemUpdatePreviousReleaseSchema>;
 
+export const SystemRestartReasonSchema = z.enum(["update", "rollback", "manual", "auto_rollback"]);
+export type SystemRestartReason = z.infer<typeof SystemRestartReasonSchema>;
+
+/** Live state of a full-service restart the running edge is carrying out. */
+export const SystemRestartProgressSchema = z.object({
+  phase: z.enum(["scheduled", "draining", "stopping"]),
+  reason: SystemRestartReasonSchema,
+  inflight: z.number().int().nonnegative().default(0),
+  startedAtIso: z.string(),
+  drainDeadlineIso: z.string().nullable().default(null),
+});
+export type SystemRestartProgress = z.infer<typeof SystemRestartProgressSchema>;
+
+/** Outcome of the most recent full-service restart, confirmed by the boot that followed it. */
+export const SystemLastRestartSchema = z.object({
+  id: z.string(),
+  reason: SystemRestartReasonSchema,
+  outcome: z.enum(["succeeded", "degraded", "rolled_back"]),
+  fromVersion: z.string(),
+  toVersion: z.string(),
+  fromCommit: z.string(),
+  toCommit: z.string(),
+  requestedAtIso: z.string(),
+  completedAtIso: z.string(),
+  durationMs: z.number().int().nonnegative(),
+  coldBoots: z.number().int().nonnegative().default(0),
+  message: z.string().nullable().default(null),
+});
+export type SystemLastRestart = z.infer<typeof SystemLastRestartSchema>;
+
 export const SystemReleaseItemSchema = z.object({
   tag: z.string(),
   name: z.string(),
@@ -127,7 +157,16 @@ export const SystemUpdateStatusSchema = z.object({
   autoSyncEnabled: z.boolean(),
   intervalSeconds: z.number().int().nonnegative(),
   autoRestartAfterUpdate: z.boolean().default(true),
+  /** Seconds a restart lets in-flight requests finish while new ones get 503 + Retry-After. */
+  drainTimeoutSeconds: z.number().int().nonnegative().default(30),
   restartScheduled: z.boolean().default(false),
+  restartProgress: SystemRestartProgressSchema.nullable().default(null),
+  lastRestart: SystemLastRestartSchema.nullable().default(null),
+  /**
+   * Whether apply / rollback / restart need a password or passkey re-confirmation. Set by the
+   * BFF from the deployment mode: dev-mode instances skip it.
+   */
+  stepUpRequired: z.boolean().default(true),
   bootId: z.string().default(""),
   state: SystemUpdateStateSchema,
   progress: SystemUpdateProgressSchema.nullable().default(null),
@@ -162,6 +201,7 @@ export const UpdateSystemConfigRequestSchema = z.object({
   autoSyncEnabled: z.boolean().optional(),
   intervalSeconds: z.number().int().min(30).max(86400).optional(),
   autoRestartAfterUpdate: z.boolean().optional(),
+  drainTimeoutSeconds: z.number().int().min(5).max(600).optional(),
   strategy: DevSyncStrategySchema.optional(),
 });
 export type UpdateSystemConfigRequest = z.infer<typeof UpdateSystemConfigRequestSchema>;

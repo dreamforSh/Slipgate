@@ -30,12 +30,14 @@ const form = reactive<{
   autoSyncEnabled: boolean;
   intervalSeconds: number;
   autoRestartAfterUpdate: boolean;
+  drainTimeoutSeconds: number;
   strategy: DevSyncStrategy;
 }>({
   channel: "stable",
   autoSyncEnabled: false,
   intervalSeconds: 3600,
   autoRestartAfterUpdate: true,
+  drainTimeoutSeconds: 30,
   strategy: "auto",
 });
 
@@ -47,10 +49,13 @@ watch(
     form.autoSyncEnabled = next.autoSyncEnabled;
     form.intervalSeconds = next.intervalSeconds > 0 ? next.intervalSeconds : 3600;
     form.autoRestartAfterUpdate = next.autoRestartAfterUpdate ?? true;
+    form.drainTimeoutSeconds = next.drainTimeoutSeconds > 0 ? next.drainTimeoutSeconds : 30;
     form.strategy = next.strategy;
   },
   { immediate: true },
 );
+
+const drainPresets = [15, 30, 60, 120];
 
 const strategyOptions = computed(() => [
   { value: "auto" as const, label: t("updates.strategies.auto") },
@@ -69,11 +74,14 @@ const intervalPresets = computed(() => [
 function submit() {
   const clamped = Math.min(86400, Math.max(30, Math.round(form.intervalSeconds || 300)));
   form.intervalSeconds = clamped;
+  const drain = Math.min(600, Math.max(5, Math.round(form.drainTimeoutSeconds || 30)));
+  form.drainTimeoutSeconds = drain;
   emit("save", {
     channel: form.channel,
     autoSyncEnabled: form.autoSyncEnabled,
     intervalSeconds: clamped,
     autoRestartAfterUpdate: form.autoRestartAfterUpdate,
+    drainTimeoutSeconds: drain,
     strategy: form.strategy,
   });
 }
@@ -162,13 +170,44 @@ function submit() {
         </FormField>
       </div>
 
-      <!-- Auto-restart after update toggle -->
-      <div class="flex items-center justify-between gap-4 rounded-xl border border-line bg-surface-2/40 p-4">
-        <div class="space-y-1">
-          <span class="text-xs font-semibold text-fg">{{ t("updates.policy.autoRestartLabel") }}</span>
-          <p class="text-xs leading-relaxed text-fg-muted">{{ t("updates.policy.autoRestartHint") }}</p>
+      <!-- Graceful full-service restart: auto-restart toggle & drain window -->
+      <div class="space-y-4 rounded-xl border border-line bg-surface-2/40 p-4">
+        <div class="flex items-center justify-between gap-4">
+          <div class="space-y-1">
+            <span class="text-xs font-semibold text-fg">{{ t("updates.policy.autoRestartLabel") }}</span>
+            <p class="text-xs leading-relaxed text-fg-muted">{{ t("updates.policy.autoRestartHint") }}</p>
+          </div>
+          <UiSwitch v-model="form.autoRestartAfterUpdate" :disabled="saving" />
         </div>
-        <UiSwitch v-model="form.autoRestartAfterUpdate" :disabled="saving" />
+
+        <div class="space-y-2 border-t border-line pt-4">
+          <span class="text-xs font-semibold text-fg">{{ t("updates.policy.drainLabel") }}</span>
+          <div class="flex flex-wrap items-center gap-2">
+            <input
+              v-model.number="form.drainTimeoutSeconds"
+              type="number"
+              min="5"
+              max="600"
+              class="input w-28 font-mono"
+              :disabled="saving"
+            />
+            <span class="text-xs text-fg-subtle">{{ t("updates.policy.intervalUnit") }}</span>
+            <div class="flex flex-wrap gap-1.5">
+              <button
+                v-for="sec in drainPresets"
+                :key="sec"
+                type="button"
+                class="btn btn-xs"
+                :class="form.drainTimeoutSeconds === sec ? 'btn-primary' : 'btn-secondary'"
+                :disabled="saving"
+                @click="form.drainTimeoutSeconds = sec"
+              >
+                {{ t("updates.policy.drainPreset", { seconds: sec }) }}
+              </button>
+            </div>
+          </div>
+          <p class="text-xs leading-relaxed text-fg-muted">{{ t("updates.policy.drainHint") }}</p>
+        </div>
       </div>
 
       <!-- Repository & credentials read-only diagnostics -->

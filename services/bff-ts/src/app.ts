@@ -252,6 +252,8 @@ function buildStandaloneSystemUpdateStatus() {
   const intervalRaw = Number(process.env.SLIPGATE_DEV_SYNC_INTERVAL_SEC ?? "60");
   const intervalSeconds =
     Number.isFinite(intervalRaw) && intervalRaw >= 0 ? Math.floor(intervalRaw) : 60;
+  const drainRaw = Number(process.env.SLIPGATE_DRAIN_TIMEOUT_SEC ?? "30");
+  const drainTimeoutSeconds = Number.isInteger(drainRaw) && drainRaw >= 5 && drainRaw <= 600 ? drainRaw : 30;
 
   return SystemUpdateStatusSchema.parse({
     mode,
@@ -268,6 +270,7 @@ function buildStandaloneSystemUpdateStatus() {
     autoSyncEnabled: mode === "dev" && intervalSeconds > 0,
     intervalSeconds,
     autoRestartAfterUpdate: process.env.SLIPGATE_AUTO_RESTART_AFTER_UPDATE !== "false",
+    drainTimeoutSeconds,
     restartScheduled: false,
     bootId: "",
     state: "idle",

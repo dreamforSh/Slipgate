@@ -6,7 +6,7 @@ import CopyButton from "../../ui/CopyButton.vue";
 import UiAlert from "../../ui/UiAlert.vue";
 import UiBadge from "../../ui/UiBadge.vue";
 import UiIcon from "../../ui/UiIcon.vue";
-import { formatBytes, formatDateTime, formatRelative, shortHash } from "../../../lib/format";
+import { formatBytes, formatDateTime, formatDurationMs, formatRelative, shortHash } from "../../../lib/format";
 
 const props = defineProps<{
   status: SystemUpdateStatus | null;
@@ -14,6 +14,8 @@ const props = defineProps<{
   applying: boolean;
   rollingBack: boolean;
   restarting?: boolean;
+  restartStage?: "scheduled" | "draining" | "stopping" | "starting" | null;
+  stepUpRequired?: boolean;
   busy: boolean;
   error: string | null;
 }>();
@@ -27,7 +29,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 
-const PIPELINE_STEPS = ["checking", "downloading", "applying", "reloading_planes", "restarting", "done"] as const;
+const PIPELINE_STEPS = ["checking", "downloading", "applying", "reloading_planes", "done"] as const;
 
 const activeStepIndex = computed(() => {
   const s = props.status?.state;
@@ -37,8 +39,15 @@ const activeStepIndex = computed(() => {
   return idx >= 0 ? idx : 0;
 });
 
+const showRestartBanner = computed(
+  () => Boolean(props.restarting) || Boolean(props.status?.restartScheduled) || props.status?.state === "restarting",
+);
+
+// Once a restart is under way its own banner takes over from the update pipeline.
 const showPipeline = computed(
-  () => props.busy || Boolean(props.restarting) || (props.status?.progress !== null && props.status?.progress !== undefined),
+  () =>
+    !showRestartBanner.value &&
+    (props.busy || (props.status?.progress !== null && props.status?.progress !== undefined)),
 );
 
 const progressPercent = computed(() => Math.round(props.status?.progress?.percent ?? 0));
@@ -51,6 +60,35 @@ const progressLabel = computed(() => {
     downloaded: formatBytes(p.downloadedBytes),
     total: p.totalBytes > 0 ? formatBytes(p.totalBytes) : "—",
   });
+});
+
+// Graceful restart, as the console sees it: the old process drains and stops, the new one boots
+// and passes its readiness check before serving.
+const RESTART_STEPS = ["draining", "stopping", "starting", "done"] as const;
+
+const restartStepIndex = computed(() => {
+  const stage = props.restartStage ?? props.status?.restartProgress?.phase ?? "scheduled";
+  if (stage === "scheduled") return 0;
+  const idx = RESTART_STEPS.indexOf(stage as (typeof RESTART_STEPS)[number]);
+  return idx >= 0 ? idx : 0;
+});
+
+const drainDetail = computed(() => {
+  const prog = props.status?.restartProgress;
+  if (!prog || prog.phase !== "draining") return "";
+  return t("updates.hero.restartDrainDetail", {
+    count: prog.inflight,
+    deadline: prog.drainDeadlineIso ? formatDateTime(prog.drainDeadlineIso) : "—",
+  });
+});
+
+const lastRestart = computed(() => props.status?.lastRestart ?? null);
+
+const lastRestartTone = computed(() => {
+  const outcome = lastRestart.value?.outcome;
+  if (outcome === "rolled_back") return "danger" as const;
+  if (outcome === "degraded") return "warning" as const;
+  return "success" as const;
 });
 
 const dockerRestartCmd = "docker compose restart slipgate";
@@ -148,11 +186,42 @@ const stateTone = computed(() => {
                 {{ status?.lastUpdatedAtIso ? formatDateTime(status.lastUpdatedAtIso) : t("updates.hero.neverUpdated") }}
               </span>
             </div>
+
+            <!-- Last full-service restart, as confirmed by the boot that followed it -->
+            <div v-if="lastRestart" class="flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-fg-subtle">
+              <UiIcon name="refresh" :size="12" />
+              <span>{{ t("updates.hero.lastRestart") }}:</span>
+              <span class="text-fg-muted">{{ t(`updates.hero.restartReasons.${lastRestart.reason}`) }}</span>
+              <span class="font-mono text-fg-muted">
+                {{ lastRestart.fromVersion }}
+                <template v-if="lastRestart.toVersion !== lastRestart.fromVersion"> → {{ lastRestart.toVersion }}</template>
+              </span>
+              <span>· {{ t("updates.hero.restartTook", { duration: formatDurationMs(lastRestart.durationMs) }) }}</span>
+              <span>· {{ formatRelative(lastRestart.completedAtIso) }}</span>
+              <UiBadge :tone="lastRestartTone" dot>{{ t(`updates.hero.restartOutcomes.${lastRestart.outcome}`) }}</UiBadge>
+            </div>
+            <p v-if="lastRestart?.message && lastRestart.outcome !== 'succeeded'" class="text-2xs text-fg-muted">
+              {{ lastRestart.message }}
+            </p>
           </div>
         </div>
 
         <!-- Right: primary actions -->
         <div class="flex shrink-0 flex-wrap items-center gap-2">
+          <!-- Staged edge binaries get their own restart button in the banner below. -->
+          <button
+            v-if="status && !status.standalone && !status.edgeBinaryStaged"
+            type="button"
+            class="btn btn-secondary"
+            :disabled="busy || restarting"
+            :title="t('updates.hero.restartServicesHint')"
+            @click="emit('restart')"
+          >
+            <UiIcon :name="restarting ? 'loader' : 'zap'" :size="15" :spin="Boolean(restarting)" />
+            {{ restarting ? t("updates.hero.restartingBtn") : t("updates.hero.restartServices") }}
+            <UiIcon v-if="stepUpRequired && !restarting" name="shield" :size="13" class="opacity-80" />
+          </button>
+
           <button type="button" class="btn btn-secondary" :disabled="busy" @click="emit('check')">
             <UiIcon :name="checking ? 'loader' : 'refresh'" :size="15" :spin="checking" />
             {{ checking ? t("updates.hero.checking") : t("updates.hero.checkNow") }}
@@ -167,6 +236,7 @@ const stateTone = computed(() => {
           >
             <UiIcon :name="rollingBack ? 'loader' : 'rotate-ccw'" :size="15" :spin="rollingBack" />
             {{ t("updates.hero.rollbackPrev", { version: status.previousRelease.version }) }}
+            <UiIcon v-if="stepUpRequired && !rollingBack" name="shield" :size="13" class="opacity-80" />
           </button>
 
           <button
@@ -177,18 +247,25 @@ const stateTone = computed(() => {
           >
             <UiIcon :name="applying ? 'loader' : 'download'" :size="15" :spin="applying" />
             {{ applying ? t("updates.hero.updating") : t("updates.hero.updateNow") }}
-            <UiIcon v-if="status?.mode !== 'dev' && !applying" name="shield" :size="13" class="opacity-80" />
+            <UiIcon v-if="stepUpRequired && !applying" name="shield" :size="13" class="opacity-80" />
           </button>
         </div>
       </div>
 
-      <!-- Release step-up hint when applicable -->
+      <!-- Step-up policy hint -->
       <p
-        v-if="status?.updateAvailable && status.mode !== 'dev' && !status.standalone"
+        v-if="status && !status.standalone && stepUpRequired && status.updateAvailable"
         class="mt-3 flex items-center gap-1.5 text-2xs text-fg-subtle"
       >
         <UiIcon name="lock" :size="12" />
         {{ t("updates.hero.stepUpHint") }}
+      </p>
+      <p
+        v-else-if="status && !status.standalone && !stepUpRequired"
+        class="mt-3 flex items-center gap-1.5 text-2xs text-fg-subtle"
+      >
+        <UiIcon name="unlock" :size="12" />
+        {{ t("updates.hero.devNoStepUpHint") }}
       </p>
 
       <!-- Live pipeline stepper + progress bar -->
@@ -232,13 +309,36 @@ const stateTone = computed(() => {
         </div>
       </div>
 
-      <!-- Live automatic restart notice banner -->
-      <UiAlert v-if="restarting || status?.restartScheduled || status?.state === 'restarting'" tone="info" class="mt-4">
+      <!-- Live graceful restart banner -->
+      <UiAlert v-if="showRestartBanner" tone="info" class="mt-4">
         <div class="flex items-start gap-2.5">
           <UiIcon name="loader" :size="16" spin class="mt-0.5 text-accent" />
-          <div class="space-y-1">
-            <p class="font-semibold text-fg">{{ t("updates.hero.restartingTitle") }}</p>
-            <p class="text-xs leading-relaxed text-fg-muted">{{ t("updates.hero.restartingDesc") }}</p>
+          <div class="min-w-0 flex-1 space-y-2.5">
+            <div class="space-y-1">
+              <p class="font-semibold text-fg">{{ t("updates.hero.restartingTitle") }}</p>
+              <p class="text-xs leading-relaxed text-fg-muted">{{ t("updates.hero.restartingDesc") }}</p>
+            </div>
+            <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <div v-for="(step, idx) in RESTART_STEPS" :key="step" class="flex flex-col gap-1.5">
+                <div
+                  class="h-1.5 w-full rounded-full transition-colors duration-300"
+                  :class="
+                    idx < restartStepIndex
+                      ? 'bg-success'
+                      : idx === restartStepIndex
+                        ? 'bg-accent animate-pulse'
+                        : 'bg-surface-3'
+                  "
+                />
+                <span
+                  class="truncate text-2xs font-medium"
+                  :class="idx === restartStepIndex ? 'text-accent' : idx < restartStepIndex ? 'text-success' : 'text-fg-subtle'"
+                >
+                  {{ t(`updates.hero.restartSteps.${step}`) }}
+                </span>
+              </div>
+            </div>
+            <p v-if="drainDetail" class="font-mono text-2xs text-fg-muted">{{ drainDetail }}</p>
           </div>
         </div>
       </UiAlert>
@@ -260,7 +360,7 @@ const stateTone = computed(() => {
             >
               <UiIcon :name="restarting ? 'loader' : 'refresh'" :size="14" :spin="Boolean(restarting)" />
               {{ restarting ? t("updates.hero.restartingBtn") : t("updates.hero.restartNow") }}
-              <UiIcon v-if="status?.mode !== 'dev' && !restarting" name="shield" :size="12" class="opacity-80" />
+              <UiIcon v-if="stepUpRequired && !restarting" name="shield" :size="12" class="opacity-80" />
             </button>
             <div class="inline-flex items-center gap-1 rounded-lg border border-line bg-surface px-2.5 py-1 font-mono text-xs text-fg">
               <span>{{ dockerRestartCmd }}</span>

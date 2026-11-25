@@ -464,11 +464,11 @@ func TestStableChannelApplyCatalogHistoryAndRollback(t *testing.T) {
 	makeBundle := func(tag, version, commit, uiMarker string) (string, []byte, string) {
 		asset := PlatformAssetName(tag)
 		bytes := buildMockArchive(t, asset, map[string][]byte{
-			"slipgate-" + tag + "/webui/index.html":        []byte("<html>" + uiMarker + "</html>"),
-			"slipgate-" + tag + "/slipgate-core" + ext:     exeBytes,
-			"slipgate-" + tag + "/slipgate-bff" + ext:      exeBytes,
-			"slipgate-" + tag + "/slipgate-guestd" + ext:   []byte("guestd-" + version),
-			"slipgate-" + tag + "/slipgate" + ext:          []byte("edge-" + version),
+			"slipgate-" + tag + "/webui/index.html":      []byte("<html>" + uiMarker + "</html>"),
+			"slipgate-" + tag + "/slipgate-core" + ext:   exeBytes,
+			"slipgate-" + tag + "/slipgate-bff" + ext:    exeBytes,
+			"slipgate-" + tag + "/slipgate-guestd" + ext: []byte("guestd-" + version),
+			"slipgate-" + tag + "/slipgate" + ext:        []byte("edge-" + version),
 		})
 		sum := sha256.Sum256(bytes)
 		return asset, bytes, hex.EncodeToString(sum[:])
@@ -637,22 +637,34 @@ func TestUpdateConfigPersistenceAndValidation(t *testing.T) {
 	if _, err := mgr.UpdateConfig(ConfigPatch{IntervalSeconds: &badInt}); !errors.Is(err, ErrInvalidUpdateConfig) {
 		t.Fatalf("expected ErrInvalidUpdateConfig for interval=10, got %v", err)
 	}
+	if got := mgr.Status().DrainTimeoutSeconds; got != config.DefaultDrainTimeoutSec {
+		t.Fatalf("expected default drain timeout %d, got %d", config.DefaultDrainTimeoutSec, got)
+	}
+	badDrain := 1
+	if _, err := mgr.UpdateConfig(ConfigPatch{DrainTimeoutSeconds: &badDrain}); !errors.Is(err, ErrInvalidUpdateConfig) {
+		t.Fatalf("expected ErrInvalidUpdateConfig for drainTimeoutSeconds=1, got %v", err)
+	}
 
 	ch := ChannelDev
 	auto := true
 	interval := 180
 	strat := "release"
+	drain := 90
 	st, err := mgr.UpdateConfig(ConfigPatch{
-		Channel:         &ch,
-		AutoSyncEnabled: &auto,
-		IntervalSeconds: &interval,
-		Strategy:        &strat,
+		Channel:             &ch,
+		AutoSyncEnabled:     &auto,
+		IntervalSeconds:     &interval,
+		Strategy:            &strat,
+		DrainTimeoutSeconds: &drain,
 	})
 	if err != nil {
 		t.Fatalf("UpdateConfig failed: %v", err)
 	}
-	if st.Channel != ChannelDev || !st.AutoSyncEnabled || st.IntervalSeconds != 180 || st.Strategy != "release" {
+	if st.Channel != ChannelDev || !st.AutoSyncEnabled || st.IntervalSeconds != 180 || st.Strategy != "release" || st.DrainTimeoutSeconds != 90 {
 		t.Fatalf("unexpected updated config snapshot: %+v", st)
+	}
+	if mgr.DrainTimeout() != 90*time.Second {
+		t.Fatalf("expected DrainTimeout 90s, got %s", mgr.DrainTimeout())
 	}
 
 	// Fresh Manager loads persisted config.json cleanly
@@ -667,7 +679,7 @@ func TestUpdateConfigPersistenceAndValidation(t *testing.T) {
 		Version: "0.1.0",
 		Logger:  log.New(io.Discard, "", 0),
 	}).Status()
-	if reloaded.Channel != ChannelDev || !reloaded.AutoSyncEnabled || reloaded.IntervalSeconds != 180 || reloaded.Strategy != "release" {
+	if reloaded.Channel != ChannelDev || !reloaded.AutoSyncEnabled || reloaded.IntervalSeconds != 180 || reloaded.Strategy != "release" || reloaded.DrainTimeoutSeconds != 90 {
 		t.Fatalf("reloaded config mismatch: %+v", reloaded)
 	}
 
@@ -803,28 +815,42 @@ func TestAutoRestartAfterUpdateAndActiveReleasePersistence(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for ValidateEdgeBin")
 	}
+	var gotTarget string
 	select {
-	case gotTarget := <-restartCh:
-		if !SameExecutablePath(gotTarget, edgeExe) {
-			t.Fatalf("expected OnEdgeRestart target %s, got %s", edgeExe, gotTarget)
-		}
+	case gotTarget = <-restartCh:
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for OnEdgeRestart callback")
 	}
+	if st.EdgeBinaryPath == nil || !SameExecutablePath(gotTarget, *st.EdgeBinaryPath) ||
+		!strings.HasPrefix(filepath.Clean(gotTarget), filepath.Clean(hotDir)) {
+		t.Fatalf("expected OnEdgeRestart to exec the staged bundle edge, got %s (status path %v)", gotTarget, st.EdgeBinaryPath)
+	}
 
-	// Swapped executable on disk now contains v2 binary.
-	swappedRaw, err := os.ReadFile(edgeExe)
-	if err != nil || string(swappedRaw) != "v2-edge-binary" {
-		t.Fatalf("expected atomic swap onto %s, got %q err=%v", edgeExe, string(swappedRaw), err)
+	// The installed binary is never overwritten, so the baseline stays bootable for rollback.
+	installedRaw, err := os.ReadFile(edgeExe)
+	if err != nil || string(installedRaw) != "v1-edge" {
+		t.Fatalf("installed edge binary must stay untouched, got %q err=%v", string(installedRaw), err)
 	}
 
 	active, ok := LoadActiveRelease(hotDir)
-	if !ok || active.Version != "0.2.0" || !SameExecutablePath(active.EdgeBin, edgeExe) {
+	if !ok || active.Version != "0.2.0" || !SameExecutablePath(active.EdgeBin, gotTarget) ||
+		!SameExecutablePath(active.InstallExe, edgeExe) || active.BaseCommit != "111111110000" {
 		t.Fatalf("unexpected persisted active.json: ok=%v active=%+v", ok, active)
 	}
 
-	// Simulated restarted edge process loads active.json cleanly without pending edge restart.
-	rebooted := NewManager(Options{
+	// The restart marker carries the rollback plan back to the baseline.
+	marker, ok := LoadRestartMarker(hotDir)
+	if !ok || marker.Reason != RestartReasonUpdate || marker.ToVersion != "0.2.0" || marker.FromVersion != "0.1.0" ||
+		marker.Rollback == nil || !marker.Rollback.Baseline || !SameExecutablePath(marker.Rollback.EdgeBin, edgeExe) {
+		t.Fatalf("unexpected restart marker: ok=%v marker=%+v", ok, marker)
+	}
+	if st.RestartProgress == nil || st.RestartProgress.Phase != RestartPhaseScheduled {
+		t.Fatalf("expected scheduled restart progress, got %+v", st.RestartProgress)
+	}
+
+	// Simulated restarted edge process (running the staged edge) loads active.json cleanly
+	// without a pending edge restart, then confirms the restart once its planes are ready.
+	rebootedMgr := NewManager(Options{
 		Config: config.Config{
 			Mode:                   "release",
 			DevSyncMode:            "release",
@@ -835,14 +861,30 @@ func TestAutoRestartAfterUpdateAndActiveReleasePersistence(t *testing.T) {
 		},
 		Version:            "0.2.0",
 		InitialCommit:      "deadbeef12345678",
-		EdgeExecutablePath: edgeExe,
+		EdgeExecutablePath: gotTarget,
 		Logger:             log.New(io.Discard, "", 0),
-	}).Status()
+	})
+	rebooted := rebootedMgr.Status()
 	if rebooted.BootID == "" || rebooted.BootID == st.BootID {
 		t.Fatalf("expected new unique BootID after restart, old=%q new=%q", st.BootID, rebooted.BootID)
 	}
 	if rebooted.Version != "0.2.0" || rebooted.EdgeBinaryStaged || !rebooted.CanRollback || rebooted.RestartScheduled {
 		t.Fatalf("unexpected rebooted status from active.json: %+v", rebooted)
+	}
+	if !rebootedMgr.HasPendingBoot() {
+		t.Fatalf("expected the rebooted manager to pick up the restart marker")
+	}
+	rebootedMgr.CompleteBoot(context.Background(), true)
+	done := rebootedMgr.Status()
+	if done.LastRestart == nil || done.LastRestart.Outcome != RestartOutcomeSucceeded ||
+		done.LastRestart.ToVersion != "0.2.0" || done.LastRestart.Reason != RestartReasonUpdate {
+		t.Fatalf("expected a succeeded last-restart report, got %+v", done.LastRestart)
+	}
+	if _, still := LoadRestartMarker(hotDir); still {
+		t.Fatalf("restart marker must be cleared after a healthy boot")
+	}
+	if rebootedMgr.HasPendingBoot() {
+		t.Fatalf("CompleteBoot must settle the pending boot")
 	}
 }
 
@@ -1071,10 +1113,15 @@ func TestManualTriggerRestartAndAutoRestartConfigToggle(t *testing.T) {
 	}
 	select {
 	case target := <-restartCh:
-		if !SameExecutablePath(target, edgeExe) {
-			t.Fatalf("expected TriggerRestart target %s, got %s", edgeExe, target)
+		if st.EdgeBinaryPath == nil || !SameExecutablePath(target, *st.EdgeBinaryPath) {
+			t.Fatalf("expected TriggerRestart to exec the staged edge %v, got %s", st.EdgeBinaryPath, target)
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for TriggerRestart callback")
+	}
+	// The manual restart activates the staged update, so it keeps that update's rollback plan.
+	marker, ok := LoadRestartMarker(hotDir)
+	if !ok || marker.Reason != RestartReasonUpdate || marker.Rollback == nil || marker.ToCommit != "cafebabe1234" {
+		t.Fatalf("expected update restart marker with rollback plan, got ok=%v %+v", ok, marker)
 	}
 }

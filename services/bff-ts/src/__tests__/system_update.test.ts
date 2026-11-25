@@ -330,6 +330,133 @@ describe("admin system update routes", () => {
       expect(restartBody.bootId).toBe("boot-2");
       expect(receivedRestartPayloads.length).toBe(1);
       expect("confirm" in (receivedRestartPayloads[0] ?? {})).toBe(false);
+
+      // Release-mode status tells the UI to ask for confirmation.
+      const statusRes = await app.request("/api/v1/admin/system/update", { headers });
+      expect(((await statusRes.json()) as { stepUpRequired: boolean }).stepUpRequired).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => mockSupervisor.close(() => resolve()));
+      if (prevUrl !== undefined) process.env.SLIPGATE_NET_INTERNAL_URL = prevUrl;
+      else delete process.env.SLIPGATE_NET_INTERNAL_URL;
+      if (prevToken !== undefined) process.env.SLIPGATE_INTERNAL_TOKEN = prevToken;
+      else delete process.env.SLIPGATE_INTERNAL_TOKEN;
+    }
+  });
+
+  it("skips the password / passkey re-confirmation for every update action in dev mode", async () => {
+    const received: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const devStatus = {
+      mode: "dev",
+      channel: "dev",
+      standalone: false,
+      strategy: "release",
+      resolvedStrategy: "release",
+      repo: "dreamforSh/Slipgate",
+      branch: "main",
+      version: "0.2.0-dev.1",
+      activeCommit: "22222222aaaa",
+      remoteCommit: "33333333bbbb",
+      updateAvailable: true,
+      autoSyncEnabled: true,
+      intervalSeconds: 60,
+      drainTimeoutSeconds: 45,
+      state: "idle",
+      reloadCount: 0,
+      webUiOverridden: false,
+      edgeBinaryStaged: false,
+      canRollback: true,
+      lastCheckedAtIso: null,
+      lastUpdatedAtIso: null,
+      lastError: null,
+    };
+    const mockSupervisor = createServer((req, res) => {
+      if (req.headers["x-slipgate-internal-token"] !== "dev-internal-token") {
+        res.statusCode = 403;
+        res.end(JSON.stringify({ error: "forbidden" }));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        res.setHeader("Content-Type", "application/json");
+        if (req.method !== "GET" && req.url?.startsWith("/internal/supervisor/")) {
+          received.push({ path: req.url, body: raw ? (JSON.parse(raw) as Record<string, unknown>) : {} });
+        }
+        if (req.method === "POST" && req.url === "/internal/supervisor/update/restart") {
+          res.end(
+            JSON.stringify({
+              ...devStatus,
+              state: "restarting",
+              restartScheduled: true,
+              restartProgress: { phase: "scheduled", reason: "manual", startedAtIso: "2026-11-24T01:00:00Z" },
+            }),
+          );
+          return;
+        }
+        res.end(JSON.stringify(devStatus));
+      });
+    });
+    await new Promise<void>((resolve) => mockSupervisor.listen(0, "127.0.0.1", () => resolve()));
+    const addr = mockSupervisor.address() as AddressInfo;
+
+    const prevUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    const prevToken = process.env.SLIPGATE_INTERNAL_TOKEN;
+    process.env.SLIPGATE_NET_INTERNAL_URL = `http://127.0.0.1:${addr.port}`;
+    process.env.SLIPGATE_INTERNAL_TOKEN = "dev-internal-token";
+
+    try {
+      const app = createBffApp({
+        jwtSecret: "test-jwt-secret-32-bytes-minimum",
+        vaultSecret: "test-vault-secret-32-bytes-minimum",
+      });
+      const headers = await initAdminHeaders(app);
+
+      const statusRes = await app.request("/api/v1/admin/system/update", { headers });
+      expect(statusRes.status).toBe(200);
+      const status = (await statusRes.json()) as { stepUpRequired: boolean; drainTimeoutSeconds: number };
+      expect(status.stepUpRequired).toBe(false);
+      expect(status.drainTimeoutSeconds).toBe(45);
+
+      const apply = await app.request("/api/v1/admin/system/update/sync", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ checkOnly: false }),
+      });
+      expect(apply.status).toBe(200);
+
+      const rollback = await app.request("/api/v1/admin/system/update/rollback", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ releaseId: "rel-9" }),
+      });
+      expect(rollback.status).toBe(200);
+      expect(((await rollback.json()) as { stepUpRequired: boolean }).stepUpRequired).toBe(false);
+
+      const restart = await app.request("/api/v1/admin/system/update/restart", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({}),
+      });
+      expect(restart.status).toBe(200);
+      const restartBody = (await restart.json()) as { restartProgress: { phase: string; inflight: number } | null };
+      expect(restartBody.restartProgress?.phase).toBe("scheduled");
+      expect(restartBody.restartProgress?.inflight).toBe(0);
+
+      const cfg = await app.request("/api/v1/admin/system/update/config", {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ drainTimeoutSeconds: 2 }),
+      });
+      expect(cfg.status).toBe(400);
+
+      expect(received.map((r) => r.path)).toEqual([
+        "/internal/supervisor/update/sync",
+        "/internal/supervisor/update/rollback",
+        "/internal/supervisor/update/restart",
+      ]);
+      expect(received[0]?.body.allowReleaseApply).toBe(true);
+      expect(received[1]?.body.releaseId).toBe("rel-9");
     } finally {
       await new Promise<void>((resolve) => mockSupervisor.close(() => resolve()));
       if (prevUrl !== undefined) process.env.SLIPGATE_NET_INTERNAL_URL = prevUrl;

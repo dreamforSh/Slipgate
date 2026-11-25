@@ -754,6 +754,14 @@ func (c *Coordinator) ResyncCore(ctx context.Context) error {
 	return errors.New("dataplane: failed to resync slipgate-core after restart")
 }
 
+// SnapshotApplied reports whether a ControlPlane snapshot (API keys, routes, accounts) has been
+// applied since start, i.e. whether DataPlane requests can authenticate yet.
+func (c *Coordinator) SnapshotApplied() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.snapshotApplied
+}
+
 // PullSnapshotFromBFF fetches the latest DataPlaneSyncSnapshot from slipgate-bff and applies it to Vault + slipgate-core.
 func (c *Coordinator) PullSnapshotFromBFF(ctx context.Context) error {
 	if c.bffOrigin == "" || c.internalToken == "" {

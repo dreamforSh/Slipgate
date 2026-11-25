@@ -6,8 +6,10 @@ import {
   SystemUpdateStatusSchema,
   TriggerUpdateSyncRequestSchema,
   UpdateSystemConfigRequestSchema,
+  type AdminStepUp,
   type DevSyncStrategy,
   type SystemUpdateChannel,
+  type SystemUpdateMode,
   type SystemUpdateStatus,
 } from "@slipgate/contracts";
 import type { AuthEnv, SessionManager } from "../middleware/auth.ts";
@@ -26,7 +28,21 @@ interface StandalonePolicy {
   autoSyncEnabled: boolean;
   intervalSeconds: number;
   autoRestartAfterUpdate: boolean;
+  drainTimeoutSeconds: number;
   strategy: DevSyncStrategy;
+}
+
+/**
+ * Whether update actions (apply, rollback, restart) need the administrator to re-confirm with a
+ * password or passkey. Dev-mode deployments (SLIPGATE_MODE=dev) are developer sandboxes that
+ * auto-apply their own channel, so they skip it; release deployments always ask.
+ */
+export function updateStepUpRequired(mode: SystemUpdateMode): boolean {
+  return mode !== "dev";
+}
+
+function withStepUpPolicy(status: SystemUpdateStatus): SystemUpdateStatus {
+  return { ...status, stepUpRequired: updateStepUpRequired(status.mode) };
 }
 
 async function readJsonBody(c: Context): Promise<{ ok: true; data: unknown } | { ok: false; response: Response }> {
@@ -67,8 +83,26 @@ function unreachableResponse(c: Context, err: unknown): Response {
   );
 }
 
+type SupervisorStatusResult = { ok: true; status: SystemUpdateStatus } | { ok: false; response: Response };
+
+async function fetchSupervisorStatus(
+  c: Context,
+  sup: { url: string; token: string },
+): Promise<SupervisorStatusResult> {
+  const res = await fetch(`${sup.url}/internal/supervisor/update`, {
+    headers: { "X-Slipgate-Internal-Token": sup.token },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) {
+    const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    return { ok: false, response: c.json(payload, forwardSupervisorErrorStatus(res.status)) };
+  }
+  return { ok: true, status: SystemUpdateStatusSchema.parse(await res.json()) };
+}
+
 /**
- * Registers admin system update, release catalog, policy config, and rollback endpoints under /api/v1/admin/system/update*.
+ * Registers admin system update, release catalog, policy config, rollback, and restart endpoints
+ * under /api/v1/admin/system/update*.
  */
 export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdateRoutesDeps): void {
   const { store, sessions, vaultSecret, buildStandaloneSystemUpdateStatus } = deps;
@@ -78,28 +112,67 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
     autoSyncEnabled: initialStandalone.autoSyncEnabled,
     intervalSeconds: initialStandalone.intervalSeconds,
     autoRestartAfterUpdate: initialStandalone.autoRestartAfterUpdate,
+    drainTimeoutSeconds: initialStandalone.drainTimeoutSeconds,
     strategy: initialStandalone.strategy,
   };
 
   function currentStandaloneStatus(extra?: Partial<SystemUpdateStatus>): SystemUpdateStatus {
     const base = buildStandaloneSystemUpdateStatus();
-    return SystemUpdateStatusSchema.parse({
-      ...base,
-      standalone: true,
-      channel: standalonePolicy.channel,
-      autoSyncEnabled: standalonePolicy.autoSyncEnabled,
-      intervalSeconds: standalonePolicy.intervalSeconds,
-      autoRestartAfterUpdate: standalonePolicy.autoRestartAfterUpdate,
-      strategy: standalonePolicy.strategy,
-      resolvedStrategy: standalonePolicy.strategy === "git" ? "git" : "release",
-      githubTokenConfigured: Boolean(process.env.SLIPGATE_GITHUB_TOKEN || process.env.GITHUB_TOKEN),
-      canRollback: false,
-      components: [
-        { name: "bff", status: "running", overridden: false, restartRequired: false, pid: process.pid },
-        { name: "webui", status: "embedded", overridden: false, restartRequired: false, pid: 0 },
-      ],
-      ...extra,
+    return withStepUpPolicy(
+      SystemUpdateStatusSchema.parse({
+        ...base,
+        standalone: true,
+        channel: standalonePolicy.channel,
+        autoSyncEnabled: standalonePolicy.autoSyncEnabled,
+        intervalSeconds: standalonePolicy.intervalSeconds,
+        autoRestartAfterUpdate: standalonePolicy.autoRestartAfterUpdate,
+        drainTimeoutSeconds: standalonePolicy.drainTimeoutSeconds,
+        strategy: standalonePolicy.strategy,
+        resolvedStrategy: standalonePolicy.strategy === "git" ? "git" : "release",
+        githubTokenConfigured: Boolean(process.env.SLIPGATE_GITHUB_TOKEN || process.env.GITHUB_TOKEN),
+        canRollback: false,
+        components: [
+          { name: "bff", status: "running", overridden: false, restartRequired: false, pid: process.pid },
+          { name: "webui", status: "embedded", overridden: false, restartRequired: false, pid: 0 },
+        ],
+        ...extra,
+      }),
+    );
+  }
+
+  /** null when the action may proceed: dev mode, or a valid password / passkey confirmation. */
+  async function confirmIfRequired(
+    c: Context<AuthEnv>,
+    mode: SystemUpdateMode,
+    confirm: AdminStepUp | undefined,
+  ): Promise<Response | null> {
+    if (!updateStepUpRequired(mode)) return null;
+    const claims = c.get("authUser");
+    return totpStepUp(store, vaultSecret).confirmAdmin(c, sessions, claims.sub, confirm);
+  }
+
+  async function forwardMutation(
+    c: Context<AuthEnv>,
+    sup: { url: string; token: string },
+    path: string,
+    method: "POST" | "PUT",
+    body: unknown,
+    timeoutMs: number,
+  ): Promise<Response> {
+    const res = await fetch(`${sup.url}${path}`, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Slipgate-Internal-Token": sup.token,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     });
+    const payload = (await res.json()) as Record<string, unknown>;
+    if (!res.ok) {
+      return c.json(payload, forwardSupervisorErrorStatus(res.status));
+    }
+    return c.json(withStepUpPolicy(SystemUpdateStatusSchema.parse(payload)));
   }
 
   app.get("/api/v1/admin/system/update", async (c) => {
@@ -108,15 +181,9 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
       return c.json(currentStandaloneStatus());
     }
     try {
-      const res = await fetch(`${sup.url}/internal/supervisor/update`, {
-        headers: { "X-Slipgate-Internal-Token": sup.token },
-        signal: AbortSignal.timeout(5000),
-      });
-      const payload = (await res.json()) as Record<string, unknown>;
-      if (!res.ok) {
-        return c.json(payload, forwardSupervisorErrorStatus(res.status));
-      }
-      return c.json(SystemUpdateStatusSchema.parse(payload));
+      const result = await fetchSupervisorStatus(c, sup);
+      if (!result.ok) return result.response;
+      return c.json(withStepUpPolicy(result.status));
     } catch (err) {
       return unreachableResponse(c, err);
     }
@@ -170,45 +237,27 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
 
     try {
       if (!parsed.data.checkOnly) {
-        const statusRes = await fetch(`${sup.url}/internal/supervisor/update`, {
-          headers: { "X-Slipgate-Internal-Token": sup.token },
-          signal: AbortSignal.timeout(5000),
-        });
-        if (!statusRes.ok) {
-          const payload = (await statusRes.json().catch(() => ({}))) as Record<string, unknown>;
-          return c.json(payload, forwardSupervisorErrorStatus(statusRes.status));
-        }
-        const statusJson = SystemUpdateStatusSchema.parse(await statusRes.json());
-        if (statusJson.mode !== "dev") {
-          const claims = c.get("authUser");
-          const denied = await totpStepUp(store, vaultSecret).confirmAdmin(c, sessions, claims.sub, parsed.data.confirm);
-          if (denied) return denied;
-        }
+        const current = await fetchSupervisorStatus(c, sup);
+        if (!current.ok) return current.response;
+        const denied = await confirmIfRequired(c, current.status.mode, parsed.data.confirm);
+        if (denied) return denied;
       }
 
       // Never forward admin step-up credentials to the net supervisor.
-      const forwardPayload = {
-        checkOnly: parsed.data.checkOnly,
-        channel: parsed.data.channel,
-        targetTag: parsed.data.targetTag,
-        force: parsed.data.force,
-        allowReleaseApply: !parsed.data.checkOnly,
-      };
-
-      const res = await fetch(`${sup.url}/internal/supervisor/update/sync`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Slipgate-Internal-Token": sup.token,
+      return await forwardMutation(
+        c,
+        sup,
+        "/internal/supervisor/update/sync",
+        "POST",
+        {
+          checkOnly: parsed.data.checkOnly,
+          channel: parsed.data.channel,
+          targetTag: parsed.data.targetTag,
+          force: parsed.data.force,
+          allowReleaseApply: !parsed.data.checkOnly,
         },
-        body: JSON.stringify(forwardPayload),
-        signal: AbortSignal.timeout(180_000),
-      });
-      const payload = (await res.json()) as Record<string, unknown>;
-      if (!res.ok) {
-        return c.json(payload, forwardSupervisorErrorStatus(res.status));
-      }
-      return c.json(SystemUpdateStatusSchema.parse(payload));
+        180_000,
+      );
     } catch (err) {
       return unreachableResponse(c, err);
     }
@@ -231,25 +280,15 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
       if (parsed.data.autoRestartAfterUpdate !== undefined) {
         standalonePolicy.autoRestartAfterUpdate = parsed.data.autoRestartAfterUpdate;
       }
+      if (parsed.data.drainTimeoutSeconds !== undefined) {
+        standalonePolicy.drainTimeoutSeconds = parsed.data.drainTimeoutSeconds;
+      }
       if (parsed.data.strategy !== undefined) standalonePolicy.strategy = parsed.data.strategy;
       return c.json(currentStandaloneStatus());
     }
 
     try {
-      const res = await fetch(`${sup.url}/internal/supervisor/update/config`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Slipgate-Internal-Token": sup.token,
-        },
-        body: JSON.stringify(parsed.data),
-        signal: AbortSignal.timeout(10_000),
-      });
-      const payload = (await res.json()) as Record<string, unknown>;
-      if (!res.ok) {
-        return c.json(payload, forwardSupervisorErrorStatus(res.status));
-      }
-      return c.json(SystemUpdateStatusSchema.parse(payload));
+      return await forwardMutation(c, sup, "/internal/supervisor/update/config", "PUT", parsed.data, 10_000);
     } catch (err) {
       return unreachableResponse(c, err);
     }
@@ -264,12 +303,10 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
 
-    const claims = c.get("authUser");
-    const denied = await totpStepUp(store, vaultSecret).confirmAdmin(c, sessions, claims.sub, parsed.data.confirm);
-    if (denied) return denied;
-
     const sup = supervisorCredentials();
     if (!sup) {
+      const denied = await confirmIfRequired(c, currentStandaloneStatus().mode, parsed.data.confirm);
+      if (denied) return denied;
       return c.json(
         {
           error: "rollback_unavailable_standalone",
@@ -280,20 +317,19 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
     }
 
     try {
-      const res = await fetch(`${sup.url}/internal/supervisor/update/rollback`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Slipgate-Internal-Token": sup.token,
-        },
-        body: JSON.stringify({ releaseId: parsed.data.releaseId }),
-        signal: AbortSignal.timeout(60_000),
-      });
-      const payload = (await res.json()) as Record<string, unknown>;
-      if (!res.ok) {
-        return c.json(payload, forwardSupervisorErrorStatus(res.status));
-      }
-      return c.json(SystemUpdateStatusSchema.parse(payload));
+      const current = await fetchSupervisorStatus(c, sup);
+      if (!current.ok) return current.response;
+      const denied = await confirmIfRequired(c, current.status.mode, parsed.data.confirm);
+      if (denied) return denied;
+
+      return await forwardMutation(
+        c,
+        sup,
+        "/internal/supervisor/update/rollback",
+        "POST",
+        { releaseId: parsed.data.releaseId },
+        60_000,
+      );
     } catch (err) {
       return unreachableResponse(c, err);
     }
@@ -310,8 +346,7 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
 
     const sup = supervisorCredentials();
     if (!sup) {
-      const claims = c.get("authUser");
-      const denied = await totpStepUp(store, vaultSecret).confirmAdmin(c, sessions, claims.sub, parsed.data.confirm);
+      const denied = await confirmIfRequired(c, currentStandaloneStatus().mode, parsed.data.confirm);
       if (denied) return denied;
       return c.json(
         {
@@ -323,35 +358,12 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
     }
 
     try {
-      const statusRes = await fetch(`${sup.url}/internal/supervisor/update`, {
-        headers: { "X-Slipgate-Internal-Token": sup.token },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!statusRes.ok) {
-        const payload = (await statusRes.json().catch(() => ({}))) as Record<string, unknown>;
-        return c.json(payload, forwardSupervisorErrorStatus(statusRes.status));
-      }
-      const statusJson = SystemUpdateStatusSchema.parse(await statusRes.json());
-      if (statusJson.mode !== "dev") {
-        const claims = c.get("authUser");
-        const denied = await totpStepUp(store, vaultSecret).confirmAdmin(c, sessions, claims.sub, parsed.data.confirm);
-        if (denied) return denied;
-      }
+      const current = await fetchSupervisorStatus(c, sup);
+      if (!current.ok) return current.response;
+      const denied = await confirmIfRequired(c, current.status.mode, parsed.data.confirm);
+      if (denied) return denied;
 
-      const res = await fetch(`${sup.url}/internal/supervisor/update/restart`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Slipgate-Internal-Token": sup.token,
-        },
-        body: JSON.stringify({}),
-        signal: AbortSignal.timeout(15_000),
-      });
-      const payload = (await res.json()) as Record<string, unknown>;
-      if (!res.ok) {
-        return c.json(payload, forwardSupervisorErrorStatus(res.status));
-      }
-      return c.json(SystemUpdateStatusSchema.parse(payload));
+      return await forwardMutation(c, sup, "/internal/supervisor/update/restart", "POST", {}, 15_000);
     } catch (err) {
       return unreachableResponse(c, err);
     }

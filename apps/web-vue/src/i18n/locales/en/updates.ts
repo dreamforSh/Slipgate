@@ -8,7 +8,7 @@ const en: typeof zh = {
       "BFF is running in standalone mode without the slipgate-net supervisor. Policy preferences can be previewed, while live binary hot-updates and rollbacks require the unified Slipgate runtime.",
     channels: {
       stable: "Stable releases",
-      stableDesc: "Tracks official GitHub Releases. Applying upgrades and rollbacks requires admin re-confirmation.",
+      stableDesc: "Tracks official GitHub Releases. In release mode, upgrades and rollbacks require admin re-confirmation.",
       dev: "Dev builds",
       devDesc: "Tracks rolling dev-latest prereleases or local git commits for staging and rapid iteration.",
       shortStable: "Stable",
@@ -29,7 +29,7 @@ const en: typeof zh = {
       downloading: "Downloading bundle",
       applying: "Extracting & staging",
       reloading_planes: "Reloading runtime planes",
-      restarting: "Restarting gateway",
+      restarting: "Gracefully restarting all services",
       rolling_back: "Rolling back version",
       error: "Error",
       failed: "Failed",
@@ -50,15 +50,38 @@ const en: typeof zh = {
       updateNow: "Update now",
       updating: "Updating…",
       rollbackPrev: "Roll back to {version}",
-      stepUpHint: "Applying updates or rolling back in release mode requires admin step-up confirmation",
+      stepUpHint: "Applying updates, rolling back or restarting in release mode requires admin step-up confirmation",
+      devNoStepUpHint: "Dev mode: updates, rollbacks and restarts need no password re-entry",
       edgeRestartTitle: "Updated edge binary staged (restart required)",
       edgeRestartDesc:
         "Core, BFF, and Web UI are already running the new release. Restart the slipgate service or container to load the staged edge binary at {path}:",
       restartNow: "Restart service now",
+      restartServices: "Graceful restart",
+      restartServicesHint: "Drain in-flight requests, then restart every service (core, BFF, edge)",
       restartingBtn: "Restarting…",
-      restartingTitle: "Draining connections & restarting Slipgate automatically…",
+      restartingTitle: "Gracefully restarting all Slipgate services…",
       restartingDesc:
-        "The staged edge binary passed preflight checks. Slipgate is draining in-flight requests and handing off to the new process; this console will reload once it is back.",
+        "In-flight requests finish first (new ones get 503 with Retry-After), then core, BFF and the edge stop and the new release starts; it serves once its health check passes and is rolled back automatically if it does not. This console reloads when the service is back.",
+      restartDrainDetail: "{count} request(s) still in flight; drain ends by {deadline}",
+      restartSteps: {
+        draining: "Drain requests",
+        stopping: "Stop services",
+        starting: "Start new release",
+        done: "Health check",
+      },
+      lastRestart: "Last restart",
+      restartTook: "took {duration}",
+      restartReasons: {
+        update: "After update",
+        rollback: "After rollback",
+        manual: "Manual",
+        auto_rollback: "Automatic rollback",
+      },
+      restartOutcomes: {
+        succeeded: "Healthy",
+        degraded: "Partially ready",
+        rolled_back: "Rolled back",
+      },
       pipeline: {
         checking: "Check",
         downloading: "Download",
@@ -145,9 +168,13 @@ const en: typeof zh = {
       autoSyncHintRelease:
         "In release mode, scheduled runs only check and surface availability; production planes are never restarted unprompted.",
       autoSyncHintDev: "In dev mode, new commits or rolling releases are downloaded and hot-reloaded automatically.",
-      autoRestartLabel: "Auto-restart gateway after update or rollback",
+      autoRestartLabel: "Gracefully restart all services after update or rollback",
       autoRestartHint:
-        "When enabled and a release includes an updated edge binary, Slipgate gracefully drains in-flight requests, re-execs the new binary, and automatically refreshes this console. Disable to reload child planes only and restart manually.",
+        "When enabled and a release changes any binary (edge, core, bff, guestd), Slipgate drains in-flight requests, stops every service and starts the new release; a release that is not ready within the health timeout, or keeps failing to boot, is rolled back automatically. Disable to hot-reload child planes only and restart the edge manually.",
+      drainLabel: "Drain timeout",
+      drainHint:
+        "How long a restart or shutdown waits for in-flight requests (streams included) to finish; new requests get 503 with Retry-After meanwhile. Requests still running afterwards are closed.",
+      drainPreset: "{seconds}s",
       intervalLabel: "Check interval (seconds)",
       intervalUnit: "sec",
       presets: {
@@ -179,6 +206,8 @@ const en: typeof zh = {
       restarting: "Service restart scheduled; waiting for reconnect…",
       restarted: "Service restarted and online ({version})",
       restartTimeout: "Timed out waiting for service reconnect; please refresh manually.",
+      restartRolledBack: "The new release failed its health check and was rolled back to {version}",
+      restartDegraded: "Service restarted, but some planes are not ready: {message}",
     },
   },
 };

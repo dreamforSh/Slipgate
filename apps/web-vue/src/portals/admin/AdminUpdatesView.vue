@@ -5,6 +5,7 @@ import type {
   SystemReleaseItem,
   SystemUpdateChannel,
   SystemUpdateHistoryEntry,
+  SystemUpdateStatus,
   UpdateSystemConfigRequest,
 } from "@slipgate/contracts";
 import { useI18n } from "vue-i18n";
@@ -87,18 +88,27 @@ async function handleCheck() {
   void store.loadReleases(true);
 }
 
-function handlePostMutationFeedback(
-  next: { version: string; bootId?: string; state: string; restartScheduled?: boolean },
-  beforeBootId: string,
-  defaultMsg: string,
-) {
+/** Toast for a completed full-service restart, then reload so the console runs the new web UI. */
+function announceRestart(next: SystemUpdateStatus) {
+  const last = next.lastRestart;
+  if (last?.outcome === "rolled_back") {
+    toast.warning(t("updates.toast.restartRolledBack", { version: next.version }));
+  } else if (last?.outcome === "degraded") {
+    toast.warning(t("updates.toast.restartDegraded", { message: last.message ?? "" }));
+  } else {
+    toast.success(t("updates.toast.restarted", { version: next.version }));
+  }
+  const reloadDelay = last && last.outcome !== "succeeded" ? 3000 : 1000;
+  window.setTimeout(() => window.location.reload(), reloadDelay);
+}
+
+function handlePostMutationFeedback(next: SystemUpdateStatus, beforeBootId: string, defaultMsg: string) {
   if (store.restartTimedOut || next.state === "restarting" || next.restartScheduled) {
     toast.warning(t("updates.toast.restartTimeout"));
     return;
   }
   if (beforeBootId && next.bootId && next.bootId !== beforeBootId) {
-    toast.success(t("updates.toast.restarted", { version: next.version }));
-    window.setTimeout(() => window.location.reload(), 1000);
+    announceRestart(next);
     return;
   }
   toast.success(defaultMsg);
@@ -124,20 +134,21 @@ async function runRestartEdge(opts: { confirm?: AdminStepUp } = {}) {
     return;
   }
   if (!beforeBootId || !next.bootId || next.bootId !== beforeBootId) {
-    toast.success(t("updates.toast.restarted", { version: next.version }));
-    window.setTimeout(() => window.location.reload(), 1000);
+    announceRestart(next);
   }
 }
 
+function reportFailure(err: unknown) {
+  toast.error(errorText(err, t("common.requestFailed")));
+}
+
 function requestApply(opts: { channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; label?: string } = {}) {
-  if (store.requiresStepUpForApply) {
+  if (store.requiresStepUp) {
     pendingAction.value = { kind: "apply", ...opts };
     stepUpOpen.value = true;
     return;
   }
-  void runApply(opts).catch((err) => {
-    toast.error(errorText(err, t("common.requestFailed")));
-  });
+  void runApply(opts).catch(reportFailure);
 }
 
 function requestInstallRelease(rel: SystemReleaseItem) {
@@ -149,35 +160,31 @@ function requestInstallRelease(rel: SystemReleaseItem) {
   });
 }
 
+function requestRollback(releaseId: string | undefined, label: string) {
+  if (store.requiresStepUp) {
+    pendingAction.value = { kind: "rollback", releaseId, label };
+    stepUpOpen.value = true;
+    return;
+  }
+  void runRollback({ releaseId }).catch(reportFailure);
+}
+
 function requestRollbackLatest() {
   const prev = store.status?.previousRelease;
-  const label = prev?.tag ?? prev?.version ?? "-";
-  pendingAction.value = {
-    kind: "rollback",
-    releaseId: prev?.id,
-    label,
-  };
-  stepUpOpen.value = true;
+  requestRollback(prev?.id, prev?.tag ?? prev?.version ?? "-");
 }
 
 function requestRestoreHistory(entry: SystemUpdateHistoryEntry) {
-  pendingAction.value = {
-    kind: "rollback",
-    releaseId: entry.id,
-    label: entry.tag ?? entry.toVersion,
-  };
-  stepUpOpen.value = true;
+  requestRollback(entry.id, entry.tag ?? entry.toVersion);
 }
 
 function requestRestartEdge() {
-  if (store.requiresStepUpForApply) {
+  if (store.requiresStepUp) {
     pendingAction.value = { kind: "restart" };
     stepUpOpen.value = true;
     return;
   }
-  void runRestartEdge().catch((err) => {
-    toast.error(errorText(err, t("common.requestFailed")));
-  });
+  void runRestartEdge().catch(reportFailure);
 }
 
 async function executeStepUpAction(confirm: AdminStepUp) {
@@ -245,6 +252,8 @@ onBeforeUnmount(() => {
       :applying="store.applying"
       :rolling-back="store.rollingBack"
       :restarting="store.restarting"
+      :restart-stage="store.restartStage"
+      :step-up-required="store.requiresStepUp"
       :busy="store.isBusy"
       :error="store.error"
       @check="handleCheck"

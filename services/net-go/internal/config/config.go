@@ -30,37 +30,54 @@ type Config struct {
 	JWTSecret string
 	// AllowInsecureSecrets (SLIPGATE_ALLOW_INSECURE_SECRETS) lets weak secrets through with a
 	// warning. Local development only.
-	AllowInsecureSecrets  bool
-	ClashMode             string
-	ClashDataDir          string
-	ClashProbeURL         string
-	ClashIPEchoURL        string
-	ClashProbeIntervalSec int
-	ClashPortMin          int
-	ClashPortMax          int
-	MaxAccountsPerExit    int
-	VMDataDir             string
-	GuestdBin             string
-	DevUIURL              string
+	AllowInsecureSecrets   bool
+	ClashMode              string
+	ClashDataDir           string
+	ClashProbeURL          string
+	ClashIPEchoURL         string
+	ClashProbeIntervalSec  int
+	ClashPortMin           int
+	ClashPortMax           int
+	MaxAccountsPerExit     int
+	VMDataDir              string
+	GuestdBin              string
+	DevUIURL               string
 	Mode                   string
 	DevSyncMode            string
 	DevSyncIntervalSec     int
 	AutoRestartAfterUpdate bool
-	UpdateRepo             string
-	UpdateBranch          string
-	GitRepoDir            string
-	HotUpdateDir          string
-	WebUIDir              string
-	GitHubToken           string
-	InternalToken         string
-	TrustedProxies        string
-	AllowPrivateUpstreams bool
+	// DrainTimeoutSec (SLIPGATE_DRAIN_TIMEOUT_SEC, default 30, 5..600) bounds how long a restart or
+	// shutdown lets in-flight requests finish while new ones get 503 + Retry-After.
+	DrainTimeoutSec int
+	// StartupReadyTimeoutSec (SLIPGATE_STARTUP_READY_TIMEOUT_SEC, default 30, 0 = off) bounds how long
+	// the edge holds queued public connections after a restart until core, BFF and the DataPlane
+	// snapshot are ready.
+	StartupReadyTimeoutSec int
+	// RestartHealthTimeoutSec (SLIPGATE_RESTART_HEALTH_TIMEOUT_SEC, default 180, min 30) is how long
+	// a restarted release gets to become ready before the boot guard rolls it back.
+	RestartHealthTimeoutSec int
+	UpdateRepo              string
+	UpdateBranch            string
+	GitRepoDir              string
+	HotUpdateDir            string
+	WebUIDir                string
+	GitHubToken             string
+	InternalToken           string
+	TrustedProxies          string
+	AllowPrivateUpstreams   bool
 	// UpstreamHeaderTimeout / UpstreamIdleTimeout bound an AI upstream's wait for response headers
 	// and each stall of its response stream (SLIPGATE_UPSTREAM_HEADER_TIMEOUT_SEC, default 600;
 	// SLIPGATE_UPSTREAM_IDLE_TIMEOUT_SEC, default 300; 0 = unbounded).
 	UpstreamHeaderTimeout time.Duration
 	UpstreamIdleTimeout   time.Duration
 }
+
+// Drain timeout bounds shared by the env loader and the runtime update policy.
+const (
+	DefaultDrainTimeoutSec = 30
+	MinDrainTimeoutSec     = 5
+	MaxDrainTimeoutSec     = 600
+)
 
 // LoadFromEnv loads configuration from SLIPGATE_* environment variables with safe defaults.
 func LoadFromEnv() Config {
@@ -102,50 +119,65 @@ func LoadFromEnv() Config {
 	if clashMode != "disabled" {
 		clashMode = "embedded"
 	}
+	drainTimeout := envInt("SLIPGATE_DRAIN_TIMEOUT_SEC", DefaultDrainTimeoutSec)
+	if drainTimeout < MinDrainTimeoutSec || drainTimeout > MaxDrainTimeoutSec {
+		drainTimeout = DefaultDrainTimeoutSec
+	}
+	readyTimeout := envInt("SLIPGATE_STARTUP_READY_TIMEOUT_SEC", 30)
+	if readyTimeout < 0 {
+		readyTimeout = 0
+	}
+	healthTimeout := envInt("SLIPGATE_RESTART_HEALTH_TIMEOUT_SEC", 180)
+	if healthTimeout < 30 {
+		healthTimeout = 30
+	}
 	probeInterval := envInt("SLIPGATE_CLASH_PROBE_INTERVAL_SEC", 300)
 	if probeInterval < 0 {
 		probeInterval = 0
 	}
 
 	return Config{
-		ListenAddr:            envString("SLIPGATE_LISTEN_ADDR", ":8080"),
-		InternalListenAddr:    envString("SLIPGATE_INTERNAL_LISTEN_ADDR", "127.0.0.1:19083"),
-		CoreIPC:               envString("SLIPGATE_CORE_IPC", "127.0.0.1:19081"),
-		BFFAddr:               envString("SLIPGATE_BFF_ADDR", "127.0.0.1:19082"),
-		Supervise:             envBool("SLIPGATE_SUPERVISE", true),
-		AllowDegraded:         envBool("SLIPGATE_ALLOW_DEGRADED", false),
-		CoreBin:               envString("SLIPGATE_CORE_BIN", ResolveSiblingBinary("slipgate-core")),
-		BFFBin:                envString("SLIPGATE_BFF_BIN", ResolveSiblingBinary("slipgate-bff")),
-		DatabaseURL:           strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		VaultSecret:           envString("SLIPGATE_VAULT_SECRET", DevVaultSecret),
-		JWTSecret:             strings.TrimSpace(os.Getenv("SLIPGATE_JWT_SECRET")),
-		AllowInsecureSecrets:  envBool("SLIPGATE_ALLOW_INSECURE_SECRETS", false),
-		ClashMode:             clashMode,
-		ClashDataDir:          envString("SLIPGATE_CLASH_DATA_DIR", defaultClashDir),
-		ClashProbeURL:         envString("SLIPGATE_CLASH_PROBE_URL", "https://www.gstatic.com/generate_204"),
-		ClashIPEchoURL:        envString("SLIPGATE_CLASH_IP_ECHO_URL", "https://api.ipify.org?format=json"),
-		ClashProbeIntervalSec: probeInterval,
-		VMDataDir:             envString("SLIPGATE_VM_DATA_DIR", defaultVMDir),
-		GuestdBin:             envString("SLIPGATE_GUESTD_BIN", defaultGuestd),
-		ClashPortMin:          envInt("SLIPGATE_CLASH_PORT_MIN", 20000),
-		ClashPortMax:          envInt("SLIPGATE_CLASH_PORT_MAX", 24999),
-		MaxAccountsPerExit:    envInt("SLIPGATE_MAX_ACCOUNTS_PER_EXIT_IP", 1),
-		DevUIURL:              strings.TrimSpace(os.Getenv("SLIPGATE_DEV_UI_URL")),
-		Mode:                   mode,
-		DevSyncMode:            syncMode,
-		DevSyncIntervalSec:     interval,
-		AutoRestartAfterUpdate: envBool("SLIPGATE_AUTO_RESTART_AFTER_UPDATE", true),
-		UpdateRepo:             envString("SLIPGATE_UPDATE_REPO", "dreamforSh/Slipgate"),
-		UpdateBranch:          envString("SLIPGATE_UPDATE_BRANCH", "main"),
-		GitRepoDir:            strings.TrimSpace(os.Getenv("SLIPGATE_GIT_REPO_DIR")),
-		HotUpdateDir:          envString("SLIPGATE_HOTUPDATE_DIR", defaultHotDir),
-		WebUIDir:              strings.TrimSpace(os.Getenv("SLIPGATE_WEBUI_DIR")),
-		GitHubToken:           ghToken,
-		InternalToken:         internalToken,
-		TrustedProxies:        strings.TrimSpace(os.Getenv("SLIPGATE_TRUSTED_PROXIES")),
-		AllowPrivateUpstreams: envBool("SLIPGATE_ALLOW_PRIVATE_UPSTREAMS", false),
-		UpstreamHeaderTimeout: envSeconds("SLIPGATE_UPSTREAM_HEADER_TIMEOUT_SEC", 600),
-		UpstreamIdleTimeout:   envSeconds("SLIPGATE_UPSTREAM_IDLE_TIMEOUT_SEC", 300),
+		ListenAddr:              envString("SLIPGATE_LISTEN_ADDR", ":8080"),
+		InternalListenAddr:      envString("SLIPGATE_INTERNAL_LISTEN_ADDR", "127.0.0.1:19083"),
+		CoreIPC:                 envString("SLIPGATE_CORE_IPC", "127.0.0.1:19081"),
+		BFFAddr:                 envString("SLIPGATE_BFF_ADDR", "127.0.0.1:19082"),
+		Supervise:               envBool("SLIPGATE_SUPERVISE", true),
+		AllowDegraded:           envBool("SLIPGATE_ALLOW_DEGRADED", false),
+		CoreBin:                 envString("SLIPGATE_CORE_BIN", ResolveSiblingBinary("slipgate-core")),
+		BFFBin:                  envString("SLIPGATE_BFF_BIN", ResolveSiblingBinary("slipgate-bff")),
+		DatabaseURL:             strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		VaultSecret:             envString("SLIPGATE_VAULT_SECRET", DevVaultSecret),
+		JWTSecret:               strings.TrimSpace(os.Getenv("SLIPGATE_JWT_SECRET")),
+		AllowInsecureSecrets:    envBool("SLIPGATE_ALLOW_INSECURE_SECRETS", false),
+		ClashMode:               clashMode,
+		ClashDataDir:            envString("SLIPGATE_CLASH_DATA_DIR", defaultClashDir),
+		ClashProbeURL:           envString("SLIPGATE_CLASH_PROBE_URL", "https://www.gstatic.com/generate_204"),
+		ClashIPEchoURL:          envString("SLIPGATE_CLASH_IP_ECHO_URL", "https://api.ipify.org?format=json"),
+		ClashProbeIntervalSec:   probeInterval,
+		VMDataDir:               envString("SLIPGATE_VM_DATA_DIR", defaultVMDir),
+		GuestdBin:               envString("SLIPGATE_GUESTD_BIN", defaultGuestd),
+		ClashPortMin:            envInt("SLIPGATE_CLASH_PORT_MIN", 20000),
+		ClashPortMax:            envInt("SLIPGATE_CLASH_PORT_MAX", 24999),
+		MaxAccountsPerExit:      envInt("SLIPGATE_MAX_ACCOUNTS_PER_EXIT_IP", 1),
+		DevUIURL:                strings.TrimSpace(os.Getenv("SLIPGATE_DEV_UI_URL")),
+		Mode:                    mode,
+		DevSyncMode:             syncMode,
+		DevSyncIntervalSec:      interval,
+		AutoRestartAfterUpdate:  envBool("SLIPGATE_AUTO_RESTART_AFTER_UPDATE", true),
+		DrainTimeoutSec:         drainTimeout,
+		StartupReadyTimeoutSec:  readyTimeout,
+		RestartHealthTimeoutSec: healthTimeout,
+		UpdateRepo:              envString("SLIPGATE_UPDATE_REPO", "dreamforSh/Slipgate"),
+		UpdateBranch:            envString("SLIPGATE_UPDATE_BRANCH", "main"),
+		GitRepoDir:              strings.TrimSpace(os.Getenv("SLIPGATE_GIT_REPO_DIR")),
+		HotUpdateDir:            envString("SLIPGATE_HOTUPDATE_DIR", defaultHotDir),
+		WebUIDir:                strings.TrimSpace(os.Getenv("SLIPGATE_WEBUI_DIR")),
+		GitHubToken:             ghToken,
+		InternalToken:           internalToken,
+		TrustedProxies:          strings.TrimSpace(os.Getenv("SLIPGATE_TRUSTED_PROXIES")),
+		AllowPrivateUpstreams:   envBool("SLIPGATE_ALLOW_PRIVATE_UPSTREAMS", false),
+		UpstreamHeaderTimeout:   envSeconds("SLIPGATE_UPSTREAM_HEADER_TIMEOUT_SEC", 600),
+		UpstreamIdleTimeout:     envSeconds("SLIPGATE_UPSTREAM_IDLE_TIMEOUT_SEC", 300),
 	}
 }
 

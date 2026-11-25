@@ -35,6 +35,8 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
   const rollingBack = ref(false);
   const restarting = ref(false);
   const restartTimedOut = ref(false);
+  /** Where a full-service restart is, as seen from the console: reported by the old process, then inferred. */
+  const restartStage = ref<"scheduled" | "draining" | "stopping" | "starting" | null>(null);
   const savingConfig = ref(false);
   const error = ref<string | null>(null);
 
@@ -53,7 +55,9 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
   const updateAvailable = computed(() => Boolean(status.value?.updateAvailable));
   const needsEdgeRestart = computed(() => Boolean(status.value?.edgeBinaryStaged));
   const canRollback = computed(() => Boolean(status.value?.canRollback));
-  const requiresStepUpForApply = computed(() => status.value?.mode !== "dev");
+  // Dev-mode deployments skip the password / passkey re-confirmation for every update action;
+  // the BFF decides (stepUpRequired), with the mode as a fallback for older backends.
+  const requiresStepUp = computed(() => status.value?.stepUpRequired ?? status.value?.mode !== "dev");
 
   function syncPolling() {
     const active = status.value !== null && BUSY_STATES.has(status.value.state);
@@ -142,37 +146,53 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
   async function waitForRestartRecovery(prevBootId: string): Promise<SystemUpdateStatus | null> {
     restarting.value = true;
     restartTimedOut.value = false;
+    restartStage.value = status.value?.restartProgress?.phase ?? "scheduled";
     stopPolling();
     error.value = null;
 
     const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
-    await sleep(1500);
+    await sleep(1000);
 
-    const deadline = Date.now() + 60_000;
+    // The old process may spend the whole drain window finishing requests before it re-execs,
+    // then the new one waits for its planes before it serves.
+    const drainSeconds = status.value?.drainTimeoutSeconds ?? 30;
+    const deadline = Date.now() + Math.max(90, drainSeconds + 90) * 1000;
     while (Date.now() < deadline) {
       try {
         const next = await apiJson<SystemUpdateStatus>("/api/v1/admin/system/update");
         if ((!prevBootId || next.bootId !== prevBootId) && next.state !== "restarting" && !next.restartScheduled) {
           status.value = next;
           restarting.value = false;
+          restartStage.value = null;
           syncPolling();
           void loadReleases(true);
           return next;
         }
         status.value = next;
+        if (next.bootId === prevBootId && next.restartProgress) {
+          restartStage.value = next.restartProgress.phase;
+        } else if (next.bootId !== prevBootId) {
+          // A new process that is itself restarting (an automatic rollback) is still starting up.
+          restartStage.value = "starting";
+        }
       } catch (err) {
         if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
           restarting.value = false;
+          restartStage.value = null;
           error.value = err.message;
           syncPolling();
           throw err;
         }
         // Transient network reset / 502 / 503 while Slipgate drains and re-execs is expected.
+        if (restartStage.value === "stopping" || restartStage.value === "draining") {
+          restartStage.value = "starting";
+        }
       }
       await sleep(1500);
     }
 
     restarting.value = false;
+    restartStage.value = null;
     restartTimedOut.value = true;
     error.value = "Timed out waiting for Slipgate service reconnect; refresh manually to verify.";
     syncPolling();
@@ -309,13 +329,14 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
     rollingBack,
     restarting,
     restartTimedOut,
+    restartStage,
     savingConfig,
     error,
     isBusy,
     updateAvailable,
     needsEdgeRestart,
     canRollback,
-    requiresStepUpForApply,
+    requiresStepUp,
     loadStatus,
     loadReleases,
     checkForUpdates,

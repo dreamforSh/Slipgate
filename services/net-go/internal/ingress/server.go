@@ -21,6 +21,7 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dataplane"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dpbridge"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/hotupdate"
+	"github.com/dreamforSh/slipgate/services/net-go/internal/lifecycle"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/netguard"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/supervisor"
 	"github.com/dreamforSh/slipgate/services/net-go/internal/vmslot"
@@ -39,6 +40,7 @@ type Server struct {
 	dpCoord    *dataplane.Coordinator
 	sup        *supervisor.Supervisor
 	updater    *hotupdate.Manager
+	drainer    *lifecycle.Drainer
 	httpClient *http.Client
 	bffProxy   *httputil.ReverseProxy
 	uiDynamic  *webui.DynamicHandler
@@ -59,6 +61,11 @@ func (s *Server) WithCommit(commit string) {
 // WithHotUpdater attaches the dev-mode hot-update manager exposed via internal endpoints.
 func (s *Server) WithHotUpdater(updater *hotupdate.Manager) {
 	s.updater = updater
+}
+
+// WithDrainer attaches the public drain gate so readiness reports a restart in progress.
+func (s *Server) WithDrainer(d *lifecycle.Drainer) {
+	s.drainer = d
 }
 
 // SetWebUIOverrideDir swaps the active frontend directory served by the embedded UI handler.
@@ -227,9 +234,10 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	coreUp := dpbridge.PingAuth(ctx, s.cfg.CoreIPC, s.cfg.InternalToken) == nil
 	bffUp := s.probeBFF(ctx)
 	ready := coreUp && bffUp
+	draining := s.drainer != nil && s.drainer.Draining()
 
 	status := http.StatusOK
-	if !ready && !s.cfg.AllowDegraded {
+	if (!ready && !s.cfg.AllowDegraded) || draining {
 		status = http.StatusServiceUnavailable
 	}
 
@@ -254,8 +262,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, status, map[string]any{
-		"ready":         ready,
+		"ready":         ready && !draining,
 		"degraded":      !ready,
+		"draining":      draining,
 		"version":       s.version,
 		"commit":        s.commit,
 		"mode":          s.cfg.Mode,

@@ -421,7 +421,15 @@ func (s *Supervisor) stopChild(child *managedChild, graceTimeout time.Duration) 
 	}
 
 	// Try graceful interrupt first; force-kill if the child doesn't exit within graceTimeout.
-	_ = cmd.Process.Signal(os.Interrupt)
+	// Where interrupts cannot be delivered (os.Interrupt is unsupported on Windows) waiting would
+	// only delay the restart, so kill right away.
+	if err := cmd.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		// A child already on its way out (e.g. its context was just cancelled) makes Kill fail
+		// with "Access is denied" on Windows; once done closes it is stopped either way.
+		_ = cmd.Process.Kill()
+		<-done
+		return nil
+	}
 	timer := time.NewTimer(graceTimeout)
 	defer timer.Stop()
 

@@ -21,13 +21,15 @@ type ActiveRelease struct {
 	Tag         string `json:"tag,omitempty"`
 	BaseVersion string `json:"baseVersion,omitempty"`
 	BaseCommit  string `json:"baseCommit,omitempty"`
-	BundleDir   string `json:"bundleDir,omitempty"`
-	EdgeBin     string `json:"edgeBin,omitempty"`
-	CoreBin     string `json:"coreBin,omitempty"`
-	BFFBin      string `json:"bffBin,omitempty"`
-	GuestdBin   string `json:"guestdBin,omitempty"`
-	WebUIDir    string `json:"webUiDir,omitempty"`
-	UpdatedAt   string `json:"updatedAt"`
+	// InstallExe is the externally installed edge binary (what a cold boot runs before handing off).
+	InstallExe string `json:"installExe,omitempty"`
+	BundleDir  string `json:"bundleDir,omitempty"`
+	EdgeBin    string `json:"edgeBin,omitempty"`
+	CoreBin    string `json:"coreBin,omitempty"`
+	BFFBin     string `json:"bffBin,omitempty"`
+	GuestdBin  string `json:"guestdBin,omitempty"`
+	WebUIDir   string `json:"webUiDir,omitempty"`
+	UpdatedAt  string `json:"updatedAt"`
 }
 
 func activeReleasePath(hotUpdateDir string) string {
@@ -139,118 +141,21 @@ func validateEdgeBinary(ctx context.Context, binPath string) error {
 	return nil
 }
 
-func replaceExecutableAtomically(currentExe, newBin string) error {
-	return replaceExecutableAtomicallyWithValidator(context.Background(), currentExe, newBin, nil)
-}
-
-func replaceExecutableAtomicallyWithValidator(
-	ctx context.Context,
-	currentExe string,
-	newBin string,
-	validator func(context.Context, string) error,
-) error {
-	if strings.TrimSpace(currentExe) == "" {
-		return errors.New("hotupdate: current executable path is empty")
+// validateStagedEdgeBinary checks a staged edge binary in place (chmod + `--version` preflight
+// through validator) before anything is switched over to it.
+func validateStagedEdgeBinary(ctx context.Context, binPath string, validator func(context.Context, string) error) error {
+	info, err := os.Stat(binPath)
+	if err != nil {
+		return fmt.Errorf("hotupdate: inspect staged edge binary %s: %w", binPath, err)
 	}
-	dir := filepath.Dir(currentExe)
-	tmpPath := filepath.Join(dir, fmt.Sprintf(".%s.tmp-%d", filepath.Base(currentExe), time.Now().UnixNano()))
-	if err := copyFile(newBin, tmpPath, 0o755); err != nil {
-		return err
+	if info.IsDir() || info.Size() == 0 {
+		return fmt.Errorf("hotupdate: invalid staged edge binary %s (dir=%v size=%d)", binPath, info.IsDir(), info.Size())
 	}
-	_ = os.Chmod(tmpPath, 0o755)
-	cleanupTmp := true
-	defer func() {
-		if cleanupTmp {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
+	_ = os.Chmod(binPath, 0o755)
 	if validator != nil {
-		if err := validator(ctx, tmpPath); err != nil {
-			return err
-		}
+		return validator(ctx, binPath)
 	}
-
-	if runtime.GOOS == "windows" {
-		backup := currentExe + ".old"
-		_ = os.Remove(backup)
-		if _, err := os.Stat(currentExe); err == nil {
-			if err := os.Rename(currentExe, backup); err != nil {
-				return err
-			}
-		}
-		if err := os.Rename(tmpPath, currentExe); err != nil {
-			_ = os.Rename(backup, currentExe)
-			return err
-		}
-		cleanupTmp = false
-		_ = os.Remove(backup)
-		return nil
-	}
-
-	if err := os.Rename(tmpPath, currentExe); err != nil {
-		return err
-	}
-	cleanupTmp = false
 	return nil
-}
-
-// prepareAndStageEdgeBinary validates srcBin (preflighting a sibling temp copy first when
-// currentExe's directory is writable, then swapping atomically onto currentExe; otherwise
-// validating srcBin directly in the update stage directory for non-writable system paths).
-func prepareAndStageEdgeBinary(
-	ctx context.Context,
-	currentExe string,
-	srcBin string,
-	validator func(context.Context, string) error,
-) (target string, err error) {
-	_ = os.Chmod(srcBin, 0o755)
-
-	if strings.TrimSpace(currentExe) != "" {
-		tmpPath := filepath.Join(
-			filepath.Dir(currentExe),
-			fmt.Sprintf(".%s.tmp-%d", filepath.Base(currentExe), time.Now().UnixNano()),
-		)
-		if copyErr := copyFile(srcBin, tmpPath, 0o755); copyErr == nil {
-			_ = os.Chmod(tmpPath, 0o755)
-			if validator != nil {
-				if valErr := validator(ctx, tmpPath); valErr != nil {
-					_ = os.Remove(tmpPath)
-					return "", valErr
-				}
-			}
-			swapErr := func() error {
-				if runtime.GOOS == "windows" {
-					backup := currentExe + ".old"
-					_ = os.Remove(backup)
-					if _, stErr := os.Stat(currentExe); stErr == nil {
-						if err := os.Rename(currentExe, backup); err != nil {
-							return err
-						}
-					}
-					if err := os.Rename(tmpPath, currentExe); err != nil {
-						_ = os.Rename(backup, currentExe)
-						return err
-					}
-					_ = os.Remove(backup)
-					return nil
-				}
-				return os.Rename(tmpPath, currentExe)
-			}()
-			if swapErr == nil {
-				return currentExe, nil
-			}
-			_ = os.Remove(tmpPath)
-			return srcBin, nil
-		}
-	}
-
-	if validator != nil {
-		if err := validator(ctx, srcBin); err != nil {
-			return "", err
-		}
-	}
-	return srcBin, nil
 }
 
 func backupBaselineEdge(hotUpdateDir, currentExe string) (string, error) {

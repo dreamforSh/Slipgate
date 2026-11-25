@@ -53,6 +53,8 @@ const (
 	maxHistoryItems  = 30
 	maxKeepReleases  = 5
 	releasesCacheTTL = 60 * time.Second
+
+	defaultDrainTimeoutSec = config.DefaultDrainTimeoutSec
 )
 
 // Options configures the repo-synced hot-update manager.
@@ -152,6 +154,7 @@ type ConfigPatch struct {
 	AutoSyncEnabled        *bool   `json:"autoSyncEnabled,omitempty"`
 	IntervalSeconds        *int    `json:"intervalSeconds,omitempty"`
 	AutoRestartAfterUpdate *bool   `json:"autoRestartAfterUpdate,omitempty"`
+	DrainTimeoutSeconds    *int    `json:"drainTimeoutSeconds,omitempty"`
 	Strategy               *string `json:"strategy,omitempty"`
 }
 
@@ -189,7 +192,10 @@ type StatusSnapshot struct {
 	AutoSyncEnabled        bool                 `json:"autoSyncEnabled"`
 	IntervalSeconds        int                  `json:"intervalSeconds"`
 	AutoRestartAfterUpdate bool                 `json:"autoRestartAfterUpdate"`
+	DrainTimeoutSeconds    int                  `json:"drainTimeoutSeconds"`
 	RestartScheduled       bool                 `json:"restartScheduled"`
+	RestartProgress        *RestartProgress     `json:"restartProgress"`
+	LastRestart            *LastRestart         `json:"lastRestart"`
 	BootID                 string               `json:"bootId"`
 	State                  string               `json:"state"`
 	Progress               *Progress            `json:"progress"`
@@ -232,6 +238,14 @@ type Manager struct {
 
 	restartMu        sync.Mutex
 	restartTriggered bool
+
+	// installExe is the externally installed edge binary a cold boot runs (carried in active.json).
+	installExe string
+	// bootMarker is the restart this boot completes, settled by CompleteBoot.
+	bootMarker *RestartMarker
+	// pendingRestart remembers the rollback plan of an applied update whose restart was left to
+	// the operator (autoRestartAfterUpdate off), for TriggerRestart.
+	pendingRestart *restartRequest
 
 	syncMu sync.Mutex
 	mu     sync.RWMutex
@@ -292,6 +306,11 @@ func NewManager(opts Options) *Manager {
 		intervalSec = 3600
 	}
 
+	drainSec := opts.Config.DrainTimeoutSec
+	if drainSec < config.MinDrainTimeoutSec || drainSec > config.MaxDrainTimeoutSec {
+		drainSec = defaultDrainTimeoutSec
+	}
+
 	validateFn := opts.ValidateEdgeBin
 	if validateFn == nil && opts.OnEdgeRestart != nil {
 		validateFn = validateEdgeBinary
@@ -331,6 +350,7 @@ func NewManager(opts Options) *Manager {
 			AutoSyncEnabled:        autoSync,
 			IntervalSeconds:        opts.Config.DevSyncIntervalSec,
 			AutoRestartAfterUpdate: opts.Config.AutoRestartAfterUpdate,
+			DrainTimeoutSeconds:    drainSec,
 			BootID:                 bootID,
 			State:                  StateIdle,
 			WebUIOverridden:        opts.Config.WebUIDir != "",
@@ -519,8 +539,31 @@ func (m *Manager) currentExePath() string {
 	return ResolvedCurrentExecutable()
 }
 
-func (m *Manager) triggerEdgeRestart(targetBinary string, async bool) {
-	if strings.TrimSpace(targetBinary) == "" {
+// restartRequest describes a full-service restart: the edge drains, stops every plane and
+// re-execs Target, which starts the planes of the active release again.
+type restartRequest struct {
+	Target      string
+	Async       bool
+	Reason      string
+	FromVersion string
+	FromCommit  string
+	ToVersion   string
+	ToCommit    string
+	Rollback    *RollbackPlan
+}
+
+func restartReasonFor(action string) string {
+	if action == "rollback" {
+		return RestartReasonRollback
+	}
+	return RestartReasonUpdate
+}
+
+// triggerEdgeRestart writes the restart marker (so the successor can confirm health or roll
+// back) and invokes OnEdgeRestart once after a short delay that lets the HTTP response which
+// requested the restart reach the browser.
+func (m *Manager) triggerEdgeRestart(req restartRequest) {
+	if strings.TrimSpace(req.Target) == "" {
 		return
 	}
 	m.restartMu.Lock()
@@ -533,8 +576,39 @@ func (m *Manager) triggerEdgeRestart(targetBinary string, async bool) {
 	cb := m.onEdgeRestart
 	m.restartMu.Unlock()
 
+	m.mu.Lock()
+	reason := nonEmptyOr(req.Reason, RestartReasonManual)
+	marker := &RestartMarker{
+		ID:          fmt.Sprintf("rst-%d", time.Now().UnixNano()),
+		Reason:      reason,
+		Target:      req.Target,
+		FromVersion: nonEmptyOr(req.FromVersion, m.status.Version),
+		FromCommit:  nonEmptyOr(req.FromCommit, m.status.ActiveCommit),
+		ToVersion:   nonEmptyOr(req.ToVersion, m.status.Version),
+		ToCommit:    nonEmptyOr(req.ToCommit, m.status.ActiveCommit),
+		FromBootID:  m.status.BootID,
+		RequestedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Rollback:    req.Rollback,
+	}
+	m.status.RestartScheduled = true
+	m.status.State = StateRestarting
+	m.status.LastError = nil
+	m.status.RestartProgress = &RestartProgress{
+		Phase:        RestartPhaseScheduled,
+		Reason:       reason,
+		StartedAtIso: isoNow(),
+	}
+	m.pendingRestart = nil
+	m.mu.Unlock()
+
+	if err := saveRestartMarker(m.cfg.HotUpdateDir, marker); err != nil {
+		m.logger.Printf("[hotupdate] warning: persist restart marker: %v (restart continues without boot guard)", err)
+	}
+	m.logger.Printf("[hotupdate] full-service restart scheduled (%s): %s -> %s via %s",
+		reason, marker.FromVersion, marker.ToVersion, req.Target)
+
 	if delay <= 0 {
-		if async {
+		if req.Async {
 			delay = 600 * time.Millisecond
 		} else {
 			delay = 150 * time.Millisecond
@@ -544,7 +618,7 @@ func (m *Manager) triggerEdgeRestart(targetBinary string, async bool) {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		<-timer.C
-		cb(targetBinary)
+		cb(req.Target)
 	}()
 }
 
