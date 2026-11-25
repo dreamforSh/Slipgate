@@ -57,6 +57,7 @@ services:
       - ../migrations/core/0020_account_privacy_mode.sql:/docker-entrypoint-initdb.d/47_core_account_privacy_mode.sql:ro
       - ../migrations/core/0021_account_quota.sql:/docker-entrypoint-initdb.d/48_core_account_quota.sql:ro
       - ../migrations/core/0022_usage_rollup_sealed_before.sql:/docker-entrypoint-initdb.d/49_core_usage_rollup_sealed_before.sql:ro
+      - ../migrations/core/0023_account_test_runs.sql:/docker-entrypoint-initdb.d/50_core_account_test_runs.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slipgate} -d ${POSTGRES_DB:-slipgate}"]
       interval: 5s

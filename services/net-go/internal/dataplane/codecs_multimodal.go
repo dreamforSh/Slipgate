@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -133,6 +134,20 @@ func isVideosPostEndpoint(path string) bool {
 	}
 }
 
+// videoSecondsValue reads a video length given as a JSON number or a numeric string (rounded up
+// to whole seconds); 0 when absent or not a positive number.
+func videoSecondsValue(raw json.RawMessage) uint32 {
+	text := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if text == "" || text == "null" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	if err != nil || f <= 0 || f > 1e6 {
+		return 0
+	}
+	return uint32(math.Ceil(f))
+}
+
 func parseMultimodalIngress(r *http.Request, rawBody []byte) (*CanonicalTurn, error) {
 	path := r.URL.Path
 	ct := r.Header.Get("Content-Type")
@@ -233,19 +248,20 @@ func parseMultimodalIngress(r *http.Request, rawBody []byte) (*CanonicalTurn, er
 			RawBody:      rawBody,
 		}
 		var payload struct {
-			Model    string `json:"model"`
-			Prompt   string `json:"prompt"`
-			Seconds  uint32 `json:"seconds"`
-			Duration uint32 `json:"duration"`
+			Model  string `json:"model"`
+			Prompt string `json:"prompt"`
+			// OpenAI's Videos API sends seconds as a string ("4"); others send a number.
+			Seconds  json.RawMessage `json:"seconds"`
+			Duration json.RawMessage `json:"duration"`
 		}
 		if err := json.Unmarshal(rawBody, &payload); err != nil {
 			return nil, fmt.Errorf("invalid video generation JSON: %w", err)
 		}
 		turn.PublicModel = strings.TrimSpace(payload.Model)
-		if payload.Seconds > 0 && payload.Seconds <= 120 {
-			turn.VideoSeconds = payload.Seconds
-		} else if payload.Duration > 0 && payload.Duration <= 120 {
-			turn.VideoSeconds = payload.Duration
+		if s := videoSecondsValue(payload.Seconds); s > 0 && s <= 120 {
+			turn.VideoSeconds = s
+		} else if d := videoSecondsValue(payload.Duration); d > 0 && d <= 120 {
+			turn.VideoSeconds = d
 		}
 		turn.EstimatedInputTokens = uint64(max(32, (len(payload.Prompt)+3)/4))
 		turn.BodyExcerpt = payload.Prompt[:min(len(payload.Prompt), 8192)]

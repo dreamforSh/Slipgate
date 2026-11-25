@@ -7,7 +7,7 @@ import {
   AccountExportRequestSchema,
   AccountImportRequestSchema,
   AccountStatsRangeSchema,
-  AccountTestEventSchema,
+  ACCOUNT_TEST_HISTORY_LIMIT,
   AccountTestRequestSchema,
   RefreshAccountOAuthResponseSchema,
   NetAccountPrivacyResultSchema,
@@ -63,7 +63,7 @@ import {
   type AccountBulkResult,
   type AccountExportFile,
   type AccountImportResult,
-  type AccountTestResult,
+  type AccountTestRunsResponse,
   type AccountUsageSummaryResponse,
   type CreateAccountRequest,
   type ClashExitNode,
@@ -80,6 +80,7 @@ import {
   type TlsProfile,
   type VmSlotSummary,
 } from "@slipgate/contracts";
+import { AccountTestTally } from "./account_test_runs.ts";
 import { UsageAggregateTimeoutError, type DashboardUsageAggregate } from "./store/usage_aggregates.ts";
 import { PaymentNotifier } from "./payments/notifications.ts";
 import { DataPlanePublishTracker, pushOutcome, type EdgePushBody, type EdgeSyncStatus } from "./dataplane_sync.ts";
@@ -2134,54 +2135,24 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       );
     }
 
-    const startedAt = Date.now();
-    let model = parsed.data.model ?? "";
-    let outcome: AccountTestResult | null = null;
-    let buffered = "";
+    const kind = parsed.data.kind ?? "text";
+    const tally = new AccountTestTally(kind, parsed.data.model ?? "");
     const decoder = new TextDecoder();
-    const observe = (text: string) => {
-      buffered += text;
-      let nl = buffered.indexOf("\n");
-      while (nl >= 0) {
-        const line = buffered.slice(0, nl).trim();
-        buffered = buffered.slice(nl + 1);
-        nl = buffered.indexOf("\n");
-        if (!line.startsWith("data:")) continue;
-        let json: unknown;
-        try {
-          json = JSON.parse(line.slice(5).trim());
-        } catch {
-          continue;
-        }
-        const ev = AccountTestEventSchema.safeParse(json);
-        if (!ev.success) continue;
-        const e = ev.data;
-        if (e.type === "start" && e.model) model = e.model;
-        // Only text tests speak for the account's health: an image / embedding / speech test
-        // may fail because that endpoint or model is not offered, not because the account broke.
-        if ((e.type === "done" || e.type === "error") && (parsed.data.kind ?? "text") === "text") {
-          const ok = e.type === "done" && e.success === true;
-          outcome = {
-            ok,
-            atIso: new Date().toISOString(),
-            model,
-            durationMs: Math.max(0, Math.round(e.durationMs ?? Date.now() - startedAt)),
-            message: ok ? "" : (e.message ?? e.code ?? (e.status ? `HTTP ${e.status}` : "test failed")).slice(0, 500),
-          };
-        }
-      }
-    };
-
     const relay = upstream.body.pipeThrough(
       new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
           controller.enqueue(chunk);
-          observe(decoder.decode(chunk, { stream: true }));
+          tally.feed(decoder.decode(chunk, { stream: true }));
         },
         async flush() {
-          observe(decoder.decode());
-          if (outcome) {
-            await store.recordAccountTestResult(accountId, outcome).catch(() => undefined);
+          tally.feed(decoder.decode());
+          tally.flush();
+          // Every test goes into the history; only text tests speak for the account's health (its
+          // last test): an image / embedding / speech / video test may fail because that endpoint
+          // or model is not offered, not because the account broke.
+          await store.recordAccountTestRun(tally.run(accountId, "manual")).catch(() => undefined);
+          if (kind === "text") {
+            await store.recordAccountTestResult(accountId, tally.result()).catch(() => undefined);
           }
         },
       }),
@@ -2194,6 +2165,17 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
         "X-Accel-Buffering": "no",
       },
     });
+  });
+
+  /** The account's test history (console, scheduled and automatic tests), newest first. */
+  app.get("/api/v1/admin/accounts/:accountId/test-runs", async (c) => {
+    const accountId = c.req.param("accountId");
+    if (!(await store.getAccount(accountId))) {
+      return c.json({ error: "not_found", message: `Account ${accountId} not found` }, 404);
+    }
+    const limit = Number(c.req.query("limit") ?? ACCOUNT_TEST_HISTORY_LIMIT);
+    const items = await store.listAccountTestRuns(accountId, Number.isFinite(limit) ? limit : ACCOUNT_TEST_HISTORY_LIMIT);
+    return c.json({ items } satisfies AccountTestRunsResponse);
   });
 
   /**

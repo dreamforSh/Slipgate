@@ -1,5 +1,6 @@
 import postgres from "postgres";
 import {
+  ACCOUNT_TEST_HISTORY_LIMIT,
   AccountAuthKindSchema,
   AccountPrivacyModeSchema,
   accountQuotaState,
@@ -15,6 +16,7 @@ import {
   type AccountQuota,
   type AccountQuotaState,
   type AccountTestResult,
+  type AccountTestRun,
   type AccountUsageSummaryItem,
   type ApiKeyItem,
   type CreateAccountRequest,
@@ -511,6 +513,27 @@ export class PostgresControlStore implements ControlStore {
 
       ALTER TABLE IF EXISTS core.account_window_quotas
           ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+
+      -- Account test history (migrations/core/0023_account_test_runs.sql).
+      CREATE TABLE IF NOT EXISTS core.account_test_runs (
+          id           TEXT PRIMARY KEY,
+          account_id   TEXT NOT NULL REFERENCES core.accounts(id) ON DELETE CASCADE,
+          at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          source       TEXT NOT NULL,
+          kind         TEXT NOT NULL,
+          ok           BOOLEAN NOT NULL,
+          model        TEXT NOT NULL DEFAULT '',
+          status       INTEGER NOT NULL DEFAULT 0,
+          duration_ms  INTEGER NOT NULL DEFAULT 0,
+          ttft_ms      INTEGER,
+          code         TEXT NOT NULL DEFAULT '',
+          message      TEXT NOT NULL DEFAULT '',
+          output       TEXT NOT NULL DEFAULT '',
+          media_count  INTEGER NOT NULL DEFAULT 0,
+          dimensions   INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_core_account_test_runs_account_at
+          ON core.account_test_runs (account_id, at DESC);
 
       -- No index builds on core.usage_logs here: this batch runs in one implicit transaction
       -- before the BFF listens, so scanning a large partition would block settlements.
@@ -1606,6 +1629,87 @@ export class PostgresControlStore implements ControlStore {
           last_test_message = ${result.message}
       WHERE id = ${accountId}
     `;
+  }
+
+  async recordAccountTestRun(run: Omit<AccountTestRun, "id">): Promise<AccountTestRun> {
+    const id = `atr_${crypto.randomUUID()}`;
+    try {
+      await this.sql.begin(async (tx) => {
+        await tx`
+          INSERT INTO core.account_test_runs
+            (id, account_id, at, source, kind, ok, model, status, duration_ms, ttft_ms, code, message,
+             output, media_count, dimensions)
+          VALUES
+            (${id}, ${run.accountId}, ${new Date(run.atIso)}, ${run.source}, ${run.kind}, ${run.ok}, ${run.model},
+             ${run.status}, ${run.durationMs}, ${run.ttftMs}, ${run.code}, ${run.message}, ${run.output},
+             ${run.mediaCount}, ${run.dimensions})
+        `;
+        // Keep the newest runs only (the index walks this account's rows newest first).
+        await tx`
+          DELETE FROM core.account_test_runs
+          WHERE account_id = ${run.accountId}
+            AND id NOT IN (
+              SELECT id FROM core.account_test_runs
+              WHERE account_id = ${run.accountId}
+              ORDER BY at DESC, id DESC
+              LIMIT ${ACCOUNT_TEST_HISTORY_LIMIT}
+            )
+        `;
+      });
+    } catch (err) {
+      if ((err as { code?: string }).code === "23503") {
+        throw new StoreError("not_found", `Account ${run.accountId} not found`);
+      }
+      throw err;
+    }
+    return { id, ...run };
+  }
+
+  async listAccountTestRuns(accountId: string, limit = ACCOUNT_TEST_HISTORY_LIMIT): Promise<AccountTestRun[]> {
+    const n = Math.max(1, Math.min(ACCOUNT_TEST_HISTORY_LIMIT, Math.floor(limit)));
+    const rows = await this.sql<
+      {
+        id: string;
+        account_id: string;
+        at: Date;
+        source: string;
+        kind: string;
+        ok: boolean;
+        model: string;
+        status: number;
+        duration_ms: number;
+        ttft_ms: number | null;
+        code: string;
+        message: string;
+        output: string;
+        media_count: number;
+        dimensions: number | null;
+      }[]
+    >`
+      SELECT id, account_id, at, source, kind, ok, model, status, duration_ms, ttft_ms, code, message, output,
+             media_count, dimensions
+      FROM core.account_test_runs
+      WHERE account_id = ${accountId}
+      ORDER BY at DESC, id DESC
+      LIMIT ${n}
+    `;
+    return rows.map((r) => ({
+      id: r.id,
+      accountId: r.account_id,
+      atIso: new Date(r.at).toISOString(),
+      source: r.source as AccountTestRun["source"],
+      kind: r.kind as AccountTestRun["kind"],
+      ok: r.ok,
+      model: r.model,
+      status: Number(r.status),
+      durationMs: Number(r.duration_ms),
+      ttftMs: r.ttft_ms === null ? null : Number(r.ttft_ms),
+      code: r.code,
+      message: r.message,
+      output: r.output,
+      mediaCount: Number(r.media_count),
+      dimensions: r.dimensions === null ? null : Number(r.dimensions),
+    }));
   }
 
   async listAccountSecrets(accountIds?: string[]): Promise<AccountSecretRecord[]> {

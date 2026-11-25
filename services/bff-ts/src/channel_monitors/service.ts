@@ -88,7 +88,8 @@ export class ChannelMonitorService {
           message = "Network service unavailable in standalone mode";
         } else {
           await this.syncDataPlane().catch(() => undefined);
-          const res = await probeAccount(target, monitor.accountId, monitor.model);
+          // Channel checks keep their own results; they do not go into the account's test history.
+          const { result: res } = await probeAccount(target, monitor.accountId, monitor.model, "auto");
           ok = res.ok;
           latencyMs = Math.max(0, Math.round(res.durationMs));
           usedModel = res.model || monitor.model;

@@ -15,12 +15,17 @@ import (
 //
 //	start → delta* → done           (text: success, or an upstream error reported in done.success=false)
 //	start → media* → done           (image / speech: one media event per image or the audio clip)
+//	start → progress* → media? → done   (video: task status while it renders, then the clip)
+//	start → progress? → delta? → done   (transcription: the transcript as one delta)
 //	error                           (the probe could not be dispatched at all)
 type ProbeEvent struct {
-	Type         string `json:"type"`
-	Kind         string `json:"kind,omitempty"`
-	Model        string `json:"model,omitempty"`
-	Text         string `json:"text,omitempty"`
+	Type  string `json:"type"`
+	Kind  string `json:"kind,omitempty"`
+	Model string `json:"model,omitempty"`
+	// Text is a reply delta, a transcript, or the status line of a progress event.
+	Text string `json:"text,omitempty"`
+	// Progress is a video task's completion percentage (progress events), when the provider reports it.
+	Progress     int    `json:"progress,omitempty"`
 	Success      bool   `json:"success,omitempty"`
 	Status       int    `json:"status,omitempty"`
 	Code         string `json:"code,omitempty"`
@@ -38,10 +43,15 @@ type ProbeEvent struct {
 
 // ProbeRequest selects the kind of test (text by default; see ProbeKindsFor), the model and the
 // prompt (the embedding / speech input for those kinds) used to test one upstream account.
+// ImageDataURL / AudioDataURL are optional uploads as data: URLs (at most probeMaxInputMediaBytes
+// decoded): a source image turns an OpenAI image test into an edit and is a Grok video's first
+// frame; audio is what a transcription test transcribes (a built-in silent clip otherwise).
 type ProbeRequest struct {
-	Kind   string `json:"kind"`
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
+	Kind         string `json:"kind"`
+	Model        string `json:"model"`
+	Prompt       string `json:"prompt"`
+	ImageDataURL string `json:"imageDataUrl,omitempty"`
+	AudioDataURL string `json:"audioDataUrl,omitempty"`
 }
 
 const (
@@ -136,8 +146,13 @@ func (c *Coordinator) ProbeAccount(ctx context.Context, accountID string, req Pr
 	if r := []rune(prompt); len(r) > probeMaxPromptRunes {
 		prompt = string(r[:probeMaxPromptRunes])
 	}
+	inputs, code, err := decodeProbeInputs(meta.Platform, kind, req)
+	if err != nil {
+		emit(ProbeEvent{Type: "error", Kind: kind, Code: code, Message: err.Error()})
+		return
+	}
 	if kind != ProbeKindText {
-		c.probeMediaAccount(ctx, accountID, meta, secret, c.probePersona(accountID, meta, secret), kind, model, prompt, emit)
+		c.probeMediaAccount(ctx, accountID, meta, secret, c.probePersona(accountID, meta, secret), kind, model, prompt, inputs, emit)
 		return
 	}
 

@@ -1,12 +1,13 @@
 import type { Hono } from "hono";
 import { z } from "zod";
 import {
-  AccountTestEventSchema,
   AccountTestScheduleSchema,
   type AccountTestResult,
   type AccountTestSchedule,
   type AccountTestScheduleItem,
+  type AccountTestSource,
 } from "@slipgate/contracts";
+import { AccountTestTally, failedTestRun, type NewAccountTestRun } from "./account_test_runs.ts";
 import type { AuthEnv } from "./middleware/auth.ts";
 import { StoreError, type ControlStore } from "./store/types.ts";
 
@@ -48,21 +49,28 @@ export interface ProbeTarget {
   token: string;
 }
 
-/** Runs one streamed account test to completion and returns its outcome. */
+/** Outcome of one test: the account's last test and its history entry. */
+export interface ProbeOutcome {
+  result: AccountTestResult;
+  run: NewAccountTestRun;
+}
+
+/** Runs one streamed (text) account test to completion and returns its outcome. */
 export async function probeAccount(
   target: ProbeTarget,
   accountId: string,
   model: string,
+  source: AccountTestSource,
   fetchImpl: typeof fetch = fetch,
-): Promise<AccountTestResult> {
+): Promise<ProbeOutcome> {
   const started = Date.now();
-  const fail = (message: string): AccountTestResult => ({
-    ok: false,
-    atIso: new Date().toISOString(),
-    model,
-    durationMs: Date.now() - started,
-    message: message.slice(0, 500),
-  });
+  const fail = (message: string): ProbeOutcome => {
+    const run = failedTestRun(accountId, source, "text", model, message);
+    return {
+      result: { ok: false, atIso: run.atIso, model, durationMs: Date.now() - started, message: run.message },
+      run: { ...run, durationMs: Date.now() - started },
+    };
+  };
   let res: Response;
   try {
     res = await fetchImpl(`${target.url}/internal/net/accounts/${encodeURIComponent(accountId)}/test`, {
@@ -78,34 +86,10 @@ export async function probeAccount(
     const payload = (await res.json().catch(() => ({}))) as { message?: string };
     return fail(payload.message ?? `HTTP ${res.status}`);
   }
-  const text = await res.text();
-  let usedModel = model;
-  let outcome: AccountTestResult | null = null;
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (!line.startsWith("data:")) continue;
-    let json: unknown;
-    try {
-      json = JSON.parse(line.slice(5).trim());
-    } catch {
-      continue;
-    }
-    const ev = AccountTestEventSchema.safeParse(json);
-    if (!ev.success) continue;
-    const e = ev.data;
-    if (e.type === "start" && e.model) usedModel = e.model;
-    if (e.type === "done" || e.type === "error") {
-      const ok = e.type === "done" && e.success === true;
-      outcome = {
-        ok,
-        atIso: new Date().toISOString(),
-        model: usedModel,
-        durationMs: Math.max(0, Math.round(e.durationMs ?? Date.now() - started)),
-        message: ok ? "" : (e.message ?? e.code ?? (e.status ? `HTTP ${e.status}` : "test failed")).slice(0, 500),
-      };
-    }
-  }
-  return outcome ?? fail("stream_interrupted");
+  const tally = new AccountTestTally("text", model);
+  tally.feed(await res.text());
+  tally.flush();
+  return { result: tally.result(), run: tally.run(accountId, source) };
 }
 
 export class AccountAutoTester {
@@ -209,8 +193,9 @@ export class AccountAutoTester {
   ): Promise<{ result: AccountTestResult; recovered: boolean } | null> {
     const account = await this.store.getAccount(accountId);
     if (!account || account.executionMode === "vm_slot") return null;
-    const result = await probeAccount(target, accountId, schedule.model, this.fetchImpl);
+    const { result, run } = await probeAccount(target, accountId, schedule.model, "scheduled", this.fetchImpl);
     await this.store.recordAccountTestResult(accountId, result).catch(() => undefined);
+    await this.store.recordAccountTestRun(run).catch(() => undefined);
     let recovered = false;
     if (schedule.autoRecover && result.ok && account.effectiveStatus === "cooldown") {
       // A stored "cooldown" status goes back to active (that also clears the deadline); an active
@@ -311,10 +296,11 @@ export class AccountAutoTester {
       const queue = [...accounts];
       const worker = async () => {
         for (let a = queue.shift(); a; a = queue.shift()) {
-          const result = await probeAccount(target, a.id, cfg.model, this.fetchImpl);
+          const { result, run } = await probeAccount(target, a.id, cfg.model, "auto", this.fetchImpl);
           tested++;
           if (!result.ok) failed++;
           await this.store.recordAccountTestResult(a.id, result).catch(() => undefined);
+          await this.store.recordAccountTestRun(run).catch(() => undefined);
         }
       };
       await Promise.all(Array.from({ length: Math.min(cfg.concurrency, Math.max(1, accounts.length)) }, worker));

@@ -2,6 +2,7 @@ import type {
   AccountPrivacyMode,
   AccountQuotaState,
   AccountTestResult,
+  AccountTestRun,
   AccountUsageSummaryItem,
   ApiKeyItem,
   CreateAccountRequest,
@@ -205,6 +206,13 @@ export interface ControlStore {
   updateAccount(accountId: string, req: UpdateAccountRequest, credential?: StoredCredential): Promise<UpstreamAccount>;
   deleteAccount(accountId: string): Promise<void>;
   recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void>;
+  /**
+   * Appends a test to the account's history, keeping its newest ACCOUNT_TEST_HISTORY_LIMIT runs;
+   * not_found for an unknown account.
+   */
+  recordAccountTestRun(run: Omit<AccountTestRun, "id">): Promise<AccountTestRun>;
+  /** The account's test history, newest first (at most ACCOUNT_TEST_HISTORY_LIMIT). */
+  listAccountTestRuns(accountId: string, limit?: number): Promise<AccountTestRun[]>;
   /** Stores the outcome of the "set privacy" action (see AccountPrivacyModeSchema). */
   recordAccountPrivacy(accountId: string, mode: AccountPrivacyMode, checkedAtIso: string): Promise<void>;
   /** Accounts with at least one spend-quota limit (the settlement path checks only these). */

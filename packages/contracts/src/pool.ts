@@ -747,21 +747,23 @@ export const AccountBulkResultSchema = z.object({
 export type AccountBulkResult = z.infer<typeof AccountBulkResultSchema>;
 
 /**
- * Endpoint an account test calls: text streams a chat completion; image, embedding and speech call
- * /v1/images/generations, /v1/embeddings and /v1/audio/speech through the same outbound path.
+ * Endpoint an account test calls: text streams a chat completion; image, embedding, speech,
+ * transcription and video call /v1/images/generations (or /edits with a source image),
+ * /v1/embeddings, /v1/audio/speech, /v1/audio/transcriptions and /v1/videos (polled until the
+ * clip renders) through the same outbound path as production traffic.
  */
-export const AccountTestKindSchema = z.enum(["text", "image", "embedding", "speech"]);
+export const AccountTestKindSchema = z.enum(["text", "image", "embedding", "speech", "transcription", "video"]);
 export type AccountTestKind = z.infer<typeof AccountTestKindSchema>;
 
 /** Test kinds an account of this provider offers (mirrors net-go ProbeKindsFor); text for all. */
 export function accountTestKinds(provider: string): AccountTestKind[] {
   switch (provider) {
     case "openai":
-      return ["text", "image", "embedding", "speech"];
+      return ["text", "image", "embedding", "speech", "transcription", "video"];
     case "gemini":
       return ["text", "image", "embedding"];
     case "grok":
-      return ["text", "image"];
+      return ["text", "image", "video"];
     case "qwen":
       return ["text", "embedding"];
     default:
@@ -769,12 +771,35 @@ export function accountTestKinds(provider: string): AccountTestKind[] {
   }
 }
 
+/** Largest upload (decoded) an account test takes; its base64 must fit the 8 MiB API body. */
+export const ACCOUNT_TEST_MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const testUploadSchema = (prefix: string) =>
+  z
+    .string()
+    .max(Math.ceil((ACCOUNT_TEST_MAX_UPLOAD_BYTES * 4) / 3) + 128)
+    .refine((v) => v.startsWith(prefix) && v.includes(";base64,"), `expected a base64 ${prefix}… URL`);
+
+/**
+ * Which uploads a test kind takes on a provider (mirrors net-go decodeProbeInputs): a source image
+ * for OpenAI image edits and Grok video first frames; audio for transcriptions.
+ */
+export function accountTestUploads(provider: string, kind: AccountTestKind): { image: boolean; audio: boolean } {
+  return {
+    image: (kind === "image" && provider === "openai") || (kind === "video" && provider === "grok"),
+    audio: kind === "transcription",
+  };
+}
+
 export const AccountTestRequestSchema = z.object({
   /** Defaults to text. Only text tests are recorded as the account's last test. */
   kind: AccountTestKindSchema.optional(),
   model: z.string().trim().max(128).optional(),
-  /** The prompt, or the embedding / speech input. */
+  /** The prompt, or the embedding / speech input (an optional hint for transcriptions). */
   prompt: z.string().trim().max(2000).optional(),
+  /** Source image as a data: URL (see accountTestUploads). */
+  imageDataUrl: testUploadSchema("data:image/").optional(),
+  /** Audio to transcribe as a data: URL; a transcription test without it sends a silent clip. */
+  audioDataUrl: testUploadSchema("data:").optional(),
 });
 export type AccountTestRequest = z.infer<typeof AccountTestRequestSchema>;
 
@@ -783,8 +808,11 @@ export type AccountTestRequest = z.infer<typeof AccountTestRequestSchema>;
  * Sequence: start, then delta events, then done; or a single error when the test cannot be dispatched.
  */
 export const AccountTestEventSchema = z.object({
-  /** start, then delta (text) or media (image / speech) events, then done; or a single error. */
-  type: z.enum(["start", "delta", "media", "done", "error"]),
+  /**
+   * start, then delta (text, a transcript), media (image / speech / video) and progress (a status
+   * line, e.g. a video task while it renders) events, then done; or a single error.
+   */
+  type: z.enum(["start", "delta", "media", "progress", "done", "error"]),
   kind: AccountTestKindSchema.optional(),
   model: z.string().optional(),
   text: z.string().optional(),
@@ -796,13 +824,55 @@ export const AccountTestEventSchema = z.object({
   durationMs: z.number().optional(),
   inputTokens: z.number().optional(),
   outputTokens: z.number().optional(),
-  /** A generated image (URL or data: URL) or the speech audio (data: URL). */
+  /** A generated image or video (URL or data: URL) or the speech audio (data: URL). */
   mediaUrl: z.string().optional(),
   mimeType: z.string().optional(),
   /** Vector length of an embedding test. */
   dimensions: z.number().int().optional(),
+  /** Completion percentage of a progress event (video tasks), when the provider reports it. */
+  progress: z.number().optional(),
 });
 export type AccountTestEvent = z.infer<typeof AccountTestEventSchema>;
+
+/** Who ran a test: an admin in the console, an account's schedule, or the fleet-wide auto test. */
+export const AccountTestSourceSchema = z.enum(["manual", "scheduled", "auto"]);
+export type AccountTestSource = z.infer<typeof AccountTestSourceSchema>;
+
+/** Test runs kept per account (older ones are pruned as new ones arrive). */
+export const ACCOUNT_TEST_HISTORY_LIMIT = 50;
+
+/** One recorded account test (sub2api "测试结果"), any kind and source. */
+export const AccountTestRunSchema = z.object({
+  id: z.string(),
+  accountId: z.string(),
+  atIso: z.string(),
+  source: AccountTestSourceSchema,
+  kind: AccountTestKindSchema,
+  ok: z.boolean(),
+  model: z.string(),
+  /** Upstream HTTP status of the done event; 0 when the test never reached the provider. */
+  status: z.number().int().nonnegative(),
+  durationMs: z.number().int().nonnegative(),
+  /** Time to the first text token (text tests); null otherwise. */
+  ttftMs: z.number().int().nonnegative().nullable(),
+  /** Error code and message of a failed test; empty when it passed. */
+  code: z.string(),
+  message: z.string(),
+  /**
+   * What came back, abridged (≤ 500 chars): the reply or transcript, or for a video without a
+   * clip the last status line. Media themselves are never stored, only counted.
+   */
+  output: z.string(),
+  /** Images, audio or video clips the test returned. */
+  mediaCount: z.number().int().nonnegative(),
+  /** Vector length of an embedding test; null otherwise. */
+  dimensions: z.number().int().nonnegative().nullable(),
+});
+export type AccountTestRun = z.infer<typeof AccountTestRunSchema>;
+
+/** `GET /api/v1/admin/accounts/:id/test-runs`, newest first. */
+export const AccountTestRunsResponseSchema = z.object({ items: z.array(AccountTestRunSchema) });
+export type AccountTestRunsResponse = z.infer<typeof AccountTestRunsResponseSchema>;
 
 /**
  * `GET /api/v1/admin/accounts/:id/models`: models the account can use, asked from the provider over

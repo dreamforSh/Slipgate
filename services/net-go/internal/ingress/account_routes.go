@@ -12,8 +12,13 @@ import (
 	"github.com/dreamforSh/slipgate/services/net-go/internal/dataplane"
 )
 
-// accountProbeTimeout bounds one admin account test end to end (dial + first token + short completion).
+// accountProbeTimeout bounds one admin account test end to end (dial + first token + short completion,
+// or a video task polled until it renders).
 const accountProbeTimeout = 90 * time.Second
+
+// accountProbeMaxBody caps a test request: the uploads (a source image or audio, up to 5 MiB each
+// decoded) arrive as base64 data: URLs.
+const accountProbeMaxBody = 16 << 20
 
 func (s *Server) registerAccountInternalRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/net/accounts/{id}/test", s.handleTestAccount)
@@ -177,7 +182,7 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 
 	var req dataplane.ProbeRequest
 	if r.Body != nil {
-		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		if err := json.NewDecoder(io.LimitReader(r.Body, accountProbeMaxBody)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "message": err.Error()})
 			return
 		}

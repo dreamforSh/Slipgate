@@ -1,4 +1,5 @@
 import {
+  ACCOUNT_TEST_HISTORY_LIMIT,
   ACCOUNT_QUOTA_DAY_MS,
   ACCOUNT_QUOTA_WEEK_MS,
   accountQuotaLimited,
@@ -13,6 +14,7 @@ import {
   type AccountQuota,
   type AccountQuotaState,
   type AccountTestResult,
+  type AccountTestRun,
   type AccountUsageSummaryItem,
   type ApiKeyItem,
   type CreateAccountRequest,
@@ -138,6 +140,8 @@ export class MemoryControlStore implements ControlStore {
   private readonly idempotencyKeys = new Set<string>();
   private readonly groups = new Map<string, InternalGroup>();
   private readonly accounts = new Map<string, InternalAccount>();
+  /** Test history per account, newest first (ACCOUNT_TEST_HISTORY_LIMIT each). */
+  private readonly accountTestRuns = new Map<string, AccountTestRun[]>();
   private readonly apiKeys = new Map<string, InternalApiKey>();
   private readonly routes = new Map<string, StoredCompositeRoute>();
   /** Settlement id -> the usage row it recorded (billing idempotency, see recordTurnSettlement). */
@@ -681,11 +685,29 @@ export class MemoryControlStore implements ControlStore {
     if (!this.accounts.delete(accountId)) {
       throw new StoreError("not_found", `Account ${accountId} not found`);
     }
+    this.accountTestRuns.delete(accountId);
   }
 
   async recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void> {
     const acc = this.accounts.get(accountId);
     if (acc) acc.lastTest = { ...result };
+  }
+
+  async recordAccountTestRun(run: Omit<AccountTestRun, "id">): Promise<AccountTestRun> {
+    if (!this.accounts.has(run.accountId)) {
+      throw new StoreError("not_found", `Account ${run.accountId} not found`);
+    }
+    const saved: AccountTestRun = { id: `atr_${crypto.randomUUID()}`, ...run };
+    const list = this.accountTestRuns.get(run.accountId) ?? [];
+    list.unshift(saved);
+    list.length = Math.min(list.length, ACCOUNT_TEST_HISTORY_LIMIT);
+    this.accountTestRuns.set(run.accountId, list);
+    return { ...saved };
+  }
+
+  async listAccountTestRuns(accountId: string, limit = ACCOUNT_TEST_HISTORY_LIMIT): Promise<AccountTestRun[]> {
+    const n = Math.max(1, Math.min(ACCOUNT_TEST_HISTORY_LIMIT, Math.floor(limit)));
+    return (this.accountTestRuns.get(accountId) ?? []).slice(0, n).map((r) => ({ ...r }));
   }
 
   /** Quota limits and usage; usage is only summed for accounts that have a limit. */

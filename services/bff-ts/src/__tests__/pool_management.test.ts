@@ -354,7 +354,7 @@ describe("account connectivity test", () => {
     expect(seen[0]).toEqual({ kind: "image", prompt: "a cat" });
     const recorded = (await call<{ accounts: UpstreamAccount[] }>("GET", "/api/v1/admin/accounts", admin)).body.accounts.find((a) => a.id === acc.id);
     expect(recorded?.lastTest ?? null).toBeNull();
-    expect((await call("POST", `/api/v1/admin/accounts/${acc.id}/test`, admin, { kind: "video" })).status).toBe(400);
+    expect((await call("POST", `/api/v1/admin/accounts/${acc.id}/test`, admin, { kind: "telepathy" })).status).toBe(400);
   });
 
   it("records failed tests with the upstream message", async () => {
