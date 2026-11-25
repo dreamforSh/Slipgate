@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
-import type { AccountUsageSummaryItem, UpstreamAccount } from "@slipgate/contracts";
+import type { AccountExitBinding, AccountUsageSummaryItem, ClashExitNode, UpstreamAccount } from "@slipgate/contracts";
 import UiBadge from "../../ui/UiBadge.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UsageMeter from "../../ui/UsageMeter.vue";
+import AccountExitCell from "./AccountExitCell.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
 import PlatformTypeBadge from "./PlatformTypeBadge.vue";
 import { EXPIRY_TONE, MODE_ICON, expiryState } from "./accountDisplay";
+import { modeUsesExit } from "./exitPool";
 import { platformStyle } from "../../../lib/platformStyle";
 import {
   executionModeLabel,
@@ -24,6 +26,10 @@ const props = defineProps<{
   today: AccountUsageSummaryItem | null;
   now: number;
   busy: boolean;
+  exitBinding: AccountExitBinding | null;
+  exitNode: ClashExitNode | null;
+  /** The exit pool reflects slipgate-net (not standalone samples, not a failed load). */
+  exitReady: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -49,6 +55,8 @@ const MODE_DOT: Record<string, string> = {
   vm_slot: "bg-violet",
 };
 const expiry = computed(() => expiryState(acc.value, props.now));
+/** Exit-routed account with no exit: slipgate-net refuses its traffic until one is bound. */
+const exitMissing = computed(() => props.exitReady && !props.exitBinding && modeUsesExit(acc.value.executionMode));
 
 const todayTitle = computed(() => {
   const d = props.today;
@@ -132,6 +140,22 @@ const lastTestClass = computed(() => {
         <UiIcon :name="MODE_ICON[acc.executionMode]" :size="11" />
         {{ executionModeLabel(acc.executionMode) }}
       </span>
+    </div>
+
+    <!-- Exit proxy -->
+    <div
+      class="mt-2.5 flex items-center gap-2 rounded-lg px-2.5 py-1.5"
+      :class="exitMissing ? 'bg-warning/[0.07] ring-1 ring-inset ring-warning/20' : 'bg-surface-2/60'"
+    >
+      <UiIcon name="network" :size="12" class="shrink-0 text-fg-subtle" />
+      <AccountExitCell
+        inline
+        class="flex-1"
+        :mode="acc.executionMode"
+        :binding="exitBinding"
+        :node="exitNode"
+        :ready="exitReady"
+      />
     </div>
 
     <!-- Notes + credential -->

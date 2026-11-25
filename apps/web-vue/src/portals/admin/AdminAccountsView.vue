@@ -69,6 +69,7 @@ import {
 } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 import UiSelect from "../../components/ui/UiSelect.vue";
+import { exitAvailability, modeUsesExit, useExitPool } from "../../components/admin/accounts/exitPool";
 
 const { t } = useI18n();
 const route = useRoute();
@@ -83,6 +84,46 @@ const errorMessage = ref<string | null>(null);
 const toast = useFeedbackToasts(errorMessage);
 const now = useNow(30_000);
 
+/* ---------------- Exit proxies (slipgate-net bindings) ---------------- */
+
+const exitPool = useExitPool();
+/** Bindings are real only with slipgate-net attached; standalone samples must not drive warnings. */
+const exitReady = computed(() => exitPool.loaded && !exitPool.standalone && !exitPool.failed);
+const hasExit = (accountId: string) => exitPool.bindingByAccount.has(accountId);
+const exitBindingOf = (acc: UpstreamAccount) => exitPool.bindingByAccount.get(acc.id) ?? null;
+const exitNodeOf = (acc: UpstreamAccount) => {
+  const b = exitBindingOf(acc);
+  return b ? exitPool.nodeById.get(b.nodeId) ?? null : null;
+};
+/** Exit-routed accounts (HTTP direct / VM slot) without an exit: slipgate-net refuses their traffic. */
+const missingExitAccounts = computed(() =>
+  exitReady.value ? accounts.value.filter((a) => modeUsesExit(a.executionMode) && !hasExit(a.id)) : [],
+);
+const exitAssigning = ref(false);
+
+/** Give each account its own free healthy exit (fastest first); reports how many got one. */
+async function assignExits(targets: UpstreamAccount[]) {
+  if (!targets.length || exitAssigning.value) return;
+  exitAssigning.value = true;
+  try {
+    const free = exitPool.nodes
+      .filter((n) => exitAvailability(n, null) === "ok")
+      .sort((a, b) => (a.latencyMs || 1e9) - (b.latencyMs || 1e9))
+      .map((n) => n.nodeId);
+    let bound = 0;
+    for (const acc of targets) {
+      const nodeId = free.shift();
+      if (!nodeId) break;
+      if (!(await exitPool.bind(acc.id, nodeId, ""))) bound += 1;
+    }
+    if (bound > 0) toast.success(t("accounts.exit.assigned", { n: bound }));
+    if (bound < targets.length) toast.warning(t("accounts.exit.assignShort", { n: targets.length - bound }));
+    await exitPool.load();
+  } finally {
+    exitAssigning.value = false;
+  }
+}
+
 /* ---------------- View preferences (per browser) ---------------- */
 
 type ViewMode = "table" | "card";
@@ -96,6 +137,21 @@ const viewMode = usePersistentState<ViewMode>(
   (v): v is ViewMode => v === "table" || v === "card",
 );
 const columns = usePersistentState<ColumnKey[]>("slipgate.accounts.columns", [...DEFAULT_COLUMNS], isColumnList);
+// Column lists saved before the exit column existed get it once (it can still be hidden afterwards).
+try {
+  const MIGRATED = "slipgate.accounts.columns.exit";
+  if (!localStorage.getItem(MIGRATED)) {
+    if (!columns.value.includes("exit")) {
+      const at = columns.value.indexOf("platform");
+      const next = [...columns.value];
+      next.splice(at >= 0 ? at + 1 : next.length, 0, "exit");
+      columns.value = next;
+    }
+    localStorage.setItem(MIGRATED, "1");
+  }
+} catch {
+  // Storage unavailable: the default list already includes the column.
+}
 const sort = usePersistentState<SortState>("slipgate.accounts.sort", { key: "priority", dir: "asc" }, isSortState);
 const pageSize = usePersistentState<number>("slipgate.accounts.pageSize", 20, (v): v is number =>
   (PAGE_SIZES as readonly unknown[]).includes(v),
@@ -211,7 +267,7 @@ const baseFiltered = computed(() => {
   return accounts.value.filter((a) => {
     if (platformFilter.value !== "all" && a.platform !== platformFilter.value) return false;
     if (!matchesGroupFilter(a, groupFilter.value)) return false;
-    if (!matchesStatusFilter(a, statusFilter.value, nowMs)) return false;
+    if (!matchesStatusFilter(a, statusFilter.value, nowMs, exitReady.value ? hasExit : undefined)) return false;
     return !q || (searchHaystack.value.get(a.id) ?? "").includes(q);
   });
 });
@@ -251,6 +307,9 @@ watch(pageCount, (count) => {
 const selected = ref<Set<string>>(new Set());
 const selectedAccounts = computed(() => accounts.value.filter((a) => selected.value.has(a.id)));
 const selectedIds = computed(() => selectedAccounts.value.map((a) => a.id));
+const selectedMissingExit = computed(() =>
+  exitReady.value ? selectedAccounts.value.filter((a) => modeUsesExit(a.executionMode) && !hasExit(a.id)) : [],
+);
 const allPageSelected = computed(
   () => pagedAccounts.value.length > 0 && pagedAccounts.value.every((a) => selected.value.has(a.id)),
 );
@@ -323,6 +382,8 @@ async function refreshPool(silent = false) {
       auth.apiFetch("/api/v1/admin/groups"),
       auth.apiFetch("/api/v1/admin/accounts"),
       auth.apiFetch(`/api/v1/admin/accounts/usage-today?tz=${tz}`).catch(() => null),
+      // Best-effort like usage: without slipgate-net the exit column just reads "—".
+      exitPool.load(),
     ]);
     if (gRes.ok) groups.value = ((await gRes.json()) as { groups: GroupItem[] }).groups;
     if (aRes.ok) {
@@ -893,11 +954,50 @@ onMounted(() => {
             <UiIcon name="sliders" :size="13" />
             {{ t("accounts.bulk.edit") }}
           </button>
+          <button
+            v-if="exitReady && selectedMissingExit.length > 0"
+            type="button"
+            class="btn btn-secondary btn-sm"
+            :disabled="bulkBusy || exitAssigning"
+            @click="assignExits(selectedMissingExit)"
+          >
+            <UiIcon :name="exitAssigning ? 'loader' : 'network'" :size="13" :spin="exitAssigning" />
+            {{ t("accounts.exit.assignSelected", { n: selectedMissingExit.length }) }}
+          </button>
           <button type="button" class="btn btn-secondary btn-sm" :disabled="bulkBusy" @click="openExport(selectedIds)">
             <UiIcon name="download" :size="13" />
             {{ t("accounts.bulk.export") }}
           </button>
           <ConfirmButton size="sm" :label="t('accounts.bulk.delete')" :disabled="bulkBusy" @confirm="bulkDelete" />
+        </div>
+      </div>
+
+      <!-- Exit-routed accounts without an exit are refused by slipgate-net: surface and fix in place -->
+      <div
+        v-if="missingExitAccounts.length > 0"
+        class="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-line/70 bg-warning/[0.06] px-5 py-2.5 text-sm"
+      >
+        <UiIcon name="alert" :size="15" class="shrink-0 text-warning" />
+        <span class="min-w-0 flex-1 text-fg">{{ t("accounts.exit.banner", { n: missingExitAccounts.length }) }}</span>
+        <div class="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :class="statusFilter === 'missing_exit' ? 'text-accent' : ''"
+            @click="statusFilter = statusFilter === 'missing_exit' ? 'all' : 'missing_exit'"
+          >
+            <UiIcon name="filter" :size="13" />
+            {{ statusFilter === "missing_exit" ? t("accounts.exit.bannerShowAll") : t("accounts.exit.bannerShow") }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary btn-sm"
+            :disabled="exitAssigning"
+            @click="assignExits(missingExitAccounts)"
+          >
+            <UiIcon :name="exitAssigning ? 'loader' : 'network'" :size="13" :spin="exitAssigning" />
+            {{ t("accounts.exit.assignAll") }}
+          </button>
         </div>
       </div>
 
@@ -930,6 +1030,8 @@ onMounted(() => {
         :today="todayUsage"
         :now="now"
         :busy="busyIds"
+        :exit-pool="exitPool"
+        :exit-ready="exitReady"
         @toggle-select="toggleOne"
         @toggle-page="togglePage"
         @sort="setSort"
@@ -951,6 +1053,9 @@ onMounted(() => {
           :today="todayUsage.get(acc.id) ?? null"
           :now="now"
           :busy="busyIds.has(acc.id)"
+          :exit-binding="exitBindingOf(acc)"
+          :exit-node="exitNodeOf(acc)"
+          :exit-ready="exitReady"
           @toggle-select="toggleOne(acc.id)"
           @filter-group="groupFilter = $event || UNGROUPED_FILTER"
           @toggle-status="toggleAccountStatus(acc)"
@@ -1011,6 +1116,7 @@ onMounted(() => {
       :groups="groups"
       :default-group-id="defaultGroupId"
       :account-names="accountNames"
+      :exit-pool="exitPool"
       @saved="refreshPool(true)"
     />
     <AccountStatsDrawer v-model:open="statsOpen" :account="statsAccount" :now="now" />

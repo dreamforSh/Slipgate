@@ -7,6 +7,7 @@ import type {
 } from "@slipgate/contracts";
 import type { Tone } from "../../../lib/format";
 import type { IconName } from "../../ui/icons";
+import { modeUsesExit } from "./exitPool";
 
 export const ACCOUNT_STATUSES: AccountStatus[] = ["active", "paused", "cooldown", "expired"];
 export const EXECUTION_MODES: ExecutionMode[] = ["stealth_http", "direct_api", "vm_slot"];
@@ -58,11 +59,20 @@ export function matchesGroupFilter(acc: Pick<UpstreamAccount, "groupId">, filter
   return acc.groupId === (filter === UNGROUPED_FILTER ? "" : filter);
 }
 
-export type AttentionFilter = "failed_test" | "expiring" | "never_tested";
+export type AttentionFilter = "failed_test" | "expiring" | "never_tested" | "missing_exit";
 export type StatusFilter = "all" | AccountStatus | AttentionFilter;
-export const ATTENTION_FILTERS: AttentionFilter[] = ["failed_test", "expiring", "never_tested"];
+export const ATTENTION_FILTERS: AttentionFilter[] = ["failed_test", "expiring", "never_tested", "missing_exit"];
 
-export function matchesStatusFilter(acc: UpstreamAccount, filter: StatusFilter, nowMs: number): boolean {
+/**
+ * `hasExit` answers whether an account has an exit binding; without it (exit pool unknown)
+ * `missing_exit` matches nothing rather than every exit-routed account.
+ */
+export function matchesStatusFilter(
+  acc: UpstreamAccount,
+  filter: StatusFilter,
+  nowMs: number,
+  hasExit?: (accountId: string) => boolean,
+): boolean {
   switch (filter) {
     case "all":
       return true;
@@ -70,6 +80,8 @@ export function matchesStatusFilter(acc: UpstreamAccount, filter: StatusFilter, 
       return acc.lastTest?.ok === false;
     case "never_tested":
       return acc.lastTest === null && acc.executionMode !== "vm_slot";
+    case "missing_exit":
+      return !!hasExit && modeUsesExit(acc.executionMode) && !hasExit(acc.id);
     case "expiring": {
       const state = expiryState(acc, nowMs);
       return state === "soon" || state === "expired";
@@ -189,6 +201,7 @@ export function compareAccounts(
 export type ColumnKey =
   | "group"
   | "platform"
+  | "exit"
   | "status"
   | "usage"
   | "today"
@@ -201,6 +214,7 @@ export type ColumnKey =
 export const COLUMN_KEYS: ColumnKey[] = [
   "group",
   "platform",
+  "exit",
   "status",
   "usage",
   "today",
@@ -211,7 +225,7 @@ export const COLUMN_KEYS: ColumnKey[] = [
   "created",
 ];
 
-export const DEFAULT_COLUMNS: ColumnKey[] = ["group", "platform", "status", "usage", "today", "limits", "lastTest", "expires"];
+export const DEFAULT_COLUMNS: ColumnKey[] = ["group", "platform", "exit", "status", "usage", "today", "limits", "lastTest", "expires"];
 
 /** The column header that sorts by each column, when sortable. */
 export const COLUMN_SORT: Partial<Record<ColumnKey | "name", SortKey>> = {

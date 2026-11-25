@@ -5,8 +5,10 @@ import type { AccountUsageSummaryItem, UpstreamAccount } from "@slipgate/contrac
 import UiBadge from "../../ui/UiBadge.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UsageMeter from "../../ui/UsageMeter.vue";
+import AccountExitCell from "./AccountExitCell.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
 import PlatformTypeBadge from "./PlatformTypeBadge.vue";
+import type { ExitPool } from "./exitPool";
 import {
   COLUMN_SORT,
   EXPIRY_TONE,
@@ -33,6 +35,9 @@ const props = defineProps<{
   today: ReadonlyMap<string, AccountUsageSummaryItem>;
   now: number;
   busy: ReadonlySet<string>;
+  exitPool: ExitPool;
+  /** The exit pool reflects slipgate-net (not standalone samples, not a failed load). */
+  exitReady: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -65,7 +70,15 @@ function ariaSort(key: SortKey | undefined): "ascending" | "descending" | undefi
   return props.sort.dir === "asc" ? "ascending" : "descending";
 }
 
-const HEADER_KEYS: ColumnKey[] = ["group", "platform", "status", "usage", "today", "limits", "lastTest", "lastUsed", "expires", "created"];
+const HEADER_KEYS: ColumnKey[] = ["group", "platform", "exit", "status", "usage", "today", "limits", "lastTest", "lastUsed", "expires", "created"];
+
+function exitBinding(acc: UpstreamAccount) {
+  return props.exitPool.bindingByAccount.get(acc.id) ?? null;
+}
+function exitNode(acc: UpstreamAccount) {
+  const b = exitBinding(acc);
+  return b ? props.exitPool.nodeById.get(b.nodeId) ?? null : null;
+}
 const headers = computed(() => HEADER_KEYS.filter((k) => visible.value.has(k)));
 
 function openMenu(acc: UpstreamAccount, ev: MouseEvent) {
@@ -169,6 +182,10 @@ function openMenu(acc: UpstreamAccount, ev: MouseEvent) {
               <UiIcon :name="MODE_ICON[acc.executionMode]" :size="11" />
               <span>{{ executionModeLabel(acc.executionMode) }}</span>
             </div>
+          </td>
+
+          <td v-if="visible.has('exit')" class="min-w-[9rem] max-w-[13rem]">
+            <AccountExitCell :mode="acc.executionMode" :binding="exitBinding(acc)" :node="exitNode(acc)" :ready="exitReady" />
           </td>
 
           <td v-if="visible.has('status')">

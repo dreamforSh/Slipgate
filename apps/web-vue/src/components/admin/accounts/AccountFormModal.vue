@@ -9,7 +9,9 @@ import {
   recommendedMaxConcurrencyForTier,
   resolveTierForPlatform,
   type AccountAuthKind,
+  type AccountExitBinding,
   type AccountImportResult,
+  type ClashExitNode,
   type AccountInitialStatus,
   type AccountMode,
   type AccountOAuthProvider,
@@ -49,12 +51,13 @@ import { platformShortLabel, platformStyle } from "../../../lib/platformStyle";
 import { useAuthStore } from "../../../stores/auth";
 import { useToastStore } from "../../../stores/toast";
 import UiSelect from "../../ui/UiSelect.vue";
+import { exitAvailability, isStaticExit, modeUsesExit, type ExitAvailability, type ExitPool } from "./exitPool";
 
 /**
  * Create (single or batch), edit and "duplicate as new" for upstream accounts. Sections follow the
- * sub2api add-account dialog: basic info → platform & account type → credentials → plan &
- * scheduling → validity → group. The group is optional and comes last: it no longer picks the
- * platform, the platform filters the groups instead (same platform or composite).
+ * sub2api add-account dialog: basic info → platform & account type → credentials → exit proxy →
+ * plan & scheduling → validity → group. The group is optional and comes last: it no longer picks
+ * the platform, the platform filters the groups instead (same platform or composite).
  */
 const props = defineProps<{
   open: boolean;
@@ -67,6 +70,8 @@ const props = defineProps<{
   defaultGroupId: string;
   /** id → name, to label duplicate skips in batch results. */
   accountNames: ReadonlyMap<string, string>;
+  /** Exit nodes and bindings; the exit is bound through slipgate-net after the account is saved. */
+  exitPool: ExitPool;
 }>();
 const emit = defineEmits<{ (e: "update:open", value: boolean): void; (e: "saved"): void }>();
 
@@ -200,6 +205,11 @@ const formInitialStatus = ref<AccountInitialStatus>("active");
 const formExpires = ref("");
 const formAutoPause = ref(true);
 const formCooldownUntil = ref("");
+/** Bound exit node (`""` = none) and the uTLS profile carried by the binding (`""` = platform default). */
+const formExitNodeId = ref("");
+const formUtlsProfileId = ref("");
+/** Batch create: give each new account its own free healthy exit. */
+const batchAutoExit = ref(true);
 const batchPrefix = ref("");
 const batchText = ref("");
 const batchSkipDup = ref(true);
@@ -512,10 +522,17 @@ function reset() {
   oauthCodeInput.value = "";
   oauthProjectId.value = "";
   formInitialStatus.value = "active";
+  batchAutoExit.value = true;
   if (props.account) {
     loadFrom(props.account, false);
+    const bound = props.exitPool.bindingByAccount.get(props.account.id) ?? null;
+    formExitNodeId.value = bound?.nodeId ?? "";
+    formUtlsProfileId.value = bound?.utlsProfileId ?? "";
     return;
   }
+  // An exit IP serves one account, so a duplicate never inherits the original's exit.
+  formExitNodeId.value = "";
+  formUtlsProfileId.value = "";
   if (props.template) {
     loadFrom(props.template, true);
     formStatus.value = "active";
@@ -564,6 +581,88 @@ const batchExample = computed(() => {
   if (n <= 3) return Array.from({ length: n }, (_, i) => batchName(i)).join(", ");
   return `${batchName(0)}, ${batchName(1)} … ${batchName(n - 1)}`;
 });
+
+/* ---------------- Exit proxy ---------------- */
+
+const currentBinding = computed(() => (editing.value ? props.exitPool.bindingByAccount.get(editing.value.id) ?? null : null));
+/** The pool cannot bind for real: no slipgate-net, or the overview did not load. */
+const exitPickerDisabled = computed(() => props.exitPool.standalone || props.exitPool.failed);
+const exitNeeded = computed(() => modeUsesExit(formMode.value));
+
+interface ExitOption {
+  nodeId: string;
+  label: string;
+  availability: ExitAvailability;
+}
+
+function exitOption(node: ClashExitNode): ExitOption {
+  const availability = exitAvailability(node, currentBinding.value);
+  const parts = [node.name, node.exitIp || t("accounts.form.exit.unprobed")];
+  if (node.exitIp && node.latencyMs > 0) parts.push(`${node.latencyMs} ms`);
+  const label = parts.join(" · ");
+  return {
+    nodeId: node.nodeId,
+    availability,
+    // An unprobed exit already reads "not probed" in place of its IP; other reasons are appended.
+    label:
+      availability === "ok" || availability === "unprobed"
+        ? label
+        : `${label}（${t(`accounts.form.exit.reasons.${availability}`)}）`,
+  };
+}
+
+/** Free healthy exits first, fastest first; unavailable ones stay listed (disabled) with the reason. */
+function exitOptions(list: ClashExitNode[]): ExitOption[] {
+  return list
+    .map(exitOption)
+    .sort((a, b) => {
+      const rank = (o: ExitOption) => (o.availability === "ok" ? 0 : 1);
+      const na = props.exitPool.nodeById.get(a.nodeId)!;
+      const nb = props.exitPool.nodeById.get(b.nodeId)!;
+      return rank(a) - rank(b) || (na.latencyMs || 1e9) - (nb.latencyMs || 1e9);
+    });
+}
+
+const clashExitOptions = computed(() => exitOptions(props.exitPool.clashNodes));
+const staticExitOptions = computed(() => exitOptions(props.exitPool.staticNodes));
+const freeExitCount = computed(
+  () => [...clashExitOptions.value, ...staticExitOptions.value].filter((o) => o.availability === "ok").length,
+);
+const selectedExit = computed(() => props.exitPool.nodeById.get(formExitNodeId.value) ?? null);
+
+watch(formExitNodeId, (nodeId) => {
+  if (!nodeId) formUtlsProfileId.value = "";
+});
+
+/** Bind / move / clear the account's exit when the form differs from the stored binding. */
+async function applyExit(accountId: string, current: AccountExitBinding | null): Promise<void> {
+  if (exitPickerDisabled.value) return;
+  const nodeId = formExitNodeId.value;
+  if (!nodeId) {
+    if (!current) return;
+    const err = await props.exitPool.unbind(accountId);
+    if (err) toast.warning(t("accounts.form.exit.unbindFailed", { message: err }));
+    return;
+  }
+  if (current && current.nodeId === nodeId && (current.utlsProfileId ?? "") === formUtlsProfileId.value) return;
+  const err = await props.exitPool.bind(accountId, nodeId, formUtlsProfileId.value);
+  if (err) toast.warning(t("accounts.form.exit.bindFailed", { message: err }));
+}
+
+/** After a batch create: one free healthy exit per new account, in list order. */
+async function autoAssignExits(accountIds: string[]): Promise<void> {
+  const free = [...clashExitOptions.value, ...staticExitOptions.value]
+    .filter((o) => o.availability === "ok")
+    .map((o) => o.nodeId);
+  let bound = 0;
+  for (const accountId of accountIds) {
+    const nodeId = free.shift();
+    if (!nodeId) break;
+    if (!(await props.exitPool.bind(accountId, nodeId, ""))) bound += 1;
+  }
+  if (bound > 0) toast.info(t("accounts.form.exit.batchAssigned", { n: bound }));
+  if (bound < accountIds.length) toast.warning(t("accounts.form.exit.batchShort", { n: accountIds.length - bound }));
+}
 
 /* ---------------- Submit ---------------- */
 
@@ -630,19 +729,27 @@ async function readError(res: Response, fallback: string): Promise<string> {
 
 async function submitEdit(acc: UpstreamAccount) {
   const patch = buildPatch(acc);
-  if (Object.keys(patch).length === 0) {
+  const current = currentBinding.value;
+  const exitChanged =
+    !exitPickerDisabled.value &&
+    (formExitNodeId.value !== (current?.nodeId ?? "") ||
+      (!!formExitNodeId.value && formUtlsProfileId.value !== (current?.utlsProfileId ?? "")));
+  if (Object.keys(patch).length === 0 && !exitChanged) {
     emit("update:open", false);
     return;
   }
-  const res = await auth.apiFetch(`/api/v1/admin/accounts/${encodeURIComponent(acc.id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch),
-  });
-  if (!res.ok) {
-    toast.error(await readError(res, t("accounts.errors.updateAccount")));
-    return;
+  if (Object.keys(patch).length > 0) {
+    const res = await auth.apiFetch(`/api/v1/admin/accounts/${encodeURIComponent(acc.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) {
+      toast.error(await readError(res, t("accounts.errors.updateAccount")));
+      return;
+    }
   }
+  if (exitChanged) await applyExit(acc.id, current);
   toast.success(t("accounts.toast.updated"));
   emit("saved");
   emit("update:open", false);
@@ -659,6 +766,9 @@ async function submitSingle() {
     toast.error(await readError(res, t("accounts.errors.createAccount")));
     return;
   }
+  const { account } = (await res.json()) as { account: UpstreamAccount };
+  // The account exists either way; a failed binding only warns (it can be bound later).
+  if (account?.id) await applyExit(account.id, null);
   toast.success(t("accounts.toast.created"));
   emit("saved");
   emit("update:open", false);
@@ -692,6 +802,10 @@ async function submitBatch() {
     );
   }
   if (merged.results.length === 0) return;
+  const createdIds = merged.results.flatMap((r) => (r.outcome === "created" && r.accountId ? [r.accountId] : []));
+  if (batchAutoExit.value && exitNeeded.value && !exitPickerDisabled.value && createdIds.length) {
+    await autoAssignExits(createdIds);
+  }
   batchResult.value = merged;
   if (merged.created > 0) emit("saved");
   if (merged.failed === 0 && merged.skipped === 0) {
@@ -1100,7 +1214,87 @@ const credentialPlaceholder = computed(() => {
         </div>
       </AccountFormSection>
 
-      <!-- 4. Plan & scheduling -->
+      <!-- 4. Exit proxy: the Clash node / static IP the account's traffic leaves through -->
+      <AccountFormSection :title="t('accounts.form.sections.exit')" icon="network" :tag="exitNeeded ? undefined : t('accounts.form.optional')">
+        <UiAlert v-if="exitPool.standalone" tone="info">{{ t("accounts.form.exit.standalone") }}</UiAlert>
+        <UiAlert v-else-if="exitPool.failed" tone="warning">{{ t("accounts.form.exit.loadFailed") }}</UiAlert>
+
+        <!-- Batch: one exit per account, so offer automatic assignment instead of a single pick -->
+        <div v-if="!editing && mode === 'batch'" class="space-y-1.5">
+          <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-fg" :class="exitPickerDisabled || !exitNeeded ? 'opacity-60' : ''">
+            <input v-model="batchAutoExit" type="checkbox" class="checkbox" :disabled="exitPickerDisabled || !exitNeeded" />
+            {{ t("accounts.form.exit.batchAuto") }}
+          </label>
+          <p class="text-2xs leading-relaxed text-fg-subtle">
+            {{ exitNeeded ? t("accounts.form.exit.batchHint", { n: freeExitCount }) : t("accounts.form.exit.directHint") }}
+          </p>
+        </div>
+
+        <template v-else>
+          <div class="grid gap-4" :class="formExitNodeId ? 'sm:grid-cols-[minmax(0,1fr)_12rem]' : ''">
+            <div class="min-w-0">
+              <label class="label flex items-center justify-between gap-3" for="account-form-exit">
+                <span>{{ t("accounts.form.exit.node") }}</span>
+                <RouterLink to="/admin/proxy/ips" class="font-normal text-accent hover:underline" target="_blank">
+                  {{ t("accounts.form.exit.manage") }}
+                </RouterLink>
+              </label>
+              <UiSelect
+                id="account-form-exit"
+                v-model="formExitNodeId"
+                class="select"
+                :disabled="exitPickerDisabled"
+                :searchable="true"
+              >
+                <option value="">{{ t("accounts.form.exit.none") }}</option>
+                <optgroup v-if="clashExitOptions.length" :label="t('accounts.form.exit.groupClash')">
+                  <option
+                    v-for="o in clashExitOptions"
+                    :key="o.nodeId"
+                    :value="o.nodeId"
+                    :disabled="o.availability !== 'ok' && o.nodeId !== currentBinding?.nodeId"
+                  >
+                    {{ o.label }}
+                  </option>
+                </optgroup>
+                <optgroup v-if="staticExitOptions.length" :label="t('accounts.form.exit.groupStatic')">
+                  <option
+                    v-for="o in staticExitOptions"
+                    :key="o.nodeId"
+                    :value="o.nodeId"
+                    :disabled="o.availability !== 'ok' && o.nodeId !== currentBinding?.nodeId"
+                  >
+                    {{ o.label }}
+                  </option>
+                </optgroup>
+              </UiSelect>
+            </div>
+            <div v-if="formExitNodeId">
+              <label class="label" for="account-form-utls">{{ t("accounts.form.exit.profile") }}</label>
+              <UiSelect id="account-form-utls" v-model="formUtlsProfileId" class="select" :disabled="exitPickerDisabled">
+                <option value="">{{ t("accounts.form.exit.profileDefault") }}</option>
+                <option v-for="p in exitPool.profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
+              </UiSelect>
+            </div>
+          </div>
+
+          <!-- What the pick means for this access mode -->
+          <p v-if="selectedExit" class="flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-fg-subtle">
+            <span class="inline-flex items-center gap-1">
+              <span class="h-1.5 w-1.5 rounded-full" :class="selectedExit.healthStatus === 'healthy' ? 'bg-success' : 'bg-warning'" />
+              {{ selectedExit.proxyType ? selectedExit.proxyType.toUpperCase() : "" }}
+              {{ selectedExit.server ? `${selectedExit.server}${selectedExit.serverPort ? `:${selectedExit.serverPort}` : ""}` : "" }}
+            </span>
+            <span class="font-mono">{{ t("accounts.form.exit.exitIp", { ip: selectedExit.exitIp || t("accounts.form.exit.unprobed") }) }}</span>
+          </p>
+          <UiAlert v-if="exitNeeded && !formExitNodeId && !exitPickerDisabled" tone="warning">
+            {{ t("accounts.form.exit.requiredHint", { mode: executionModeLabel(formMode) }) }}
+          </UiAlert>
+          <p v-else-if="!exitNeeded" class="text-2xs leading-relaxed text-fg-subtle">{{ t("accounts.form.exit.directHint") }}</p>
+        </template>
+      </AccountFormSection>
+
+      <!-- 5. Plan & scheduling -->
       <AccountFormSection :title="t('accounts.form.sections.scheduling')" icon="gauge">
         <!-- Plan (subscriptions only) and access mode -->
         <div class="grid gap-4" :class="!isApiKey && tierOptions.length ? 'sm:grid-cols-2' : ''">
