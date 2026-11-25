@@ -5,7 +5,9 @@ export default {
       create: "新建分组",
       edit: "编辑",
       duplicate: "复制",
-      deleteBlocked: "仍有账号或密钥使用此分组",
+      deleteBlocked: "仍有 API 密钥使用此分组，无法删除",
+      deleteUngroups: "删除（{n} 个账号将转为未分组）",
+      confirmDeleteUngroups: "确认？{n} 个账号转为未分组",
       viewAccounts: "查看该分组的账号",
     },
     stats: {
@@ -85,6 +87,7 @@ export default {
       saved: "已保存分组 {name}",
       duplicated: "已复制为 {name}",
       deleted: "已删除分组",
+      deletedUngrouped: "已删除分组，{n} 个账号已转为未分组",
       enabled: "已启用 {name}",
       disabled: "已禁用 {name}",
     },

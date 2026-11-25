@@ -51,7 +51,8 @@ export type DataPlaneSyncGroup = z.infer<typeof DataPlaneSyncGroupSchema>;
 
 export const DataPlaneSyncAccountSchema = z.object({
   id: z.string().min(1),
-  groupId: z.string().min(1),
+  /** Empty for ungrouped accounts: only composite groups (any account of a platform) reach them. */
+  groupId: z.string(),
   platform: ProviderSchema,
   executionMode: ExecutionModeSchema,
   authKind: z.string(),

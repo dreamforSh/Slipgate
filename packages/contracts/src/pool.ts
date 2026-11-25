@@ -443,7 +443,9 @@ export const UpstreamAccountSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   notes: z.string(),
-  groupId: z.string().min(1),
+  /** Empty string = ungrouped (see `UNGROUPED_ACCOUNT_GROUP_ID`). */
+  groupId: z.string(),
+  /** Empty string when the account is ungrouped. */
   groupName: z.string(),
   platform: ProviderSchema,
   executionMode: ExecutionModeSchema,
@@ -473,10 +475,18 @@ export const UpstreamAccountSchema = z.object({
 });
 export type UpstreamAccount = z.infer<typeof UpstreamAccountSchema>;
 
+/**
+ * `groupId` of an account that belongs to no group. Ungrouped accounts stay in the pool (they can
+ * be tested, edited and later assigned) but no single-platform group schedules them; composite
+ * groups, which draw on every account of a platform, still can.
+ */
+export const UNGROUPED_ACCOUNT_GROUP_ID = "";
+
 export const CreateAccountRequestSchema = z.object({
   name: z.string().trim().min(1).max(64),
   notes: z.string().trim().max(500).default(""),
-  groupId: z.string().min(1),
+  /** Optional: omitted or `""` creates an ungrouped account. */
+  groupId: z.string().trim().max(128).default(UNGROUPED_ACCOUNT_GROUP_ID),
   platform: ProviderSchema,
   executionMode: ExecutionModeSchema.default("stealth_http"),
   authKind: AccountAuthKindSchema.default("oauth"),
@@ -492,13 +502,14 @@ export type CreateAccountRequest = z.infer<typeof CreateAccountRequestSchema>;
 
 /**
  * Platform is fixed at creation time; omit `credentialSecret` to keep the stored credential.
+ * `groupId: ""` moves the account out of its group.
  * Setting `status` to anything but `cooldown` clears the cooldown deadline unless
  * `cooldownUntilIso` is sent in the same patch.
  */
 export const UpdateAccountRequestSchema = z.object({
   name: z.string().trim().min(1).max(64).optional(),
   notes: z.string().trim().max(500).optional(),
-  groupId: z.string().min(1).optional(),
+  groupId: z.string().trim().max(128).optional(),
   executionMode: ExecutionModeSchema.optional(),
   authKind: AccountAuthKindSchema.optional(),
   subscriptionTier: SubscriptionTierSchema.optional(),

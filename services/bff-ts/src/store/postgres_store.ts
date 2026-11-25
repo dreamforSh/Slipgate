@@ -454,6 +454,32 @@ export class PostgresControlStore implements ControlStore {
           ADD COLUMN IF NOT EXISTS auto_pause_on_expired BOOLEAN NOT NULL DEFAULT TRUE,
           ADD COLUMN IF NOT EXISTS credential_fingerprint TEXT;
 
+      -- The group is optional: NULL = ungrouped (the FK still guards non-null ids).
+      ALTER TABLE core.accounts ALTER COLUMN group_id DROP NOT NULL;
+
+      -- Deleting a group ungroups its accounts instead of cascading (older schemas: ON DELETE CASCADE).
+      DO $$
+      DECLARE
+          fk record;
+      BEGIN
+          FOR fk IN
+              SELECT c.conname
+              FROM pg_constraint c
+              JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+              WHERE c.conrelid = 'core.accounts'::regclass
+                AND c.contype = 'f'
+                AND c.confrelid = 'core.groups'::regclass
+                AND a.attname = 'group_id'
+                AND c.confdeltype <> 'n'
+          LOOP
+              EXECUTE format('ALTER TABLE core.accounts DROP CONSTRAINT %I', fk.conname);
+              EXECUTE format(
+                  'ALTER TABLE core.accounts ADD CONSTRAINT %I FOREIGN KEY (group_id) REFERENCES core.groups(id) ON DELETE SET NULL',
+                  fk.conname
+              );
+          END LOOP;
+      END $$;
+
       CREATE INDEX IF NOT EXISTS idx_core_accounts_credential_fingerprint
           ON core.accounts (credential_fingerprint);
 
@@ -1119,21 +1145,26 @@ export class PostgresControlStore implements ControlStore {
     }
   }
 
-  async deleteGroup(groupId: string): Promise<void> {
+  async deleteGroup(groupId: string): Promise<{ ungroupedAccounts: number }> {
     try {
-      // core.accounts cascades on group delete; refuse instead of silently dropping accounts.
-      const accountRows = await this.sql<{ count: string }[]>`
-        SELECT COUNT(*)::text AS count FROM core.accounts WHERE group_id = ${groupId}
-      `;
-      if (Number.parseInt(accountRows[0]?.count ?? "0", 10) > 0) {
-        throw new StoreError("conflict", "Cannot delete group that still contains accounts");
-      }
-      const rows = await this.sql<{ id: string }[]>`
-        DELETE FROM core.groups WHERE id = ${groupId} RETURNING id
-      `;
-      if (rows.length === 0) {
-        throw new StoreError("not_found", `Group ${groupId} not found`);
-      }
+      return await this.sql.begin(async (txRaw) => {
+        const tx = txRaw as unknown as SqlExecutor;
+        // Lock the group so no key is minted on it (createApiKey takes FOR SHARE) mid-delete.
+        const group = await tx<{ id: string }[]>`SELECT id FROM core.groups WHERE id = ${groupId} FOR UPDATE`;
+        if (group.length === 0) {
+          throw new StoreError("not_found", `Group ${groupId} not found`);
+        }
+        const keys = await tx<{ id: string }[]>`SELECT id FROM core.api_keys WHERE group_id = ${groupId} LIMIT 1`;
+        if (keys.length > 0) {
+          throw new StoreError("conflict", "Cannot delete group referenced by active API keys");
+        }
+        // Accounts outlive their group: ungroup them explicitly (the FK is ON DELETE SET NULL too).
+        const ungrouped = await tx<{ id: string }[]>`
+          UPDATE core.accounts SET group_id = NULL, updated_at = NOW() WHERE group_id = ${groupId} RETURNING id
+        `;
+        await tx`DELETE FROM core.groups WHERE id = ${groupId}`;
+        return { ungroupedAccounts: ungrouped.length };
+      });
     } catch (err) {
       if (err instanceof StoreError) throw err;
       mapPgError(err);
@@ -1219,8 +1250,8 @@ export class PostgresControlStore implements ControlStore {
         a.id,
         COALESCE(NULLIF(a.name, ''), a.id) AS name,
         a.notes,
-        a.group_id,
-        g.name AS group_name,
+        COALESCE(a.group_id, '') AS group_id,
+        COALESCE(g.name, '') AS group_name,
         a.platform,
         a.execution_mode,
         a.auth_kind,
@@ -1245,7 +1276,7 @@ export class PostgresControlStore implements ControlStore {
         a.last_test_message,
         a.created_at
       FROM core.accounts a
-      JOIN core.groups g ON g.id = a.group_id
+      LEFT JOIN core.groups g ON g.id = a.group_id
       LEFT JOIN core.account_window_quotas q ON q.account_id = a.id
       WHERE (${filter.groupId ?? null}::text IS NULL OR a.group_id = ${filter.groupId ?? null})
         AND (${filter.executionMode ?? null}::text IS NULL OR a.execution_mode = ${filter.executionMode ?? null})
@@ -1318,7 +1349,7 @@ export class PostgresControlStore implements ControlStore {
           ${id},
           ${req.name},
           ${req.notes},
-          ${req.groupId},
+          ${req.groupId || null},
           ${req.platform},
           ${req.executionMode},
           ${req.authKind},
@@ -1372,7 +1403,11 @@ export class PostgresControlStore implements ControlStore {
         UPDATE core.accounts
         SET name = COALESCE(${req.name ?? null}, name),
             notes = COALESCE(${req.notes ?? null}, notes),
-            group_id = COALESCE(${req.groupId ?? null}, group_id),
+            -- "" ungroups the account, so the "was it sent" flag decides like the nullable columns below.
+            group_id = CASE
+              WHEN ${req.groupId !== undefined}::boolean THEN NULLIF(${req.groupId ?? ""}, '')
+              ELSE group_id
+            END,
             execution_mode = COALESCE(${req.executionMode ?? null}, execution_mode),
             auth_kind = COALESCE(${req.authKind ?? null}, auth_kind),
             -- The right-hand auth_kind is the old value, so COALESCE yields the resulting kind.
@@ -1921,7 +1956,7 @@ export class PostgresControlStore implements ControlStore {
       >`
         SELECT
           a.id,
-          a.group_id,
+          COALESCE(a.group_id, '') AS group_id,
           a.platform,
           a.execution_mode,
           a.auth_kind,

@@ -97,7 +97,8 @@ watch(
     importPaused.value = false;
     skipExisting.value = true;
     matchPlatform.value = true;
-    targetGroupId.value = props.defaultGroupId || props.groups[0]?.id || "";
+    // The group is optional: "" imports the accounts ungrouped.
+    targetGroupId.value = props.defaultGroupId;
   },
 );
 
@@ -274,7 +275,8 @@ function groupFor(draft: { groupName: string | null; platform: string }): string
     if (match) return match;
   }
   // A CPA folder mixes providers: land each account in a group of its own platform.
-  if (matchPlatform.value && targetPlatform.value !== draft.platform) {
+  // Only relative to a chosen group; "no group" keeps every unmatched account ungrouped.
+  if (matchPlatform.value && targetGroupId.value && targetPlatform.value !== draft.platform) {
     const match = groupByPlatform.value.get(draft.platform);
     if (match) return match;
   }
@@ -284,7 +286,8 @@ function groupFor(draft: { groupName: string | null; platform: string }): string
 /** The platform option is only offered when it would move at least one account. */
 const showMatchPlatform = computed(
   () =>
-    parsed.value?.drafts.some((d) => targetPlatform.value !== d.platform && groupByPlatform.value.has(d.platform)) ?? false,
+    !!targetGroupId.value &&
+    (parsed.value?.drafts.some((d) => targetPlatform.value !== d.platform && groupByPlatform.value.has(d.platform)) ?? false),
 );
 
 const groupNameById = computed(() => new Map(props.groups.map((g) => [g.id, g.name])));
@@ -315,13 +318,13 @@ const previewRows = computed(() =>
   (parsed.value?.drafts ?? []).slice(0, PREVIEW_LIMIT).map((d, i) => ({
     ...d,
     key: `${i}-${d.name}`,
-    groupLabel: groupNameById.value.get(groupFor(d)) ?? "",
+    groupLabel: groupNameById.value.get(groupFor(d)) ?? t("accounts.ungrouped"),
     tierMultiplier: subscriptionTierMultiplier(d.platform, d.subscriptionTier),
   })),
 );
 
 const canImport = computed(
-  () => !reading.value && !!parsed.value?.drafts.length && !!targetGroupId.value && !importing.value,
+  () => !reading.value && !!parsed.value?.drafts.length && !importing.value,
 );
 
 async function runImport() {
@@ -471,10 +474,12 @@ function startOver() {
       <!-- Options -->
       <div v-if="parsed?.drafts.length" class="grid gap-4 sm:grid-cols-2">
         <label class="block min-w-0">
-          <span class="label">{{ t("accounts.import.targetGroup") }} <span class="text-danger">*</span></span>
+          <span class="label">{{ t("accounts.import.targetGroup") }}</span>
           <select v-model="targetGroupId" class="select">
+            <option value="">{{ t("accounts.form.noGroup") }}</option>
             <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
           </select>
+          <span v-if="!targetGroupId" class="mt-1 block text-2xs leading-relaxed text-fg-subtle">{{ t("accounts.import.noGroupHint") }}</span>
         </label>
         <div class="flex flex-col justify-end gap-2 pb-1">
           <label v-if="parsed.formats.includes('slipgate')" class="inline-flex cursor-pointer items-center gap-2 text-xs text-fg-muted">

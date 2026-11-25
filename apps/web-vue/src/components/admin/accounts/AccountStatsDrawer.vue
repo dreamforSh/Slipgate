@@ -176,7 +176,7 @@ const hasTraffic = computed(() => (stats.value?.period.requests ?? 0) > 0);
               :tier-multiplier="account.tierMultiplier"
             />
             <UiBadge :tone="healthTone(account.effectiveStatus)" dot>{{ accountStatusLabel(account.effectiveStatus) }}</UiBadge>
-            <span class="text-xs text-fg-muted">{{ account.groupName }}</span>
+            <span class="text-xs text-fg-muted">{{ account.groupName || t("accounts.ungrouped") }}</span>
           </div>
         </div>
         <SegmentedControl v-model="range" :options="rangeOptions" />

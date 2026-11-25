@@ -87,7 +87,8 @@ watch(
 
 function buildPatch(): AccountBulkPatch {
   const patch: AccountBulkPatch = {};
-  if (apply.group && groupId.value) patch.groupId = groupId.value;
+  // "" moves the selected accounts out of their groups.
+  if (apply.group) patch.groupId = groupId.value;
   if (apply.status) patch.status = status.value;
   if (apply.mode) patch.executionMode = executionMode.value;
   if (apply.tier && sharedTiers.value.length && subscriptionAccounts.value.length) patch.subscriptionTier = tier.value;
@@ -164,6 +165,7 @@ const rowClass = (on: boolean) =>
         <input id="be-group" v-model="apply.group" type="checkbox" class="checkbox" />
         <label for="be-group" class="text-sm font-medium text-fg">{{ t("accounts.bulkEdit.group") }}</label>
         <select v-model="groupId" class="select input-sm" :disabled="!apply.group" :aria-label="t('accounts.bulkEdit.group')">
+          <option value="">{{ t("accounts.form.noGroup") }}</option>
           <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
         </select>
       </div>

@@ -122,14 +122,22 @@ describe("group management", () => {
     const dup2 = await call<{ group: GroupItem }>("POST", `/api/v1/admin/groups/${group.id}/duplicate`, admin);
     expect(dup2.body.group.name).toBe("claude-pro-copy-2");
 
-    await createAccount(call, admin, { name: "acc-in-group", groupId: group.id });
+    const member = await createAccount(call, admin, { name: "acc-in-group", groupId: group.id });
     const counted = (await call<{ groups: GroupItem[] }>("GET", "/api/v1/admin/groups", admin)).body.groups.find(
       (g) => g.id === group.id,
     );
     expect(counted).toMatchObject({ accountCount: 1, activeAccountCount: 1 });
 
-    const blocked = await call<{ error: string }>("DELETE", `/api/v1/admin/groups/${group.id}`, admin);
-    expect(blocked.status).toBe(409);
+    // Deleting a group keeps its accounts: they become ungrouped.
+    const dropped = await call<{ deleted: boolean; ungroupedAccounts: number }>(
+      "DELETE",
+      `/api/v1/admin/groups/${group.id}`,
+      admin,
+    );
+    expect(dropped.status).toBe(200);
+    expect(dropped.body).toMatchObject({ deleted: true, ungroupedAccounts: 1 });
+    const accounts = (await call<{ accounts: UpstreamAccount[] }>("GET", "/api/v1/admin/accounts", admin)).body.accounts;
+    expect(accounts.find((a) => a.id === member.id)).toMatchObject({ groupId: "", groupName: "" });
 
     const removed = await call("DELETE", `/api/v1/admin/groups/${dup2.body.group.id}`, admin);
     expect(removed.status).toBe(200);
@@ -156,6 +164,10 @@ describe("group management", () => {
       (g) => g.id === exclusive.id,
     );
     expect(keyCount?.apiKeyCount).toBe(1);
+
+    // API keys still pin their group.
+    const blocked = await call("DELETE", `/api/v1/admin/groups/${exclusive.id}`, admin);
+    expect(blocked.status).toBe(409);
   });
 
   it("refuses API keys on missing or disabled groups, keeping disabled exclusive groups admin-only", async () => {

@@ -188,7 +188,11 @@ export interface ControlStore {
   listGroups(enabledOnly?: boolean): Promise<GroupItem[]>;
   createGroup(req: CreateGroupRequest): Promise<GroupItem>;
   updateGroup(groupId: string, req: UpdateGroupRequest): Promise<GroupItem>;
-  deleteGroup(groupId: string): Promise<void>;
+  /**
+   * Delete a group: its accounts become ungrouped (never deleted), its composite routes go with it.
+   * Refused while API keys still use the group.
+   */
+  deleteGroup(groupId: string): Promise<{ ungroupedAccounts: number }>;
   /** Copy a group's settings into a new, disabled group (accounts and keys are not copied). */
   duplicateGroup(groupId: string): Promise<GroupItem>;
 

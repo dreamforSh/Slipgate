@@ -107,7 +107,7 @@ const lastTestClass = computed(() => {
           @click="emit('filter-group', acc.groupId)"
         >
           <UiIcon name="layers" :size="12" />
-          <span class="truncate">{{ acc.groupName }}</span>
+          <span class="truncate" :class="{ italic: !acc.groupId }">{{ acc.groupName || t("accounts.ungrouped") }}</span>
         </button>
       </div>
       <div class="shrink-0">

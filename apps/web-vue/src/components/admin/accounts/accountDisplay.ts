@@ -49,6 +49,15 @@ export function isSchedulable(acc: Pick<UpstreamAccount, "effectiveStatus">): bo
 
 /* ---------------- Filters ---------------- */
 
+/** Group-filter value (and `?groupId=` query) for accounts without a group; real ids start with `grp_`. */
+export const UNGROUPED_FILTER = "ungrouped";
+
+/** Whether an account passes the group filter (`"all"`, `UNGROUPED_FILTER` or a group id). */
+export function matchesGroupFilter(acc: Pick<UpstreamAccount, "groupId">, filter: string): boolean {
+  if (filter === "all") return true;
+  return acc.groupId === (filter === UNGROUPED_FILTER ? "" : filter);
+}
+
 export type AttentionFilter = "failed_test" | "expiring" | "never_tested";
 export type StatusFilter = "all" | AccountStatus | AttentionFilter;
 export const ATTENTION_FILTERS: AttentionFilter[] = ["failed_test", "expiring", "never_tested"];

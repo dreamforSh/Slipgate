@@ -451,18 +451,21 @@ export class MemoryControlStore implements ControlStore {
     return this.withGroupCounts(existing);
   }
 
-  async deleteGroup(groupId: string): Promise<void> {
+  async deleteGroup(groupId: string): Promise<{ ungroupedAccounts: number }> {
     if (!this.groups.has(groupId)) {
       throw new StoreError("not_found", `Group ${groupId} not found`);
-    }
-    for (const acc of this.accounts.values()) {
-      if (acc.groupId === groupId) {
-        throw new StoreError("conflict", "Cannot delete group that still contains accounts");
-      }
     }
     for (const key of this.apiKeys.values()) {
       if (key.groupId === groupId) {
         throw new StoreError("conflict", "Cannot delete group referenced by active API keys");
+      }
+    }
+    // Accounts outlive their group: they stay in the pool, ungrouped.
+    let ungroupedAccounts = 0;
+    for (const acc of this.accounts.values()) {
+      if (acc.groupId === groupId) {
+        acc.groupId = "";
+        ungroupedAccounts += 1;
       }
     }
     for (const [routeId, route] of this.routes.entries()) {
@@ -471,6 +474,7 @@ export class MemoryControlStore implements ControlStore {
       }
     }
     this.groups.delete(groupId);
+    return { ungroupedAccounts };
   }
 
   async duplicateGroup(groupId: string): Promise<GroupItem> {
@@ -520,7 +524,7 @@ export class MemoryControlStore implements ControlStore {
       window5hUsedBps: win.window5hUsedBps,
       window7dUsedBps: win.window7dUsedBps,
       lastTest: acc.lastTest ? { ...acc.lastTest } : null,
-      groupName: this.groups.get(acc.groupId)?.name ?? acc.groupId,
+      groupName: acc.groupId ? (this.groups.get(acc.groupId)?.name ?? acc.groupId) : "",
       effectiveStatus: effectiveAccountStatus(acc, nowMs),
     };
   }
@@ -542,8 +546,8 @@ export class MemoryControlStore implements ControlStore {
   }
 
   async createAccount(req: CreateAccountRequest, credential: StoredCredential): Promise<UpstreamAccount> {
-    const group = this.groups.get(req.groupId);
-    if (!group) {
+    // An empty group id creates an ungrouped account.
+    if (req.groupId && !this.groups.has(req.groupId)) {
       throw new StoreError("not_found", `Group ${req.groupId} not found`);
     }
     if (!isSubscriptionTierAllowedForProvider(req.platform, req.subscriptionTier)) {
@@ -596,7 +600,7 @@ export class MemoryControlStore implements ControlStore {
       throw new StoreError("not_found", `Account ${accountId} not found`);
     }
     // Validate everything before mutating so a rejected patch leaves the record untouched.
-    if (req.groupId !== undefined && !this.groups.has(req.groupId)) {
+    if (req.groupId && !this.groups.has(req.groupId)) {
       throw new StoreError("not_found", `Group ${req.groupId} not found`);
     }
     if (req.subscriptionTier !== undefined && !isSubscriptionTierAllowedForProvider(acc.platform, req.subscriptionTier)) {

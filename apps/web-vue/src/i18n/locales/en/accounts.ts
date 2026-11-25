@@ -2,6 +2,8 @@ import type zh from "../zh-CN/accounts";
 
 const en: typeof zh = {
   accounts: {
+    /** Label of accounts that belong to no group (list, card, drawers, filters). */
+    ungrouped: "Ungrouped",
     actions: {
       addAccount: "Add account",
       saveAccount: "Save",
@@ -191,8 +193,23 @@ const en: typeof zh = {
       copyHint: "Settings were copied from the original account. Enter the new account's credentials.",
       modeSingle: "Single",
       modeBatch: "Batch",
-      targetGroup: "Target group",
-      platformLocked: "The platform follows group {name}; pick another group for another platform",
+      sections: {
+        basic: "Basic info",
+        platform: "Platform & account type",
+        credentials: "Credentials",
+        scheduling: "Plan & scheduling",
+        validity: "Validity",
+        group: "Group",
+      },
+      optional: "Optional",
+      platformFixed: "Fixed after creation",
+      noGroup: "No group",
+      groupsOfPlatform: "{platform} groups",
+      compositeGroups: "Composite groups",
+      groupDisabled: "{name} (disabled)",
+      groupHint: "API keys of this group will schedule the account.",
+      noGroupHint: "Without a group the account only joins the pool: single-platform groups won't schedule it (composite groups still use it by platform). You can assign a group later via edit or bulk edit.",
+      noGroupsForPlatform: "{platform} has no groups yet; you can create one in group management later.",
       notesHint: "Optional, visible to admins only",
       accountType: "Account type",
       types: {
@@ -340,6 +357,7 @@ const en: typeof zh = {
         "Auth files carry no plan tier or account expiry: accounts whose tier cannot be told are imported as Standard and can be bulk-edited afterwards, and the token expiry in the file is not used as the account expiry. Files marked disabled are imported paused.",
       parseError: "Could not read the file: {message}",
       targetGroup: "Import into group",
+      noGroupHint: "Accounts that match no group are imported ungrouped; you can assign groups in bulk later.",
       matchGroupName: "Prefer groups named as in the backup",
       matchPlatform: "Put accounts of another platform into a group of their platform",
       subscriptionMode: "Access mode for subscription accounts",

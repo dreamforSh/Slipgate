@@ -1518,11 +1518,12 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return c.json({ group });
   });
 
+  /** Accounts of the deleted group stay in the pool, ungrouped; API keys still block the delete. */
   app.delete("/api/v1/admin/groups/:groupId", async (c) => {
     const groupId = c.req.param("groupId");
-    await store.deleteGroup(groupId);
+    const { ungroupedAccounts } = await store.deleteGroup(groupId);
     await syncDataPlaneBestEffort();
-    return c.json({ deleted: true, groupId });
+    return c.json({ deleted: true, groupId, ungroupedAccounts });
   });
 
   app.post("/api/v1/admin/groups/:groupId/duplicate", async (c) => {

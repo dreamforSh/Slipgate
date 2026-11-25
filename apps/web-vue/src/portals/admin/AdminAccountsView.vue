@@ -33,12 +33,14 @@ import {
   EXECUTION_MODES,
   SORT_DEFAULT_DIR,
   SORT_KEYS,
+  UNGROUPED_FILTER,
   compareAccounts,
   expiryState,
   isColumnList,
   isSchedulable,
   isSortState,
   isStatusFilter,
+  matchesGroupFilter,
   matchesStatusFilter,
   type ColumnKey,
   type SortKey,
@@ -194,7 +196,10 @@ function clearFilters() {
 const searchHaystack = computed(
   () =>
     new Map(
-      accounts.value.map((a) => [a.id, [a.name, a.notes, a.id, a.credentialPreview, a.groupName].join("\n").toLowerCase()]),
+      accounts.value.map((a) => [
+        a.id,
+        [a.name, a.notes, a.id, a.credentialPreview, a.groupName || t("accounts.ungrouped")].join("\n").toLowerCase(),
+      ]),
     ),
 );
 
@@ -204,7 +209,7 @@ const baseFiltered = computed(() => {
   const nowMs = now.value;
   return accounts.value.filter((a) => {
     if (platformFilter.value !== "all" && a.platform !== platformFilter.value) return false;
-    if (groupFilter.value !== "all" && a.groupId !== groupFilter.value) return false;
+    if (!matchesGroupFilter(a, groupFilter.value)) return false;
     if (!matchesStatusFilter(a, statusFilter.value, nowMs)) return false;
     return !q || (searchHaystack.value.get(a.id) ?? "").includes(q);
   });
@@ -516,9 +521,8 @@ function openDuplicate(acc: UpstreamAccount) {
   formOpen.value = true;
 }
 
-const defaultGroupId = computed(() =>
-  groupFilter.value !== "all" && groups.value.some((g) => g.id === groupFilter.value) ? groupFilter.value : (groups.value[0]?.id ?? ""),
-);
+/** Group preselected in the add / import dialogs: the filtered group, otherwise none (ungrouped). */
+const defaultGroupId = computed(() => (groups.value.some((g) => g.id === groupFilter.value) ? groupFilter.value : ""));
 
 const statsOpen = ref(false);
 const statsAccountId = ref<string | null>(null);
@@ -785,6 +789,7 @@ onMounted(() => {
         </select>
         <select v-model="groupFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('accounts.form.group')">
           <option value="all">{{ t("accounts.filters.allGroups") }}</option>
+          <option :value="UNGROUPED_FILTER">{{ t("accounts.ungrouped") }}</option>
           <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
         </select>
         <select v-model="statusFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('common.status')">
@@ -927,7 +932,7 @@ onMounted(() => {
         @toggle-select="toggleOne"
         @toggle-page="togglePage"
         @sort="setSort"
-        @filter-group="groupFilter = $event"
+        @filter-group="groupFilter = $event || UNGROUPED_FILTER"
         @toggle-status="toggleAccountStatus"
         @resume="resumeAccount"
         @test="openTest"
@@ -946,7 +951,7 @@ onMounted(() => {
           :now="now"
           :busy="busyIds.has(acc.id)"
           @toggle-select="toggleOne(acc.id)"
-          @filter-group="groupFilter = $event"
+          @filter-group="groupFilter = $event || UNGROUPED_FILTER"
           @toggle-status="toggleAccountStatus(acc)"
           @resume="resumeAccount(acc)"
           @test="openTest(acc)"

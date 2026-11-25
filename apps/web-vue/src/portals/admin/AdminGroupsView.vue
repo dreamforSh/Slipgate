@@ -207,15 +207,23 @@ async function deleteGroup(group: GroupItem) {
       errorMessage.value = await readError(res, t("groups.errors.delete"));
       return;
     }
-    notice.value = t("groups.notice.deleted");
+    const { ungroupedAccounts = 0 } = (await res.json().catch(() => ({}))) as { ungroupedAccounts?: number };
+    notice.value =
+      ungroupedAccounts > 0 ? t("groups.notice.deletedUngrouped", { n: ungroupedAccounts }) : t("groups.notice.deleted");
     await loadGroups();
   } finally {
     setBusy(group.id, false);
   }
 }
 
-function isInUse(group: GroupItem) {
-  return group.accountCount > 0 || group.apiKeyCount > 0;
+/** API keys pin their group; accounts do not (deleting the group leaves them ungrouped). */
+function deleteBlocked(group: GroupItem) {
+  return group.apiKeyCount > 0;
+}
+
+function deleteLabel(group: GroupItem): string {
+  if (deleteBlocked(group)) return t("groups.actions.deleteBlocked");
+  return group.accountCount > 0 ? t("groups.actions.deleteUngroups", { n: group.accountCount }) : t("common.delete");
 }
 
 /* ---------------- Create / edit form ---------------- */
@@ -652,8 +660,9 @@ onMounted(() => {
                   </button>
                   <ConfirmButton
                     icon-only
-                    :disabled="isInUse(g) || busyIds.has(g.id)"
-                    :label="isInUse(g) ? t('groups.actions.deleteBlocked') : t('common.delete')"
+                    :disabled="deleteBlocked(g) || busyIds.has(g.id)"
+                    :label="deleteLabel(g)"
+                    :confirm-label="g.accountCount > 0 ? t('groups.actions.confirmDeleteUngroups', { n: g.accountCount }) : undefined"
                     @confirm="deleteGroup(g)"
                   />
                 </div>

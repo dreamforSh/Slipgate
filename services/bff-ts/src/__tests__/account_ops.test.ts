@@ -12,13 +12,15 @@ import {
 } from "@slipgate/contracts";
 import { createBffApp } from "../app.ts";
 import { maskSecret } from "../security/crypto.ts";
+import type { ControlStore } from "../store/types.ts";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const HOUR = 3_600_000;
 const ADMIN_PASSWORD = "AdminPassword123!";
 
-async function bootstrap(internalToken = "") {
+async function bootstrap(internalToken = "", store?: ControlStore) {
   const app = createBffApp({
+    store,
     jwtSecret: "account-ops-jwt-secret-32-bytes-min",
     vaultSecret: "account-ops-vault-secret-32-bytes-min",
     internalToken,
@@ -317,6 +319,84 @@ describe("account import and export", () => {
     });
     expect(again.body).toMatchObject({ created: 0, skipped: 2, failed: 0 });
     expect(again.body.results.find((r) => r.name === "claude-1")?.duplicateOf).toBe(a.id);
+  });
+});
+
+describe("ungrouped accounts", () => {
+  it("creates, moves, imports and exports accounts without a group", async () => {
+    // Runs against Postgres when a test preload provides a store factory (nullable group_id path).
+    const factory = (globalThis as { __slipgateTestStoreFactory?: () => Promise<ControlStore> }).__slipgateTestStoreFactory;
+    const env = await bootstrap("ungrouped-internal-token", factory ? await factory() : undefined);
+    const { app, admin, call } = env;
+    const g = await env.createGroup("team");
+
+    // No groupId at all, and an explicit empty one, both create an ungrouped account.
+    const loose = await env.createAccount({ name: "loose" });
+    expect(loose).toMatchObject({ groupId: "", groupName: "" });
+    const blank = await env.createAccount({ name: "blank", groupId: "" });
+    expect(blank).toMatchObject({ groupId: "", groupName: "" });
+
+    const missing = await call("POST", "/api/v1/admin/accounts", admin, {
+      name: "ghost",
+      groupId: "grp_missing",
+      platform: "anthropic",
+      executionMode: "direct_api",
+      authKind: "api_key",
+      credentialSecret: "sk-ghost-0001",
+    });
+    // Memory store: 404; Postgres: the group_id FK violation maps to 409.
+    expect([404, 409]).toContain(missing.status);
+
+    // Assigning and clearing the group through PATCH.
+    const moved = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${loose.id}`, admin, {
+      groupId: g.id,
+    });
+    expect(moved.body.account).toMatchObject({ groupId: g.id, groupName: "team" });
+    const cleared = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${loose.id}`, admin, {
+      groupId: "",
+    });
+    expect(cleared.body.account).toMatchObject({ groupId: "", groupName: "" });
+
+    // Bulk edit can move accounts out of a group too.
+    await call("PATCH", `/api/v1/admin/accounts/${blank.id}`, admin, { groupId: g.id });
+    const bulk = await call<AccountBulkResult>("POST", "/api/v1/admin/accounts/bulk-update", admin, {
+      accountIds: [blank.id],
+      patch: { groupId: "" },
+    });
+    expect(bulk.body).toMatchObject({ success: 1, failed: 0 });
+
+    const groups = (await call<{ groups: GroupItem[] }>("GET", "/api/v1/admin/groups", admin)).body.groups;
+    expect(groups.find((x) => x.id === g.id)?.accountCount).toBe(0);
+
+    // Import items may leave the group out as well.
+    const imported = await call<AccountImportResult>("POST", "/api/v1/admin/accounts/import", admin, {
+      accounts: [{ name: "imp", platform: "openai", authKind: "api_key", executionMode: "direct_api", credentialSecret: "sk-imp-0001" }],
+    });
+    expect(imported.body).toMatchObject({ created: 1, failed: 0 });
+    const accounts = await env.listAccounts();
+    expect(accounts.find((a) => a.name === "imp")).toMatchObject({ groupId: "", groupName: "" });
+
+    // The data plane receives them with an empty group (only composite groups reach them).
+    const snapRes = await app.request("/api/v1/internal/dataplane/snapshot", {
+      headers: { "X-Slipgate-Internal-Token": "ungrouped-internal-token" },
+    });
+    const snap = (await snapRes.json()) as DataPlaneSyncSnapshot;
+    expect(snap.accounts.find((a) => a.id === loose.id)?.groupId).toBe("");
+
+    const exported = await call<AccountExportFile>("POST", "/api/v1/admin/accounts/export", admin, {
+      password: ADMIN_PASSWORD,
+      accountIds: [loose.id],
+    });
+    expect(exported.body.accounts[0]).toMatchObject({ name: "loose", groupName: "" });
+    expect(parseAccountImportFile(exported.body).drafts[0]?.groupName).toBeNull();
+
+    // Deleting a group ungroups its accounts instead of deleting them.
+    const doomed = await env.createGroup("doomed");
+    const member = await env.createAccount({ name: "member", groupId: doomed.id });
+    const dropped = await call<{ ungroupedAccounts: number }>("DELETE", `/api/v1/admin/groups/${doomed.id}`, admin);
+    expect(dropped.status).toBe(200);
+    expect(dropped.body.ungroupedAccounts).toBe(1);
+    expect((await env.listAccounts()).find((a) => a.id === member.id)).toMatchObject({ groupId: "", groupName: "" });
   });
 });
 

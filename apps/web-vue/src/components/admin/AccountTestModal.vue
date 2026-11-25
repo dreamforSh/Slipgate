@@ -239,7 +239,7 @@ const lineClass: Record<LineKind, string> = {
       <div class="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-surface-2/50 px-4 py-3">
         <div class="min-w-0 flex-1">
           <p class="truncate text-sm font-semibold text-fg">{{ account.name }}</p>
-          <p class="mt-0.5 truncate text-xs text-fg-muted">{{ account.groupName }} · {{ executionModeLabel(account.executionMode) }}</p>
+          <p class="mt-0.5 truncate text-xs text-fg-muted">{{ account.groupName || t("accounts.ungrouped") }} · {{ executionModeLabel(account.executionMode) }}</p>
         </div>
         <UiBadge tone="accent">{{ platformLabel }}</UiBadge>
         <UiBadge :tone="healthTone(account.status)" dot>{{ accountStatusLabel(account.status) }}</UiBadge>

@@ -33,6 +33,7 @@ import UiIcon from "../../ui/UiIcon.vue";
 import UiModal from "../../ui/UiModal.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
 import type { IconName } from "../../ui/icons";
+import AccountFormSection from "./AccountFormSection.vue";
 import ImportResultSummary from "./ImportResultSummary.vue";
 import {
   ACCOUNT_STATUSES,
@@ -49,9 +50,10 @@ import { useAuthStore } from "../../../stores/auth";
 import { useToastStore } from "../../../stores/toast";
 
 /**
- * Create (single or batch), edit and "duplicate as new" for upstream accounts, laid out after
- * the linksyncx add-account dialog: target group → name/notes → platform → account type →
- * type-specific credentials → plan, access mode and limits → validity.
+ * Create (single or batch), edit and "duplicate as new" for upstream accounts. Sections follow the
+ * sub2api add-account dialog: basic info → platform & account type → credentials → plan &
+ * scheduling → validity → group. The group is optional and comes last: it no longer picks the
+ * platform, the platform filters the groups instead (same platform or composite).
  */
 const props = defineProps<{
   open: boolean;
@@ -60,6 +62,7 @@ const props = defineProps<{
   /** Settings to start from when duplicating (create mode only). */
   template: UpstreamAccount | null;
   groups: GroupItem[];
+  /** Group preselected on create (e.g. the list's group filter); `""` = ungrouped. */
   defaultGroupId: string;
   /** id → name, to label duplicate skips in batch results. */
   accountNames: ReadonlyMap<string, string>;
@@ -307,15 +310,26 @@ const modeOptions = computed(() => [
 // Standard stays selectable: imported subscriptions with an unknown plan must not be upgraded on save.
 const tierOptions = computed(() => allowedSubscriptionTiersForProvider(formPlatform.value));
 
-/* ---------------- Group ↔ platform ---------------- */
+/* ---------------- Group (optional, filtered by platform) ---------------- */
 
 const selectedGroup = computed(() => props.groups.find((g) => g.id === formGroupId.value) ?? null);
-/** A single-platform group decides the platform; composite groups take any. */
-const groupPlatform = computed<Provider | null>(() => {
-  const p = selectedGroup.value?.platform;
-  return p && p !== "composite" ? p : null;
-});
-const platformLocked = computed(() => !!editing.value || groupPlatform.value !== null);
+/** Single-platform groups of the chosen platform; the current group stays listed even if it no longer fits. */
+const platformGroups = computed(() =>
+  props.groups.filter((g) => g.platform !== "composite" && (g.platform === formPlatform.value || g.id === formGroupId.value)),
+);
+/** Composite groups draw on every platform. */
+const compositeGroups = computed(() => props.groups.filter((g) => g.platform === "composite"));
+
+function groupFits(g: GroupItem, platform: Provider): boolean {
+  return g.platform === "composite" || g.platform === platform;
+}
+
+function groupLabel(g: GroupItem): string {
+  return g.enabled ? g.name : t("accounts.form.groupDisabled", { name: g.name });
+}
+
+/** The platform is fixed once the account exists. */
+const platformLocked = computed(() => !!editing.value);
 
 const multiProtoSpec = computed(() => PLATFORM_MULTI_PROTOCOL_CATALOG[formPlatform.value] ?? null);
 const accountModeOptions = computed(() => multiProtoSpec.value?.modes ?? []);
@@ -376,15 +390,13 @@ function setPlatform(platform: Provider) {
   formPlatform.value = platform;
   syncMultiProtoDefaults();
   applyKind(kindOptions.value[0]!.key);
+  // A single-platform group of another platform cannot hold the account: fall back to ungrouped.
+  if (selectedGroup.value && !groupFits(selectedGroup.value, platform)) formGroupId.value = "";
 }
 
-/** Picker clicks; ignored while the group or the edited account fixes the platform. */
+/** Picker clicks; ignored while editing (the platform is fixed at creation). */
 function selectPlatform(platform: Provider) {
   if (!platformLocked.value) setPlatform(platform);
-}
-
-function onGroupChange() {
-  if (!editing.value && groupPlatform.value && groupPlatform.value !== formPlatform.value) setPlatform(groupPlatform.value);
 }
 
 function onTierChange() {
@@ -510,14 +522,16 @@ function reset() {
   }
   formName.value = "";
   formNotes.value = "";
-  formGroupId.value = props.defaultGroupId || props.groups[0]?.id || "";
+  // No group unless the list is filtered by one; a single-platform preset also picks the platform.
+  const preset = props.groups.find((g) => g.id === props.defaultGroupId) ?? null;
+  formGroupId.value = preset?.id ?? "";
   formPriority.value = 100;
   formStatus.value = "active";
   formExpires.value = "";
   formAutoPause.value = true;
   formCooldownUntil.value = "";
   addMethod.value = "oauth";
-  formPlatform.value = groupPlatform.value ?? "anthropic";
+  formPlatform.value = preset && preset.platform !== "composite" ? preset.platform : "anthropic";
   syncMultiProtoDefaults();
   formTier.value = defaultTierFor(formPlatform.value);
   applyKind(kindOptions.value[0]!.key);
@@ -686,7 +700,8 @@ async function submitBatch() {
 }
 
 const canSubmit = computed(() => {
-  if (saving.value || !formGroupId.value) return false;
+  // The group is optional: an empty one creates (or moves to) an ungrouped account.
+  if (saving.value) return false;
   // Switching the account type needs the matching credential; otherwise it may stay as stored.
   if (editing.value) return formName.value.trim().length > 0 && (authKind.value === editing.value.authKind || singleSecret.value.length > 0);
   if (mode.value === "batch") {
@@ -735,402 +750,406 @@ const credentialPlaceholder = computed(() => {
       <span class="icon-chip icon-chip-accent h-8 w-8"><UiIcon :name="editing ? 'pencil' : 'plus'" :size="16" /></span>
     </template>
 
-    <form id="account-form" class="space-y-5" @submit.prevent="submit">
+    <form id="account-form" class="space-y-7" @submit.prevent="submit">
       <UiAlert v-if="template && !editing" tone="info">{{ t("accounts.form.copyHint") }}</UiAlert>
-
-      <!-- Target group: the group decides the platform unless it is composite -->
-      <div class="flex items-center gap-3 rounded-xl border border-accent/25 bg-accent/[0.05] px-4 py-3">
-        <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-surface text-fg shadow-sm" :class="platformStyle(selectedGroup?.platform ?? '').text">
-          <PlatformIcon :platform="selectedGroup?.platform ?? ''" :size="16" />
-        </span>
-        <label class="min-w-0 flex-1">
-          <span class="block text-2xs text-fg-subtle">{{ t("accounts.form.targetGroup") }} <span class="text-danger">*</span></span>
-          <select v-model="formGroupId" required class="select mt-1 h-9 py-1 text-sm font-semibold" @change="onGroupChange">
-            <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
-          </select>
-          <span v-if="groupPlatform && !editing" class="mt-1 block text-2xs text-fg-subtle">
-            {{ t("accounts.form.platformLocked", { name: selectedGroup?.name ?? "" }) }}
-          </span>
-        </label>
-      </div>
 
       <SegmentedControl v-if="!editing && !template" v-model="mode" :options="modeOptions" block size="md" />
 
-      <!-- Name / notes -->
-      <div v-if="editing || mode === 'single'">
-        <label class="label" for="account-form-name">{{ t("accounts.form.name") }} <span class="text-danger">*</span></label>
-        <input
-          id="account-form-name"
-          v-model="formName"
-          type="text"
-          required
-          maxlength="64"
-          :placeholder="t('accounts.form.namePlaceholder')"
-          class="input"
-        />
-      </div>
-      <div v-else>
-        <label class="label" for="account-form-prefix">{{ t("accounts.form.batchPrefix") }} <span class="text-danger">*</span></label>
-        <input id="account-form-prefix" v-model="batchPrefix" type="text" required maxlength="56" placeholder="claude-pool" class="input" />
-        <p v-if="batchPrefix.trim()" class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.batchPrefixHint", { example: batchExample }) }}</p>
-      </div>
-      <div>
-        <label class="label" for="account-form-notes">{{ t("accounts.form.notes") }}</label>
-        <textarea
-          id="account-form-notes"
-          v-model="formNotes"
-          rows="2"
-          maxlength="500"
-          :placeholder="t('accounts.form.notesPlaceholder')"
-          class="textarea"
-        />
-        <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.notesHint") }}</p>
-      </div>
-
-      <!-- Platform (hidden when the group or the edited account fixes it) -->
-      <div v-if="!platformLocked">
-        <p class="label">{{ t("accounts.form.platform") }}</p>
-        <div class="flex flex-wrap gap-1 rounded-lg bg-surface-2 p-1" role="radiogroup" :aria-label="t('accounts.form.platform')">
-          <button
-            v-for="p in PROVIDER_OPTIONS"
-            :key="p.value"
-            type="button"
-            role="radio"
-            :aria-checked="formPlatform === p.value"
-            :title="p.label"
-            class="flex min-w-[6.5rem] flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md px-2.5 py-2 text-sm font-medium transition-all"
-            :class="formPlatform === p.value ? ['bg-surface shadow-sm', platformStyle(p.value).text] : 'text-fg-muted hover:text-fg'"
-            @click="selectPlatform(p.value)"
-          >
-            <PlatformIcon :platform="p.value" :size="14" />
-            {{ platformShortLabel(p.value) }}
-          </button>
+      <!-- 1. Basic info -->
+      <AccountFormSection :title="t('accounts.form.sections.basic')" icon="pencil">
+        <div v-if="editing || mode === 'single'">
+          <label class="label" for="account-form-name">{{ t("accounts.form.name") }} <span class="text-danger">*</span></label>
+          <input
+            id="account-form-name"
+            v-model="formName"
+            type="text"
+            required
+            maxlength="64"
+            :placeholder="t('accounts.form.namePlaceholder')"
+            class="input"
+          />
         </div>
-      </div>
-
-      <!-- Account type -->
-      <div>
-        <p class="label">{{ t("accounts.form.accountType") }}</p>
-        <div class="grid gap-3" :class="kindOptions.length >= 3 ? 'grid-cols-1 sm:grid-cols-3' : kindOptions.length === 2 ? 'grid-cols-2' : 'grid-cols-1 sm:grid-cols-2'">
-          <button
-            v-for="k in kindOptions"
-            :key="k.key"
-            type="button"
-            class="flex cursor-pointer items-center gap-3 rounded-lg border-2 p-3 text-left transition-all"
-            :class="formKind === k.key ? TONE[k.tone].on : ['border-line', TONE[k.tone].off]"
-            :aria-pressed="formKind === k.key"
-            @click="applyKind(k.key)"
-          >
-            <span
-              class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg"
-              :class="formKind === k.key ? TONE[k.tone].chip : 'bg-surface-2 text-fg-muted'"
-            >
-              <UiIcon :name="k.icon" :size="15" />
-            </span>
-            <span class="min-w-0">
-              <span class="block truncate text-sm font-medium text-fg">{{ k.title }}</span>
-              <span class="block truncate text-xs text-fg-muted">{{ k.desc }}</span>
-            </span>
-          </button>
+        <div v-else>
+          <label class="label" for="account-form-prefix">{{ t("accounts.form.batchPrefix") }} <span class="text-danger">*</span></label>
+          <input id="account-form-prefix" v-model="batchPrefix" type="text" required maxlength="56" placeholder="claude-pool" class="input" />
+          <p v-if="batchPrefix.trim()" class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.batchPrefixHint", { example: batchExample }) }}</p>
         </div>
-      </div>
-
-      <!-- Add method (Claude Code) -->
-      <div v-if="kind.key === 'claude_code'">
-        <p class="label">{{ t("accounts.form.addMethod") }}</p>
-        <div class="flex flex-wrap gap-4">
-          <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-fg">
-            <input v-model="addMethod" type="radio" value="oauth" class="radio" />
-            {{ t("accounts.form.addMethodOauth") }}
-          </label>
-          <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-fg">
-            <input v-model="addMethod" type="radio" value="setup_token" class="radio" />
-            {{ t("accounts.form.addMethodSetupToken") }}
-          </label>
+        <div>
+          <label class="label" for="account-form-notes">{{ t("accounts.form.notes") }}</label>
+          <textarea
+            id="account-form-notes"
+            v-model="formNotes"
+            rows="2"
+            maxlength="500"
+            :placeholder="t('accounts.form.notesPlaceholder')"
+            class="textarea"
+          />
+          <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.notesHint") }}</p>
         </div>
-      </div>
+      </AccountFormSection>
 
-      <!-- Credentials: single -->
-      <template v-if="editing || mode === 'single'">
-        <div
-          v-if="supportsInteractiveOAuth"
-          class="space-y-3 rounded-xl border border-accent/25 bg-accent/[0.04] p-3.5"
-        >
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="min-w-0">
-              <p class="flex items-center gap-1.5 text-xs font-semibold text-fg">
-                <UiIcon name="link" :size="13" class="text-accent" />
-                {{ t("accounts.form.oauth.title") }}
-              </p>
-              <p class="mt-0.5 text-2xs text-fg-subtle">{{ t("accounts.form.oauth.hint") }}</p>
-            </div>
+      <!-- 2. Platform & account type (the platform is fixed once the account exists) -->
+      <AccountFormSection :title="t('accounts.form.sections.platform')" icon="box">
+        <div v-if="!platformLocked">
+          <p class="label">{{ t("accounts.form.platform") }}</p>
+          <div class="flex flex-wrap gap-1 rounded-lg bg-surface-2 p-1" role="radiogroup" :aria-label="t('accounts.form.platform')">
             <button
+              v-for="p in PROVIDER_OPTIONS"
+              :key="p.value"
               type="button"
-              class="btn btn-secondary btn-xs shrink-0"
-              :disabled="oauthStarting"
-              @click="startInteractiveOAuth"
+              role="radio"
+              :aria-checked="formPlatform === p.value"
+              :title="p.label"
+              class="flex min-w-[6.5rem] flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md px-2.5 py-2 text-sm font-medium transition-all"
+              :class="formPlatform === p.value ? ['bg-surface shadow-sm', platformStyle(p.value).text] : 'text-fg-muted hover:text-fg'"
+              @click="selectPlatform(p.value)"
             >
-              <UiIcon :name="oauthStarting ? 'loader' : 'external-link'" :size="12" :spin="oauthStarting" />
-              {{ oauthSession ? t("accounts.form.oauth.regenerateLink") : t("accounts.form.oauth.generateLink") }}
+              <PlatformIcon :platform="p.value" :size="14" />
+              {{ platformShortLabel(p.value) }}
             </button>
           </div>
-
-          <div v-if="formPlatform === 'antigravity' || formPlatform === 'gemini'">
-            <label class="label text-2xs" for="account-form-oauth-project">{{ t("accounts.form.oauth.projectId") }}</label>
-            <input
-              id="account-form-oauth-project"
-              v-model="oauthProjectId"
-              type="text"
-              maxlength="128"
-              :placeholder="t('accounts.form.oauth.projectIdPlaceholder')"
-              class="input input-sm font-mono text-xs"
-            />
-          </div>
-
-          <div v-if="oauthSession" class="space-y-2.5 border-t border-line/60 pt-2.5">
-            <div>
-              <span class="mb-1 block text-2xs font-medium text-fg-subtle">{{ t("accounts.form.oauth.authorizeUrl") }}</span>
-              <div class="flex items-center gap-1.5">
-                <input
-                  :value="oauthSession.authorizeUrl"
-                  type="text"
-                  readonly
-                  class="input input-sm min-w-0 flex-1 font-mono text-2xs"
-                  @focus="($event.target as HTMLInputElement).select()"
-                />
-                <button type="button" class="btn btn-secondary btn-xs shrink-0" @click="copyAuthorizeUrl">
-                  <UiIcon name="copy" :size="12" />
-                </button>
-                <a
-                  :href="oauthSession.authorizeUrl"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  class="btn btn-primary btn-xs shrink-0"
-                >
-                  <UiIcon name="external-link" :size="12" />
-                  {{ t("accounts.form.oauth.openBrowser") }}
-                </a>
-              </div>
-              <p v-if="oauthSession.instructions" class="mt-1 text-2xs text-fg-subtle">{{ oauthSession.instructions }}</p>
-            </div>
-
-            <div>
-              <label class="mb-1 block text-2xs font-medium text-fg-subtle" for="account-form-oauth-code">
-                {{ t("accounts.form.oauth.codeInput") }}
-              </label>
-              <div class="flex items-center gap-1.5">
-                <input
-                  id="account-form-oauth-code"
-                  v-model="oauthCodeInput"
-                  type="text"
-                  spellcheck="false"
-                  autocomplete="off"
-                  :placeholder="t('accounts.form.oauth.codePlaceholder')"
-                  class="input input-sm min-w-0 flex-1 font-mono text-xs"
-                />
-                <button
-                  type="button"
-                  class="btn btn-primary btn-xs shrink-0"
-                  :disabled="!oauthCodeInput.trim() || oauthExchanging"
-                  @click="exchangeInteractiveOAuth"
-                >
-                  <UiIcon :name="oauthExchanging ? 'loader' : 'check'" :size="12" :spin="oauthExchanging" />
-                  {{ t("accounts.form.oauth.exchange") }}
-                </button>
-              </div>
-            </div>
+        </div>
+        <div v-else>
+          <p class="label">{{ t("accounts.form.platform") }}</p>
+          <div class="flex items-center gap-2 rounded-lg border border-line bg-surface-2/60 px-3 py-2" :class="platformStyle(formPlatform).text">
+            <PlatformIcon :platform="formPlatform" :size="14" />
+            <span class="text-sm font-medium">{{ platformShortLabel(formPlatform) }}</span>
+            <span class="ml-auto inline-flex items-center gap-1 text-2xs text-fg-subtle">
+              <UiIcon name="lock" :size="11" />
+              {{ t("accounts.form.platformFixed") }}
+            </span>
           </div>
         </div>
 
-        <div v-if="isApiKey" class="space-y-4">
-          <UiAlert v-if="formPlatform === 'typesafe'" tone="info">{{ t("accounts.form.typesafeHint") }}</UiAlert>
+        <div>
+          <p class="label">{{ t("accounts.form.accountType") }}</p>
+          <div class="grid gap-3" :class="kindOptions.length >= 3 ? 'grid-cols-1 sm:grid-cols-3' : kindOptions.length === 2 ? 'grid-cols-2' : 'grid-cols-1 sm:grid-cols-2'">
+            <button
+              v-for="k in kindOptions"
+              :key="k.key"
+              type="button"
+              class="flex cursor-pointer items-center gap-3 rounded-lg border-2 p-3 text-left transition-all"
+              :class="formKind === k.key ? TONE[k.tone].on : ['border-line', TONE[k.tone].off]"
+              :aria-pressed="formKind === k.key"
+              @click="applyKind(k.key)"
+            >
+              <span
+                class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg"
+                :class="formKind === k.key ? TONE[k.tone].chip : 'bg-surface-2 text-fg-muted'"
+              >
+                <UiIcon :name="k.icon" :size="15" />
+              </span>
+              <span class="min-w-0">
+                <span class="block truncate text-sm font-medium text-fg">{{ k.title }}</span>
+                <span class="block truncate text-xs text-fg-muted">{{ k.desc }}</span>
+              </span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Add method (Claude Code) -->
+        <div v-if="kind.key === 'claude_code'">
+          <p class="label">{{ t("accounts.form.addMethod") }}</p>
+          <div class="flex flex-wrap gap-4">
+            <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-fg">
+              <input v-model="addMethod" type="radio" value="oauth" class="radio" />
+              {{ t("accounts.form.addMethodOauth") }}
+            </label>
+            <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-fg">
+              <input v-model="addMethod" type="radio" value="setup_token" class="radio" />
+              {{ t("accounts.form.addMethodSetupToken") }}
+            </label>
+          </div>
+        </div>
+      </AccountFormSection>
+
+      <!-- 3. Credentials -->
+      <AccountFormSection :title="t('accounts.form.sections.credentials')" icon="key">
+        <!-- Credentials: single -->
+        <template v-if="editing || mode === 'single'">
           <div
-            v-if="accountModeOptions.length > 1 || apiProtocolOptions.length > 1"
-            class="grid gap-4"
-            :class="accountModeOptions.length > 1 && apiProtocolOptions.length > 1 ? 'sm:grid-cols-2' : ''"
+            v-if="supportsInteractiveOAuth"
+            class="space-y-3 rounded-xl border border-accent/25 bg-accent/[0.04] p-3.5"
           >
-            <div v-if="accountModeOptions.length > 1">
-              <label class="label" for="account-form-acct-mode">{{ t("accounts.form.accountMode") }}</label>
-              <select id="account-form-acct-mode" v-model="formAccountMode" class="select">
-                <option v-for="m in accountModeOptions" :key="m.mode" :value="m.mode">
-                  {{ t(`accounts.form.accountModes.${m.mode}`) }}
-                </option>
-              </select>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="min-w-0">
+                <p class="flex items-center gap-1.5 text-xs font-semibold text-fg">
+                  <UiIcon name="link" :size="13" class="text-accent" />
+                  {{ t("accounts.form.oauth.title") }}
+                </p>
+                <p class="mt-0.5 text-2xs text-fg-subtle">{{ t("accounts.form.oauth.hint") }}</p>
+              </div>
+              <button
+                type="button"
+                class="btn btn-secondary btn-xs shrink-0"
+                :disabled="oauthStarting"
+                @click="startInteractiveOAuth"
+              >
+                <UiIcon :name="oauthStarting ? 'loader' : 'external-link'" :size="12" :spin="oauthStarting" />
+                {{ oauthSession ? t("accounts.form.oauth.regenerateLink") : t("accounts.form.oauth.generateLink") }}
+              </button>
             </div>
-            <div v-if="apiProtocolOptions.length > 1">
-              <label class="label" for="account-form-api-proto">{{ t("accounts.form.apiProtocol") }}</label>
-              <select id="account-form-api-proto" v-model="formApiProtocol" class="select">
-                <option v-for="p in apiProtocolOptions" :key="p" :value="p">
-                  {{ t(`accounts.form.apiProtocols.${p}`) }}
-                </option>
-              </select>
+
+            <div v-if="formPlatform === 'antigravity' || formPlatform === 'gemini'">
+              <label class="label text-2xs" for="account-form-oauth-project">{{ t("accounts.form.oauth.projectId") }}</label>
+              <input
+                id="account-form-oauth-project"
+                v-model="oauthProjectId"
+                type="text"
+                maxlength="128"
+                :placeholder="t('accounts.form.oauth.projectIdPlaceholder')"
+                class="input input-sm font-mono text-xs"
+              />
+            </div>
+
+            <div v-if="oauthSession" class="space-y-2.5 border-t border-line/60 pt-2.5">
+              <div>
+                <span class="mb-1 block text-2xs font-medium text-fg-subtle">{{ t("accounts.form.oauth.authorizeUrl") }}</span>
+                <div class="flex items-center gap-1.5">
+                  <input
+                    :value="oauthSession.authorizeUrl"
+                    type="text"
+                    readonly
+                    class="input input-sm min-w-0 flex-1 font-mono text-2xs"
+                    @focus="($event.target as HTMLInputElement).select()"
+                  />
+                  <button type="button" class="btn btn-secondary btn-xs shrink-0" @click="copyAuthorizeUrl">
+                    <UiIcon name="copy" :size="12" />
+                  </button>
+                  <a
+                    :href="oauthSession.authorizeUrl"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="btn btn-primary btn-xs shrink-0"
+                  >
+                    <UiIcon name="external-link" :size="12" />
+                    {{ t("accounts.form.oauth.openBrowser") }}
+                  </a>
+                </div>
+                <p v-if="oauthSession.instructions" class="mt-1 text-2xs text-fg-subtle">{{ oauthSession.instructions }}</p>
+              </div>
+
+              <div>
+                <label class="mb-1 block text-2xs font-medium text-fg-subtle" for="account-form-oauth-code">
+                  {{ t("accounts.form.oauth.codeInput") }}
+                </label>
+                <div class="flex items-center gap-1.5">
+                  <input
+                    id="account-form-oauth-code"
+                    v-model="oauthCodeInput"
+                    type="text"
+                    spellcheck="false"
+                    autocomplete="off"
+                    :placeholder="t('accounts.form.oauth.codePlaceholder')"
+                    class="input input-sm min-w-0 flex-1 font-mono text-xs"
+                  />
+                  <button
+                    type="button"
+                    class="btn btn-primary btn-xs shrink-0"
+                    :disabled="!oauthCodeInput.trim() || oauthExchanging"
+                    @click="exchangeInteractiveOAuth"
+                  >
+                    <UiIcon :name="oauthExchanging ? 'loader' : 'check'" :size="12" :spin="oauthExchanging" />
+                    {{ t("accounts.form.oauth.exchange") }}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
-          <div>
-            <label class="label" for="account-form-base-url">{{ t("accounts.form.baseUrl") }}</label>
-            <input
-              id="account-form-base-url"
-              v-model="formBaseUrl"
-              type="url"
-              spellcheck="false"
-              autocomplete="off"
-              :placeholder="baseUrlPlaceholder"
-              class="input font-mono text-xs"
-            />
-            <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.baseUrlHint") }}</p>
+
+          <div v-if="isApiKey" class="space-y-4">
+            <UiAlert v-if="formPlatform === 'typesafe'" tone="info">{{ t("accounts.form.typesafeHint") }}</UiAlert>
+            <div
+              v-if="accountModeOptions.length > 1 || apiProtocolOptions.length > 1"
+              class="grid gap-4"
+              :class="accountModeOptions.length > 1 && apiProtocolOptions.length > 1 ? 'sm:grid-cols-2' : ''"
+            >
+              <div v-if="accountModeOptions.length > 1">
+                <label class="label" for="account-form-acct-mode">{{ t("accounts.form.accountMode") }}</label>
+                <select id="account-form-acct-mode" v-model="formAccountMode" class="select">
+                  <option v-for="m in accountModeOptions" :key="m.mode" :value="m.mode">
+                    {{ t(`accounts.form.accountModes.${m.mode}`) }}
+                  </option>
+                </select>
+              </div>
+              <div v-if="apiProtocolOptions.length > 1">
+                <label class="label" for="account-form-api-proto">{{ t("accounts.form.apiProtocol") }}</label>
+                <select id="account-form-api-proto" v-model="formApiProtocol" class="select">
+                  <option v-for="p in apiProtocolOptions" :key="p" :value="p">
+                    {{ t(`accounts.form.apiProtocols.${p}`) }}
+                  </option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label class="label" for="account-form-base-url">{{ t("accounts.form.baseUrl") }}</label>
+              <input
+                id="account-form-base-url"
+                v-model="formBaseUrl"
+                type="url"
+                spellcheck="false"
+                autocomplete="off"
+                :placeholder="baseUrlPlaceholder"
+                class="input font-mono text-xs"
+              />
+              <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.baseUrlHint") }}</p>
+            </div>
+            <div>
+              <label class="label flex items-center justify-between gap-3" for="account-form-api-key">
+                <span>{{ t("accounts.form.apiKey") }} <span v-if="!editing" class="text-danger">*</span></span>
+                <span v-if="editing" class="truncate font-mono font-normal text-fg-muted">
+                  {{ t("accounts.form.credentialsCurrent", { preview: editing.credentialPreview }) }}
+                </span>
+              </label>
+              <input
+                id="account-form-api-key"
+                v-model="formApiKey"
+                type="password"
+                :required="!editing"
+                autocomplete="new-password"
+                :placeholder="editing ? t('accounts.form.credentialsKeepPlaceholder') : 'sk-...'"
+                class="input font-mono"
+              />
+            </div>
           </div>
-          <div>
-            <label class="label flex items-center justify-between gap-3" for="account-form-api-key">
-              <span>{{ t("accounts.form.apiKey") }} <span v-if="!editing" class="text-danger">*</span></span>
+
+          <div v-else-if="authKind === 'setup_token'">
+            <label class="label flex items-center justify-between gap-3" for="account-form-setup-token">
+              <span>Setup Token <span v-if="!editing" class="text-danger">*</span></span>
               <span v-if="editing" class="truncate font-mono font-normal text-fg-muted">
                 {{ t("accounts.form.credentialsCurrent", { preview: editing.credentialPreview }) }}
               </span>
             </label>
             <input
-              id="account-form-api-key"
-              v-model="formApiKey"
+              id="account-form-setup-token"
+              v-model="formSecret"
               type="password"
               :required="!editing"
               autocomplete="new-password"
-              :placeholder="editing ? t('accounts.form.credentialsKeepPlaceholder') : 'sk-...'"
+              :placeholder="editing ? t('accounts.form.credentialsKeepPlaceholder') : 'sk-ant-oat01-...'"
               class="input font-mono"
             />
+            <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.setupTokenHint") }}</p>
           </div>
-        </div>
 
-        <div v-else-if="authKind === 'setup_token'">
-          <label class="label flex items-center justify-between gap-3" for="account-form-setup-token">
-            <span>Setup Token <span v-if="!editing" class="text-danger">*</span></span>
-            <span v-if="editing" class="truncate font-mono font-normal text-fg-muted">
-              {{ t("accounts.form.credentialsCurrent", { preview: editing.credentialPreview }) }}
+          <div v-else>
+            <div class="mb-1.5 flex items-center justify-between gap-3">
+              <label class="label mb-0" for="account-form-secret">
+                {{ authKind === "vm_cli_seed" ? t("accounts.form.vmSeedCredentials") : t("accounts.form.oauthCredentials") }}
+                <span v-if="!editing" class="text-danger">*</span>
+              </label>
+              <span v-if="editing" class="min-w-0 truncate font-mono text-2xs text-fg-muted">
+                {{ t("accounts.form.credentialsCurrent", { preview: editing.credentialPreview }) }}
+              </span>
+              <label v-else class="btn btn-ghost btn-xs shrink-0 cursor-pointer">
+                <UiIcon name="file" :size="12" />
+                {{ t("accounts.form.loadFile") }}
+                <input type="file" accept=".json,application/json,text/plain" class="sr-only" @change="loadCredentialFile" />
+              </label>
+            </div>
+            <textarea
+              id="account-form-secret"
+              v-model="formSecret"
+              rows="6"
+              :required="!editing"
+              spellcheck="false"
+              autocomplete="off"
+              :placeholder="editing ? t('accounts.form.credentialsKeepPlaceholder') : credentialPlaceholder"
+              class="textarea font-mono text-xs"
+            />
+            <p v-if="insightSummary" class="mt-1 flex items-center gap-1 text-2xs text-success">
+              <UiIcon name="check" :size="12" />
+              {{ t("accounts.form.detected", { summary: insightSummary }) }}
+            </p>
+            <p v-if="platformMismatch" class="mt-1 text-2xs text-warning">{{ t("accounts.form.platformMismatch", { platform: platformMismatch }) }}</p>
+            <p class="mt-1 text-2xs text-fg-subtle">
+              {{ authKind === "vm_cli_seed" ? t("accounts.form.vmSeedHint") : t("accounts.form.oauthCredentialsHint") }}
+            </p>
+          </div>
+        </template>
+
+        <!-- Credentials: batch -->
+        <div v-else class="space-y-2">
+          <div v-if="isApiKey">
+            <label class="label" for="account-form-batch-base-url">{{ t("accounts.form.baseUrl") }}</label>
+            <input id="account-form-batch-base-url" v-model="formBaseUrl" type="url" spellcheck="false" placeholder="https://" class="input font-mono text-xs" />
+            <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.baseUrlHint") }}</p>
+          </div>
+          <label class="block min-w-0">
+            <span class="label flex items-center justify-between gap-3">
+              <span>{{ t("accounts.form.batchCredentials") }} <span class="text-danger">*</span></span>
+              <span class="font-normal text-fg-muted">{{ t("accounts.form.batchCount", { count: batchCredentials.length }) }}</span>
             </span>
+            <textarea
+              v-model="batchText"
+              rows="8"
+              spellcheck="false"
+              autocomplete="off"
+              :placeholder="isApiKey ? 'sk-...\nsk-...' : authKind === 'setup_token' ? 'sk-ant-oat01-...\nsk-ant-oat01-...' : '{...}\n{...}'"
+              class="textarea font-mono text-xs"
+            />
           </label>
-          <input
-            id="account-form-setup-token"
-            v-model="formSecret"
-            type="password"
-            :required="!editing"
-            autocomplete="new-password"
-            :placeholder="editing ? t('accounts.form.credentialsKeepPlaceholder') : 'sk-ant-oat01-...'"
-            class="input font-mono"
-          />
-          <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.setupTokenHint") }}</p>
+          <p v-if="batchBlock.invalidJson" class="text-xs text-danger">{{ t("accounts.form.batchInvalidJson") }}</p>
+          <p class="text-2xs text-fg-subtle">{{ isApiKey ? t("accounts.form.batchKeysHint") : t("accounts.form.batchCredentialsHint") }}</p>
+          <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-fg-muted">
+            <input v-model="batchSkipDup" type="checkbox" class="checkbox" />
+            {{ t("accounts.form.skipDuplicates") }}
+          </label>
+          <ImportResultSummary v-if="batchResult" :result="batchResult" :account-names="accountNames" />
         </div>
+      </AccountFormSection>
 
-        <div v-else>
-          <div class="mb-1.5 flex items-center justify-between gap-3">
-            <label class="label mb-0" for="account-form-secret">
-              {{ authKind === "vm_cli_seed" ? t("accounts.form.vmSeedCredentials") : t("accounts.form.oauthCredentials") }}
-              <span v-if="!editing" class="text-danger">*</span>
-            </label>
-            <span v-if="editing" class="min-w-0 truncate font-mono text-2xs text-fg-muted">
-              {{ t("accounts.form.credentialsCurrent", { preview: editing.credentialPreview }) }}
-            </span>
-            <label v-else class="btn btn-ghost btn-xs shrink-0 cursor-pointer">
-              <UiIcon name="file" :size="12" />
-              {{ t("accounts.form.loadFile") }}
-              <input type="file" accept=".json,application/json,text/plain" class="sr-only" @change="loadCredentialFile" />
-            </label>
+      <!-- 4. Plan & scheduling -->
+      <AccountFormSection :title="t('accounts.form.sections.scheduling')" icon="gauge">
+        <!-- Plan (subscriptions only) and access mode -->
+        <div class="grid gap-4" :class="!isApiKey && tierOptions.length ? 'sm:grid-cols-2' : ''">
+          <div v-if="!isApiKey && tierOptions.length">
+            <label class="label" for="account-form-tier">{{ t("accounts.form.tier") }}</label>
+            <select id="account-form-tier" v-model="formTier" class="select" @change="onTierChange">
+              <option v-for="opt in tierOptions" :key="opt.tier" :value="opt.tier">{{ opt.label }}</option>
+            </select>
           </div>
-          <textarea
-            id="account-form-secret"
-            v-model="formSecret"
-            rows="6"
-            :required="!editing"
-            spellcheck="false"
-            autocomplete="off"
-            :placeholder="editing ? t('accounts.form.credentialsKeepPlaceholder') : credentialPlaceholder"
-            class="textarea font-mono text-xs"
-          />
-          <p v-if="insightSummary" class="mt-1 flex items-center gap-1 text-2xs text-success">
-            <UiIcon name="check" :size="12" />
-            {{ t("accounts.form.detected", { summary: insightSummary }) }}
-          </p>
-          <p v-if="platformMismatch" class="mt-1 text-2xs text-warning">{{ t("accounts.form.platformMismatch", { platform: platformMismatch }) }}</p>
-          <p class="mt-1 text-2xs text-fg-subtle">
-            {{ authKind === "vm_cli_seed" ? t("accounts.form.vmSeedHint") : t("accounts.form.oauthCredentialsHint") }}
-          </p>
+          <div>
+            <label class="label" for="account-form-mode">{{ t("accounts.form.mode") }}</label>
+            <select id="account-form-mode" v-model="formMode" class="select">
+              <option v-for="m in EXECUTION_MODES" :key="m" :value="m">{{ executionModeLabel(m) }}</option>
+            </select>
+          </div>
         </div>
-      </template>
 
-      <!-- Credentials: batch -->
-      <div v-else class="space-y-2">
-        <div v-if="isApiKey">
-          <label class="label" for="account-form-batch-base-url">{{ t("accounts.form.baseUrl") }}</label>
-          <input id="account-form-batch-base-url" v-model="formBaseUrl" type="url" spellcheck="false" placeholder="https://" class="input font-mono text-xs" />
-          <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.baseUrlHint") }}</p>
+        <!-- Limits and status -->
+        <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
+          <div>
+            <label class="label" for="account-form-conc">{{ t("accounts.form.concurrency") }}</label>
+            <input id="account-form-conc" v-model.number="formMaxConc" type="number" min="1" max="64" required class="input font-mono" />
+          </div>
+          <div>
+            <label class="label" for="account-form-priority">{{ t("accounts.form.priority") }}</label>
+            <input id="account-form-priority" v-model.number="formPriority" type="number" min="0" max="10000" required class="input font-mono" />
+          </div>
+          <div v-if="editing" class="col-span-2 sm:col-span-1">
+            <label class="label" for="account-form-status">{{ t("accounts.form.status") }}</label>
+            <select id="account-form-status" v-model="formStatus" class="select">
+              <option v-for="s in ACCOUNT_STATUSES" :key="s" :value="s">{{ accountStatusLabel(s) }}</option>
+            </select>
+          </div>
+          <div v-else class="col-span-2 sm:col-span-1">
+            <label class="label" for="account-form-initial">{{ t("accounts.form.initialStatus") }}</label>
+            <select id="account-form-initial" v-model="formInitialStatus" class="select">
+              <option value="active">{{ t("accounts.form.startActive") }}</option>
+              <option value="paused">{{ t("accounts.form.startPaused") }}</option>
+            </select>
+          </div>
         </div>
-        <label class="block min-w-0">
-          <span class="label flex items-center justify-between gap-3">
-            <span>{{ t("accounts.form.batchCredentials") }} <span class="text-danger">*</span></span>
-            <span class="font-normal text-fg-muted">{{ t("accounts.form.batchCount", { count: batchCredentials.length }) }}</span>
-          </span>
-          <textarea
-            v-model="batchText"
-            rows="8"
-            spellcheck="false"
-            autocomplete="off"
-            :placeholder="isApiKey ? 'sk-...\nsk-...' : authKind === 'setup_token' ? 'sk-ant-oat01-...\nsk-ant-oat01-...' : '{...}\n{...}'"
-            class="textarea font-mono text-xs"
-          />
-        </label>
-        <p v-if="batchBlock.invalidJson" class="text-xs text-danger">{{ t("accounts.form.batchInvalidJson") }}</p>
-        <p class="text-2xs text-fg-subtle">{{ isApiKey ? t("accounts.form.batchKeysHint") : t("accounts.form.batchCredentialsHint") }}</p>
-        <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-fg-muted">
-          <input v-model="batchSkipDup" type="checkbox" class="checkbox" />
-          {{ t("accounts.form.skipDuplicates") }}
-        </label>
-        <ImportResultSummary v-if="batchResult" :result="batchResult" :account-names="accountNames" />
-      </div>
+        <div v-if="editing && (formStatus === 'cooldown' || formCooldownUntil)">
+          <label class="label" for="account-form-cooldown">{{ t("accounts.form.cooldownUntil") }}</label>
+          <input id="account-form-cooldown" v-model="formCooldownUntil" type="datetime-local" class="input font-mono" />
+          <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.cooldownUntilHint") }}</p>
+        </div>
+      </AccountFormSection>
 
-      <!-- Plan (subscriptions only) and access mode -->
-      <div class="grid gap-4" :class="!isApiKey && tierOptions.length ? 'sm:grid-cols-2' : ''">
-        <div v-if="!isApiKey && tierOptions.length">
-          <label class="label" for="account-form-tier">{{ t("accounts.form.tier") }}</label>
-          <select id="account-form-tier" v-model="formTier" class="select" @change="onTierChange">
-            <option v-for="opt in tierOptions" :key="opt.tier" :value="opt.tier">{{ opt.label }}</option>
-          </select>
-        </div>
-        <div>
-          <label class="label" for="account-form-mode">{{ t("accounts.form.mode") }}</label>
-          <select id="account-form-mode" v-model="formMode" class="select">
-            <option v-for="m in EXECUTION_MODES" :key="m" :value="m">{{ executionModeLabel(m) }}</option>
-          </select>
-        </div>
-      </div>
-
-      <!-- Limits and status -->
-      <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
-        <div>
-          <label class="label" for="account-form-conc">{{ t("accounts.form.concurrency") }}</label>
-          <input id="account-form-conc" v-model.number="formMaxConc" type="number" min="1" max="64" required class="input font-mono" />
-        </div>
-        <div>
-          <label class="label" for="account-form-priority">{{ t("accounts.form.priority") }}</label>
-          <input id="account-form-priority" v-model.number="formPriority" type="number" min="0" max="10000" required class="input font-mono" />
-        </div>
-        <div v-if="editing" class="col-span-2 sm:col-span-1">
-          <label class="label" for="account-form-status">{{ t("accounts.form.status") }}</label>
-          <select id="account-form-status" v-model="formStatus" class="select">
-            <option v-for="s in ACCOUNT_STATUSES" :key="s" :value="s">{{ accountStatusLabel(s) }}</option>
-          </select>
-        </div>
-        <div v-else class="col-span-2 sm:col-span-1">
-          <label class="label" for="account-form-initial">{{ t("accounts.form.initialStatus") }}</label>
-          <select id="account-form-initial" v-model="formInitialStatus" class="select">
-            <option value="active">{{ t("accounts.form.startActive") }}</option>
-            <option value="paused">{{ t("accounts.form.startPaused") }}</option>
-          </select>
-        </div>
-      </div>
-      <div v-if="editing && (formStatus === 'cooldown' || formCooldownUntil)">
-        <label class="label" for="account-form-cooldown">{{ t("accounts.form.cooldownUntil") }}</label>
-        <input id="account-form-cooldown" v-model="formCooldownUntil" type="datetime-local" class="input font-mono" />
-        <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.cooldownUntilHint") }}</p>
-      </div>
-
-      <!-- Validity -->
-      <div class="border-t border-line/70 pt-4">
+      <!-- 5. Validity -->
+      <AccountFormSection :title="t('accounts.form.sections.validity')" icon="calendar">
         <div class="grid gap-4 sm:grid-cols-2">
           <div>
             <label class="label" for="account-form-expires">{{ t("accounts.form.expires") }}</label>
@@ -1147,7 +1166,39 @@ const credentialPlaceholder = computed(() => {
             <p class="text-2xs leading-relaxed text-fg-subtle">{{ t("accounts.form.expiresHint") }}</p>
           </div>
         </div>
-      </div>
+      </AccountFormSection>
+
+      <!-- 6. Group: optional, listed by the chosen platform (plus composite groups) -->
+      <AccountFormSection :title="t('accounts.form.sections.group')" icon="layers" :tag="t('accounts.form.optional')">
+        <div>
+          <label class="label" for="account-form-group">{{ t("accounts.form.group") }}</label>
+          <div class="flex items-center gap-2">
+            <span
+              class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-line bg-surface-2"
+              :class="selectedGroup ? platformStyle(selectedGroup.platform).text : 'text-fg-subtle'"
+              aria-hidden="true"
+            >
+              <PlatformIcon v-if="selectedGroup" :platform="selectedGroup.platform" :size="15" />
+              <UiIcon v-else name="layers" :size="15" />
+            </span>
+            <select id="account-form-group" v-model="formGroupId" class="select min-w-0 flex-1">
+              <option value="">{{ t("accounts.form.noGroup") }}</option>
+              <optgroup v-if="platformGroups.length" :label="t('accounts.form.groupsOfPlatform', { platform: platformShortLabel(formPlatform) })">
+                <option v-for="g in platformGroups" :key="g.id" :value="g.id">{{ groupLabel(g) }}</option>
+              </optgroup>
+              <optgroup v-if="compositeGroups.length" :label="t('accounts.form.compositeGroups')">
+                <option v-for="g in compositeGroups" :key="g.id" :value="g.id">{{ groupLabel(g) }}</option>
+              </optgroup>
+            </select>
+          </div>
+          <p class="mt-1 text-2xs leading-relaxed text-fg-subtle">
+            {{ formGroupId ? t("accounts.form.groupHint") : t("accounts.form.noGroupHint") }}
+          </p>
+          <p v-if="!platformGroups.length && !compositeGroups.length" class="mt-1 text-2xs text-fg-subtle">
+            {{ t("accounts.form.noGroupsForPlatform", { platform: platformShortLabel(formPlatform) }) }}
+          </p>
+        </div>
+      </AccountFormSection>
     </form>
 
     <template #footer>

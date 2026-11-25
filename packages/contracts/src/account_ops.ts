@@ -239,7 +239,7 @@ export function resolveTierForPlatform(platform: Provider, hint: string | null |
 /** `cpa` = CLIProxyAPI auth files (one JSON object per account, `type` names the provider). */
 export type AccountImportFormat = "slipgate" | "sub2api" | "cpa";
 
-/** One account ready to be sent to the import endpoint once a target group is chosen. */
+/** One account ready to be sent to the import endpoint (with an optional target group). */
 export interface AccountImportDraft {
   /** Which kind of file the account came from (not sent to the server). */
   origin: AccountImportFormat;
@@ -939,7 +939,7 @@ export function parseCredentialBlock(text: string): CredentialBlock {
   return { credentials, invalidJson: false };
 }
 
-/** Validate a draft + target group the same way the import endpoint will. */
+/** Validate a draft + target group (`""` = ungrouped) the same way the import endpoint will. */
 export function draftToCreateRequest(draft: AccountImportDraft, groupId: string) {
   return CreateAccountRequestSchema.safeParse({
     name: draft.name,

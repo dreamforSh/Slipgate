@@ -6,7 +6,9 @@ const en: typeof zh = {
       create: "New group",
       edit: "Edit",
       duplicate: "Duplicate",
-      deleteBlocked: "Still used by accounts or keys",
+      deleteBlocked: "Still used by API keys, cannot delete",
+      deleteUngroups: "Delete ({n} accounts become ungrouped)",
+      confirmDeleteUngroups: "Confirm? {n} accounts become ungrouped",
       viewAccounts: "View accounts in this group",
     },
     stats: {
@@ -86,6 +88,7 @@ const en: typeof zh = {
       saved: "Saved group {name}",
       duplicated: "Duplicated as {name}",
       deleted: "Group deleted",
+      deletedUngrouped: "Group deleted; {n} accounts are now ungrouped",
       enabled: "Enabled {name}",
       disabled: "Disabled {name}",
     },

@@ -1,6 +1,8 @@
 /** Page copy for account management: list, form, bulk tools, import/export, stats and tests. */
 export default {
   accounts: {
+    /** Label of accounts that belong to no group (list, card, drawers, filters). */
+    ungrouped: "未分组",
     actions: {
       addAccount: "添加账号",
       saveAccount: "保存",
@@ -190,8 +192,23 @@ export default {
       copyHint: "已带入原账号的配置，请填写新账号的凭据。",
       modeSingle: "单个添加",
       modeBatch: "批量添加",
-      targetGroup: "目标分组",
-      platformLocked: "平台由分组「{name}」决定，如需其他平台请切换分组",
+      sections: {
+        basic: "基础信息",
+        platform: "平台与账号类型",
+        credentials: "凭据",
+        scheduling: "套餐与调度",
+        validity: "有效期",
+        group: "分组",
+      },
+      optional: "可选",
+      platformFixed: "创建后不可更改",
+      noGroup: "不分组",
+      groupsOfPlatform: "{platform} 分组",
+      compositeGroups: "组合分组",
+      groupDisabled: "{name}（已停用）",
+      groupHint: "该分组下的 API Key 会调度这个账号。",
+      noGroupHint: "不选分组时，账号只进入账号池：单平台分组不会调度它（组合分组仍会按平台使用），之后可在编辑或批量编辑中再分配分组。",
+      noGroupsForPlatform: "{platform} 还没有可用的分组，可稍后在分组管理中创建。",
       notesHint: "备注可选，仅管理员可见",
       accountType: "账号类型",
       types: {
@@ -339,6 +356,7 @@ export default {
         "认证文件不含订阅等级与账号到期时间：无法判断等级的账号按 Standard 导入，可在导入后批量修改；文件里的 token 过期时间不会当作账号到期时间。标记为 disabled 的账号会以暂停状态导入。",
       parseError: "无法识别文件内容：{message}",
       targetGroup: "导入到分组",
+      noGroupHint: "未匹配到分组的账号将以未分组状态导入，之后可批量分配分组。",
       matchGroupName: "优先放入与备份同名的分组",
       matchPlatform: "平台与所选分组不同的账号放入同平台分组",
       subscriptionMode: "订阅账号接入方式",
