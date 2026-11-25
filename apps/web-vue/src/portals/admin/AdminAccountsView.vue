@@ -307,6 +307,7 @@ watch(pageCount, (count) => {
 const selected = ref<Set<string>>(new Set());
 const selectedAccounts = computed(() => accounts.value.filter((a) => selected.value.has(a.id)));
 const selectedIds = computed(() => selectedAccounts.value.map((a) => a.id));
+const selectedOauth = computed(() => selectedAccounts.value.filter((a) => a.authKind === "oauth"));
 const selectedMissingExit = computed(() =>
   exitReady.value ? selectedAccounts.value.filter((a) => modeUsesExit(a.executionMode) && !hasExit(a.id)) : [],
 );
@@ -472,6 +473,66 @@ async function toggleAccountStatus(acc: UpstreamAccount) {
   const pause = acc.effectiveStatus === "active";
   const updated = await patchAccount(acc, { status: pause ? "paused" : "active" }, t("accounts.errors.updateStatus"));
   if (updated) reportScheduling(updated);
+}
+
+/** Inline priority edits save at once; the list re-sorts when priority is the sort key. */
+async function setPriority(acc: UpstreamAccount, priority: number) {
+  if (priority === acc.priority) return;
+  const updated = await patchAccount(acc, { priority }, t("accounts.errors.updateAccount"));
+  if (updated) toast.success(t("accounts.priority.saved", { name: updated.name, n: updated.priority }));
+}
+
+/* ---------------- OAuth token refresh (slipgate-net renews and persists it) ---------------- */
+
+const refreshingTokens = ref(false);
+
+async function refreshOne(acc: UpstreamAccount): Promise<{ ok: true; expiresAtUnixMs: number } | { ok: false; message: string }> {
+  setBusy(acc.id, true);
+  try {
+    const res = await auth.apiFetch(`/api/v1/admin/accounts/${encodeURIComponent(acc.id)}/oauth/refresh`, { method: "POST" });
+    const data = (await res.json().catch(() => ({}))) as { message?: string; expiresAtUnixMs?: number };
+    if (!res.ok) return { ok: false, message: data.message ?? t("accounts.refresh.failed") };
+    return { ok: true, expiresAtUnixMs: data.expiresAtUnixMs ?? 0 };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : t("accounts.refresh.failed") };
+  } finally {
+    setBusy(acc.id, false);
+  }
+}
+
+async function refreshToken(acc: UpstreamAccount) {
+  const result = await refreshOne(acc);
+  if (!result.ok) {
+    toast.error(t("accounts.refresh.failedFor", { name: acc.name, message: result.message }));
+    return;
+  }
+  toast.success(
+    result.expiresAtUnixMs
+      ? t("accounts.refresh.doneUntil", { name: acc.name, time: formatRelative(new Date(result.expiresAtUnixMs).toISOString()) })
+      : t("accounts.refresh.done", { name: acc.name }),
+  );
+  await refreshPool(true);
+}
+
+/** Selected OAuth accounts, one after another (each refresh talks to the provider). */
+async function bulkRefreshTokens() {
+  const targets = selectedOauth.value;
+  if (!targets.length || refreshingTokens.value) return;
+  refreshingTokens.value = true;
+  try {
+    let ok = 0;
+    const failures: string[] = [];
+    for (const acc of targets) {
+      const result = await refreshOne(acc);
+      if (result.ok) ok += 1;
+      else failures.push(`${acc.name}: ${result.message}`);
+    }
+    if (ok) toast.success(t("accounts.refresh.bulkDone", { n: ok }));
+    if (failures.length) toast.error(t("accounts.refresh.bulkFailed", { n: failures.length, first: failures[0] }));
+    await refreshPool(true);
+  } finally {
+    refreshingTokens.value = false;
+  }
 }
 
 async function resumeAccount(acc: UpstreamAccount) {
@@ -955,6 +1016,16 @@ onMounted(() => {
             {{ t("accounts.bulk.edit") }}
           </button>
           <button
+            v-if="selectedOauth.length > 0"
+            type="button"
+            class="btn btn-secondary btn-sm"
+            :disabled="bulkBusy || refreshingTokens"
+            @click="bulkRefreshTokens"
+          >
+            <UiIcon :name="refreshingTokens ? 'loader' : 'rotate-ccw'" :size="13" :spin="refreshingTokens" />
+            {{ t("accounts.refresh.bulk", { n: selectedOauth.length }) }}
+          </button>
+          <button
             v-if="exitReady && selectedMissingExit.length > 0"
             type="button"
             class="btn btn-secondary btn-sm"
@@ -1042,6 +1113,7 @@ onMounted(() => {
         @edit="openEdit"
         @stats="openStats"
         @menu="openMenu"
+        @priority="setPriority"
       />
 
       <div v-else class="grid gap-4 p-4 sm:p-5 md:grid-cols-2 xl:grid-cols-3">
@@ -1064,6 +1136,7 @@ onMounted(() => {
           @edit="openEdit(acc)"
           @stats="openStats(acc)"
           @menu="openMenu(acc, $event)"
+          @priority="setPriority(acc, $event)"
         />
       </div>
 
@@ -1106,6 +1179,7 @@ onMounted(() => {
       @duplicate="openDuplicate"
       @cooldown="cooldownAccount"
       @resume="resumeAccount"
+      @refresh="refreshToken"
       @delete="removeAccount"
     />
 

@@ -8,6 +8,7 @@ import UsageMeter from "../../ui/UsageMeter.vue";
 import AccountExitCell from "./AccountExitCell.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
 import PlatformTypeBadge from "./PlatformTypeBadge.vue";
+import PriorityStepper from "./PriorityStepper.vue";
 import { EXPIRY_TONE, MODE_ICON, expiryState } from "./accountDisplay";
 import { modeUsesExit } from "./exitPool";
 import { platformStyle } from "../../../lib/platformStyle";
@@ -37,6 +38,7 @@ const emit = defineEmits<{
   (e: "filter-group", groupId: string): void;
   (e: "toggle-status" | "resume" | "test" | "edit" | "stats"): void;
   (e: "menu", anchor: HTMLElement): void;
+  (e: "priority", value: number): void;
 }>();
 
 const { t, te } = useI18n();
@@ -171,14 +173,17 @@ const lastTestClass = computed(() => {
     </div>
 
     <!-- Limits + today -->
-    <dl class="mt-3 grid grid-cols-3 gap-2">
+    <!-- The middle cell sizes to the priority stepper; the other two share the rest -->
+    <dl class="mt-3 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-2">
       <div class="rounded-lg bg-surface-2/60 px-2.5 py-1.5">
         <dt class="text-2xs text-fg-subtle">{{ t("accounts.card.concurrency") }}</dt>
         <dd class="font-mono text-sm font-medium tabular-nums text-fg">{{ acc.maxConcurrency }}</dd>
       </div>
       <div class="rounded-lg bg-surface-2/60 px-2.5 py-1.5">
         <dt class="text-2xs text-fg-subtle">{{ t("accounts.card.priority") }}</dt>
-        <dd class="font-mono text-sm font-medium tabular-nums text-fg">#{{ acc.priority }}</dd>
+        <dd class="mt-0.5">
+          <PriorityStepper :value="acc.priority" :name="acc.name" :disabled="busy" @commit="emit('priority', $event)" />
+        </dd>
       </div>
       <div class="rounded-lg bg-surface-2/60 px-2.5 py-1.5" :title="todayTitle">
         <dt class="text-2xs text-fg-subtle">{{ t("accounts.card.today") }}</dt>

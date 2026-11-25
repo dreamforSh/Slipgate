@@ -4,6 +4,54 @@ const en: typeof zh = {
   accounts: {
     /** Label of accounts that belong to no group (list, card, drawers, filters). */
     ungrouped: "Ungrouped",
+    /** Temporary-unschedulable rules editor (account form). */
+    rules: {
+      hint: "When the upstream answers with a matching error, the account pauses for a while and requests fail over to other accounts. Rules are checked in order and the first match wins. Leave the status blank for any error; keywords are searched in the error body (any one matches), blank means the status alone decides.",
+      status: "Status",
+      anyStatus: "Any",
+      keywords: "Error keywords",
+      keywordsPlaceholder: "Comma separated, e.g. organization has been disabled",
+      duration: "Pause (minutes)",
+      description: "Note",
+      descriptionPlaceholder: "Note (shown as the cooldown reason), e.g. org disabled",
+      remove: "Remove rule",
+      add: "Add rule",
+      presets: "Presets:",
+      presetLabels: {
+        overloaded: "Upstream overloaded",
+        orgDisabled: "Organization disabled",
+        forbidden: "403 forbidden",
+      },
+      problems: {
+        status: "Status must be 400–599, or blank for any error",
+        duration: "Pause must be 1–10080 minutes",
+        keywords: "At most 20 keywords of up to 200 characters each",
+      },
+      count: "{n} rules",
+    },
+    /** Cooldown causes recorded by slipgate-net. */
+    cooldownReason: {
+      rule: "Rule: {label}",
+      upstream: "Upstream {status}",
+    },
+    /** Manual OAuth token refresh. */
+    refresh: {
+      failed: "Token refresh failed",
+      failedFor: "Refreshing {name} failed: {message}",
+      done: "Refreshed the token of {name}",
+      doneUntil: "Refreshed the token of {name}; it expires {time}",
+      bulk: "Refresh tokens ({n})",
+      bulkDone: "Refreshed tokens of {n} accounts",
+      bulkFailed: "{n} refreshes failed, e.g. {first}",
+    },
+    /** Inline priority stepper. */
+    priority: {
+      hint: "Priority: lower numbers are scheduled first; click the number to type one",
+      label: "Priority of {name}",
+      decrease: "Raise the priority of {name} (number − 1)",
+      increase: "Lower the priority of {name} (number + 1)",
+      saved: "Priority of {name} is now #{n}",
+    },
     /** Exit proxy shown in the list and cards (bindings live in slipgate-net). */
     exit: {
       missing: "No exit bound",
@@ -162,6 +210,7 @@ const en: typeof zh = {
       edit: "Edit",
       stats: "Usage stats",
       duplicate: "Duplicate as new",
+      refreshToken: "Refresh token",
       cooldown: "Pause scheduling for",
       resume: "Resume scheduling",
       delete: "Delete account",
@@ -224,6 +273,7 @@ const en: typeof zh = {
         platform: "Platform & account type",
         credentials: "Credentials",
         exit: "Exit proxy",
+        rules: "Temporary unschedulable",
         scheduling: "Plan & scheduling",
         validity: "Validity",
         group: "Group",

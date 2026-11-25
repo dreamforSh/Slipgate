@@ -73,6 +73,8 @@ type SyncAccountInput struct {
 	Window7dUsedBps       uint16 `json:"window7dUsedBps"`
 	Window5hResetAtUnixMs int64  `json:"window5hResetAtUnixMs,omitempty"`
 	Window7dResetAtUnixMs int64  `json:"window7dResetAtUnixMs,omitempty"`
+	// TempUnschedRules are admin rules turning matching upstream errors into a cooldown.
+	TempUnschedRules []TempUnschedRule `json:"tempUnschedRules,omitempty"`
 }
 
 // SyncApiKeyInput matches DataPlaneSyncApiKeySchema from @slipgate/contracts.
@@ -534,6 +536,7 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 			AuthKind:         authKind,
 			SubscriptionTier: subTier,
 			TierMultiplier:   tierMult,
+			TempUnschedRules: a.TempUnschedRules,
 		}
 		coreAccounts = append(coreAccounts, coreAccount{
 			ID:                    a.ID,
@@ -1641,11 +1644,19 @@ func (c *Coordinator) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Check pre-first-byte upstream HTTP errors eligible for cooldown and cross-account failover.
-		if !(turn.IngressCodec == CodecTypeSafeSystemOne && IsSystemOneRequestErrorStatus(upstreamResp.StatusCode)) && isFailoverEligibleStatus(upstreamResp.StatusCode) {
+		// An account's temp-unschedulable rules can make any error status eligible and set the cooldown.
+		ruleHit, ruleMatched := c.accountTempUnschedHit(directive.AccountID, upstreamResp)
+		if !(turn.IngressCodec == CodecTypeSafeSystemOne && IsSystemOneRequestErrorStatus(upstreamResp.StatusCode)) &&
+			(isFailoverEligibleStatus(upstreamResp.StatusCode) || ruleMatched) {
 			cooldownMs := computeUpstreamCooldownMs(upstreamResp.StatusCode, upstreamResp.Header)
+			cooldownReason := fmt.Sprintf("upstream_http_%d", upstreamResp.StatusCode)
+			if ruleMatched {
+				cooldownMs = ruleHit.cooldownMs()
+				cooldownReason = ruleHit.reason(upstreamResp.StatusCode)
+			}
 			if cooldownMs > 0 {
 				pendingCooldown = cooldownMs
-				c.persistAccountCooldownBounded(directive.AccountID, cooldownMs, fmt.Sprintf("upstream_http_%d", upstreamResp.StatusCode))
+				c.persistAccountCooldownBounded(directive.AccountID, cooldownMs, cooldownReason)
 			}
 			if attempt+1 < maxDispatchAttempts && tracker.CanFailover() {
 				excludedAccIDs = append(excludedAccIDs, directive.AccountID)

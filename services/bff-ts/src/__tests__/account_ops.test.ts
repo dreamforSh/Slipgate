@@ -400,6 +400,111 @@ describe("ungrouped accounts", () => {
   });
 });
 
+describe("temporary-unschedulable rules", () => {
+  it("stores, replaces and clears rules and ships them to the data plane", async () => {
+    // Runs against Postgres when a test preload provides a store factory (temp_unsched_rules JSONB).
+    const factory = (globalThis as { __slipgateTestStoreFactory?: () => Promise<ControlStore> }).__slipgateTestStoreFactory;
+    const env = await bootstrap("rules-internal-token", factory ? await factory() : undefined);
+    const { app, admin, call } = env;
+    const snapshotRules = async (id: string) => {
+      const res = await app.request("/api/v1/internal/dataplane/snapshot", {
+        headers: { "X-Slipgate-Internal-Token": "rules-internal-token" },
+      });
+      const snap = (await res.json()) as DataPlaneSyncSnapshot;
+      return snap.accounts.find((a) => a.id === id)?.tempUnschedRules;
+    };
+
+    const rule = { statusCode: 400, keywords: ["organization has been disabled"], durationMinutes: 1440, description: "org disabled" };
+    const acc = await env.createAccount({ name: "ruled", tempUnschedRules: [rule] });
+    expect(acc.tempUnschedRules).toEqual([rule]);
+    expect(await snapshotRules(acc.id)).toEqual([rule]);
+
+    // Defaults fill in; a non-error status is refused.
+    const plain = await env.createAccount({ name: "plain" });
+    expect(plain.tempUnschedRules).toEqual([]);
+    expect(await snapshotRules(plain.id)).toBeUndefined();
+    const bad = await call("POST", "/api/v1/admin/accounts", admin, {
+      name: "bad",
+      platform: "anthropic",
+      executionMode: "direct_api",
+      authKind: "api_key",
+      credentialSecret: "sk-bad-rule-0001",
+      tempUnschedRules: [{ statusCode: 200, durationMinutes: 5 }],
+    });
+    expect(bad.status).toBe(400);
+
+    // PATCH replaces the whole list; [] clears it; leaving it out keeps it.
+    const replaced = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${acc.id}`, admin, {
+      tempUnschedRules: [{ statusCode: 0, keywords: ["overloaded"], durationMinutes: 10 }],
+    });
+    expect(replaced.body.account.tempUnschedRules).toEqual([
+      { statusCode: 0, keywords: ["overloaded"], durationMinutes: 10, description: "" },
+    ]);
+    const kept = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${acc.id}`, admin, { priority: 7 });
+    expect(kept.body.account.tempUnschedRules).toHaveLength(1);
+    const cleared = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${acc.id}`, admin, {
+      tempUnschedRules: [],
+    });
+    expect(cleared.body.account.tempUnschedRules).toEqual([]);
+    expect(await snapshotRules(acc.id)).toBeUndefined();
+  });
+});
+
+describe("manual OAuth token refresh", () => {
+  it("refuses non-OAuth and standalone, and relays slipgate-net's refresh", async () => {
+    const savedUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    const seen: { path: string; token: string | null }[] = [];
+    const netServer = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/internal/net/dataplane/sync") return Response.json({ ok: true });
+        seen.push({ path: url.pathname, token: req.headers.get("X-Slipgate-Internal-Token") });
+        if (url.pathname.endsWith("/acc_broken/oauth/refresh")) {
+          return Response.json({ error: "oauth_refresh_failed", message: "invalid_grant" }, { status: 502 });
+        }
+        return Response.json({ ok: true, subscriptionTier: "max", expiresAtUnixMs: 1_900_000_000_000 });
+      },
+    });
+    try {
+      delete process.env.SLIPGATE_NET_INTERNAL_URL;
+      const env = await bootstrap("refresh-internal-token");
+      const { admin, call } = env;
+      const oauth = await env.createAccount({
+        name: "oauth",
+        authKind: "oauth",
+        executionMode: "stealth_http",
+        subscriptionTier: "max",
+        credentialSecret: JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-oat01-x", refreshToken: "sk-ant-ort01-y" } }),
+      });
+      const key = await env.createAccount({ name: "key" });
+
+      expect((await call("POST", "/api/v1/admin/accounts/acc_missing/oauth/refresh", admin)).status).toBe(404);
+      expect((await call("POST", `/api/v1/admin/accounts/${key.id}/oauth/refresh`, admin)).status).toBe(400);
+      const standalone = await call<{ error: string }>("POST", `/api/v1/admin/accounts/${oauth.id}/oauth/refresh`, admin);
+      expect(standalone.status).toBe(503);
+      expect(standalone.body.error).toBe("net_supervisor_unconfigured");
+
+      process.env.SLIPGATE_NET_INTERNAL_URL = `http://127.0.0.1:${netServer.port}`;
+      const ok = await call<{ ok: boolean; subscriptionTier: string; expiresAtUnixMs: number }>(
+        "POST",
+        `/api/v1/admin/accounts/${oauth.id}/oauth/refresh`,
+        admin,
+      );
+      expect(ok.status).toBe(200);
+      expect(ok.body).toEqual({ ok: true, subscriptionTier: "max", expiresAtUnixMs: 1_900_000_000_000 });
+      expect(seen.at(-1)).toEqual({ path: `/internal/net/accounts/${oauth.id}/oauth/refresh`, token: "refresh-internal-token" });
+
+      // Users without admin rights never reach the data plane.
+      expect((await call("POST", `/api/v1/admin/accounts/${oauth.id}/oauth/refresh`, env.user)).status).toBe(403);
+    } finally {
+      netServer.stop(true);
+      if (savedUrl === undefined) delete process.env.SLIPGATE_NET_INTERNAL_URL;
+      else process.env.SLIPGATE_NET_INTERNAL_URL = savedUrl;
+    }
+  });
+});
+
 describe("API keys carry no plan", () => {
   it("stores and schedules API-key accounts as standard on every write path", async () => {
     const env = await bootstrap("tier-internal-token");

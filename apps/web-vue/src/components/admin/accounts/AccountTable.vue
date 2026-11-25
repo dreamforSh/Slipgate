@@ -8,6 +8,7 @@ import UsageMeter from "../../ui/UsageMeter.vue";
 import AccountExitCell from "./AccountExitCell.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
 import PlatformTypeBadge from "./PlatformTypeBadge.vue";
+import PriorityStepper from "./PriorityStepper.vue";
 import type { ExitPool } from "./exitPool";
 import {
   COLUMN_SORT,
@@ -47,6 +48,7 @@ const emit = defineEmits<{
   (e: "filter-group", groupId: string): void;
   (e: "toggle-status" | "resume" | "test" | "edit" | "stats", account: UpstreamAccount): void;
   (e: "menu", account: UpstreamAccount, anchor: HTMLElement): void;
+  (e: "priority", account: UpstreamAccount, value: number): void;
 }>();
 
 const { t, te } = useI18n();
@@ -221,9 +223,16 @@ function openMenu(acc: UpstreamAccount, ev: MouseEvent) {
             <span v-else class="text-xs text-fg-subtle">—</span>
           </td>
 
-          <td v-if="visible.has('limits')" class="whitespace-nowrap font-mono text-xs tabular-nums">
-            <span class="text-fg">{{ acc.maxConcurrency }}</span>
-            <span class="text-fg-subtle"> / #{{ acc.priority }}</span>
+          <td v-if="visible.has('limits')" class="whitespace-nowrap">
+            <div class="flex items-center gap-2">
+              <span class="font-mono text-xs tabular-nums text-fg" :title="t('accounts.card.concurrency')">{{ acc.maxConcurrency }}</span>
+              <PriorityStepper
+                :value="acc.priority"
+                :name="acc.name"
+                :disabled="busy.has(acc.id)"
+                @commit="emit('priority', acc, $event)"
+              />
+            </div>
           </td>
 
           <td v-if="visible.has('lastTest')" class="whitespace-nowrap">

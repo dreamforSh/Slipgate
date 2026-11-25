@@ -25,6 +25,7 @@ import {
   type UpdateAccountRequest,
   type UpdateApiKeyRequest,
   type UpdateGroupRequest,
+  type TempUnschedRule,
   type UpstreamAccount,
   type UsageLogItem,
   type UserProfile,
@@ -77,6 +78,10 @@ function bytesToHex(bytes: Uint8Array): string {
 }
 
 type InternalGroup = Omit<GroupItem, "accountCount" | "activeAccountCount" | "apiKeyCount">;
+
+function cloneRules(rules: readonly TempUnschedRule[]): TempUnschedRule[] {
+  return rules.map((r) => ({ ...r, keywords: [...r.keywords] }));
+}
 
 interface InternalAccount extends Omit<UpstreamAccount, "groupName" | "effectiveStatus"> {
   credentialsEnc: Uint8Array;
@@ -524,6 +529,7 @@ export class MemoryControlStore implements ControlStore {
       window5hUsedBps: win.window5hUsedBps,
       window7dUsedBps: win.window7dUsedBps,
       lastTest: acc.lastTest ? { ...acc.lastTest } : null,
+      tempUnschedRules: cloneRules(acc.tempUnschedRules),
       groupName: acc.groupId ? (this.groups.get(acc.groupId)?.name ?? acc.groupId) : "",
       effectiveStatus: effectiveAccountStatus(acc, nowMs),
     };
@@ -584,6 +590,7 @@ export class MemoryControlStore implements ControlStore {
       window7dResetAtMs: null,
       lastTest: null,
       lastUsedAtIso: null,
+      tempUnschedRules: cloneRules(req.tempUnschedRules),
       createdAtIso: new Date().toISOString(),
     };
     this.accounts.set(id, record);
@@ -625,6 +632,7 @@ export class MemoryControlStore implements ControlStore {
     if (req.status !== undefined) acc.status = req.status;
     if (req.expiresAtIso !== undefined) acc.expiresAtIso = normalizeIso(req.expiresAtIso) ?? null;
     if (req.autoPauseOnExpired !== undefined) acc.autoPauseOnExpired = req.autoPauseOnExpired;
+    if (req.tempUnschedRules !== undefined) acc.tempUnschedRules = cloneRules(req.tempUnschedRules);
     const cooldown = resolveCooldownChange(req);
     if (cooldown.untilIso !== undefined) acc.cooldownUntilIso = cooldown.untilIso;
     if (cooldown.reason !== undefined) acc.cooldownReason = cooldown.reason;
@@ -932,6 +940,7 @@ export class MemoryControlStore implements ControlStore {
           window7dUsedBps: win.window7dUsedBps,
           ...(win.window5hResetAtUnixMs !== undefined ? { window5hResetAtUnixMs: win.window5hResetAtUnixMs } : {}),
           ...(win.window7dResetAtUnixMs !== undefined ? { window7dResetAtUnixMs: win.window7dResetAtUnixMs } : {}),
+          ...(a.tempUnschedRules.length ? { tempUnschedRules: cloneRules(a.tempUnschedRules) } : {}),
         };
       }),
       apiKeys: Array.from(this.apiKeys.values()).map((k) => ({

@@ -200,6 +200,7 @@ type accountMeta struct {
 	AuthKind         string
 	SubscriptionTier string
 	TierMultiplier   uint16
+	TempUnschedRules []TempUnschedRule
 }
 
 func (c *Coordinator) accountMetaFor(accountID string) (accountMeta, bool) {

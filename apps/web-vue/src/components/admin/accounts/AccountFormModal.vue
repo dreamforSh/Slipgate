@@ -52,6 +52,8 @@ import { useAuthStore } from "../../../stores/auth";
 import { useToastStore } from "../../../stores/toast";
 import UiSelect from "../../ui/UiSelect.vue";
 import { exitAvailability, isStaticExit, modeUsesExit, type ExitAvailability, type ExitPool } from "./exitPool";
+import TempUnschedRulesEditor from "./TempUnschedRulesEditor.vue";
+import { ruleProblem, sameRules, toEditable, toRule, type EditableRule } from "./tempUnschedRules";
 
 /**
  * Create (single or batch), edit and "duplicate as new" for upstream accounts. Sections follow the
@@ -210,6 +212,9 @@ const formExitNodeId = ref("");
 const formUtlsProfileId = ref("");
 /** Batch create: give each new account its own free healthy exit. */
 const batchAutoExit = ref(true);
+/** Temporary-unschedulable rules as edited (status / keywords as text). */
+const formRules = ref<EditableRule[]>([]);
+const rulesInvalid = computed(() => formRules.value.some((r) => ruleProblem(r) !== null));
 const batchPrefix = ref("");
 const batchText = ref("");
 const batchSkipDup = ref(true);
@@ -507,6 +512,7 @@ function loadFrom(src: UpstreamAccount, asCopy: boolean) {
   formExpires.value = isoToDateInput(src.expiresAtIso);
   formAutoPause.value = src.autoPauseOnExpired;
   formCooldownUntil.value = isoToDatetimeInput(src.cooldownUntilIso);
+  formRules.value = src.tempUnschedRules.map(toEditable);
 }
 
 function reset() {
@@ -548,6 +554,7 @@ function reset() {
   formExpires.value = "";
   formAutoPause.value = true;
   formCooldownUntil.value = "";
+  formRules.value = [];
   addMethod.value = "oauth";
   formPlatform.value = preset && preset.platform !== "composite" ? preset.platform : "anthropic";
   syncMultiProtoDefaults();
@@ -689,6 +696,7 @@ function baseFields() {
     status: formInitialStatus.value,
     expiresAtIso: expiresIso.value,
     autoPauseOnExpired: formAutoPause.value,
+    tempUnschedRules: formRules.value.map(toRule),
   };
 }
 
@@ -718,6 +726,8 @@ function buildPatch(acc: UpstreamAccount): UpdateAccountRequest {
   } else if (untilChanged) {
     patch.cooldownUntilIso = datetimeInputToIso(formCooldownUntil.value);
   }
+  const rules = formRules.value.map(toRule);
+  if (!sameRules(rules, acc.tempUnschedRules)) patch.tempUnschedRules = rules;
   if (singleSecret.value) patch.credentialSecret = singleSecret.value;
   return patch;
 }
@@ -816,7 +826,7 @@ async function submitBatch() {
 
 const canSubmit = computed(() => {
   // The group is optional: an empty one creates (or moves to) an ungrouped account.
-  if (saving.value) return false;
+  if (saving.value || rulesInvalid.value) return false;
   // Switching the account type needs the matching credential; otherwise it may stay as stored.
   if (editing.value) return formName.value.trim().length > 0 && (authKind.value === editing.value.authKind || singleSecret.value.length > 0);
   if (mode.value === "batch") {
@@ -1343,7 +1353,16 @@ const credentialPlaceholder = computed(() => {
         </div>
       </AccountFormSection>
 
-      <!-- 5. Validity -->
+      <!-- 6. Temporary-unschedulable rules (applied by slipgate-net to upstream errors) -->
+      <AccountFormSection
+        :title="t('accounts.form.sections.rules')"
+        icon="shield-alert"
+        :tag="formRules.length ? t('accounts.rules.count', { n: formRules.length }) : t('accounts.form.optional')"
+      >
+        <TempUnschedRulesEditor v-model="formRules" />
+      </AccountFormSection>
+
+      <!-- 7. Validity -->
       <AccountFormSection :title="t('accounts.form.sections.validity')" icon="calendar">
         <div class="grid gap-4 sm:grid-cols-2">
           <div>
@@ -1363,7 +1382,7 @@ const credentialPlaceholder = computed(() => {
         </div>
       </AccountFormSection>
 
-      <!-- 6. Group: optional, listed by the chosen platform (plus composite groups) -->
+      <!-- 8. Group: optional, listed by the chosen platform (plus composite groups) -->
       <AccountFormSection :title="t('accounts.form.sections.group')" icon="layers" :tag="t('accounts.form.optional')">
         <div>
           <label class="label" for="account-form-group">{{ t("accounts.form.group") }}</label>

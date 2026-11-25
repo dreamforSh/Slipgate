@@ -6,6 +6,7 @@ import {
   GroupSubscriptionTypeSchema,
   ProviderSchema,
   SubscriptionTierSchema,
+  TempUnschedRuleSchema,
 } from "./pool.ts";
 import { DataPlaneSyncUserLimitsSchema } from "./user_limits.ts";
 
@@ -66,6 +67,8 @@ export const DataPlaneSyncAccountSchema = z.object({
   window7dUsedBps: z.number().int().min(0).max(10000).default(0),
   window5hResetAtUnixMs: z.number().int().nonnegative().optional(),
   window7dResetAtUnixMs: z.number().int().nonnegative().optional(),
+  /** Sent only when the account has rules; slipgate-net applies them to upstream errors. */
+  tempUnschedRules: z.array(TempUnschedRuleSchema).optional(),
 });
 export type DataPlaneSyncAccount = z.infer<typeof DataPlaneSyncAccountSchema>;
 

@@ -49,3 +49,12 @@ export const ExchangeAccountOAuthResponseSchema = z.object({
   expiresAtIso: z.string().nullable().default(null),
 });
 export type ExchangeAccountOAuthResponse = z.infer<typeof ExchangeAccountOAuthResponseSchema>;
+
+/** `POST /api/v1/admin/accounts/:id/oauth/refresh`: slipgate-net renewed (and persisted) the token now. */
+export const RefreshAccountOAuthResponseSchema = z.object({
+  ok: z.literal(true),
+  subscriptionTier: z.string().default(""),
+  /** New access-token expiry; 0 when the upstream did not say. */
+  expiresAtUnixMs: z.number().int().nonnegative().default(0),
+});
+export type RefreshAccountOAuthResponse = z.infer<typeof RefreshAccountOAuthResponseSchema>;

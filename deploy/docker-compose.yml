@@ -53,6 +53,7 @@ services:
       - ../migrations/commerce/0021_system_logs.sql:/docker-entrypoint-initdb.d/43_commerce_system_logs.sql:ro
       - ../migrations/core/0017_media_billing.sql:/docker-entrypoint-initdb.d/44_core_media_billing.sql:ro
       - ../migrations/core/0018_optional_account_group.sql:/docker-entrypoint-initdb.d/45_core_optional_account_group.sql:ro
+      - ../migrations/core/0019_account_temp_unsched_rules.sql:/docker-entrypoint-initdb.d/46_core_account_temp_unsched_rules.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slipgate} -d ${POSTGRES_DB:-slipgate}"]
       interval: 5s

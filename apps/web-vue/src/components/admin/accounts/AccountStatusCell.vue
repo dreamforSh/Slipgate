@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
-import type { UpstreamAccount } from "@slipgate/contracts";
+import { TEMP_UNSCHED_REASON_PREFIX, type UpstreamAccount } from "@slipgate/contracts";
 import UiBadge from "../../ui/UiBadge.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
 import { accountStatusLabel, formatDateShort, formatDateTime, formatRelative } from "../../../lib/format";
@@ -34,8 +34,20 @@ const cooldownText = computed(() =>
     : t("accounts.status.cooldownManual"),
 );
 
+/** Readable cooldown cause: an admin rule, an upstream status, or the reason as typed. */
+const reasonText = computed(() => {
+  const reason = props.account.cooldownReason.trim();
+  if (!reason) return "";
+  if (reason.startsWith(TEMP_UNSCHED_REASON_PREFIX)) {
+    return t("accounts.cooldownReason.rule", { label: reason.slice(TEMP_UNSCHED_REASON_PREFIX.length) });
+  }
+  const upstream = /^upstream_http_(\d+)$/.exec(reason);
+  if (upstream) return t("accounts.cooldownReason.upstream", { status: upstream[1] });
+  return reason;
+});
+
 const cooldownTitle = computed(() =>
-  [props.account.cooldownReason, props.account.cooldownUntilIso ? formatDateTime(props.account.cooldownUntilIso) : ""]
+  [reasonText.value, props.account.cooldownUntilIso ? formatDateTime(props.account.cooldownUntilIso) : ""]
     .filter(Boolean)
     .join(" · ") || undefined,
 );
@@ -65,9 +77,10 @@ const cooldownTitle = computed(() =>
           {{ t("accounts.status.resume") }}
         </button>
       </div>
-      <span v-if="kind === 'cooldown'" class="max-w-[11rem] truncate text-2xs text-fg-subtle" :title="cooldownTitle">
-        {{ cooldownText }}
-      </span>
+      <template v-if="kind === 'cooldown'">
+        <span class="max-w-[11rem] truncate text-2xs text-fg-subtle" :title="cooldownTitle">{{ cooldownText }}</span>
+        <span v-if="reasonText" class="max-w-[11rem] truncate text-2xs text-warning" :title="cooldownTitle">{{ reasonText }}</span>
+      </template>
       <span
         v-else-if="kind === 'lapsed' && account.expiresAtIso"
         class="max-w-[11rem] truncate text-2xs text-fg-subtle"

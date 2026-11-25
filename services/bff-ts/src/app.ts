@@ -9,6 +9,7 @@ import {
   AccountStatsRangeSchema,
   AccountTestEventSchema,
   AccountTestRequestSchema,
+  RefreshAccountOAuthResponseSchema,
   canonicalCredentialText,
   DashboardRangeSchema,
   AuthLoginRequestSchema,
@@ -1820,6 +1821,58 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
     c.header("Cache-Control", "no-store");
     return c.json(file);
+  });
+
+  /**
+   * Renews an OAuth account's access token now. slipgate-net talks to the provider through the
+   * account's own persona / exit and persists the rotated credential back to this BFF itself.
+   */
+  app.post("/api/v1/admin/accounts/:accountId/oauth/refresh", async (c) => {
+    const accountId = c.req.param("accountId");
+    const account = await store.getAccount(accountId);
+    if (!account) {
+      return c.json({ error: "not_found", message: `Account ${accountId} not found` }, 404);
+    }
+    if (account.authKind !== "oauth") {
+      return c.json({ error: "not_oauth", message: "Only OAuth accounts carry a refresh token" }, 400);
+    }
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    if (!internalUrl || !internalToken) {
+      return c.json(
+        {
+          error: "net_supervisor_unconfigured",
+          message: "Token refresh runs in the network service, which is not configured in standalone BFF mode",
+        },
+        503,
+      );
+    }
+    // The vault must hold this account (and its latest credential) before refreshing it.
+    await syncDataPlaneBestEffort();
+    let upstream: Response;
+    try {
+      upstream = await fetch(`${internalUrl}/internal/net/accounts/${encodeURIComponent(accountId)}/oauth/refresh`, {
+        method: "POST",
+        headers: { "X-Slipgate-Internal-Token": internalToken },
+        signal: AbortSignal.timeout(60_000),
+      });
+    } catch (err) {
+      return c.json(
+        { error: "net_supervisor_unreachable", message: err instanceof Error ? err.message : String(err) },
+        502,
+      );
+    }
+    const payload = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!upstream.ok) {
+      return c.json(
+        {
+          error: typeof payload.error === "string" ? payload.error : "oauth_refresh_failed",
+          message: typeof payload.message === "string" ? payload.message : `HTTP ${upstream.status}`,
+        },
+        toForwardStatus(upstream.status),
+      );
+    }
+    const body = RefreshAccountOAuthResponseSchema.safeParse(payload);
+    return c.json(body.success ? body.data : { ok: true, subscriptionTier: "", expiresAtUnixMs: 0 });
   });
 
   /**

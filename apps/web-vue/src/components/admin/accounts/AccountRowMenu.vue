@@ -16,7 +16,7 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   (e: "update:open", value: boolean): void;
-  (e: "test" | "stats" | "edit" | "duplicate" | "resume" | "delete", account: UpstreamAccount): void;
+  (e: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "delete", account: UpstreamAccount): void;
   (e: "cooldown", account: UpstreamAccount, hours: number): void;
 }>();
 
@@ -89,7 +89,10 @@ watch(
 
 onBeforeUnmount(() => bind(false));
 
-function pick(action: "test" | "stats" | "edit" | "duplicate" | "resume") {
+/** Only OAuth credentials carry a refresh token (setup tokens and API keys do not). */
+const canRefresh = computed(() => props.account?.authKind === "oauth");
+
+function pick(action: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh") {
   const acc = props.account;
   if (!acc) return;
   close();
@@ -109,6 +112,9 @@ function pick(action: "test" | "stats" | "edit" | "duplicate" | "resume") {
       break;
     case "resume":
       emit("resume", acc);
+      break;
+    case "refresh":
+      emit("refresh", acc);
       break;
   }
 }
@@ -167,6 +173,10 @@ const cooldownLabel = (h: number) => t(`accounts.cooldown.h${h}`);
       <button type="button" role="menuitem" class="menu-item" @click="pick('duplicate')">
         <UiIcon name="copy" :size="14" />
         {{ t("accounts.row.duplicate") }}
+      </button>
+      <button v-if="canRefresh" type="button" role="menuitem" class="menu-item" @click="pick('refresh')">
+        <UiIcon name="rotate-ccw" :size="14" />
+        {{ t("accounts.row.refreshToken") }}
       </button>
 
       <div v-if="canCooldown || canResume" class="my-1 border-t border-line/70" />

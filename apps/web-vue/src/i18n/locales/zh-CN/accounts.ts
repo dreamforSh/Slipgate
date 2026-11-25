@@ -3,6 +3,54 @@ export default {
   accounts: {
     /** Label of accounts that belong to no group (list, card, drawers, filters). */
     ungrouped: "未分组",
+    /** Temporary-unschedulable rules editor (account form). */
+    rules: {
+      hint: "上游返回匹配的错误时，账号会暂停调度一段时间，请求自动切换到其他账号；按顺序检查，第一条命中的规则生效。状态码留空表示任何错误，关键词在错误内容里查找（任一命中即可），留空则只看状态码。",
+      status: "状态码",
+      anyStatus: "任意",
+      keywords: "错误关键词",
+      keywordsPlaceholder: "用逗号分隔，例如 organization has been disabled",
+      duration: "暂停（分钟）",
+      description: "说明",
+      descriptionPlaceholder: "说明（会显示为冷却原因），例如 组织被禁用",
+      remove: "删除规则",
+      add: "添加规则",
+      presets: "常用：",
+      presetLabels: {
+        overloaded: "上游过载",
+        orgDisabled: "组织被禁用",
+        forbidden: "403 拒绝",
+      },
+      problems: {
+        status: "状态码需为 400–599，或留空表示任意错误",
+        duration: "暂停时长需为 1–10080 分钟",
+        keywords: "关键词最多 20 个，每个不超过 200 字",
+      },
+      count: "{n} 条",
+    },
+    /** Cooldown causes recorded by slipgate-net. */
+    cooldownReason: {
+      rule: "规则：{label}",
+      upstream: "上游 {status}",
+    },
+    /** Manual OAuth token refresh. */
+    refresh: {
+      failed: "刷新令牌失败",
+      failedFor: "{name} 刷新令牌失败：{message}",
+      done: "{name} 的令牌已刷新",
+      doneUntil: "{name} 的令牌已刷新，{time}到期",
+      bulk: "刷新令牌（{n}）",
+      bulkDone: "已刷新 {n} 个账号的令牌",
+      bulkFailed: "{n} 个账号刷新失败，例如 {first}",
+    },
+    /** Inline priority stepper. */
+    priority: {
+      hint: "优先级：数字越小越先调度；点数字可直接输入",
+      label: "{name} 的优先级",
+      decrease: "调高 {name} 的优先级（数字减 1）",
+      increase: "调低 {name} 的优先级（数字加 1）",
+      saved: "{name} 的优先级已改为 #{n}",
+    },
     /** Exit proxy shown in the list and cards (bindings live in slipgate-net). */
     exit: {
       missing: "未绑定出口",
@@ -161,6 +209,7 @@ export default {
       edit: "编辑",
       stats: "用量统计",
       duplicate: "复制为新账号",
+      refreshToken: "刷新令牌",
       cooldown: "临时停调度",
       resume: "恢复调度",
       delete: "删除账号",
@@ -223,6 +272,7 @@ export default {
         platform: "平台与账号类型",
         credentials: "凭据",
         exit: "出口代理",
+        rules: "临时不可调度",
         scheduling: "套餐与调度",
         validity: "有效期",
         group: "分组",

@@ -429,6 +429,31 @@ export function effectiveAccountStatus(acc: AccountLifecycleFields, nowMs: numbe
   return acc.status === "cooldown" ? "cooldown" : "active";
 }
 
+/**
+ * Temporary-unschedulable rule: when an upstream answers with an error that matches, the data
+ * plane puts the account into cooldown for `durationMinutes` and fails the request over.
+ * `statusCode` 0 matches any HTTP error (>= 400); `keywords` (any of them, case-insensitive)
+ * are searched in the error body, empty = the status alone decides.
+ */
+export const TempUnschedRuleSchema = z.object({
+  statusCode: z.number().int().min(0).max(599).default(0),
+  keywords: z.array(z.string().trim().min(1).max(200)).max(20).default([]),
+  durationMinutes: z.number().int().min(1).max(10080),
+  description: z.string().trim().max(100).default(""),
+});
+export type TempUnschedRule = z.infer<typeof TempUnschedRuleSchema>;
+
+/** At most 10 rules per account; the first matching rule wins. */
+export const TempUnschedRulesSchema = z
+  .array(TempUnschedRuleSchema)
+  .max(10)
+  .refine((rules) => rules.every((r) => r.statusCode === 0 || r.statusCode >= 400), {
+    message: "statusCode must be 0 (any error) or an HTTP error status (>= 400)",
+  });
+
+/** Cooldown reason the data plane records when a rule fires (`temp_unsched:<description or status>`). */
+export const TEMP_UNSCHED_REASON_PREFIX = "temp_unsched:";
+
 /** Outcome of the most recent admin connectivity test for an account. */
 export const AccountTestResultSchema = z.object({
   ok: z.boolean(),
@@ -471,6 +496,8 @@ export const UpstreamAccountSchema = z.object({
   lastTest: AccountTestResultSchema.nullable(),
   /** Time of the most recent settled request routed to this account. */
   lastUsedAtIso: z.string().nullable(),
+  /** Error rules that put the account into a temporary cooldown (see TempUnschedRuleSchema). */
+  tempUnschedRules: z.array(TempUnschedRuleSchema),
   createdAtIso: z.string(),
 });
 export type UpstreamAccount = z.infer<typeof UpstreamAccountSchema>;
@@ -497,6 +524,7 @@ export const CreateAccountRequestSchema = z.object({
   status: AccountInitialStatusSchema.default("active"),
   expiresAtIso: IsoDateTimeSchema.nullable().default(null),
   autoPauseOnExpired: z.boolean().default(true),
+  tempUnschedRules: TempUnschedRulesSchema.default([]),
 });
 export type CreateAccountRequest = z.infer<typeof CreateAccountRequestSchema>;
 
@@ -521,6 +549,8 @@ export const UpdateAccountRequestSchema = z.object({
   autoPauseOnExpired: z.boolean().optional(),
   cooldownUntilIso: IsoDateTimeSchema.nullable().optional(),
   cooldownReason: z.string().trim().max(200).optional(),
+  /** Replaces the whole rule list; `[]` clears it. */
+  tempUnschedRules: TempUnschedRulesSchema.optional(),
 });
 export type UpdateAccountRequest = z.infer<typeof UpdateAccountRequestSchema>;
 

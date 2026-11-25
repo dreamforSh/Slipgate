@@ -6,6 +6,7 @@ import {
   parseUsdToNano,
   isSubscriptionTierAllowedForProvider,
   SubscriptionTierSchema,
+  TempUnschedRulesSchema,
   effectiveSubscriptionTier,
   subscriptionTierMultiplier,
   type AccountTestResult,
@@ -28,6 +29,7 @@ import {
   type UpdateAccountRequest,
   type UpdateApiKeyRequest,
   type UpdateGroupRequest,
+  type TempUnschedRule,
   type UpstreamAccount,
   type UsageLogItem,
   type UserProfile,
@@ -107,6 +109,12 @@ function jsonColumn<T>(value: unknown): T | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Stored rules are re-validated on read; a malformed column reads as "no rules". */
+function parseTempUnschedRules(value: unknown): TempUnschedRule[] {
+  const parsed = TempUnschedRulesSchema.safeParse(jsonColumn<unknown>(value) ?? []);
+  return parsed.success ? parsed.data : [];
 }
 
 function jsonArray(value: unknown): string[] {
@@ -452,7 +460,8 @@ export class PostgresControlStore implements ControlStore {
           ADD COLUMN IF NOT EXISTS temp_unsched_reason TEXT,
           ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
           ADD COLUMN IF NOT EXISTS auto_pause_on_expired BOOLEAN NOT NULL DEFAULT TRUE,
-          ADD COLUMN IF NOT EXISTS credential_fingerprint TEXT;
+          ADD COLUMN IF NOT EXISTS credential_fingerprint TEXT,
+          ADD COLUMN IF NOT EXISTS temp_unsched_rules JSONB NOT NULL DEFAULT '[]'::jsonb;
 
       -- The group is optional: NULL = ungrouped (the FK still guards non-null ids).
       ALTER TABLE core.accounts ALTER COLUMN group_id DROP NOT NULL;
@@ -1238,6 +1247,7 @@ export class PostgresControlStore implements ControlStore {
         window_7d_used_bps: number | null;
         window_7d_reset_at: Date | null;
         last_used_at: Date | null;
+        temp_unsched_rules: unknown;
         last_test_at: Date | null;
         last_test_ok: boolean | null;
         last_test_model: string | null;
@@ -1269,6 +1279,7 @@ export class PostgresControlStore implements ControlStore {
         q.window_7d_used_bps,
         q.window_7d_reset_at,
         q.last_used_at,
+        a.temp_unsched_rules,
         a.last_test_at,
         a.last_test_ok,
         a.last_test_model,
@@ -1325,6 +1336,7 @@ export class PostgresControlStore implements ControlStore {
               }
             : null,
         lastUsedAtIso: r.last_used_at ? toIso(r.last_used_at) : null,
+        tempUnschedRules: parseTempUnschedRules(r.temp_unsched_rules),
         createdAtIso: toIso(r.created_at),
       };
     });
@@ -1343,7 +1355,7 @@ export class PostgresControlStore implements ControlStore {
         INSERT INTO core.accounts (
           id, name, notes, group_id, platform, execution_mode, auth_kind, subscription_tier,
           credentials_enc, credential_preview, credential_fingerprint, max_concurrency, priority, status,
-          expires_at, auto_pause_on_expired
+          expires_at, auto_pause_on_expired, temp_unsched_rules
         )
         VALUES (
           ${id},
@@ -1361,7 +1373,8 @@ export class PostgresControlStore implements ControlStore {
           ${req.priority},
           ${req.status},
           ${toDateOrNull(req.expiresAtIso)},
-          ${req.autoPauseOnExpired}
+          ${req.autoPauseOnExpired},
+          ${this.sql.json(req.tempUnschedRules as unknown as postgres.JSONValue)}
         )
       `;
       const created = await this.getAccount(id);
@@ -1399,6 +1412,7 @@ export class PostgresControlStore implements ControlStore {
       // Nullable columns need an explicit "was it sent" flag: COALESCE cannot write NULL.
       const expiresAt = normalizeIso(req.expiresAtIso);
       const cooldown = resolveCooldownChange(req);
+      const rulesJson = req.tempUnschedRules ? this.sql.json(req.tempUnschedRules as unknown as postgres.JSONValue) : null;
       const rows = await this.sql<{ id: string }[]>`
         UPDATE core.accounts
         SET name = COALESCE(${req.name ?? null}, name),
@@ -1428,6 +1442,7 @@ export class PostgresControlStore implements ControlStore {
               ELSE temp_unsched_until
             END,
             temp_unsched_reason = COALESCE(${cooldown.reason ?? null}, temp_unsched_reason),
+            temp_unsched_rules = COALESCE(${rulesJson}::jsonb, temp_unsched_rules),
             credentials_enc = COALESCE(${secretBuf}, credentials_enc),
             credential_preview = COALESCE(${credential?.preview ?? null}, credential_preview),
             credential_fingerprint = COALESCE(${credential?.fingerprint ?? null}, credential_fingerprint),
@@ -1948,6 +1963,7 @@ export class PostgresControlStore implements ControlStore {
           expires_at: Date | null;
           auto_pause_on_expired: boolean | null;
           temp_unsched_until: Date | null;
+          temp_unsched_rules: unknown;
           window_5h_used_bps: number | null;
           window_5h_reset_at: Date | null;
           window_7d_used_bps: number | null;
@@ -1968,6 +1984,7 @@ export class PostgresControlStore implements ControlStore {
           a.expires_at,
           a.auto_pause_on_expired,
           a.temp_unsched_until,
+          a.temp_unsched_rules,
           q.window_5h_used_bps,
           q.window_5h_reset_at,
           q.window_7d_used_bps,
@@ -2076,6 +2093,10 @@ export class PostgresControlStore implements ControlStore {
           ...(a.window_7d_reset_at && a.window_7d_reset_at.getTime() > nowMs
             ? { window7dResetAtUnixMs: a.window_7d_reset_at.getTime() }
             : {}),
+          ...(() => {
+            const rules = parseTempUnschedRules(a.temp_unsched_rules);
+            return rules.length ? { tempUnschedRules: rules } : {};
+          })(),
         };
       }),
       apiKeys: keyRows.map((k) => ({
