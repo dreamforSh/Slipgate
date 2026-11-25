@@ -16,6 +16,7 @@ export * from "./auth_guards.ts";
 export * from "./announcements.ts";
 export * from "./audit.ts";
 export * from "./usage.ts";
+export * from "./endpoints.ts";
 export * from "./payments.ts";
 export * from "./payment_providers.ts";
 export * from "./backup.ts";

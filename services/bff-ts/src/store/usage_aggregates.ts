@@ -1,6 +1,9 @@
 import {
+  recognizeEndpoint,
   USAGE_STATS_HOURLY_MAX_MS,
   type DashboardRange,
+  type EndpointFamily,
+  type UsageEndpointStat,
   type UsageLogItem,
   type UsageRankBy,
   type UsageSeriesPoint,
@@ -525,8 +528,15 @@ export interface UsageStatsAggregate {
   models: Map<string, UsageSums>;
   groups: Map<string, UsageSums>;
   users: Map<string, UsageSums>;
+  /** Keyed by codecPairKey(ingressCodec, egressCodec). */
+  codecPairs: Map<string, UsageSums>;
   groupNames: Map<string, string>;
   userEmails: Map<string, string>;
+}
+
+/** Map key of an (ingress, egress) codec pair; codecs never contain a newline. */
+export function codecPairKey(ingress: string, egress: string): string {
+  return `${ingress}\n${egress}`;
 }
 
 export function emptyUsageStatsAggregate(): UsageStatsAggregate {
@@ -536,6 +546,7 @@ export function emptyUsageStatsAggregate(): UsageStatsAggregate {
     models: new Map(),
     groups: new Map(),
     users: new Map(),
+    codecPairs: new Map(),
     groupNames: new Map(),
     userEmails: new Map(),
   };
@@ -555,6 +566,7 @@ export function reduceUsageStats(
     bumpSums(agg.models, log.publicModel, log);
     bumpSums(agg.groups, log.groupId, log);
     bumpSums(agg.users, log.userId, log);
+    bumpSums(agg.codecPairs, codecPairKey(log.ingressCodec, log.egressCodec), log);
   }
   for (const id of agg.groups.keys()) agg.groupNames.set(id, labels.groupName(id));
   for (const id of agg.users.keys()) agg.userEmails.set(id, labels.userEmail(id));
@@ -581,6 +593,84 @@ function rankStats(map: Map<string, UsageSums>, by: UsageRankBy, limit: number):
     .filter(([, s]) => s.requests > 0)
     .sort(([ka, a], [kb, b]) => primary(a, b) || tokens(b) - tokens(a) || b.requests - a.requests || (ka < kb ? -1 : ka > kb ? 1 : 0))
     .slice(0, limit);
+}
+
+function addSums(into: UsageSums, s: UsageSums): void {
+  into.requests += s.requests;
+  into.errors += s.errors;
+  into.inputTokens += s.inputTokens;
+  into.outputTokens += s.outputTokens;
+  into.cacheReadTokens += s.cacheReadTokens;
+  into.costNano += s.costNano;
+  into.durationSum += s.durationSum;
+  into.durationCount += s.durationCount;
+  into.ttftSum += s.ttftSum;
+  into.ttftCount += s.ttftCount;
+}
+
+/** Tokens, then requests descending, then key ascending: a total order. */
+function bySumsDesc(a: [string, UsageSums], b: [string, UsageSums]): number {
+  const ta = a[1].inputTokens + a[1].outputTokens;
+  const tb = b[1].inputTokens + b[1].outputTokens;
+  return tb - ta || b[1].requests - a[1].requests || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+}
+
+/**
+ * Inbound, upstream and inbound -> upstream endpoint distributions from the codec pairs, each codec
+ * recognised as its endpoint (recognizeEndpoint) and codecs naming the same endpoint merged.
+ */
+function endpointStats(pairs: Map<string, UsageSums>) {
+  type Acc = { sums: UsageSums; family: EndpointFamily; codecs: Set<string> };
+  type PathAcc = { inbound: string; upstream: string; inboundFamily: EndpointFamily; upstreamFamily: EndpointFamily; sums: UsageSums };
+  const inbound = new Map<string, Acc>();
+  const upstream = new Map<string, Acc>();
+  const paths = new Map<string, PathAcc>();
+  const into = (map: Map<string, Acc>, codec: string, s: UsageSums) => {
+    const ep = recognizeEndpoint(codec);
+    let acc = map.get(ep.endpoint);
+    if (!acc) {
+      acc = { sums: emptySums(), family: ep.family, codecs: new Set() };
+      map.set(ep.endpoint, acc);
+    }
+    addSums(acc.sums, s);
+    if (codec) acc.codecs.add(codec);
+  };
+  for (const [key, s] of pairs) {
+    if (s.requests <= 0) continue;
+    const cut = key.indexOf("\n");
+    const ingress = cut < 0 ? key : key.slice(0, cut);
+    const egress = cut < 0 ? "" : key.slice(cut + 1);
+    into(inbound, ingress, s);
+    into(upstream, egress, s);
+    const a = recognizeEndpoint(ingress);
+    const b = recognizeEndpoint(egress);
+    const pathKey = codecPairKey(a.endpoint, b.endpoint);
+    let p = paths.get(pathKey);
+    if (!p) {
+      p = { inbound: a.endpoint, upstream: b.endpoint, inboundFamily: a.family, upstreamFamily: b.family, sums: emptySums() };
+      paths.set(pathKey, p);
+    }
+    addSums(p.sums, s);
+  }
+  const list = (map: Map<string, Acc>): UsageEndpointStat[] =>
+    Array.from(map.entries())
+      .sort((x, y) => bySumsDesc([x[0], x[1].sums], [y[0], y[1].sums]))
+      .slice(0, USAGE_STATS_BREAKDOWN_LIMIT)
+      .map(([endpoint, acc]) => ({ endpoint, family: acc.family, codecs: Array.from(acc.codecs).sort(), ...statsSums(acc.sums) }));
+  return {
+    endpoints: list(inbound),
+    upstreamEndpoints: list(upstream),
+    endpointPaths: Array.from(paths.entries())
+      .sort((x, y) => bySumsDesc([x[0], x[1].sums], [y[0], y[1].sums]))
+      .slice(0, USAGE_STATS_BREAKDOWN_LIMIT)
+      .map(([, p]) => ({
+        inbound: p.inbound,
+        upstream: p.upstream,
+        inboundFamily: p.inboundFamily,
+        upstreamFamily: p.upstreamFamily,
+        ...statsSums(p.sums),
+      })),
+  };
 }
 
 export function finalizeUsageStats(
@@ -621,5 +711,6 @@ export function finalizeUsageStats(
     })),
     userCount: Array.from(agg.users.values()).filter((s) => s.requests > 0).length,
     rankBy: opts.rankBy,
+    ...endpointStats(agg.codecPairs),
   };
 }

@@ -19,6 +19,7 @@ import {
   formatDurationMs,
   formatNumber,
   formatRelative,
+  formatTokens,
   formatUsd,
   healthTone,
   nanoToUsd,
@@ -134,7 +135,9 @@ const series = computed<TrendSeries[]>(() => {
 const usd = (v: number) =>
   new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: v < 1 ? 4 : 2 }).format(v);
 const valueFormat = computed(() => (metric.value === "cost" ? usd : (v: number) => formatNumber(v)));
-const axisFormat = computed(() => (metric.value === "cost" ? usd : (v: number) => formatCompact(v)));
+const axisFormat = computed(() =>
+  metric.value === "cost" ? usd : metric.value === "tokens" ? (v: number) => formatTokens(v) : (v: number) => formatTokens(v),
+);
 
 const modelItems = computed<BarListItem[]>(() =>
   (stats.value?.models ?? []).map((m) => ({
@@ -142,7 +145,7 @@ const modelItems = computed<BarListItem[]>(() =>
     label: m.model,
     value: m.requests,
     valueText: formatCompact(m.requests),
-    meta: `${formatCompact(m.tokens)} tok · ${formatUsd(m.costNanoUsd)}`,
+    meta: `${formatTokens(m.tokens)} tok · ${formatUsd(m.costNanoUsd)}`,
   })),
 );
 
@@ -197,13 +200,13 @@ const hasTraffic = computed(() => (stats.value?.period.requests ?? 0) > 0);
         <div class="rounded-xl bg-surface-2/60 p-3">
           <p class="text-2xs text-fg-subtle">{{ t("accounts.statsDrawer.tokens") }}</p>
           <p class="mt-1 text-xl font-semibold tabular-nums text-fg">
-            {{ formatCompact((stats?.period.inputTokens ?? 0) + (stats?.period.outputTokens ?? 0)) }}
+            {{ formatTokens((stats?.period.inputTokens ?? 0) + (stats?.period.outputTokens ?? 0)) }}
           </p>
           <p class="mt-0.5 truncate text-2xs text-fg-subtle">
             {{
               t("accounts.statsDrawer.tokensHint", {
-                input: formatCompact(stats?.period.inputTokens ?? 0),
-                output: formatCompact(stats?.period.outputTokens ?? 0),
+                input: formatTokens(stats?.period.inputTokens ?? 0),
+                output: formatTokens(stats?.period.outputTokens ?? 0),
               })
             }}
           </p>
@@ -225,7 +228,7 @@ const hasTraffic = computed(() => (stats.value?.period.requests ?? 0) > 0);
         {{
           t("accounts.statsDrawer.today", {
             requests: formatNumber(stats.today.requests),
-            tokens: formatCompact(stats.today.inputTokens + stats.today.outputTokens),
+            tokens: formatTokens(stats.today.inputTokens + stats.today.outputTokens),
             cost: formatUsd(stats.today.costNanoUsd),
           })
         }}

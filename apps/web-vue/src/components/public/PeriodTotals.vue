@@ -2,7 +2,7 @@
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 import type { UsageTotals } from "@slipgate/contracts";
-import { formatCompact, formatDurationMs, formatNumber, formatUsd } from "../../lib/format";
+import { formatDurationMs, formatNumber, formatTokens, formatUsd } from "../../lib/format";
 import UiIcon, { type IconName } from "../ui/UiIcon.vue";
 import { RATE_TEXT, formatRate, rateTone } from "./health";
 
@@ -23,9 +23,9 @@ const successRate = computed(() => (props.totals.requests ? 1 - props.totals.err
 const rows = computed(() => [
   { key: "req", label: t("public.keyUsage.totals.requests"), value: formatNumber(props.totals.requests), cls: "text-fg" },
   { key: "rate", label: t("public.keyUsage.totals.successRate"), value: formatRate(successRate.value), cls: RATE_TEXT[rateTone(successRate.value)] },
-  { key: "in", label: t("public.keyUsage.totals.inputTokens"), value: formatCompact(props.totals.inputTokens), cls: "text-fg" },
-  { key: "out", label: t("public.keyUsage.totals.outputTokens"), value: formatCompact(props.totals.outputTokens), cls: "text-fg" },
-  { key: "cache", label: t("public.keyUsage.totals.cacheRead"), value: formatCompact(props.totals.cacheReadTokens), cls: "text-fg" },
+  { key: "in", label: t("public.keyUsage.totals.inputTokens"), value: formatTokens(props.totals.inputTokens), cls: "text-fg" },
+  { key: "out", label: t("public.keyUsage.totals.outputTokens"), value: formatTokens(props.totals.outputTokens), cls: "text-fg" },
+  { key: "cache", label: t("public.keyUsage.totals.cacheRead"), value: formatTokens(props.totals.cacheReadTokens), cls: "text-fg" },
   {
     key: "ttft",
     label: t("public.keyUsage.totals.ttft"),

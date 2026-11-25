@@ -8,12 +8,13 @@ import EmptyState from "../ui/EmptyState.vue";
 import SegmentedControl from "../ui/SegmentedControl.vue";
 import UiCard from "../ui/UiCard.vue";
 import UiIcon from "../ui/UiIcon.vue";
-import { formatCompact, formatNumber, nanoToUsd } from "../../lib/format";
+import { formatNumber, formatTokens, nanoToUsd } from "../../lib/format";
 
 /**
  * sub2api usage-page charts over the list's filters: model and group distribution (donut + legend
- * table, by tokens or spend; picking a row narrows the filters to it) and the token usage trend
- * (input / output / cache read) by hour or day, with a table view.
+ * table, by tokens or spend; picking a row narrows the filters to it), endpoint distribution
+ * (inbound, upstream or inbound -> upstream, recognised from the recorded codecs) and the token
+ * usage trend (input / output / cache read) by hour or day, with a table view.
  */
 const props = defineProps<{
   stats: UsageStatsResponse | null;
@@ -30,11 +31,19 @@ const { t, locale } = useI18n();
 type Metric = "tokens" | "cost";
 const modelMetric = ref<Metric>("tokens");
 const groupMetric = ref<Metric>("tokens");
+const endpointMetric = ref<Metric>("tokens");
+type EndpointSource = "inbound" | "upstream" | "path";
+const endpointSource = ref<EndpointSource>("inbound");
 const trendAsTable = ref(false);
 
 const metricOptions = computed(() => [
   { value: "tokens" as const, label: t("dashboard.metric.tokens") },
   { value: "cost" as const, label: t("dashboard.metric.cost") },
+]);
+const endpointSourceOptions = computed(() => [
+  { value: "inbound" as const, label: t("usageLogs.charts.endpointSource.inbound") },
+  { value: "upstream" as const, label: t("usageLogs.charts.endpointSource.upstream") },
+  { value: "path" as const, label: t("usageLogs.charts.endpointSource.path") },
 ]);
 const metricLabel = (m: Metric) => (m === "tokens" ? t("dashboard.metric.tokens") : t("dashboard.metric.cost"));
 const totalOf = (m: Metric) => {
@@ -57,6 +66,30 @@ const groupRows = computed<DistributionRow[]>(() =>
     costNanoUsd: g.costNanoUsd,
   })),
 );
+
+/** Endpoints recognised from the codecs; the tooltip names the codecs behind each one. */
+const endpointRows = computed<DistributionRow[]>(() => {
+  const s = props.stats;
+  if (!s) return [];
+  if (endpointSource.value === "path") {
+    return s.endpointPaths.map((p) => ({
+      key: `${p.inbound} -> ${p.upstream}`,
+      label: `${p.inbound} → ${p.upstream}`,
+      requests: p.requests,
+      tokens: tokensOf(p),
+      costNanoUsd: p.costNanoUsd,
+    }));
+  }
+  const list = endpointSource.value === "inbound" ? s.endpoints : s.upstreamEndpoints;
+  return list.map((e) => ({
+    key: e.endpoint,
+    label: e.endpoint,
+    requests: e.requests,
+    tokens: tokensOf(e),
+    costNanoUsd: e.costNanoUsd,
+    detail: e.codecs.length ? t("usageLogs.charts.recognizedFrom", { codecs: e.codecs.join(", ") }) : undefined,
+  }));
+});
 
 /* ---------------- Token trend ---------------- */
 
@@ -152,53 +185,74 @@ const tokenTotal = computed(() => (props.stats ? tokensOf(props.stats.totals) : 
       </UiCard>
     </div>
 
-    <UiCard icon="braces" :title="t('usageLogs.charts.trendTitle')">
-      <template #actions>
-        <span v-if="stats" class="hidden text-2xs text-fg-subtle sm:inline">{{ t("usageLogs.charts.total", { n: formatCompact(tokenTotal) }) }}</span>
-        <SegmentedControl
-          :model-value="shownGranularity"
-          :options="granularityOptions"
-          :aria-label="t('usageLogs.charts.granularity')"
-          @update:model-value="(v) => (granularity = v)"
+    <div class="grid gap-6 xl:grid-cols-2">
+      <UiCard icon="route" :title="t('usageLogs.charts.endpointTitle')">
+        <template #actions>
+          <SegmentedControl v-model="endpointSource" :options="endpointSourceOptions" :aria-label="t('usageLogs.charts.endpointSourceLabel')" />
+          <SegmentedControl v-model="endpointMetric" :options="metricOptions" />
+        </template>
+        <div v-if="!stats" class="h-[168px] animate-pulse rounded-lg bg-surface-2/60" aria-busy="true" />
+        <EmptyState v-else-if="empty" compact icon="route" :title="t('usageLogs.charts.empty')" />
+        <DistributionDonut
+          v-else
+          :key="endpointSource"
+          :rows="endpointRows"
+          :metric="endpointMetric"
+          :total="totalOf(endpointMetric)"
+          :name-header="endpointSource === 'path' ? t('usageLogs.charts.endpointPath') : t('usageLogs.charts.endpoint')"
+          :donut-label="t('usageLogs.charts.endpointDonutLabel', { metric: metricLabel(endpointMetric) })"
+          mono
         />
-        <button
-          type="button"
-          class="btn btn-ghost btn-icon btn-sm"
-          :aria-pressed="trendAsTable"
-          :title="trendAsTable ? t('dashboard.trend.showChart') : t('dashboard.trend.showTable')"
-          :aria-label="trendAsTable ? t('dashboard.trend.showChart') : t('dashboard.trend.showTable')"
-          @click="trendAsTable = !trendAsTable"
-        >
-          <UiIcon :name="trendAsTable ? 'activity' : 'list'" :size="15" />
-        </button>
-      </template>
-      <div v-if="!stats" class="h-56 animate-pulse rounded-lg bg-surface-2/60" aria-busy="true" />
-      <EmptyState v-else-if="empty" compact icon="braces" :title="t('usageLogs.charts.empty')" />
-      <div v-else-if="trendAsTable" class="table-wrap max-h-72 overflow-y-auto">
-        <table class="data-table">
-          <thead class="sticky top-0 z-10">
-            <tr>
-              <th>{{ t("dashboard.trend.time") }}</th>
-              <th v-for="sr in trendSeries" :key="sr.key" class="text-right">{{ sr.label }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="(label, i) in labels.full" :key="label">
-              <td class="whitespace-nowrap text-xs text-fg-muted">{{ label }}</td>
-              <td v-for="sr in trendSeries" :key="sr.key" class="text-right font-mono text-xs tabular-nums">{{ formatNumber(sr.values[i] ?? 0) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <TrendChart
-        v-else
-        :labels="labels.short"
-        :titles="labels.full"
-        :series="trendSeries"
-        :format="formatNumber"
-        :axis-format="formatCompact"
-        :chart-label="t('usageLogs.charts.trendTitle')"
-      />
-    </UiCard>
+      </UiCard>
+
+      <UiCard icon="braces" :title="t('usageLogs.charts.trendTitle')">
+        <template #actions>
+          <span v-if="stats" class="hidden text-2xs text-fg-subtle sm:inline">{{ t("usageLogs.charts.total", { n: formatTokens(tokenTotal) }) }}</span>
+          <SegmentedControl
+            :model-value="shownGranularity"
+            :options="granularityOptions"
+            :aria-label="t('usageLogs.charts.granularity')"
+            @update:model-value="(v) => (granularity = v)"
+          />
+          <button
+            type="button"
+            class="btn btn-ghost btn-icon btn-sm"
+            :aria-pressed="trendAsTable"
+            :title="trendAsTable ? t('dashboard.trend.showChart') : t('dashboard.trend.showTable')"
+            :aria-label="trendAsTable ? t('dashboard.trend.showChart') : t('dashboard.trend.showTable')"
+            @click="trendAsTable = !trendAsTable"
+          >
+            <UiIcon :name="trendAsTable ? 'activity' : 'list'" :size="15" />
+          </button>
+        </template>
+        <div v-if="!stats" class="h-56 animate-pulse rounded-lg bg-surface-2/60" aria-busy="true" />
+        <EmptyState v-else-if="empty" compact icon="braces" :title="t('usageLogs.charts.empty')" />
+        <div v-else-if="trendAsTable" class="table-wrap max-h-72 overflow-y-auto">
+          <table class="data-table">
+            <thead class="sticky top-0 z-10">
+              <tr>
+                <th>{{ t("dashboard.trend.time") }}</th>
+                <th v-for="sr in trendSeries" :key="sr.key" class="text-right">{{ sr.label }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(label, i) in labels.full" :key="label">
+                <td class="whitespace-nowrap text-xs text-fg-muted">{{ label }}</td>
+                <td v-for="sr in trendSeries" :key="sr.key" class="text-right font-mono text-xs tabular-nums">{{ formatNumber(sr.values[i] ?? 0) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <TrendChart
+          v-else
+          :labels="labels.short"
+          :titles="labels.full"
+          :series="trendSeries"
+          :format="formatNumber"
+          :axis-format="formatTokens"
+          :chart-label="t('usageLogs.charts.trendTitle')"
+        />
+      </UiCard>
+    </div>
   </div>
 </template>

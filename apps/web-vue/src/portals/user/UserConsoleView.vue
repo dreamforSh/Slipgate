@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   formatNanoUsd,
+  recognizeEndpoint,
   type ApiKeyItem,
   type CreatedApiKeyResponse,
   type GroupItem,
@@ -720,7 +721,9 @@ onMounted(() => {
                 <p class="font-medium text-fg">{{ log.publicModel }}</p>
                 <p class="mt-0.5 font-mono text-2xs text-fg-subtle">→ {{ log.upstreamModel }}</p>
               </td>
-              <td class="whitespace-nowrap font-mono text-xs text-fg-muted">{{ log.ingressCodec }} → {{ log.egressCodec }}</td>
+              <td class="whitespace-nowrap font-mono text-xs text-fg-muted" :title="`${log.ingressCodec} → ${log.egressCodec}`">
+                {{ recognizeEndpoint(log.ingressCodec).endpoint }} → {{ recognizeEndpoint(log.egressCodec).endpoint }}
+              </td>
               <td class="whitespace-nowrap text-right font-mono text-xs tabular-nums">
                 {{ formatNumber(log.inputTokens) }} / {{ formatNumber(log.outputTokens) }}
               </td>

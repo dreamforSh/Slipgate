@@ -3,7 +3,7 @@ import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 import type { UsageSummary } from "@slipgate/contracts";
 import StatCard from "../ui/StatCard.vue";
-import { formatCompact, formatDurationMs, formatUsd, type Tone } from "../../lib/format";
+import { formatCompact, formatDurationMs, formatTokens, formatUsd, type Tone } from "../../lib/format";
 
 /** Totals for the current filters: requests, success rate, tokens, cost and latency. */
 const props = defineProps<{ summary: UsageSummary | null }>();
@@ -56,8 +56,8 @@ const cards = computed(() => {
     {
       key: "tokens",
       label: t("usageLogs.summary.tokens"),
-      value: v ? formatCompact(v.inputTokens + v.outputTokens) : dash,
-      hint: v ? t("usageLogs.summary.tokensDetail", { input: formatCompact(v.inputTokens), output: formatCompact(v.outputTokens) }) : "",
+      value: v ? formatTokens(v.inputTokens + v.outputTokens) : dash,
+      hint: v ? t("usageLogs.summary.tokensDetail", { input: formatTokens(v.inputTokens), output: formatTokens(v.outputTokens) }) : "",
       icon: "database" as const,
       tone: "info" as Tone,
     },
@@ -91,7 +91,7 @@ const cards = computed(() => {
 const cacheText = computed(() => {
   const v = s.value;
   if (!v || v.cacheReadTokens + v.cacheWriteTokens === 0) return "";
-  return t("usageLogs.summary.cache", { read: formatCompact(v.cacheReadTokens), write: formatCompact(v.cacheWriteTokens) });
+  return t("usageLogs.summary.cache", { read: formatTokens(v.cacheReadTokens), write: formatTokens(v.cacheWriteTokens) });
 });
 </script>
 

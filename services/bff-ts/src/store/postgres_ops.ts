@@ -71,6 +71,7 @@ import { StoreError } from "./types.ts";
 import { viewerDayStartMs } from "./user_limits_types.ts";
 import {
   emptyScopedUsageAggregate,
+  codecPairKey,
   emptyUsageStatsAggregate,
   nanoFromText,
   OPS_RECENT_ERRORS,
@@ -2478,23 +2479,27 @@ export class PostgresOpsStore implements OpsStore {
       user_id: string | null;
       group_name: string | null;
       user_email: string | null;
+      ingress_codec: string | null;
+      egress_codec: string | null;
     };
-    // One scan of the filtered window, five groupings; names joined onto the grouped rows only.
+    // One scan of the filtered window, six groupings; names joined onto the grouped rows only.
     const rows = await pgReadWithTimeout(
       sql,
       USAGE_STATS_TIMEOUT_MS,
       (tx) => tx<StatsRow[]>`
         SELECT s.*, COALESCE(gr.name, '') AS group_name, COALESCE(us.email, '') AS user_email
           FROM (
-            SELECT GROUPING(x.b, x.public_model, x.group_id, x.user_id)::int AS g, x.b, x.public_model, x.group_id, x.user_id,
+            SELECT GROUPING(x.b, x.public_model, x.group_id, x.user_id, x.ingress_codec, x.egress_codec)::int AS g,
+                   x.b, x.public_model, x.group_id, x.user_id, x.ingress_codec, x.egress_codec,
                    ${this.sumsColumns()}
               FROM (
-                SELECT ${this.bucketOf(plan.startMs, plan.bucketMs)} AS b, l.public_model, l.group_id, l.user_id, l.status_code,
+                SELECT ${this.bucketOf(plan.startMs, plan.bucketMs)} AS b, l.public_model, l.group_id, l.user_id,
+                       l.ingress_codec, l.egress_codec, l.status_code,
                        l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cost_nano_usd, l.duration_ms, l.ttft_ms
                   FROM core.usage_logs l
                  WHERE ${where}
               ) x
-             GROUP BY GROUPING SETS ((), (x.b), (x.public_model), (x.group_id), (x.user_id))
+             GROUP BY GROUPING SETS ((), (x.b), (x.public_model), (x.group_id), (x.user_id), (x.ingress_codec, x.egress_codec))
           ) s
           LEFT JOIN core.groups gr ON gr.id = s.group_id
           LEFT JOIN commerce.users us ON us.id = s.user_id
@@ -2502,17 +2507,19 @@ export class PostgresOpsStore implements OpsStore {
     );
     const agg = emptyUsageStatsAggregate();
     for (const r of rows) {
-      // GROUPING bits (b, model, group, user), 1 = rolled up: 15 = total, 7 = bucket, 11 = model,
-      // 13 = group, 14 = user.
-      if (r.g === 15) agg.totals = sumsOf(r);
-      else if (r.g === 7 && r.b !== null && r.b >= 0 && r.b < plan.bucketCount) agg.buckets.set(r.b, sumsOf(r));
-      else if (r.g === 11 && r.public_model !== null) agg.models.set(r.public_model, sumsOf(r));
-      else if (r.g === 13 && r.group_id !== null) {
+      // GROUPING bits (b, model, group, user, ingress, egress), 1 = rolled up: 63 = total,
+      // 31 = bucket, 47 = model, 55 = group, 59 = user, 60 = (ingress, egress) codec pair.
+      if (r.g === 63) agg.totals = sumsOf(r);
+      else if (r.g === 31 && r.b !== null && r.b >= 0 && r.b < plan.bucketCount) agg.buckets.set(r.b, sumsOf(r));
+      else if (r.g === 47 && r.public_model !== null) agg.models.set(r.public_model, sumsOf(r));
+      else if (r.g === 55 && r.group_id !== null) {
         agg.groups.set(r.group_id, sumsOf(r));
         agg.groupNames.set(r.group_id, r.group_name ?? "");
-      } else if (r.g === 14 && r.user_id !== null) {
+      } else if (r.g === 59 && r.user_id !== null) {
         agg.users.set(r.user_id, sumsOf(r));
         agg.userEmails.set(r.user_id, r.user_email ?? "");
+      } else if (r.g === 60) {
+        agg.codecPairs.set(codecPairKey(r.ingress_codec ?? "", r.egress_codec ?? ""), sumsOf(r));
       }
     }
     return agg;

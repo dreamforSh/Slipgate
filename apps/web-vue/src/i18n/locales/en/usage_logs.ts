@@ -42,6 +42,8 @@ const en: typeof zh = {
       duration: "Avg. duration",
     },
     table: {
+      endpoint: "Endpoint",
+      endpointTitle: "Inbound codec {inbound} → upstream codec {upstream}",
       time: "Time",
       user: "User",
       apiKey: "Key",
@@ -83,6 +85,17 @@ const en: typeof zh = {
       loadFailed: "Could not load request errors",
     },
     charts: {
+      endpointTitle: "Endpoint distribution",
+      endpoint: "Endpoint",
+      endpointPath: "Inbound → upstream",
+      endpointDonutLabel: "Endpoint distribution by {metric}",
+      endpointSourceLabel: "Endpoint source",
+      endpointSource: {
+        inbound: "Inbound",
+        upstream: "Upstream",
+        path: "Path",
+      },
+      recognizedFrom: "Recognised from: {codecs}",
       modelTitle: "Model distribution",
       groupTitle: "Group distribution",
       trendTitle: "Token usage trend",

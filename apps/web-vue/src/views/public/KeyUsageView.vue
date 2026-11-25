@@ -21,6 +21,7 @@ import {
   formatDateTime,
   formatDurationMs,
   formatNumber,
+  formatTokens,
   formatUsd,
   nanoToUsd,
 } from "../../lib/format";
@@ -161,7 +162,9 @@ const usdAxis = (usd: number) =>
     ? `$${formatCompact(usd)}`
     : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: usd < 1 ? 2 : 0 }).format(usd);
 const trendFormat = computed(() => (trendMetric.value === "cost" ? usdFormat : (v: number) => formatNumber(v)));
-const trendAxisFormat = computed(() => (trendMetric.value === "cost" ? usdAxis : (v: number) => formatCompact(v)));
+const trendAxisFormat = computed(() =>
+  trendMetric.value === "cost" ? usdAxis : trendMetric.value === "tokens" ? (v: number) => formatTokens(v) : (v: number) => formatTokens(v),
+);
 const trendChartLabel = computed(
   () => t("public.keyUsage.trend.chart", { metric: metricOptions.value.find((o) => o.value === trendMetric.value)?.label ?? "" }),
 );
@@ -359,7 +362,7 @@ const modelRows = computed(() => {
                     <tr v-for="m in modelRows" :key="m.model">
                       <td class="font-mono text-xs text-fg">{{ m.model }}</td>
                       <td class="text-right text-xs tabular-nums">{{ formatNumber(m.requests) }}</td>
-                      <td class="text-right text-xs tabular-nums">{{ formatCompact(m.tokens) }}</td>
+                      <td class="text-right text-xs tabular-nums">{{ formatTokens(m.tokens) }}</td>
                       <td class="text-right font-mono text-xs tabular-nums text-fg">{{ formatUsd(m.costNanoUsd) }}</td>
                       <td>
                         <div class="flex items-center gap-2.5">

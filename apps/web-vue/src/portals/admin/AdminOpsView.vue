@@ -23,7 +23,7 @@ import UiTabs from "../../components/ui/UiTabs.vue";
 import { useNow } from "../../composables/useNow";
 import { usePersistentState } from "../../composables/usePersistentState";
 import { apiJson, errorText } from "../../lib/api";
-import { formatCompact, formatDurationMs, formatNumber, formatUsd, type Tone } from "../../lib/format";
+import { formatCompact, formatDurationMs, formatNumber, formatTokens, formatUsd, type Tone } from "../../lib/format";
 import { useToastStore } from "../../stores/toast";
 
 const { t, locale } = useI18n();
@@ -237,7 +237,7 @@ const stats = computed<Stat[]>(() => {
       key: "rpm",
       label: t("security.ops.stats.throughput"),
       value: t("security.ops.stats.rpm", { n: formatCompact(s.rpm) }),
-      hint: t("security.ops.stats.tpm", { n: formatCompact(s.tpm) }),
+      hint: t("security.ops.stats.tpm", { n: formatTokens(s.tpm) }),
       icon: "zap",
       tone: "info",
     },
@@ -261,7 +261,7 @@ const stats = computed<Stat[]>(() => {
       key: "cost",
       label: t("security.ops.stats.cost"),
       value: `${lb}${formatUsd(s.costNanoUsd)}`,
-      hint: t("security.ops.stats.tokensHint", { input: formatCompact(s.inputTokens), output: formatCompact(s.outputTokens) }),
+      hint: t("security.ops.stats.tokensHint", { input: formatTokens(s.inputTokens), output: formatTokens(s.outputTokens) }),
       icon: "wallet",
       tone: "success",
     },

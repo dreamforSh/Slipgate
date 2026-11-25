@@ -14,6 +14,7 @@ import type {
   UsageLogItem,
   VmSlotSummary,
 } from "@slipgate/contracts";
+import { recognizeEndpoint } from "@slipgate/contracts";
 import { useI18n } from "vue-i18n";
 import { RouterLink } from "vue-router";
 import BarList, { type BarListItem } from "../../components/charts/BarList.vue";
@@ -32,18 +33,19 @@ import UiIcon, { type IconName } from "../../components/ui/UiIcon.vue";
 import UsageMeter from "../../components/ui/UsageMeter.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import {
-  PROVIDER_OPTIONS,
-  RUNTIME_PROFILE_TONE,
   formatCompact,
   formatDateTime,
   formatDurationMs,
   formatNumber,
   formatRelative,
+  formatTokens,
   formatUsd,
-  nanoToUsd,
   healthLabel,
   healthTone,
+  nanoToUsd,
   planeLabel,
+  PROVIDER_OPTIONS,
+  RUNTIME_PROFILE_TONE,
   shortHash,
   slotStateLabel,
 } from "../../lib/format";
@@ -256,11 +258,13 @@ const usdAxis = (usd: number) =>
     ? `$${formatCompact(usd)}`
     : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: usd < 1 ? 2 : 0 }).format(usd);
 const trendFormat = computed(() => (trendMetric.value === "cost" ? usdFormat : (v: number) => formatNumber(v)));
-const trendAxisFormat = computed(() => (trendMetric.value === "cost" ? usdAxis : (v: number) => formatCompact(v)));
+const trendAxisFormat = computed(() =>
+  trendMetric.value === "cost" ? usdAxis : trendMetric.value === "tokens" ? (v: number) => formatTokens(v) : (v: number) => formatTokens(v),
+);
 const userTrendFormat = computed(() => (userTrendMetric.value === "cost" ? usdFormat : (v: number) => formatNumber(v)));
-const userTrendAxisFormat = computed(() => (userTrendMetric.value === "cost" ? usdAxis : (v: number) => formatCompact(v)));
+const userTrendAxisFormat = computed(() => (userTrendMetric.value === "cost" ? usdAxis : (v: number) => formatTokens(v)));
 const tokenFormat = (v: number) => formatNumber(v);
-const tokenAxisFormat = (v: number) => formatCompact(v);
+const tokenAxisFormat = (v: number) => formatTokens(v);
 
 const trendTitle = computed(() =>
   trendMetric.value === "tokens"
@@ -366,7 +370,7 @@ const nodesToWatch = computed(() =>
 function breakdownMeta(row: { requests: number; tokens: number; costNanoUsd: string }) {
   return t("dashboard.breakdown.meta", {
     requests: formatCompact(row.requests),
-    tokens: formatCompact(row.tokens),
+    tokens: formatTokens(row.tokens),
     cost: formatUsd(row.costNanoUsd),
   });
 }
@@ -376,7 +380,7 @@ const groupItems = computed<BarListItem[]>(() =>
     key: g.groupId,
     label: g.name,
     value: g.tokens,
-    valueText: formatCompact(g.tokens),
+    valueText: formatTokens(g.tokens),
     meta: breakdownMeta(g),
   })),
 );
@@ -632,23 +636,23 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
       <div class="grid grid-cols-2 gap-3 transition-opacity sm:gap-4 xl:grid-cols-4" :class="statsLoading && stats ? 'opacity-70' : ''">
         <StatCard
           :label="t('dashboard.kpi.todayTokens')"
-          :value="formatCompact(todayTokens)"
+          :value="formatTokens(todayTokens)"
           icon="box"
           tone="warning"
           :delta="stats ? change(todayTokens, stats.yesterday.inputTokens + stats.yesterday.outputTokens) : null"
           :delta-label="t('dashboard.kpi.vsYesterday')"
-          :hint="t('dashboard.cards.costAndCache', { cost: formatUsd(stats?.today.costNanoUsd ?? '0'), cache: formatCompact(stats?.today.cacheReadTokens ?? 0) })"
+          :hint="t('dashboard.cards.costAndCache', { cost: formatUsd(stats?.today.costNanoUsd ?? '0'), cache: formatTokens(stats?.today.cacheReadTokens ?? 0) })"
         />
         <StatCard
           :label="t('dashboard.cards.periodTokens', { range: rangeLabel })"
-          :value="formatCompact(periodTokens)"
+          :value="formatTokens(periodTokens)"
           icon="database"
           tone="accent"
           :hint="t('dashboard.cards.periodCost', { cost: formatUsd(stats?.period.costNanoUsd ?? '0') })"
         />
         <StatCard :label="t('dashboard.cards.performance')" :value="`${formatCompact(stats?.throughput.rpm ?? 0)} RPM`" icon="zap" tone="violet">
           <template #hint>
-            <span class="font-medium text-violet">{{ formatCompact(stats?.throughput.tpm ?? 0) }}</span> TPM
+            <span class="font-medium text-violet">{{ formatTokens(stats?.throughput.tpm ?? 0) }}</span> TPM
           </template>
         </StatCard>
         <StatCard
@@ -710,7 +714,7 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
 
       <UiCard icon="braces" :title="t('dashboard.tokenTrend.title')">
         <template #actions>
-          <span class="hidden text-2xs text-fg-subtle sm:inline">{{ t("dashboard.tokenTrend.total", { n: formatCompact(tokenTrendTotal) }) }}</span>
+          <span class="hidden text-2xs text-fg-subtle sm:inline">{{ t("dashboard.tokenTrend.total", { n: formatTokens(tokenTrendTotal) }) }}</span>
           <button
             type="button"
             class="btn btn-ghost btn-icon btn-sm"
@@ -1029,7 +1033,7 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
                 <td class="max-w-[16rem]">
                   <p class="truncate text-sm text-fg" :title="`${u.publicModel} → ${u.upstreamModel}`">{{ u.publicModel }}</p>
                   <p class="mt-0.5 truncate text-2xs text-fg-subtle" :title="`${u.requestId}
-${u.ingressCodec} → ${u.egressCodec}`">
+${recognizeEndpoint(u.ingressCodec).endpoint} → ${recognizeEndpoint(u.egressCodec).endpoint}`">
                     {{ formatRelative(u.createdAtIso) }}
                   </p>
                 </td>
@@ -1038,7 +1042,7 @@ ${u.ingressCodec} → ${u.egressCodec}`">
                   <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle" :title="u.accountId">{{ shortHash(u.accountId, 14) }}</p>
                 </td>
                 <td class="whitespace-nowrap text-right font-mono text-xs tabular-nums">
-                  {{ formatCompact(u.inputTokens) }} / {{ formatCompact(u.outputTokens) }}
+                  {{ formatTokens(u.inputTokens) }} / {{ formatTokens(u.outputTokens) }}
                 </td>
                 <td class="text-right font-mono text-xs font-medium tabular-nums text-fg">{{ u.formattedCostUsd }}</td>
                 <td class="whitespace-nowrap">

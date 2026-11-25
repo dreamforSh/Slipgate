@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { useI18n } from "vue-i18n";
-import type { UsageRow } from "@slipgate/contracts";
+import { recognizeEndpoint, type UsageRow } from "@slipgate/contracts";
 import UiBadge from "../ui/UiBadge.vue";
 import UiIcon from "../ui/UiIcon.vue";
-import { formatCompact, formatDateTime, formatDurationMs, formatNumber, formatRelative, formatUsd } from "../../lib/format";
+import { formatDateTime, formatDurationMs, formatNumber, formatRelative, formatTokens, formatUsd } from "../../lib/format";
 
 /** Request rows; admin mode adds the user and upstream-account columns. */
 defineProps<{
@@ -28,6 +28,17 @@ function tokenTitle(r: UsageRow): string {
   ].join("\n");
 }
 
+/** Inbound endpoint, plus the upstream one when it differs (recognised from the codecs). */
+function endpointOf(r: UsageRow) {
+  const inbound = recognizeEndpoint(r.ingressCodec).endpoint;
+  const upstream = recognizeEndpoint(r.egressCodec).endpoint;
+  return {
+    inbound,
+    upstream: upstream !== inbound ? upstream : "",
+    title: t("usageLogs.table.endpointTitle", { inbound: r.ingressCodec, upstream: r.egressCodec }),
+  };
+}
+
 function delay(i: number) {
   return { animationDelay: `${Math.min(i, 12) * 20}ms` };
 }
@@ -44,6 +55,7 @@ function delay(i: number) {
           <th>{{ t("usageLogs.table.group") }}</th>
           <th v-if="mode === 'admin'">{{ t("usageLogs.table.account") }}</th>
           <th>{{ t("usageLogs.table.model") }}</th>
+          <th class="hidden 2xl:table-cell">{{ t("usageLogs.table.endpoint") }}</th>
           <th class="text-right">{{ t("usageLogs.table.tokens") }}</th>
           <th class="text-right">{{ t("usageLogs.table.cost") }}</th>
           <th class="text-right">{{ t("usageLogs.table.latency") }}</th>
@@ -117,18 +129,26 @@ function delay(i: number) {
             </p>
           </td>
 
+          <td class="hidden max-w-[14rem] 2xl:table-cell" :title="endpointOf(r).title">
+            <p class="truncate font-mono text-xs text-fg-muted">{{ endpointOf(r).inbound }}</p>
+            <p v-if="endpointOf(r).upstream" class="mt-0.5 flex items-center gap-1 truncate font-mono text-2xs text-fg-subtle">
+              <UiIcon name="arrow-right" :size="10" class="shrink-0" />
+              <span class="truncate">{{ endpointOf(r).upstream }}</span>
+            </p>
+          </td>
+
           <td class="whitespace-nowrap text-right" :title="tokenTitle(r)">
             <p class="font-mono text-xs tabular-nums text-fg">
-              {{ formatCompact(r.inputTokens) }}
+              {{ formatTokens(r.inputTokens) }}
               <span class="text-fg-subtle">/</span>
-              {{ formatCompact(r.outputTokens) }}
+              {{ formatTokens(r.outputTokens) }}
             </p>
             <p
               v-if="r.cacheReadTokens + r.cacheWriteTokens > 0"
               class="mt-0.5 inline-flex cursor-help items-center gap-1 font-mono text-2xs tabular-nums text-info"
             >
               <UiIcon name="database" :size="10" />
-              {{ formatCompact(r.cacheReadTokens) }}<span class="text-fg-subtle">/</span>{{ formatCompact(r.cacheWriteTokens) }}
+              {{ formatTokens(r.cacheReadTokens) }}<span class="text-fg-subtle">/</span>{{ formatTokens(r.cacheWriteTokens) }}
             </p>
           </td>
 

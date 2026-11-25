@@ -14,7 +14,7 @@ import UiCard from "../../components/ui/UiCard.vue";
 import UiIcon from "../../components/ui/UiIcon.vue";
 import { useNow } from "../../composables/useNow";
 import { apiJson, errorText, toQuery } from "../../lib/api";
-import { formatCompact, formatDurationMs, formatNumber, formatRelative, formatUsd, nanoToUsd } from "../../lib/format";
+import { formatCompact, formatDurationMs, formatNumber, formatRelative, formatTokens, formatUsd, nanoToUsd } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 
 const { t, locale } = useI18n();
@@ -173,7 +173,9 @@ const usdAxis = (usd: number) =>
     ? `$${formatCompact(usd)}`
     : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: usd < 1 ? 2 : 0 }).format(usd);
 const trendFormat = computed(() => (metric.value === "cost" ? usdFormat : (v: number) => formatNumber(v)));
-const trendAxisFormat = computed(() => (metric.value === "cost" ? usdAxis : (v: number) => formatCompact(v)));
+const trendAxisFormat = computed(() =>
+  metric.value === "cost" ? usdAxis : metric.value === "tokens" ? (v: number) => formatTokens(v) : (v: number) => formatTokens(v),
+);
 const trendTitle = computed(() => t(`me.trend.${metric.value}`));
 
 /* ---------------- Breakdowns ---------------- */
@@ -181,7 +183,7 @@ const trendTitle = computed(() => t(`me.trend.${metric.value}`));
 function breakdownMeta(row: { requests: number; tokens: number; costNanoUsd: string }) {
   return t("me.breakdown.meta", {
     requests: formatCompact(row.requests),
-    tokens: formatCompact(row.tokens),
+    tokens: formatTokens(row.tokens),
     cost: formatUsd(row.costNanoUsd),
   });
 }
@@ -191,7 +193,7 @@ const modelItems = computed<BarListItem[]>(() =>
     key: m.model,
     label: m.model,
     value: m.tokens,
-    valueText: formatCompact(m.tokens),
+    valueText: formatTokens(m.tokens),
     meta: breakdownMeta(m),
   })),
 );
@@ -375,13 +377,13 @@ const enter = "animate-slide-up motion-reduce:animate-none";
           :class="enter"
           :style="stagger(6)"
           :label="t('me.kpi.todayTokens')"
-          :value="formatCompact(todayTokens)"
+          :value="formatTokens(todayTokens)"
           icon="braces"
           tone="info"
           :hint="
             t('me.kpi.tokenSplit', {
-              input: formatCompact(stats.today.inputTokens),
-              output: formatCompact(stats.today.outputTokens),
+              input: formatTokens(stats.today.inputTokens),
+              output: formatTokens(stats.today.outputTokens),
             })
           "
         />
@@ -480,7 +482,7 @@ const enter = "animate-slide-up motion-reduce:animate-none";
               <div class="shrink-0 text-right">
                 <p class="font-mono text-xs font-medium tabular-nums text-fg">{{ formatUsd(row.costNanoUsd) }}</p>
                 <p class="mt-0.5 font-mono text-2xs tabular-nums text-fg-subtle">
-                  {{ t("me.recent.tokens", { input: formatCompact(row.inputTokens), output: formatCompact(row.outputTokens) }) }}
+                  {{ t("me.recent.tokens", { input: formatTokens(row.inputTokens), output: formatTokens(row.outputTokens) }) }}
                 </p>
               </div>
               <UiBadge class="hidden sm:inline-flex" :tone="row.statusCode < 400 ? 'success' : 'danger'" mono>

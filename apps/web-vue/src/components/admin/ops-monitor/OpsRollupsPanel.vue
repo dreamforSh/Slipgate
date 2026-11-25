@@ -15,6 +15,7 @@ import {
   formatDurationMs,
   formatNumber,
   formatRelative,
+  formatTokens,
   formatUsd,
 } from "../../../lib/format";
 import { useToastStore } from "../../../stores/toast";
@@ -384,7 +385,7 @@ async function runCleanup(dryRun: boolean) {
                 {{ formatNumber(pt.errors) }}
               </td>
               <td class="text-right font-mono text-xs tabular-nums text-fg-muted">
-                {{ formatCompact(pt.inputTokens) }} / {{ formatCompact(pt.outputTokens) }}
+                {{ formatTokens(pt.inputTokens) }} / {{ formatTokens(pt.outputTokens) }}
               </td>
               <td class="text-right font-mono text-xs tabular-nums text-fg">{{ formatUsd(pt.costNanoUsd) }}</td>
               <td class="text-right font-mono text-xs tabular-nums text-fg-muted">

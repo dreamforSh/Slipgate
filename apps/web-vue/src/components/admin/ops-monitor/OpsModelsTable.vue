@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import type { OpsOverview } from "@slipgate/contracts";
-import { formatCompact, formatDurationMs, formatNumber } from "../../../lib/format";
+import { formatCompact, formatDurationMs, formatNumber, formatTokens } from "../../../lib/format";
 import EmptyState from "../../ui/EmptyState.vue";
 import UiCard from "../../ui/UiCard.vue";
 import UiIcon from "../../ui/UiIcon.vue";
@@ -56,7 +56,7 @@ const maxRequests = computed(() => Math.max(1, ...props.models.map((m) => m.requ
               </td>
               <td class="whitespace-nowrap text-right font-mono text-xs tabular-nums text-fg-muted">{{ formatDurationMs(m.ttftP50) }}</td>
               <td class="whitespace-nowrap text-right font-mono text-xs tabular-nums text-fg-muted">{{ formatDurationMs(m.durationP95) }}</td>
-              <td class="text-right font-mono text-xs tabular-nums text-fg-muted" :title="formatNumber(m.tokens)">{{ formatCompact(m.tokens) }}</td>
+              <td class="text-right font-mono text-xs tabular-nums text-fg-muted" :title="formatNumber(m.tokens)">{{ formatTokens(m.tokens) }}</td>
             </tr>
           </tbody>
         </table>

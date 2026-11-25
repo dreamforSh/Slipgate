@@ -111,6 +111,16 @@ export function formatCompact(n: number | null | undefined): string {
   return new Intl.NumberFormat(activeLocale(), { notation: "compact", maximumFractionDigits: 1 }).format(v);
 }
 
+/**
+ * Token counts in K / M / B whatever the UI language (12.3K, 4.5M): 万 / 亿 read oddly for token
+ * volumes, and every model vendor quotes tokens this way. Exact digits below 1,000.
+ */
+export function formatTokens(n: number | null | undefined): string {
+  const v = n ?? 0;
+  if (Math.abs(v) < 1000) return Math.round(v).toLocaleString("en-US");
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(v);
+}
+
 /** nano-USD integer string → dollars as a float (display only, never for accounting). */
 export function nanoToUsd(nano: string | null | undefined): number {
   if (!nano) return 0;

@@ -26,6 +26,7 @@ import {
   formatDateShort,
   formatDurationMs,
   formatRelative,
+  formatTokens,
   formatUsd,
 } from "../../../lib/format";
 
@@ -228,7 +229,7 @@ function openMenu(acc: UpstreamAccount, ev: MouseEvent) {
                 </span>
               </p>
               <p class="mt-0.5 font-mono text-2xs tabular-nums text-fg-subtle">
-                {{ formatCompact(today.get(acc.id)!.inputTokens + today.get(acc.id)!.outputTokens) }} tok ·
+                {{ formatTokens(today.get(acc.id)!.inputTokens + today.get(acc.id)!.outputTokens) }} tok ·
                 {{ formatUsd(today.get(acc.id)!.costNanoUsd) }}
               </p>
             </template>

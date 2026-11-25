@@ -3,7 +3,7 @@ import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { RouterLink, type RouteLocationRaw } from "vue-router";
 import DonutChart, { type DonutItem } from "./DonutChart.vue";
-import { formatCompact, formatNumber, formatUsd, nanoToUsd } from "../../lib/format";
+import { formatCompact, formatNumber, formatTokens, formatUsd, nanoToUsd } from "../../lib/format";
 
 /**
  * sub2api-style distribution: a donut of the top 5 + "Other" beside a compact table that is its
@@ -19,6 +19,8 @@ export interface DistributionRow {
   tokens: number;
   costNanoUsd: string;
   to?: RouteLocationRaw;
+  /** Extra tooltip line (e.g. the codecs an endpoint was recognised from). */
+  detail?: string;
 }
 
 const props = withDefaults(
@@ -57,15 +59,15 @@ const TOP = 5;
 
 type Sums = { requests: number; tokens: number; costNanoUsd: string };
 const valueOf = (row: Sums) => (props.metric === "tokens" ? row.tokens : nanoToUsd(row.costNanoUsd));
-const fmt = (v: number) => (props.metric === "tokens" ? formatCompact(v) : formatUsd(String(Math.round(v * 1e9))));
+const fmt = (v: number) => (props.metric === "tokens" ? formatTokens(v) : formatUsd(String(Math.round(v * 1e9))));
 const pct = (share: number) => `${(share * 100).toFixed(share >= 0.1 ? 0 : 1)}%`;
 /** The metric not being charted, as text. */
-const otherOf = (row: Sums) => (props.metric === "tokens" ? formatUsd(row.costNanoUsd) : formatCompact(row.tokens));
+const otherOf = (row: Sums) => (props.metric === "tokens" ? formatUsd(row.costNanoUsd) : formatTokens(row.tokens));
 const tipOf = (row: DistributionRow) =>
   `${row.label}\n${t("dashboard.distribution.userMeta", {
     requests: formatNumber(row.requests),
-    other: `${formatCompact(row.tokens)} Token · ${formatUsd(row.costNanoUsd)}`,
-  })}`;
+    other: `${formatTokens(row.tokens)} Token · ${formatUsd(row.costNanoUsd)}`,
+  })}${row.detail ? `\n${row.detail}` : ""}`;
 
 const metricLabel = computed(() => (props.metric === "tokens" ? t("dashboard.metric.tokens") : t("dashboard.metric.cost")));
 const otherLabel = computed(() => (props.metric === "tokens" ? t("dashboard.metric.cost") : t("dashboard.metric.tokens")));

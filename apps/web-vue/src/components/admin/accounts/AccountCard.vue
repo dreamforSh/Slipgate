@@ -20,6 +20,7 @@ import {
   formatDateShort,
   formatDurationMs,
   formatRelative,
+  formatTokens,
   formatUsd,
 } from "../../../lib/format";
 
@@ -71,7 +72,7 @@ const todayTitle = computed(() => {
   return [
     t("accounts.today.requests", { n: formatCompact(d.requests) }),
     d.errors ? t("accounts.today.errors", { n: d.errors }) : "",
-    `${formatCompact(d.inputTokens + d.outputTokens)} tok`,
+    `${formatTokens(d.inputTokens + d.outputTokens)} tok`,
     formatUsd(d.costNanoUsd),
   ]
     .filter(Boolean)

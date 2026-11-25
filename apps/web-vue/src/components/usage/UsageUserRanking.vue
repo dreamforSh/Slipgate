@@ -5,7 +5,7 @@ import { USAGE_RANK_LIMITS, type UsageRankBy, type UsageStatsResponse } from "@s
 import EmptyState from "../ui/EmptyState.vue";
 import SegmentedControl from "../ui/SegmentedControl.vue";
 import UiSelect from "../ui/UiSelect.vue";
-import { formatCompact, formatNumber, formatUsd, nanoToUsd } from "../../lib/format";
+import { formatNumber, formatTokens, formatUsd, nanoToUsd } from "../../lib/format";
 
 /**
  * sub2api "user ranking" tab of the usage page: the top users of the list's filters by requests,
@@ -129,11 +129,11 @@ const RANK_BADGE = [
             <td class="text-right font-mono text-xs tabular-nums" :class="[metricCell('requests'), rankBy === 'requests' ? 'font-medium text-fg' : 'text-fg-muted']">
               {{ formatNumber(u.requests) }}
             </td>
-            <td class="hidden text-right font-mono text-xs tabular-nums text-fg-muted md:table-cell">{{ formatCompact(u.inputTokens) }}</td>
-            <td class="hidden text-right font-mono text-xs tabular-nums text-fg-muted md:table-cell">{{ formatCompact(u.outputTokens) }}</td>
-            <td class="hidden text-right font-mono text-xs tabular-nums text-fg-muted lg:table-cell">{{ formatCompact(u.cacheReadTokens) }}</td>
+            <td class="hidden text-right font-mono text-xs tabular-nums text-fg-muted md:table-cell">{{ formatTokens(u.inputTokens) }}</td>
+            <td class="hidden text-right font-mono text-xs tabular-nums text-fg-muted md:table-cell">{{ formatTokens(u.outputTokens) }}</td>
+            <td class="hidden text-right font-mono text-xs tabular-nums text-fg-muted lg:table-cell">{{ formatTokens(u.cacheReadTokens) }}</td>
             <td class="text-right font-mono text-xs tabular-nums" :class="[metricCell('tokens'), rankBy === 'tokens' ? 'font-medium text-fg' : 'text-fg-muted']">
-              {{ formatCompact(tokensOf(u)) }}
+              {{ formatTokens(tokensOf(u)) }}
             </td>
             <td class="text-right font-mono text-xs tabular-nums" :class="[metricCell('cost'), rankBy === 'cost' ? 'font-medium text-fg' : 'text-fg-muted']">
               {{ formatUsd(u.costNanoUsd) }}

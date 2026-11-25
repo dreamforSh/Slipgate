@@ -2,6 +2,7 @@ import { z } from "zod";
 import { PageQuerySchema } from "./commerce.ts";
 import { DashboardRangeSchema, UsageSeriesPointSchema, UsageTotalsSchema } from "./dashboard.ts";
 import { UsageLogItemSchema } from "./dataplane.ts";
+import { EndpointFamilySchema } from "./endpoints.ts";
 
 /**
  * Usage-log browsing (admin and self-service), CSV export, the user dashboard, the public
@@ -142,6 +143,14 @@ const UsageStatsSums = {
   costNanoUsd: NanoUsd,
 };
 
+const UsageEndpointStatSchema = z.object({
+  endpoint: z.string(),
+  family: EndpointFamilySchema,
+  codecs: z.array(z.string()),
+  ...UsageStatsSums,
+});
+export type UsageEndpointStat = z.infer<typeof UsageEndpointStatSchema>;
+
 export const UsageStatsResponseSchema = z.object({
   generatedAtIso: z.string(),
   /** The window actually charted. */
@@ -157,6 +166,24 @@ export const UsageStatsResponseSchema = z.object({
   groups: z.array(z.object({ groupId: z.string(), name: z.string(), ...UsageStatsSums })),
   /** Top `rankLimit` users by `rankBy`. */
   users: z.array(z.object({ userId: z.string(), email: z.string(), ...UsageStatsSums })),
+  /**
+   * Endpoint distribution, recognised from the recorded wire codecs (recognizeEndpoint): what
+   * clients called, what was sent upstream, and the inbound → upstream pairs. Codecs recognised
+   * as the same endpoint are merged; `codecs` lists them.
+   */
+  endpoints: z.array(UsageEndpointStatSchema).default([]),
+  upstreamEndpoints: z.array(UsageEndpointStatSchema).default([]),
+  endpointPaths: z
+    .array(
+      z.object({
+        inbound: z.string(),
+        upstream: z.string(),
+        inboundFamily: EndpointFamilySchema,
+        upstreamFamily: EndpointFamilySchema,
+        ...UsageStatsSums,
+      }),
+    )
+    .default([]),
   /** Distinct users with traffic in the window. */
   userCount: Count,
   rankBy: UsageRankBySchema,

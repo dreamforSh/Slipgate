@@ -612,6 +612,8 @@ describe("admin usage statistics", () => {
       groupId: "grp_default",
       publicModel: "gpt-5",
       upstreamModel: "gpt-5",
+      ingressCodec: "openai_chat",
+      egressCodec: "openai_responses",
       inputTokens: 300,
       outputTokens: 100,
       cacheReadTokens: 40,
@@ -636,6 +638,16 @@ describe("admin usage statistics", () => {
     expect(all.body.userCount).toBe(2);
     expect(all.body.rankBy).toBe("cost");
     expect(all.body.users.map((u) => u.email)).toEqual(["ivy.stats@ops.test", "gina.stats@ops.test"]);
+    // Endpoints recognised from the codecs: "anthropic" is an older alias of anthropic_messages.
+    expect(all.body.endpoints.map((e) => [e.endpoint, e.family, e.codecs, e.requests])).toEqual([
+      ["/v1/chat/completions", "openai", ["openai_chat"], 1],
+      ["/v1/messages", "anthropic", ["anthropic"], 2],
+    ]);
+    expect(all.body.upstreamEndpoints.map((e) => e.endpoint)).toEqual(["/v1/responses", "/v1/messages"]);
+    expect(all.body.endpointPaths.map((p) => `${p.inbound} -> ${p.upstream}`)).toEqual([
+      "/v1/chat/completions -> /v1/responses",
+      "/v1/messages -> /v1/messages",
+    ]);
 
     const byRequests = await stats("&rankBy=requests&rankLimit=1");
     expect(byRequests.body.users.map((u) => u.email)).toEqual(["gina.stats@ops.test"]);

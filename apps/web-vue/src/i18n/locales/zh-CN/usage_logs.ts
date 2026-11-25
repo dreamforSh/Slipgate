@@ -41,6 +41,8 @@ export default {
       duration: "平均耗时",
     },
     table: {
+      endpoint: "端点",
+      endpointTitle: "入站协议 {inbound} → 上游协议 {upstream}",
       time: "时间",
       user: "用户",
       apiKey: "密钥",
@@ -82,6 +84,17 @@ export default {
       loadFailed: "加载请求错误失败",
     },
     charts: {
+      endpointTitle: "端点分布",
+      endpoint: "端点",
+      endpointPath: "入站 → 上游",
+      endpointDonutLabel: "按{metric}的端点分布",
+      endpointSourceLabel: "端点来源",
+      endpointSource: {
+        inbound: "入站",
+        upstream: "上游",
+        path: "路径",
+      },
+      recognizedFrom: "识别自：{codecs}",
       modelTitle: "模型分布",
       groupTitle: "分组分布",
       trendTitle: "Token 使用趋势",

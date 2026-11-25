@@ -69,15 +69,7 @@ import UiIcon from "../../components/ui/UiIcon.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import { useNow } from "../../composables/useNow";
 import { usePersistentState } from "../../composables/usePersistentState";
-import {
-  PROVIDER_OPTIONS,
-  accountStatusLabel,
-  executionModeLabel,
-  formatCompact,
-  formatNumber,
-  formatRelative,
-  formatUsd,
-} from "../../lib/format";
+import { accountStatusLabel, executionModeLabel, formatNumber, formatRelative, formatTokens, formatUsd, PROVIDER_OPTIONS } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 import UiSelect from "../../components/ui/UiSelect.vue";
 import { exitAvailability, modeUsesExit, useExitPool } from "../../components/admin/accounts/exitPool";
@@ -937,7 +929,7 @@ onMounted(() => {
       <StatCard
         :label="t('accounts.stats.todayRequests')"
         :value="formatNumber(todayTotals.requests)"
-        :hint="t('accounts.stats.todayHint', { tokens: formatCompact(todayTotals.tokens), cost: formatUsd(todayTotals.cost) })"
+        :hint="t('accounts.stats.todayHint', { tokens: formatTokens(todayTotals.tokens), cost: formatUsd(todayTotals.cost) })"
         icon="activity"
         tone="info"
       />
