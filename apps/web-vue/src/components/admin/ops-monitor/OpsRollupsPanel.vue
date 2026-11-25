@@ -51,6 +51,7 @@ const status = ref<UsageRollupStatus>({
   hourlyRows: 0,
   dailyRows: 0,
   oldestLogIso: null,
+  sealedBeforeIso: null,
 });
 
 const configForm = reactive({
@@ -231,7 +232,14 @@ async function runCleanup(dryRun: boolean) {
       <StatCard
         :label="t('security.ops.rollups.kpis.oldestLog')"
         :value="status.oldestLogIso ? formatRelative(status.oldestLogIso, now) : '—'"
-        :hint="status.oldestLogIso ? formatDateTime(status.oldestLogIso) : undefined"
+        :hint="
+          [
+            status.oldestLogIso ? formatDateTime(status.oldestLogIso) : '',
+            status.sealedBeforeIso ? t('security.ops.rollups.kpis.sealedBefore', { date: formatDateTime(status.sealedBeforeIso) }) : '',
+          ]
+            .filter(Boolean)
+            .join(' · ') || undefined
+        "
         icon="activity"
         tone="neutral"
       />

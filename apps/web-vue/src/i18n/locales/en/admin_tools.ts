@@ -3,6 +3,37 @@ import type zh from "../zh-CN/admin_tools";
 const en: typeof zh = {
   adminTools: {
     title: "Admin tools",
+    notifications: {
+      title: "Payment notifications",
+      intro: "Every paid order gets one notification, written together with the order and delivered to each plugin on its own; failures retry with backoff and stop after 8 attempts until replayed. A replay re-sends the notification only: nothing is credited or delivered again.",
+      empty: "No notifications need attention",
+      attempts: "{n}×",
+      replayOne: "Replay",
+      replayAll: "Replay all",
+      replayHint: "Re-send this notification to every plugin (no second credit)",
+      replayed: "Delivered again",
+      replayFailed: "Replayed; some plugins still fail",
+      filters: {
+        attention: "Needs attention",
+        dispatched: "Delivered",
+        all: "All",
+      },
+      status: {
+        pending: "Retrying",
+        dispatched: "Delivered",
+        dead_letter: "Retries stopped",
+      },
+      columns: {
+        order: "Order",
+        status: "Status",
+        deliveries: "Plugin deliveries",
+        next: "Next retry",
+      },
+      errors: {
+        load: "Could not load payment notifications",
+        replay: "Replay failed",
+      },
+    },
     plugins: {
       intro:
         "Plugins are registered in server code. Turn them on or off, fill in their settings and send a test event here; secret fields are stored encrypted and never shown again.",

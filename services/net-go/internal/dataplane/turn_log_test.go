@@ -57,6 +57,11 @@ func turnLogCore(t *testing.T) string {
 				}
 				typ := dpbridge.FrameSettleAck
 				payload := []byte(`{"ok":false,"settledCostNanoUsd":"0"}`)
+				if req.Type == dpbridge.FrameSyncState {
+					// Snapshots are applied (the sync's ack is checked); only settlements are lost.
+					typ = dpbridge.FrameSyncAck
+					payload = []byte(`{"ok":true}`)
+				}
 				if req.Type == dpbridge.FrameReqHeaders {
 					typ = dpbridge.FrameDispatchDirective
 					payload, _ = json.Marshal(coreDispatchDirective{

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, setSystemTime } from "bun:test";
 import type {
   UsageLogItem,
   UsageRollupBackfillResponse,
@@ -73,6 +73,17 @@ async function ageUsageLog(store: ControlStore, requestId: string, daysAgo: numb
     const row = (store as unknown as { usageLogs: UsageLogItem[] }).usageLogs.find((l) => l.requestId === requestId);
     if (!row) throw new Error(`Missing usage log ${requestId}`);
     row.createdAtIso = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+  }
+}
+
+async function setUsageLogTime(store: ControlStore, requestId: string, iso: string): Promise<void> {
+  const sql = (store as unknown as { sql?: (...args: unknown[]) => Promise<unknown> }).sql;
+  if (sql) {
+    await sql`UPDATE core.usage_logs SET created_at = ${new Date(iso)} WHERE request_id = ${requestId}`;
+  } else {
+    const row = (store as unknown as { usageLogs: UsageLogItem[] }).usageLogs.find((l) => l.requestId === requestId);
+    if (!row) throw new Error(`Missing usage log ${requestId}`);
+    row.createdAtIso = iso;
   }
 }
 
@@ -223,6 +234,85 @@ describe("Lane O4: usage rollups and retention cleanup", () => {
       expect(st.status).toBe(200);
       expect(st.body.lastCleanupDeleted).toBe(1);
       expect(st.body.dailyRows).toBeGreaterThanOrEqual(2);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("never shrinks history: repeated cleanups keep the summarised counts and amounts", async () => {
+    const { store, call, admin, memberId, memberHeaders } = await bootstrap();
+    try {
+      const groupRes = await call<{ group: { id: string } }>("POST", "/api/v1/admin/groups", admin, { name: "Seal Group", platform: "openai" });
+      const groupId = groupRes.body.group.id;
+      const keyRes = await call<{ item: { id: string } }>("POST", "/api/v1/user/api-keys", memberHeaders, { groupId, name: "Seal Key" });
+      const keyId = keyRes.body.item.id;
+      // Two rows of one dimension, 6h apart on the same UTC day, 34 nano-USD in all. With the
+      // default 90-day retention the old, unaligned cutoff of the first cleanup fell between them.
+      const t0 = Date.parse("2026-06-15T12:00:00.000Z");
+      const rows = [
+        { id: "req_seal_a", at: "2026-03-17T09:00:00.000Z", cost: "10" },
+        { id: "req_seal_b", at: "2026-03-17T15:00:00.000Z", cost: "24" },
+      ];
+      for (const r of rows) {
+        await store.recordTurnSettlement({
+          settlementId: `stl_${r.id}`,
+          coreSettled: false,
+          requestId: r.id,
+          userId: memberId,
+          apiKeyId: keyId,
+          accountId: "acc_1",
+          groupId,
+          platform: "openai",
+          publicModel: "gpt-4o",
+          upstreamModel: "gpt-4o",
+          ingressCodec: "openai_chat",
+          egressCodec: "openai_chat",
+          inputTokens: 100,
+          outputTokens: 50,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costNanoUsd: r.cost,
+          ttftMs: 100,
+          durationMs: 300,
+          window5hUsedBps: 0,
+          window7dUsedBps: 0,
+          statusCode: 200,
+        });
+        await setUsageLogTime(store, r.id, r.at);
+      }
+      const totals = async () => {
+        const out: Record<string, { requests: number; cost: string }> = {};
+        for (const granularity of ["hourly", "daily"] as const) {
+          const res = await call<UsageRollupSeriesResponse>("GET", `/api/v1/admin/usage-rollups/series?granularity=${granularity}&days=120`, admin);
+          expect(res.status).toBe(200);
+          out[granularity] = { requests: res.body.totals.requests, cost: res.body.totals.costNanoUsd };
+        }
+        return out;
+      };
+      const whole = { hourly: { requests: 2, cost: "34" }, daily: { requests: 2, cost: "34" } };
+
+      try {
+        // Roll the day up while its rows are complete, then clean up repeatedly, 6h apart and
+        // across the day boundary that finally makes the day older than the retention.
+        setSystemTime(new Date(t0));
+        expect((await call("POST", "/api/v1/admin/usage-rollups/backfill", admin, { days: 120, granularity: "both" })).status).toBe(200);
+        expect(await totals()).toEqual(whole);
+        for (const offsetH of [0, 6, 24, 30]) {
+          setSystemTime(new Date(t0 + offsetH * 3_600_000));
+          const cleanup = await call<UsageRollupCleanupResponse>("POST", "/api/v1/admin/usage-rollups/cleanup", admin, { dryRun: false });
+          expect(cleanup.status).toBe(200);
+          expect(cleanup.body.cutoffIso.endsWith("T00:00:00.000Z")).toBe(true);
+          expect(await totals()).toEqual(whole);
+        }
+        // Both detail rows are gone now; a wide manual backfill must not recompute the sealed day.
+        const status = await call<UsageRollupStatus>("GET", "/api/v1/admin/usage-rollups/status", admin);
+        expect(status.body.sealedBeforeIso).toBe("2026-03-18T00:00:00.000Z");
+        expect(status.body.oldestLogIso === null || Date.parse(status.body.oldestLogIso) >= Date.parse("2026-03-18T00:00:00.000Z")).toBe(true);
+        expect((await call("POST", "/api/v1/admin/usage-rollups/backfill", admin, { days: 120, granularity: "both" })).status).toBe(200);
+        expect(await totals()).toEqual(whole);
+      } finally {
+        setSystemTime();
+      }
     } finally {
       await store.close();
     }

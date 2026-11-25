@@ -14,6 +14,11 @@ export const UsageRollupStatusSchema = z.object({
   hourlyRows: z.number().int().nonnegative(),
   dailyRows: z.number().int().nonnegative(),
   oldestLogIso: z.string().nullable(),
+  /**
+   * Rollup buckets before this UTC day boundary are sealed: a retention cleanup summarised them
+   * from complete detail rows before deleting those rows, so no backfill recomputes them again.
+   */
+  sealedBeforeIso: z.string().nullable().default(null),
 });
 export type UsageRollupStatus = z.infer<typeof UsageRollupStatusSchema>;
 

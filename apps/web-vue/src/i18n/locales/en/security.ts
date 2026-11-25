@@ -194,6 +194,7 @@ const en: typeof zh = {
           lastRun: "Last rollup",
           retention: "Raw log retention",
           oldestLog: "Oldest raw log",
+          sealedBefore: "Rollups sealed before {date} (their raw logs were pruned; never recomputed)",
           deletedLast: "Last cleanup: {n} deleted",
         },
         never: "Never",

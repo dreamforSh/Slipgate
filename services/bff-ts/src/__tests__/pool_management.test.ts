@@ -318,6 +318,45 @@ describe("account connectivity test", () => {
     expect(recorded?.lastTest).toMatchObject({ ok: true, model: "claude-haiku-4-5", durationMs: 321, message: "" });
   });
 
+  it("passes the test kind through and records only text tests as the account's last test", async () => {
+    const internalToken = "probe-internal-token";
+    const seen: unknown[] = [];
+    netServer = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/internal/net/dataplane/sync") return Response.json({ ok: true });
+        seen.push(await req.json());
+        const events = [
+          { type: "start", kind: "image", model: "gpt-image-1" },
+          { type: "media", kind: "image", mimeType: "image/png", mediaUrl: "data:image/png;base64,AAAA" },
+          { type: "done", kind: "image", success: false, status: 400, code: "model_not_found", message: "no image models" },
+        ];
+        return new Response(events.map((e) => `data: ${JSON.stringify(e)}
+
+`).join(""), { headers: { "Content-Type": "text/event-stream" } });
+      },
+    });
+    process.env.SLIPGATE_NET_INTERNAL_URL = `http://127.0.0.1:${netServer.port}`;
+
+    const { app, admin, call } = await bootstrap(internalToken);
+    const g = await createGroup(call, admin, { name: "g", platform: "composite" });
+    const acc = await createAccount(call, admin, { name: "img", groupId: g.id });
+    const res = await app.request(`/api/v1/admin/accounts/${acc.id}/test`, {
+      method: "POST",
+      headers: admin,
+      body: JSON.stringify({ kind: "image", prompt: "a cat" }),
+    });
+    expect(res.status).toBe(200);
+    const sse = await res.text();
+    expect(sse).toContain('"type":"media"');
+    expect(sse).toContain("data:image/png;base64,AAAA");
+    expect(seen[0]).toEqual({ kind: "image", prompt: "a cat" });
+    const recorded = (await call<{ accounts: UpstreamAccount[] }>("GET", "/api/v1/admin/accounts", admin)).body.accounts.find((a) => a.id === acc.id);
+    expect(recorded?.lastTest ?? null).toBeNull();
+    expect((await call("POST", `/api/v1/admin/accounts/${acc.id}/test`, admin, { kind: "video" })).status).toBe(400);
+  });
+
   it("records failed tests with the upstream message", async () => {
     netServer = Bun.serve({
       port: 0,

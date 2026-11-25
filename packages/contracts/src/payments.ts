@@ -565,3 +565,50 @@ export const AffiliateRebateItemSchema = z.object({
   createdAtIso: z.string(),
 });
 export type AffiliateRebateItem = z.infer<typeof AffiliateRebateItemSchema>;
+
+/* ------------------------------------------------------------------------------------------ */
+/* Payment notifications (plugin outbox)                                                      */
+/* ------------------------------------------------------------------------------------------ */
+
+/** Automatic attempts per plugin before a notification waits for a manual replay. */
+export const PAYMENT_NOTIFICATION_MAX_ATTEMPTS = 8;
+
+export const PaymentNotificationDeliverySchema = z.object({
+  plugin: z.string(),
+  status: z.enum(["pending", "delivered", "failed"]),
+  attempts: z.number().int().nonnegative(),
+  lastError: z.string().nullable(),
+  nextAttemptAtIso: z.string().nullable(),
+  deliveredAtIso: z.string().nullable(),
+});
+export type PaymentNotificationDelivery = z.infer<typeof PaymentNotificationDeliverySchema>;
+
+/**
+ * One paid order's `payment.settled` notification: written in the fulfilment transaction (one per
+ * order), delivered to every plugin subscribed to payments with its own retries. `dead_letter`
+ * once a plugin has failed PAYMENT_NOTIFICATION_MAX_ATTEMPTS times (replay re-arms it).
+ */
+export const PaymentNotificationSchema = z.object({
+  id: z.string(),
+  orderId: z.string(),
+  status: z.enum(["pending", "dispatched", "dead_letter"]),
+  attempts: z.number().int().nonnegative(),
+  nextRetryAtIso: z.string().nullable(),
+  createdAtIso: z.string(),
+  dispatchedAtIso: z.string().nullable(),
+  deliveries: z.array(PaymentNotificationDeliverySchema),
+});
+export type PaymentNotification = z.infer<typeof PaymentNotificationSchema>;
+
+export const PaymentNotificationQuerySchema = z.object({
+  status: z.enum(["pending", "dispatched", "dead_letter"]).optional().catch(undefined),
+  orderId: z.string().trim().max(64).optional().catch(undefined),
+  limit: z.coerce.number().int().min(1).max(200).catch(50).default(50),
+});
+export type PaymentNotificationQuery = z.infer<typeof PaymentNotificationQuerySchema>;
+
+/** Re-sends the notification only (never re-runs delivery, credit or rebates); one plugin or all. */
+export const ReplayPaymentNotificationRequestSchema = z.object({
+  plugin: z.string().trim().min(1).max(64).optional(),
+});
+export type ReplayPaymentNotificationRequest = z.infer<typeof ReplayPaymentNotificationRequestSchema>;

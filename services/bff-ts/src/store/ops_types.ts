@@ -41,6 +41,7 @@ import type {
   ChannelStatusQuery,
   OpsUsageAggregate,
   OpsUsageQuery,
+  DashboardUsageAggregate,
   ScopedUsageAggregate,
   ScopedUsageQuery,
   UsageStatsAggregate,
@@ -353,6 +354,13 @@ export interface OpsStore {
    * (UsageAggregateTimeoutError); callers cache it per scope rather than re-running it per view.
    */
   scopedUsage(query: ScopedUsageQuery): Promise<ScopedUsageAggregate>;
+  /**
+   * The admin dashboard's usage over `win` (exact; Postgres reads it in one scan plus the top
+   * users' buckets under DASHBOARD_USAGE_TIMEOUT_MS, UsageAggregateTimeoutError past it).
+   */
+  dashboardUsage(win: import("../dashboard.ts").DashboardWindow, nowMs: number): Promise<DashboardUsageAggregate>;
+  /** API keys in all and enabled (the dashboard's key tile). */
+  countApiKeys(): Promise<{ total: number; enabled: number }>;
   /** Per-group, per-bucket traffic for the public status page. */
   channelStatusUsage(query: ChannelStatusQuery): Promise<ChannelStatusAggregate>;
   /** Totals, percentiles, series, breakdowns and the newest errors for the ops monitor. */

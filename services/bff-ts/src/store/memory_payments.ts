@@ -18,11 +18,14 @@ import { clampPage, DAY_MS } from "./ops_shared.ts";
 import type { OpsStore } from "./ops_types.ts";
 import { OPEN_INSTANCE_ORDER_STATUSES } from "./payment_providers_types.ts";
 import {
+  clampConfigLimits,
+  paymentEventId,
   REFUNDABLE_STATUSES,
   type BeginRefundResult,
   type FulfillResult,
   type OrderInput,
   type OrderPaymentPatch,
+  type PaymentEventRecord,
   type PaymentsStore,
   type PlanInput,
   type RebatePolicy,
@@ -135,6 +138,8 @@ export class MemoryPaymentsStore implements PaymentsStore {
   private config: Record<string, unknown> | null = null;
   private readonly plans = new Map<string, PlanRecord>();
   private readonly orders = new Map<string, OrderRecord>();
+  /** Payment notifications by event id (the outbox). */
+  private readonly paymentEvents = new Map<string, PaymentEventRecord>();
   private readonly rebates: RebateRecord[] = [];
   private readonly affiliateAccounts = new Map<string, AffiliateAccountRecord>();
   private readonly affiliateWithdrawals: AffiliateWithdrawalRecord[] = [];
@@ -169,7 +174,7 @@ export class MemoryPaymentsStore implements PaymentsStore {
   }
 
   async saveConfigBlob(blob: Record<string, unknown>) {
-    this.config = structuredClone(blob);
+    this.config = clampConfigLimits(structuredClone(blob));
   }
 
   /* ---------------- Plans ---------------- */
@@ -403,6 +408,29 @@ export class MemoryPaymentsStore implements PaymentsStore {
     return n;
   }
 
+  async listPaymentEvents(query: {
+    status?: PaymentEventRecord["status"];
+    orderId?: string;
+    dueBeforeIso?: string;
+    limit: number;
+  }): Promise<PaymentEventRecord[]> {
+    let list = Array.from(this.paymentEvents.values());
+    if (query.status) list = list.filter((e) => e.status === query.status);
+    if (query.orderId) list = list.filter((e) => e.orderId === query.orderId);
+    if (query.dueBeforeIso) {
+      const due = query.dueBeforeIso;
+      list = list.filter((e) => e.status === "pending" && e.nextRetryAtIso <= due).sort((a, b) => a.nextRetryAtIso.localeCompare(b.nextRetryAtIso));
+    } else {
+      list.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
+    }
+    return list.slice(0, query.limit).map((e) => structuredClone(e));
+  }
+
+  async savePaymentEvent(event: PaymentEventRecord): Promise<void> {
+    if (!this.paymentEvents.has(event.id)) throw new StoreError("not_found", "Payment notification not found");
+    this.paymentEvents.set(event.id, structuredClone(event));
+  }
+
   async fulfillOrder(id: string, providerTradeNo: string | null, rebate: RebatePolicy): Promise<FulfillResult> {
     return this.locked(id, async () => {
       const o = this.require(id);
@@ -433,6 +461,21 @@ export class MemoryPaymentsStore implements PaymentsStore {
       if (!firstPayment) return { order: this.toOrder(o), fulfilled: false, delivered };
 
       o.status = "paid";
+      // The order's payment notification, in the same critical section that marks it paid.
+      const eventId = paymentEventId(o.id);
+      if (!this.paymentEvents.has(eventId)) {
+        const nowIso = new Date().toISOString();
+        this.paymentEvents.set(eventId, {
+          id: eventId,
+          orderId: o.id,
+          status: "pending",
+          attempts: 0,
+          nextRetryAtIso: nowIso,
+          createdAtIso: nowIso,
+          dispatchedAtIso: null,
+          deliveries: {},
+        });
+      }
       o.paidAtIso = new Date().toISOString();
       if (providerTradeNo) o.providerTradeNo = providerTradeNo;
 

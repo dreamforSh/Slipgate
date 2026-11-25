@@ -12,6 +12,12 @@ import { EndpointFamilySchema } from "./endpoints.ts";
 export const UsageOutcomeSchema = z.enum(["success", "error"]);
 export type UsageOutcome = z.infer<typeof UsageOutcomeSchema>;
 
+/** Sortable usage columns: time, model, cost, tokens (input + output), latency (duration). */
+export const UsageSortBySchema = z.enum(["time", "model", "cost", "tokens", "latency"]);
+export type UsageSortBy = z.infer<typeof UsageSortBySchema>;
+export const UsageSortDirSchema = z.enum(["asc", "desc"]);
+export type UsageSortDir = z.infer<typeof UsageSortDirSchema>;
+
 export const UsageQuerySchema = PageQuerySchema.extend({
   userId: z.string().trim().max(64).optional().catch(undefined),
   apiKeyId: z.string().trim().max(64).optional().catch(undefined),
@@ -20,6 +26,9 @@ export const UsageQuerySchema = PageQuerySchema.extend({
   /** Substring match on the public model name. */
   model: z.string().trim().max(128).optional().catch(undefined),
   outcome: UsageOutcomeSchema.optional().catch(undefined),
+  /** Row order (default newest first); ties fall back to newest first. Export follows it too. */
+  sortBy: UsageSortBySchema.optional().catch(undefined),
+  sortDir: UsageSortDirSchema.optional().catch(undefined),
   /** Self-service: absent means the USAGE_DEFAULT_WINDOW_DAYS before `untilIso` (or now). */
   sinceIso: z.string().datetime({ offset: true }).optional().catch(undefined),
   untilIso: z.string().datetime({ offset: true }).optional().catch(undefined),

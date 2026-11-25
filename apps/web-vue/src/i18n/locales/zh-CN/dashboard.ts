@@ -83,6 +83,8 @@ export default {
       expiring: "到期或即将到期",
       risk: "风控拦截",
       update: "有可用更新",
+      publishPending: "配置待应用到核心",
+      publishUnreachable: "数据面不可达",
     },
     spark: {
       label: "{metric}，近 {range}",

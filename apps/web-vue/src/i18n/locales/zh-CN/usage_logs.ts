@@ -41,6 +41,11 @@ export default {
       duration: "平均耗时",
     },
     table: {
+      reasoning: "推理强度",
+      serviceTier: "服务等级",
+      requestIdColumn: "请求 ID",
+      images: "{n} 张图片",
+      videoSeconds: "视频 {n} 秒",
       endpoint: "端点",
       endpointTitle: "入站协议 {inbound} → 上游协议 {upstream}",
       time: "时间",

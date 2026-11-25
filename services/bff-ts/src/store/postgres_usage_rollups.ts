@@ -12,8 +12,10 @@ import type {
 import {
   ceilUtcDayDate,
   ceilUtcHourDate,
+  clampToSealed,
   floorUtcDayDate,
   floorUtcHourDate,
+  retentionCutoffDate,
   roundOneDecimal,
   type UsageRollupBackfillInput,
   type UsageRollupsStore,
@@ -92,6 +94,9 @@ export const PG_USAGE_ROLLUPS_SCHEMA_SQL = `
       rollup_enabled       BOOLEAN NOT NULL DEFAULT TRUE,
       updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+  -- Sealed horizon (migrations/core/0022_usage_rollup_sealed_before.sql): buckets before it are
+  -- never recomputed, because a retention cleanup has deleted (some of) their detail rows.
+  ALTER TABLE core.usage_rollup_state ADD COLUMN IF NOT EXISTS sealed_before TIMESTAMPTZ;
 
   INSERT INTO core.usage_rollup_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 `;
@@ -115,6 +120,7 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
     last_daily_at: Date | null;
     last_cleanup_at: Date | null;
     last_cleanup_deleted: number;
+    sealed_before: Date | null;
   }> {
     await this.sql`INSERT INTO core.usage_rollup_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
     const rows = await this.sql<
@@ -125,9 +131,11 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
         last_daily_at: Date | null;
         last_cleanup_at: Date | null;
         last_cleanup_deleted: number;
+        sealed_before: Date | null;
       }[]
     >`
-      SELECT rollup_enabled, usage_retention_days, last_hourly_at, last_daily_at, last_cleanup_at, last_cleanup_deleted
+      SELECT rollup_enabled, usage_retention_days, last_hourly_at, last_daily_at, last_cleanup_at, last_cleanup_deleted,
+             sealed_before
       FROM core.usage_rollup_state
       WHERE id = 1
     `;
@@ -139,6 +147,7 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
         last_daily_at: null,
         last_cleanup_at: null,
         last_cleanup_deleted: 0,
+        sealed_before: null,
       }
     );
   }
@@ -161,6 +170,7 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
       lastDailyAtIso: toIsoOrNull(state.last_daily_at),
       lastCleanupAtIso: toIsoOrNull(state.last_cleanup_at),
       lastCleanupDeleted: state.last_cleanup_deleted,
+      sealedBeforeIso: toIsoOrNull(state.sealed_before),
       hourlyRows: Number.parseInt(c?.hourly_rows ?? "0", 10),
       dailyRows: Number.parseInt(c?.daily_rows ?? "0", 10),
       oldestLogIso: toIsoOrNull(c?.oldest_log),
@@ -180,7 +190,8 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
   }
 
   async backfill(req: UsageRollupBackfillInput): Promise<UsageRollupBackfillResponse> {
-    await this.ensureState();
+    const state = await this.ensureState();
+    const sealedMs = state.sealed_before ? new Date(state.sealed_before).getTime() : null;
     const untilDate = req.untilIso ? new Date(req.untilIso) : new Date();
     const days = Math.max(1, Math.min(365, req.days ?? 30));
     const sinceDate = req.sinceIso ? new Date(req.sinceIso) : new Date(untilDate.getTime() - days * 86_400_000);
@@ -189,9 +200,9 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
 
     if (req.granularity === "hourly" || req.granularity === "both") {
       // Align to UTC hour boundaries so partial-hour queries never overwrite a bucket with incomplete counts.
-      const aggSince = floorUtcHourDate(sinceDate);
+      const aggSince = new Date(clampToSealed(floorUtcHourDate(sinceDate).getTime(), sealedMs));
       const aggUntil = ceilUtcHourDate(untilDate);
-      const rows = await this.sql<{ bucket_start: Date }[]>`
+      const rows = aggSince >= aggUntil ? [] : await this.sql<{ bucket_start: Date }[]>`
         INSERT INTO core.usage_rollups_hourly (
           bucket_start, user_id, group_id, platform, public_model, account_id,
           requests, errors, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
@@ -242,9 +253,9 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
 
     if (req.granularity === "daily" || req.granularity === "both") {
       // Align to UTC day boundaries for the same reason.
-      const aggSince = floorUtcDayDate(sinceDate);
+      const aggSince = new Date(clampToSealed(floorUtcDayDate(sinceDate).getTime(), sealedMs));
       const aggUntil = ceilUtcDayDate(untilDate);
-      const rows = await this.sql<{ bucket_date: string }[]>`
+      const rows = aggSince >= aggUntil ? [] : await this.sql<{ bucket_date: string }[]>`
         INSERT INTO core.usage_rollups_daily (
           bucket_date, user_id, group_id, platform, public_model, account_id,
           requests, errors, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
@@ -313,7 +324,8 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
       };
     }
 
-    const cutoffDate = new Date(Date.now() - retentionDays * 86_400_000);
+    // Whole UTC days only (retentionCutoffDate): no bucket is ever left half-deleted.
+    const cutoffDate = retentionCutoffDate(Date.now(), retentionDays);
     const cutoffIso = cutoffDate.toISOString();
 
     if (req.dryRun) {
@@ -345,6 +357,15 @@ export class PostgresUsageRollupsStore implements UsageRollupsStore {
       });
       rolledUpBeforeDelete = true;
     }
+
+    // Seal before deleting: when the time budget below runs out mid-day, the rest of that day is
+    // deleted by the next run, and no backfill in between may recompute it from fewer rows.
+    await this.sql`
+      UPDATE core.usage_rollup_state
+      SET sealed_before = GREATEST(COALESCE(sealed_before, ${cutoffDate}), ${cutoffDate}),
+          updated_at = NOW()
+      WHERE id = 1
+    `;
 
     const startedMs = Date.now();
     let deleted = 0;

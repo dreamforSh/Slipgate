@@ -193,6 +193,7 @@ export default {
           lastRun: "最近聚合时间",
           retention: "原始日志保留天数",
           oldestLog: "最早原始日志",
+          sealedBefore: "汇总已封存至 {date}（之前的明细已清理，不再重算）",
           deletedLast: "上次清理：{n} 条",
         },
         never: "从未运行",

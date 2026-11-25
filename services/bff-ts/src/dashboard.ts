@@ -1,3 +1,10 @@
+import {
+  dashboardTopUserIds,
+  rankSums,
+  reduceDashboardUsage,
+  sumsToTotals,
+  type DashboardUsageAggregate,
+} from "./store/usage_aggregates.ts";
 import type {
   AccountStatsRange,
   AccountUsageStats,
@@ -16,7 +23,7 @@ const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
-/** Rows read per dashboard request; beyond this the period totals become a lower bound. */
+/** Rows read per account-stats request; beyond this its totals become a lower bound. */
 export const DASHBOARD_MAX_ROWS = 100_000;
 const BREAKDOWN_LIMIT = 10;
 /** Users charted over time on the dashboard (more lines stop being readable). */
@@ -145,119 +152,76 @@ export interface DashboardInputs {
   granularity?: DashboardGranularity;
   nowMs: number;
   tzOffsetMinutes: number;
-  /** Usage rows created at or after `dashboardWindow(...).sinceMs`, any order. */
-  logs: UsageLogItem[];
-  truncated: boolean;
+  /**
+   * The window's usage aggregated by the store (OpsStore.dashboardUsage, SQL in Postgres), or raw
+   * rows created at or after `dashboardWindow(...).sinceMs` to reduce here (tests).
+   */
+  usage?: DashboardUsageAggregate;
+  logs?: UsageLogItem[];
+  /** Always false with `usage` (exact); kept for older consoles. */
+  truncated?: boolean;
   users: UserProfile[];
   groups: GroupItem[];
   accounts: UpstreamAccount[];
-  apiKeys: { enabled: boolean }[];
+  /** API key counts (OpsStore.countApiKeys), or the keys themselves. */
+  apiKeys: { total: number; enabled: number } | { enabled: boolean }[];
 }
 
 export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats {
   const win = dashboardWindow(input.range, input.nowMs, input.tzOffsetMinutes, input.granularity);
-  const bucketSize = win.granularity === "hour" ? HOUR_MS : DAY_MS;
-
-  const today = new TotalsAccumulator();
-  const yesterday = new TotalsAccumulator();
-  const period = new TotalsAccumulator();
-  const buckets = win.bucketStarts.map(() => ({
-    requests: 0,
-    errors: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    cost: 0n,
-  }));
-  const models = new Map<string, Breakdown>();
-  const users = new Map<string, Breakdown>();
-  /** Per-user bucket arrays, trimmed to the top users at the end. */
-  const userBuckets = new Map<string, { tokens: number[]; cost: bigint[] }>();
-  const groups = new Map<string, Breakdown>();
-  const activeToday = new Set<string>();
-  let rpm = 0;
-  let tpm = 0;
-
-  for (const log of input.logs) {
-    const at = Date.parse(log.createdAtIso);
-    if (!Number.isFinite(at) || at > input.nowMs) continue;
-
-    if (at >= win.todayStartMs) {
-      today.add(log);
-      activeToday.add(log.userId);
-    } else if (at >= win.yesterdayStartMs) {
-      yesterday.add(log);
-    }
-    if (at > input.nowMs - MINUTE_MS) {
-      rpm += 1;
-      tpm += log.inputTokens + log.outputTokens;
-    }
-    if (at < win.periodStartMs) continue;
-
-    period.add(log);
-    const idx = Math.floor((at - win.periodStartMs) / bucketSize);
-    const bucket = buckets[idx];
-    if (bucket) {
-      bucket.requests += 1;
-      if (log.statusCode >= 400) bucket.errors += 1;
-      bucket.inputTokens += log.inputTokens;
-      bucket.outputTokens += log.outputTokens;
-      bucket.cacheReadTokens += log.cacheReadTokens;
-      bucket.cost += BigInt(log.costNanoUsd);
-      let ub = userBuckets.get(log.userId);
-      if (!ub) {
-        ub = { tokens: buckets.map(() => 0), cost: buckets.map(() => 0n) };
-        userBuckets.set(log.userId, ub);
-      }
-      ub.tokens[idx]! += log.inputTokens + log.outputTokens;
-      ub.cost[idx]! += BigInt(log.costNanoUsd);
-    }
-    bump(models, log.publicModel, log);
-    bump(users, log.userId, log);
-    bump(groups, log.groupId, log);
-  }
+  const usage = input.usage ?? reduceDashboardUsage(win, input.nowMs, input.logs ?? []);
+  const count = win.bucketStarts.length;
 
   const emailById = new Map(input.users.map((u) => [u.id, u.email]));
   const groupNameById = new Map(input.groups.map((g) => [g.id, g.name]));
 
-  const series: UsageSeriesPoint[] = buckets.map((b, i) => ({
-    startIso: new Date(win.bucketStarts[i]!).toISOString(),
-    requests: b.requests,
-    errors: b.errors,
-    inputTokens: b.inputTokens,
-    outputTokens: b.outputTokens,
-    cacheReadTokens: b.cacheReadTokens,
-    costNanoUsd: b.cost.toString(),
-  }));
+  const series: UsageSeriesPoint[] = win.bucketStarts.map((startMs, i) => {
+    const b = usage.buckets.get(i);
+    return {
+      startIso: new Date(startMs).toISOString(),
+      requests: b?.requests ?? 0,
+      errors: b?.errors ?? 0,
+      inputTokens: b?.inputTokens ?? 0,
+      outputTokens: b?.outputTokens ?? 0,
+      cacheReadTokens: b?.cacheReadTokens ?? 0,
+      costNanoUsd: (b?.costNano ?? 0n).toString(),
+    };
+  });
 
-  const topUsers = ranked(users).map(({ key, ...rest }) => ({ userId: key, email: emailById.get(key) ?? key, ...rest }));
-  const userSeries = topUsers.slice(0, USER_SERIES_LIMIT).flatMap((u) => {
-    const ub = userBuckets.get(u.userId);
-    return ub ? [{ userId: u.userId, email: u.email, tokens: ub.tokens, costNanoUsd: ub.cost.map((c) => c.toString()) }] : [];
+  const topUsers = rankSums(usage.users, BREAKDOWN_LIMIT).map(({ key, ...rest }) => ({ userId: key, email: emailById.get(key) ?? key, ...rest }));
+  const userSeries = dashboardTopUserIds(usage.users).slice(0, USER_SERIES_LIMIT).flatMap((userId) => {
+    const perUser = usage.userBuckets.get(userId);
+    if (!perUser) return [];
+    const tokens = Array.from({ length: count }, (_, i) => {
+      const s = perUser.get(i);
+      return s ? s.inputTokens + s.outputTokens : 0;
+    });
+    const costNanoUsd = Array.from({ length: count }, (_, i) => (perUser.get(i)?.costNano ?? 0n).toString());
+    return [{ userId, email: emailById.get(userId) ?? userId, tokens, costNanoUsd }];
   });
 
   // Effective status: a lapsed subscription counts as expired, a finished cooldown as active.
   const countStatus = (status: UpstreamAccount["status"]) =>
     input.accounts.filter((a) => a.effectiveStatus === status).length;
+  const apiKeys = Array.isArray(input.apiKeys)
+    ? { total: input.apiKeys.length, enabled: input.apiKeys.filter((k) => k.enabled).length }
+    : input.apiKeys;
 
   return {
     generatedAtIso: new Date(input.nowMs).toISOString(),
     range: input.range,
     granularity: win.granularity,
-    truncated: input.truncated,
-    today: today.toJSON(),
-    yesterday: yesterday.toJSON(),
-    period: period.toJSON(),
-    throughput: { rpm, tpm },
+    truncated: input.truncated ?? false,
+    today: sumsToTotals(usage.today),
+    yesterday: sumsToTotals(usage.yesterday),
+    period: sumsToTotals(usage.period),
+    throughput: { rpm: usage.lastMinuteRequests, tpm: usage.lastMinuteTokens },
     users: {
       total: input.users.length,
       newToday: input.users.filter((u) => Date.parse(u.createdAtIso) >= win.todayStartMs).length,
-      activeToday: activeToday.size,
+      activeToday: usage.activeToday,
     },
-    apiKeys: {
-      total: input.apiKeys.length,
-      enabled: input.apiKeys.filter((k) => k.enabled).length,
-    },
+    apiKeys,
     accounts: {
       total: input.accounts.length,
       active: countStatus("active"),
@@ -273,10 +237,10 @@ export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats
       }).length,
     },
     series,
-    models: ranked(models).map(({ key, ...rest }) => ({ model: key, ...rest })),
+    models: rankSums(usage.models, BREAKDOWN_LIMIT).map(({ key, ...rest }) => ({ model: key, ...rest })),
     topUsers,
     userSeries,
-    groups: ranked(groups).map(({ key, ...rest }) => ({ groupId: key, name: groupNameById.get(key) ?? key, ...rest })),
+    groups: rankSums(usage.groups, BREAKDOWN_LIMIT).map(({ key, ...rest }) => ({ groupId: key, name: groupNameById.get(key) ?? key, ...rest })),
   };
 }
 

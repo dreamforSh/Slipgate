@@ -17,6 +17,24 @@ const props = withDefaults(
 const open = ref(false);
 const root = ref<HTMLElement | null>(null);
 const panel = ref<HTMLElement | null>(null);
+/**
+ * The side the panel actually opens to: `align`, flipped when that side would run off the
+ * viewport (a trigger that wrapped to the other edge of a narrow screen) and the other fits.
+ */
+const side = ref<"left" | "right">(props.align);
+const VIEWPORT_GAP = 8;
+
+function fitToViewport() {
+  const anchor = root.value?.getBoundingClientRect();
+  // offsetWidth ignores the enter transition's scale.
+  const width = panel.value?.offsetWidth;
+  if (!anchor || !width) return;
+  const viewport = document.documentElement.clientWidth;
+  const fitsLeft = anchor.left + width <= viewport - VIEWPORT_GAP;
+  const fitsRight = anchor.right - width >= VIEWPORT_GAP;
+  if (side.value === "right" && !fitsRight && fitsLeft) side.value = "left";
+  else if (side.value === "left" && !fitsLeft && fitsRight) side.value = "right";
+}
 
 function toggle() {
   open.value = !open.value;
@@ -56,9 +74,11 @@ function onKeydown(ev: KeyboardEvent) {
 
 watch(open, async (value) => {
   if (value) {
+    side.value = props.align;
     document.addEventListener("pointerdown", onPointerDown);
     document.addEventListener("keydown", onKeydown);
     await nextTick();
+    fitToViewport();
   } else {
     document.removeEventListener("pointerdown", onPointerDown);
     document.removeEventListener("keydown", onKeydown);
@@ -81,7 +101,7 @@ defineExpose({ close });
         v-if="open"
         ref="panel"
         class="menu-panel absolute top-full z-50 mt-2"
-        :class="[props.align === 'right' ? 'right-0 origin-top-right' : 'left-0 origin-top-left', props.widthClass]"
+        :class="[side === 'right' ? 'right-0 origin-top-right' : 'left-0 origin-top-left', props.widthClass]"
         role="menu"
       >
         <slot :close="close" />

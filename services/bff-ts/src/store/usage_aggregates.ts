@@ -714,3 +714,97 @@ export function finalizeUsageStats(
     ...endpointStats(agg.codecPairs),
   };
 }
+
+/* ------------------------------------------------------------------------------------------ */
+/* Admin dashboard: today / yesterday / period totals, buckets, breakdowns, top-user series    */
+/* ------------------------------------------------------------------------------------------ */
+
+/** Longest the Postgres dashboard read may run (one scan of the window plus the top-user buckets). */
+export const DASHBOARD_USAGE_TIMEOUT_MS = 15_000;
+/** Users whose per-bucket usage the dashboard charts. */
+export const DASHBOARD_TOP_USERS = 5;
+
+export interface DashboardUsageAggregate {
+  today: UsageSums;
+  yesterday: UsageSums;
+  period: UsageSums;
+  /** Distinct users with a request since the viewer's local midnight. */
+  activeToday: number;
+  lastMinuteRequests: number;
+  lastMinuteTokens: number;
+  /** Keyed by bucket index (0 .. win.bucketStarts.length - 1). */
+  buckets: Map<number, UsageSums>;
+  /** Period breakdowns. */
+  models: Map<string, UsageSums>;
+  users: Map<string, UsageSums>;
+  groups: Map<string, UsageSums>;
+  /** Per-bucket sums of the top DASHBOARD_TOP_USERS users (dashboardTopUserIds order). */
+  userBuckets: Map<string, Map<number, UsageSums>>;
+}
+
+export function emptyDashboardUsage(): DashboardUsageAggregate {
+  return {
+    today: emptySums(),
+    yesterday: emptySums(),
+    period: emptySums(),
+    activeToday: 0,
+    lastMinuteRequests: 0,
+    lastMinuteTokens: 0,
+    buckets: new Map(),
+    models: new Map(),
+    users: new Map(),
+    groups: new Map(),
+    userBuckets: new Map(),
+  };
+}
+
+/** The users the dashboard charts over time: rankSums order (tokens, requests, id). */
+export function dashboardTopUserIds(users: Map<string, UsageSums>): string[] {
+  return rankSums(users, DASHBOARD_TOP_USERS).map((u) => u.key);
+}
+
+/**
+ * Reference reducer (MemoryOpsStore, unit tests): `logs` are rows created at or after
+ * `win.sinceMs`, any order; rows after `nowMs` are ignored.
+ */
+export function reduceDashboardUsage(win: DashboardWindow, nowMs: number, logs: readonly UsageLogItem[]): DashboardUsageAggregate {
+  const agg = emptyDashboardUsage();
+  const bucketMs = win.granularity === "hour" ? HOUR_MS : DAY_MS;
+  const count = win.bucketStarts.length;
+  const activeToday = new Set<string>();
+  const inPeriod: { log: UsageLogItem; idx: number }[] = [];
+  for (const log of logs) {
+    const at = Date.parse(log.createdAtIso);
+    if (!Number.isFinite(at) || at > nowMs || at < win.sinceMs) continue;
+    if (at >= win.todayStartMs) {
+      addLogToSums(agg.today, log);
+      activeToday.add(log.userId);
+    } else if (at >= win.yesterdayStartMs) {
+      addLogToSums(agg.yesterday, log);
+    }
+    if (at > nowMs - MINUTE_MS) {
+      agg.lastMinuteRequests += 1;
+      agg.lastMinuteTokens += log.inputTokens + log.outputTokens;
+    }
+    if (at < win.periodStartMs) continue;
+    addLogToSums(agg.period, log);
+    const idx = Math.floor((at - win.periodStartMs) / bucketMs);
+    if (idx >= 0 && idx < count) bumpSums(agg.buckets, idx, log);
+    bumpSums(agg.models, log.publicModel, log);
+    bumpSums(agg.users, log.userId, log);
+    bumpSums(agg.groups, log.groupId, log);
+    inPeriod.push({ log, idx });
+  }
+  agg.activeToday = activeToday.size;
+  const top = new Set(dashboardTopUserIds(agg.users));
+  for (const { log, idx } of inPeriod) {
+    if (!top.has(log.userId) || idx < 0 || idx >= count) continue;
+    let perUser = agg.userBuckets.get(log.userId);
+    if (!perUser) {
+      perUser = new Map();
+      agg.userBuckets.set(log.userId, perUser);
+    }
+    bumpSums(perUser, idx, log);
+  }
+  return agg;
+}

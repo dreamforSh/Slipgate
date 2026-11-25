@@ -2,6 +2,37 @@
 export default {
   adminTools: {
     title: "管理工具",
+    notifications: {
+      title: "支付通知投递",
+      intro: "每笔已支付订单生成一条通知，随订单一起写入，再逐个插件投递；失败会自动退避重试，连续失败 8 次后停止，等待手动重放。重放只重发通知，不会重新入账或开通订阅。",
+      empty: "没有需要处理的通知",
+      attempts: "{n} 次",
+      replayOne: "重放",
+      replayAll: "全部重放",
+      replayHint: "向所有插件重发这条通知（不重复入账）",
+      replayed: "已重新投递",
+      replayFailed: "已重放，仍有插件投递失败",
+      filters: {
+        attention: "待处理",
+        dispatched: "已投递",
+        all: "全部",
+      },
+      status: {
+        pending: "重试中",
+        dispatched: "已投递",
+        dead_letter: "已停止重试",
+      },
+      columns: {
+        order: "订单",
+        status: "状态",
+        deliveries: "插件投递",
+        next: "下次重试",
+      },
+      errors: {
+        load: "加载支付通知失败",
+        replay: "重放失败",
+      },
+    },
     plugins: {
       intro: "插件在服务端代码中注册。可在此启停插件、填写配置并发送测试事件；密钥类配置加密存储，保存后不会回显。",
       count: "{n} 个插件 · {enabled} 个已启用",

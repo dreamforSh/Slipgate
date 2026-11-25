@@ -152,7 +152,31 @@ type SyncAckResult struct {
 	RevisionUnixMs int64           `json:"revisionUnixMs"`
 	VaultAccounts  int             `json:"vaultAccounts"`
 	CoreAck        json.RawMessage `json:"coreAck,omitempty"`
+	// CoreApplied: slipgate-core acknowledged this revision (or no core is configured). False with
+	// a nil error when the snapshot was stale or superseded before it reached the core.
+	CoreApplied bool `json:"coreApplied"`
+	// CoreRevisionUnixMs is the newest revision slipgate-core has acknowledged.
+	CoreRevisionUnixMs int64 `json:"coreRevisionUnixMs"`
+	// Stale: an older snapshot than the one already applied; it was ignored.
+	Stale bool `json:"stale,omitempty"`
 }
+
+// SyncStatus is the edge's view of a config publish: the revision applied here and the one
+// slipgate-core has acknowledged. CorePending while the core lags (offline, or rejected the sync).
+type SyncStatus struct {
+	RevisionUnixMs     int64      `json:"revisionUnixMs"`
+	CoreConfigured     bool       `json:"coreConfigured"`
+	CoreRevisionUnixMs int64      `json:"coreRevisionUnixMs"`
+	CorePending        bool       `json:"corePending"`
+	LastCoreError      string     `json:"lastCoreError,omitempty"`
+	LastCoreAttemptAt  *time.Time `json:"lastCoreAttemptAt,omitempty"`
+	LastCoreAckAt      *time.Time `json:"lastCoreAckAt,omitempty"`
+}
+
+// staleRevisionTolerance: a snapshot older than the applied one by at most this much is an
+// in-flight straggler and is ignored; a bigger step back can only be a control plane whose clock
+// was reset, so it is applied (and logged) rather than freezing config until the clock catches up.
+const staleRevisionTolerance = 10 * time.Minute
 
 // TurnSettlementEvent matches TurnSettlementEventSchema posted back to slipgate-bff.
 type TurnSettlementEvent struct {
@@ -296,6 +320,13 @@ type Coordinator struct {
 	accountMetas       map[string]accountMeta
 	lastCoreSyncJSON   []byte
 	lastRevisionUnixMs int64
+	// Config publish to slipgate-core (SyncStatus): coreSyncMu serialises sends so an older
+	// payload never lands after a newer one; the rest is guarded by mu.
+	coreSyncMu         sync.Mutex
+	coreRevisionUnixMs int64
+	coreSyncErr        string
+	coreSyncAttemptAt  time.Time
+	coreSyncAckAt      time.Time
 	userLimits         userLimitGate  // per-user / per-group caps (user_limits.go)
 	moderation         moderationGate // prompt moderation rules & external gate (moderation.go)
 	oauthRefresher     oauthRefreshDeduper
@@ -682,6 +713,15 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	}
 
 	c.mu.Lock()
+	if last := c.lastRevisionUnixMs; snap.RevisionUnixMs > 0 && last > 0 && snap.RevisionUnixMs < last {
+		if time.Duration(last-snap.RevisionUnixMs)*time.Millisecond <= staleRevisionTolerance {
+			coreRev := c.coreRevisionUnixMs
+			c.mu.Unlock()
+			return SyncAckResult{OK: true, Stale: true, RevisionUnixMs: last, CoreRevisionUnixMs: coreRev}, nil
+		}
+		c.logEvent("warn", "control plane snapshot revision went back; assuming its clock was reset",
+			"revision", strconv.FormatInt(snap.RevisionUnixMs, 10), "previous", strconv.FormatInt(last, 10))
+	}
 	c.keyByHash = nextKeyByHash
 	c.groupPlatforms = nextGroupPlatforms
 	c.keyIPAllowlists = nextIPAllowlists
@@ -703,25 +743,109 @@ func (c *Coordinator) SyncSnapshot(ctx context.Context, snap SyncSnapshot) (Sync
 	}
 
 	if strings.TrimSpace(c.coreIPC) == "" {
+		res.CoreApplied = true
+		res.CoreRevisionUnixMs = snap.RevisionUnixMs
+		return res, nil
+	}
+
+	c.coreSyncMu.Lock()
+	defer c.coreSyncMu.Unlock()
+	c.mu.RLock()
+	superseded := c.lastRevisionUnixMs != snap.RevisionUnixMs
+	c.mu.RUnlock()
+	if superseded {
+		// A newer snapshot was applied meanwhile; its own call delivers it to the core.
+		res.CoreRevisionUnixMs = c.coreRevision()
 		return res, nil
 	}
 
 	ipcCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	attemptAt := time.Now()
 	reply, err := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
 		StreamID: c.streamSeq.Add(1),
 		Type:     dpbridge.FrameSyncState,
 		Flags:    dpbridge.FlagEndStream,
 		Payload:  corePayload,
 	})
+	if err == nil {
+		if json.Valid(reply.Payload) {
+			res.CoreAck = json.RawMessage(reply.Payload)
+		}
+		err = coreAckError(reply.Payload)
+	}
+	res.CoreRevisionUnixMs = c.recordCoreSync(snap.RevisionUnixMs, attemptAt, err)
 	if err != nil {
 		return res, fmt.Errorf("dataplane: sync slipgate-core IPC failed: %w", err)
 	}
-	if json.Valid(reply.Payload) {
-		res.CoreAck = json.RawMessage(reply.Payload)
-	}
+	res.CoreApplied = true
 	return res, nil
+}
+
+// coreAckError reports a sync slipgate-core answered but did not apply (`{"ok":false}`).
+func coreAckError(payload []byte) error {
+	var ack struct {
+		OK    *bool  `json:"ok"`
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(payload, &ack) == nil && ack.OK != nil && !*ack.OK {
+		if ack.Error != "" {
+			return fmt.Errorf("slipgate-core rejected the snapshot: %s", ack.Error)
+		}
+		return errors.New("slipgate-core rejected the snapshot")
+	}
+	return nil
+}
+
+// recordCoreSync notes one sync attempt to slipgate-core and returns the newest acknowledged
+// revision.
+func (c *Coordinator) recordCoreSync(revision int64, attemptAt time.Time, err error) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.coreSyncAttemptAt = attemptAt
+	if err != nil {
+		c.coreSyncErr = err.Error()
+		return c.coreRevisionUnixMs
+	}
+	c.coreSyncErr = ""
+	c.coreSyncAckAt = time.Now()
+	// Sends are serialised and only the applied revision is sent, so this only moves forward
+	// (or follows a reset control plane clock together with lastRevisionUnixMs).
+	c.coreRevisionUnixMs = revision
+	return revision
+}
+
+func (c *Coordinator) coreRevision() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.coreRevisionUnixMs
+}
+
+// SyncStatus reports which config revision is applied here and which one slipgate-core has
+// acknowledged (see SyncStatus).
+func (c *Coordinator) SyncStatus() SyncStatus {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	st := SyncStatus{
+		RevisionUnixMs:     c.lastRevisionUnixMs,
+		CoreConfigured:     strings.TrimSpace(c.coreIPC) != "",
+		CoreRevisionUnixMs: c.coreRevisionUnixMs,
+		LastCoreError:      c.coreSyncErr,
+	}
+	if !st.CoreConfigured {
+		st.CoreRevisionUnixMs = st.RevisionUnixMs
+	}
+	st.CorePending = st.CoreConfigured && st.RevisionUnixMs > 0 && st.CoreRevisionUnixMs != st.RevisionUnixMs
+	if !c.coreSyncAttemptAt.IsZero() {
+		t := c.coreSyncAttemptAt.UTC()
+		st.LastCoreAttemptAt = &t
+	}
+	if !c.coreSyncAckAt.IsZero() {
+		t := c.coreSyncAckAt.UTC()
+		st.LastCoreAckAt = &t
+	}
+	return st
 }
 
 // ResyncCore immediately pushes the latest cached snapshot (or pulls a fresh one from BFF) into slipgate-core
@@ -734,21 +858,8 @@ func (c *Coordinator) ResyncCore(ctx context.Context) error {
 		if err := c.PullSnapshotFromBFF(ctx); err == nil {
 			return nil
 		}
-		c.mu.RLock()
-		cachedPayload := c.lastCoreSyncJSON
-		c.mu.RUnlock()
-		if len(cachedPayload) > 0 && strings.TrimSpace(c.coreIPC) != "" {
-			ipcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			_, ipcErr := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
-				StreamID: c.streamSeq.Add(1),
-				Type:     dpbridge.FrameSyncState,
-				Flags:    dpbridge.FlagEndStream,
-				Payload:  cachedPayload,
-			})
-			cancel()
-			if ipcErr == nil {
-				return nil
-			}
+		if c.resyncCoreFromCache(ctx) == nil {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -757,6 +868,36 @@ func (c *Coordinator) ResyncCore(ctx context.Context) error {
 		}
 	}
 	return errors.New("dataplane: failed to resync slipgate-core after restart")
+}
+
+// resyncCoreFromCache sends the payload of the applied revision to slipgate-core again.
+func (c *Coordinator) resyncCoreFromCache(ctx context.Context) error {
+	if strings.TrimSpace(c.coreIPC) == "" {
+		return errors.New("dataplane: no slipgate-core configured")
+	}
+	c.coreSyncMu.Lock()
+	defer c.coreSyncMu.Unlock()
+	c.mu.RLock()
+	cachedPayload := c.lastCoreSyncJSON
+	revision := c.lastRevisionUnixMs
+	c.mu.RUnlock()
+	if len(cachedPayload) == 0 {
+		return errors.New("dataplane: no cached snapshot")
+	}
+	ipcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	attemptAt := time.Now()
+	reply, err := dpbridge.ExchangeAuth(ipcCtx, c.coreIPC, c.internalToken, dpbridge.Frame{
+		StreamID: c.streamSeq.Add(1),
+		Type:     dpbridge.FrameSyncState,
+		Flags:    dpbridge.FlagEndStream,
+		Payload:  cachedPayload,
+	})
+	if err == nil {
+		err = coreAckError(reply.Payload)
+	}
+	c.recordCoreSync(revision, attemptAt, err)
+	return err
 }
 
 // SnapshotApplied reports whether a ControlPlane snapshot (API keys, routes, accounts) has been

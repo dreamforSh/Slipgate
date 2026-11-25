@@ -74,6 +74,25 @@ export function floorUtcDayDate(date: Date): Date {
   return d;
 }
 
+const DAY_MS = 86_400_000;
+
+/**
+ * Retention cutoff of a cleanup: the UTC day boundary at or before `nowMs - retentionDays`, so a
+ * cleanup only ever deletes whole UTC days and no hourly or daily bucket is left half-deleted.
+ */
+export function retentionCutoffDate(nowMs: number, retentionDays: number): Date {
+  return floorUtcDayDate(new Date(nowMs - retentionDays * DAY_MS));
+}
+
+/**
+ * Start of a backfill's aggregation range, never before the sealed horizon: buckets before it were
+ * summarised from complete detail rows that a cleanup has since deleted (wholly or, when its time
+ * budget ran out, partly), so recomputing them from what is left would shrink history.
+ */
+export function clampToSealed(aggSinceMs: number, sealedBeforeMs: number | null): number {
+  return sealedBeforeMs !== null && sealedBeforeMs > aggSinceMs ? sealedBeforeMs : aggSinceMs;
+}
+
 export function ceilUtcDayDate(date: Date): Date {
   const floor = floorUtcDayDate(date);
   return floor.getTime() < date.getTime() ? new Date(floor.getTime() + 86_400_000) : floor;

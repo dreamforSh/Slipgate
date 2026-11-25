@@ -220,3 +220,35 @@ export const RestartUpdateRequestSchema = z.object({
   confirm: AdminStepUpSchema.optional(),
 });
 export type RestartUpdateRequest = z.infer<typeof RestartUpdateRequestSchema>;
+
+/* ------------------------------------------------------------------------------------------ */
+/* Config publish confirmation (GET /api/v1/admin/system/dataplane-sync)                      */
+/* ------------------------------------------------------------------------------------------ */
+
+/** How the BFF's last push to the edge went; only "applied" means slipgate-core has it. */
+export const DataPlanePushOutcomeSchema = z.enum(["applied", "pending_core", "stale", "failed"]);
+export type DataPlanePushOutcome = z.infer<typeof DataPlanePushOutcomeSchema>;
+
+/**
+ * Where the newest config stands: applied (slipgate-core acknowledged it), pending_edge (the edge
+ * has an older revision), pending_core (the edge has it, the core does not yet: offline or
+ * rejected), unreachable (the edge did not answer), standalone (no edge configured).
+ */
+export const DataPlaneSyncStateSchema = z.enum(["applied", "pending_edge", "pending_core", "unreachable", "standalone"]);
+export type DataPlaneSyncState = z.infer<typeof DataPlaneSyncStateSchema>;
+
+export const DataPlaneSyncStatusSchema = z.object({
+  state: DataPlaneSyncStateSchema,
+  checkedAtIso: z.string(),
+  /** Newest snapshot revision the BFF exported (null until one was exported since start). */
+  desiredRevisionUnixMs: z.number().int().nullable(),
+  /** Revision applied on the edge, and the one slipgate-core acknowledged. */
+  edgeRevisionUnixMs: z.number().int().nullable(),
+  coreRevisionUnixMs: z.number().int().nullable(),
+  coreConfigured: z.boolean().nullable(),
+  lastPushAtIso: z.string().nullable(),
+  lastPushOutcome: DataPlanePushOutcomeSchema.nullable(),
+  /** Why it is not applied (core error, or why the edge could not be asked). */
+  error: z.string().nullable(),
+});
+export type DataPlaneSyncStatus = z.infer<typeof DataPlaneSyncStatusSchema>;

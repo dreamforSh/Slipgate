@@ -12,8 +12,10 @@ import type {
 import {
   ceilUtcDayDate,
   ceilUtcHourDate,
+  clampToSealed,
   floorUtcDayDate,
   floorUtcHourDate,
+  retentionCutoffDate,
   roundOneDecimal,
   type MutableRollupBucket,
   type UsageRollupBackfillInput,
@@ -101,6 +103,8 @@ export class MemoryUsageRollupsStore implements UsageRollupsStore {
   private lastDailyAtIso: string | null = null;
   private lastCleanupAtIso: string | null = null;
   private lastCleanupDeleted = 0;
+  /** Sealed horizon (see clampToSealed); only ever moves forward. */
+  private sealedBeforeMs: number | null = null;
 
   constructor(deps: MemoryUsageRollupsDeps) {
     this.usageLogs = deps.usageLogs;
@@ -124,6 +128,7 @@ export class MemoryUsageRollupsStore implements UsageRollupsStore {
       hourlyRows: this.hourly.size,
       dailyRows: this.daily.size,
       oldestLogIso: oldestMs !== null ? new Date(oldestMs).toISOString() : null,
+      sealedBeforeIso: this.sealedBeforeMs !== null ? new Date(this.sealedBeforeMs).toISOString() : null,
     };
   }
 
@@ -141,22 +146,26 @@ export class MemoryUsageRollupsStore implements UsageRollupsStore {
     let dailyUpserted = 0;
 
     if (req.granularity === "hourly" || req.granularity === "both") {
-      const aggSinceMs = floorUtcHourDate(sinceDate).getTime();
+      const aggSinceMs = clampToSealed(floorUtcHourDate(sinceDate).getTime(), this.sealedBeforeMs);
       const aggUntilMs = ceilUtcHourDate(untilDate).getTime();
-      hourlyUpserted = reduceLogsIntoMap(this.usageLogs, aggSinceMs, aggUntilMs, utcHourIso, this.hourly);
+      if (aggSinceMs < aggUntilMs) {
+        hourlyUpserted = reduceLogsIntoMap(this.usageLogs, aggSinceMs, aggUntilMs, utcHourIso, this.hourly);
+      }
       this.lastHourlyAtIso = new Date().toISOString();
     }
 
     if (req.granularity === "daily" || req.granularity === "both") {
-      const aggSinceMs = floorUtcDayDate(sinceDate).getTime();
+      const aggSinceMs = clampToSealed(floorUtcDayDate(sinceDate).getTime(), this.sealedBeforeMs);
       const aggUntilMs = ceilUtcDayDate(untilDate).getTime();
-      dailyUpserted = reduceLogsIntoMap(
-        this.usageLogs,
-        aggSinceMs,
-        aggUntilMs,
-        (ms) => `${utcDayDateStr(ms)}T00:00:00.000Z`,
-        this.daily,
-      );
+      if (aggSinceMs < aggUntilMs) {
+        dailyUpserted = reduceLogsIntoMap(
+          this.usageLogs,
+          aggSinceMs,
+          aggUntilMs,
+          (ms) => `${utcDayDateStr(ms)}T00:00:00.000Z`,
+          this.daily,
+        );
+      }
       this.lastDailyAtIso = new Date().toISOString();
     }
 
@@ -179,7 +188,8 @@ export class MemoryUsageRollupsStore implements UsageRollupsStore {
       };
     }
 
-    const cutoffMs = Date.now() - retentionDays * 86_400_000;
+    // Whole UTC days only (retentionCutoffDate): no bucket is ever left half-deleted.
+    const cutoffMs = retentionCutoffDate(Date.now(), retentionDays).getTime();
     const cutoffIso = new Date(cutoffMs).toISOString();
 
     let matched = 0;
@@ -211,6 +221,8 @@ export class MemoryUsageRollupsStore implements UsageRollupsStore {
       rolledUpBeforeDelete = true;
     }
 
+    // Seal before deleting: no later backfill may recompute these buckets from fewer rows.
+    this.sealedBeforeMs = Math.max(this.sealedBeforeMs ?? cutoffMs, cutoffMs);
     let writeIdx = 0;
     let deleted = 0;
     for (let i = 0; i < this.usageLogs.length; i += 1) {

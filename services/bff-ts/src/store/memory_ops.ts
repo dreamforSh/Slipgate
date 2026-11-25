@@ -81,11 +81,13 @@ import { StoreError, type StoredUserRecord } from "./types.ts";
 import { laterIso, viewerDayStartMs } from "./user_limits_types.ts";
 import {
   reduceChannelStatus,
+  reduceDashboardUsage,
   reduceOpsUsage,
   reduceScopedUsage,
   reduceUsageStats,
   type ChannelStatusAggregate,
   type ChannelStatusQuery,
+  type DashboardUsageAggregate,
   type OpsUsageAggregate,
   type OpsUsageQuery,
   type ScopedUsageAggregate,
@@ -1724,7 +1726,7 @@ export class MemoryOpsStore implements OpsStore {
   }
 
   async queryUsage(query: UsageQuery, scope?: { managedGroupIds?: string[] }): Promise<UsagePageResponse> {
-    const matched = this.core.usageLogs.filter((l) => this.matchUsage(l, query, scope));
+    const matched = sortUsageLogs(this.core.usageLogs.filter((l) => this.matchUsage(l, query, scope)), query);
     const { offset, limit } = clampPage(query.page, query.pageSize);
     if (query.summary === false) {
       // Same contract as Postgres: no summary, and the total is only what this page proves.
@@ -1777,8 +1779,7 @@ export class MemoryOpsStore implements OpsStore {
   }
 
   async exportUsage(query: UsageExportQuery): Promise<UsageRow[]> {
-    return this.core.usageLogs
-      .filter((l) => this.matchUsage(l, query))
+    return sortUsageLogs(this.core.usageLogs.filter((l) => this.matchUsage(l, query)), query)
       .slice(0, query.limit)
       .map((l) => this.toRow(l));
   }
@@ -1792,6 +1793,20 @@ export class MemoryOpsStore implements OpsStore {
 
   async channelStatusUsage(query: ChannelStatusQuery): Promise<ChannelStatusAggregate> {
     return reduceChannelStatus(query, this.core.usageLogs);
+  }
+
+  async dashboardUsage(win: import("../dashboard.ts").DashboardWindow, nowMs: number): Promise<DashboardUsageAggregate> {
+    return reduceDashboardUsage(win, nowMs, this.core.usageLogs);
+  }
+
+  async countApiKeys(): Promise<{ total: number; enabled: number }> {
+    let total = 0;
+    let enabled = 0;
+    for (const k of this.core.apiKeys.values()) {
+      total += 1;
+      if (k.enabled) enabled += 1;
+    }
+    return { total, enabled };
   }
 
   async opsUsage(query: OpsUsageQuery): Promise<OpsUsageAggregate> {
@@ -1827,4 +1842,39 @@ export class MemoryOpsStore implements OpsStore {
       .filter((k) => k.userId === userId)
       .map((k) => ({ id: k.id, name: k.name, enabled: k.enabled }));
   }
+}
+
+/**
+ * Usage rows in the requested order (UsageQuery.sortBy / sortDir, default newest first); ties
+ * fall back to newest first, like PostgresOpsStore. `logs` are newest first (the store prepends),
+ * and that position breaks ties: two rows of the same millisecond keep their insertion order.
+ */
+function sortUsageLogs(logs: UsageLogItem[], q: Pick<UsageQuery, "sortBy" | "sortDir">): UsageLogItem[] {
+  const dir = q.sortDir === "asc" ? 1 : -1;
+  const by = q.sortBy ?? "time";
+  const key = (l: UsageLogItem): number | string => {
+    switch (by) {
+      case "model":
+        return l.publicModel;
+      case "cost":
+        return Number(BigInt(l.costNanoUsd));
+      case "tokens":
+        return l.inputTokens + l.outputTokens;
+      case "latency":
+        return l.durationMs;
+      default:
+        return Date.parse(l.createdAtIso);
+    }
+  };
+  // Newest-first position; an ascending time sort walks it backwards.
+  const tieDir = by === "time" && dir === 1 ? -1 : 1;
+  return logs
+    .map((log, pos) => ({ log, pos, k: key(log), at: Date.parse(log.createdAtIso) }))
+    .sort((a, b) => {
+      const primary = a.k < b.k ? -dir : a.k > b.k ? dir : 0;
+      if (primary) return primary;
+      if (by !== "time" && a.at !== b.at) return b.at - a.at;
+      return (a.pos - b.pos) * tieDir;
+    })
+    .map((x) => x.log);
 }

@@ -369,11 +369,13 @@ export class PaymentService {
     if (result.order.deliveryError) {
       console.warn(`[slipgate-bff] order ${orderId} is paid but could not be delivered: ${result.order.deliveryError}`);
     }
-    if (result.fulfilled) {
+    // First payment: deliver the notification fulfillOrder wrote. A repeated provider callback
+    // for a paid order also gives notifications that failed earlier their due retry.
+    if (result.fulfilled || (PAID_ORDER_STATUSES as readonly string[]).includes(result.order.status)) {
       try {
         await this.deps.onOrderPaid?.(result.order);
       } catch (err) {
-        console.warn(`[slipgate-bff] payment plugin hook failed: ${errMessage(err)}`);
+        console.warn(`[slipgate-bff] payment notification dispatch failed: ${errMessage(err)}`);
       }
     }
     return result;

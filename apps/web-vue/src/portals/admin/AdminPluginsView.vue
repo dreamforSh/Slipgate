@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { STAGGER_CLASS, stagger } from "../../components/admin/ops/opsUtil";
+import PaymentNotificationsCard from "../../components/admin/tools/PaymentNotificationsCard.vue";
 import PluginCard from "../../components/admin/tools/PluginCard.vue";
 import PluginEmptyState from "../../components/admin/tools/PluginEmptyState.vue";
 import type { PluginItem, PluginListResponse } from "../../components/admin/tools/toolsTypes";
@@ -98,5 +99,7 @@ onMounted(() => void load());
         @updated="onUpdated"
       />
     </div>
+
+    <PaymentNotificationsCard />
   </div>
 </template>

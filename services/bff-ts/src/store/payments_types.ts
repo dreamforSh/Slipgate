@@ -1,16 +1,17 @@
-import type {
-  AffiliateAccountItem,
-  AffiliateRebateItem,
-  AffiliateWithdrawalItem,
-  AffiliateWithdrawalStatus,
-  OrderListQuery,
-  PaymentCheckout,
-  PaymentCurrency,
-  PaymentDashboard,
-  PaymentOrderItem,
-  PaymentPlan,
-  PaymentPlanKind,
-  PaymentProvider,
+import {
+  MAX_FIAT_MINOR,
+  type AffiliateAccountItem,
+  type AffiliateRebateItem,
+  type AffiliateWithdrawalItem,
+  type AffiliateWithdrawalStatus,
+  type OrderListQuery,
+  type PaymentCheckout,
+  type PaymentCurrency,
+  type PaymentDashboard,
+  type PaymentOrderItem,
+  type PaymentPlan,
+  type PaymentPlanKind,
+  type PaymentProvider,
 } from "@slipgate/contracts";
 import type { PaymentInstanceStore } from "./payment_providers_types.ts";
 
@@ -101,6 +102,27 @@ export interface FulfillResult {
  * grant plus the referrer's rebate, all in one transaction), the admin dashboard and the
  * provider configuration blob (secrets arrive already encrypted by the BFF).
  */
+/** Per-plugin state of a payment notification (kept in the outbox event's payload). */
+export interface PaymentEventDelivery {
+  status: "pending" | "delivered" | "failed";
+  attempts: number;
+  lastError: string | null;
+  nextAttemptAtIso: string | null;
+  deliveredAtIso: string | null;
+}
+
+/** A `payment.settled` outbox event (commerce.outbox_events, id `pay_settled:<orderId>`). */
+export interface PaymentEventRecord {
+  id: string;
+  orderId: string;
+  status: "pending" | "dispatched" | "dead_letter";
+  attempts: number;
+  nextRetryAtIso: string;
+  createdAtIso: string;
+  dispatchedAtIso: string | null;
+  deliveries: Record<string, PaymentEventDelivery>;
+}
+
 export interface PaymentsStore {
   /** Provider instances (merchant accounts) the load balancer picks from. */
   readonly instances: PaymentInstanceStore;
@@ -132,6 +154,14 @@ export interface PaymentsStore {
    * call retries the delivery.
    */
   fulfillOrder(id: string, providerTradeNo: string | null, rebate: RebatePolicy): Promise<FulfillResult>;
+  /*
+   * Payment notifications. fulfillOrder writes the order's `payment.settled` event in the same
+   * transaction that marks it paid (once per order); the dispatcher (payments/notifications.ts)
+   * delivers it to each subscribed plugin and saves the per-plugin state back.
+   */
+  /** Newest first; `dueBeforeIso` limits to pending events due by then (oldest due first). */
+  listPaymentEvents(query: { status?: PaymentEventRecord["status"]; orderId?: string; dueBeforeIso?: string; limit: number }): Promise<PaymentEventRecord[]>;
+  savePaymentEvent(event: PaymentEventRecord): Promise<void>;
   /** Pending orders only; `userId` restricts to the owner. */
   cancelOrder(id: string, userId?: string): Promise<PaymentOrderItem>;
   /**
@@ -221,4 +251,24 @@ export interface PaymentsStore {
     reviewerId: string,
     reviewNote: string,
   ): Promise<AffiliateWithdrawalItem>;
+}
+
+/** The outbox id of an order's payment notification: one per order, so writing it is idempotent. */
+export function paymentEventId(orderId: string): string {
+  return `pay_settled:${orderId}`;
+}
+
+/**
+ * Fiat limits saved before MAX_FIAT_MINOR existed can exceed it. Both stores clamp them when the
+ * config blob is saved: commerce.payment_settings keeps them in INTEGER columns, which would refuse
+ * the write. The legacy backfill (PG_PAYMENT_SETTINGS_SCHEMA_SQL) and PaymentService.loadConfig
+ * clamp the same way.
+ */
+export function clampConfigLimits(blob: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...blob };
+  for (const key of ["minAmountMinor", "maxAmountMinor"]) {
+    const v = out[key];
+    if (typeof v === "number" && v > MAX_FIAT_MINOR) out[key] = MAX_FIAT_MINOR;
+  }
+  return out;
 }

@@ -69,12 +69,20 @@ import {
   type ClashExitNode,
   type ClusterNode,
   type CompositeRouteRule,
+  PaymentNotificationQuerySchema,
+  ReplayPaymentNotificationRequestSchema,
   type DataPlaneSyncSnapshot,
+  type GroupItem,
+  type UpstreamAccount,
+  type UserProfile,
   type Provider,
   type SlotSeedSnapshot,
   type TlsProfile,
   type VmSlotSummary,
 } from "@slipgate/contracts";
+import { UsageAggregateTimeoutError, type DashboardUsageAggregate } from "./store/usage_aggregates.ts";
+import { PaymentNotifier } from "./payments/notifications.ts";
+import { DataPlanePublishTracker, pushOutcome, type EdgePushBody, type EdgeSyncStatus } from "./dataplane_sync.ts";
 import { PluginRegistry } from "@slipgate/plugin-sdk";
 import { buildAccountUsageStats, buildDashboardStats, dashboardWindow, DASHBOARD_MAX_ROWS } from "./dashboard.ts";
 import { applyEntitlements, cached, detectBuiltinProvider, WindowLimiter } from "./insights.ts";
@@ -739,11 +747,18 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
    * export is only shared within its generation: a caller never gets one that began before its write.
    */
   let snapshotGen = 0;
+  /** Config publish confirmation (dataplane_sync.ts): newest exported revision and last push. */
+  const publishTracker = new DataPlanePublishTracker();
   let snapshotInflight: { gen: number; promise: Promise<DataPlaneSyncSnapshot> } | null = null;
   function sharedSnapshot(): Promise<DataPlaneSyncSnapshot> {
     const gen = snapshotGen;
     if (snapshotInflight?.gen === gen) return snapshotInflight.promise;
-    const promise = exportEffectiveSnapshot().finally(() => {
+    const promise = exportEffectiveSnapshot()
+      .then((snapshot) => {
+        publishTracker.noteExported(snapshot.revisionUnixMs);
+        return snapshot;
+      })
+      .finally(() => {
       if (snapshotInflight?.promise === promise) snapshotInflight = null;
     });
     snapshotInflight = { gen, promise };
@@ -807,16 +822,27 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     if (!internalUrl || !internalToken) return;
     const pushedAtMs = Date.now();
     const snapshot = await sharedSnapshot();
-    const pushRes = await fetch(`${internalUrl}/internal/net/dataplane/sync`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Slipgate-Internal-Token": internalToken,
-      },
-      body: JSON.stringify(snapshot),
-      signal: AbortSignal.timeout(2500),
-    });
-    if (pushRes.ok) {
+    let pushRes: Response;
+    try {
+      pushRes = await fetch(`${internalUrl}/internal/net/dataplane/sync`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Slipgate-Internal-Token": internalToken,
+        },
+        body: JSON.stringify(snapshot),
+        signal: AbortSignal.timeout(2500),
+      });
+    } catch (err) {
+      publishTracker.notePush(pushedAtMs, "failed", err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+    const pushBody = (await pushRes.json().catch(() => null)) as EdgePushBody | null;
+    const { outcome, error: pushError } = pushOutcome(pushRes.status, pushBody);
+    publishTracker.notePush(pushedAtMs, outcome, pushError);
+    // Only a revision slipgate-core acknowledged retires what the push carried: after a 202 (core
+    // offline or rejected) the pending unbans ride along with the next snapshot instead.
+    if (outcome === "applied") {
       for (const [k, addedMs] of pendingClearedRiskSubjects) {
         if (addedMs <= pushedAtMs) pendingClearedRiskSubjects.delete(k);
       }
@@ -2131,7 +2157,9 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
         if (!ev.success) continue;
         const e = ev.data;
         if (e.type === "start" && e.model) model = e.model;
-        if (e.type === "done" || e.type === "error") {
+        // Only text tests speak for the account's health: an image / embedding / speech test
+        // may fail because that endpoint or model is not offered, not because the account broke.
+        if ((e.type === "done" || e.type === "error") && (parsed.data.kind ?? "text") === "text") {
           const ok = e.type === "done" && e.success === true;
           outcome = {
             ok,
@@ -2172,33 +2200,55 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
    * Aggregated console statistics. `range` = 24h (hourly buckets) | 7d | 30d (daily buckets);
    * `tz` = the viewer's Date#getTimezoneOffset() so "today" and day buckets follow local time.
    */
+  /** Config publish: desired revision vs what the edge and slipgate-core have applied. */
+  app.get("/api/v1/admin/system/dataplane-sync", async (c) => {
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    const nowMs = Date.now();
+    if (!internalUrl || !internalToken) {
+      return c.json(publishTracker.status(null, { standalone: true, edgeError: null, nowMs }));
+    }
+    let edge: EdgeSyncStatus | null = null;
+    let edgeError: string | null = null;
+    let legacyEdge = false;
+    try {
+      const res = await fetch(`${internalUrl}/internal/net/dataplane/sync-status`, {
+        headers: { "X-Slipgate-Internal-Token": internalToken },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (res.ok) edge = (await res.json()) as EdgeSyncStatus;
+      else {
+        edgeError = `HTTP ${res.status}`;
+        legacyEdge = res.status === 404;
+      }
+    } catch (err) {
+      edgeError = err instanceof Error ? err.message : String(err);
+    }
+    return c.json(publishTracker.status(edge, { standalone: false, edgeError, nowMs, legacyEdge }));
+  });
+
   app.get("/api/v1/admin/dashboard/stats", async (c) => {
     const range = DashboardRangeSchema.catch("7d").parse(c.req.query("range") ?? "7d");
     const granularity = DashboardGranularitySchema.optional().catch(undefined).parse(c.req.query("granularity"));
     const tzOffsetMinutes = parseTzOffset(c.req.query("tz"));
     const nowMs = Date.now();
     const win = dashboardWindow(range, nowMs, tzOffsetMinutes, granularity);
-    const [logs, users, groups, accounts, snapshot] = await Promise.all([
-      store.listUsageLogs({ sinceIso: new Date(win.sinceMs).toISOString(), limit: DASHBOARD_MAX_ROWS }),
-      store.listUsers(),
-      store.listGroups(false),
-      store.listAccounts(),
-      store.exportDataPlaneSnapshot(),
-    ]);
-    return c.json(
-      buildDashboardStats({
-        range,
-        granularity,
-        nowMs,
-        tzOffsetMinutes,
-        logs,
-        truncated: logs.length >= DASHBOARD_MAX_ROWS,
-        users,
-        groups,
-        accounts,
-        apiKeys: snapshot.apiKeys,
-      }),
-    );
+    // Aggregated in the store (SQL in Postgres): no usage rows or data-plane snapshot cross the wire.
+    let loaded: [DashboardUsageAggregate, UserProfile[], GroupItem[], UpstreamAccount[], { total: number; enabled: number }];
+    try {
+      loaded = await Promise.all([
+        store.ops.dashboardUsage(win, nowMs),
+        store.listUsers(),
+        store.listGroups(false),
+        store.listAccounts(),
+        store.ops.countApiKeys(),
+      ]);
+    } catch (err) {
+      if (!(err instanceof UsageAggregateTimeoutError)) throw err;
+      c.header("Retry-After", "60");
+      return c.json({ error: "usage_timeout", message: "Dashboard figures took too long to compute; try a shorter range" }, 503);
+    }
+    const [usage, users, groups, accounts, apiKeys] = loaded;
+    return c.json(buildDashboardStats({ range, granularity, nowMs, tzOffsetMinutes, usage, users, groups, accounts, apiKeys }));
   });
 
   app.post("/api/v1/admin/users/:userId/credit", async (c) => {
@@ -3135,20 +3185,42 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     },
   });
   if (options.startSchedulers) autoTester.start();
+  // Payment notifications: written with the order, delivered per plugin with retries (payments/notifications.ts).
+  const paymentNotifier = new PaymentNotifier({
+    payments: store.payments,
+    registry,
+    context: () => ({
+      serviceVersion: "0.1.0",
+      logger: (msg, meta) => console.log(`[plugin] ${msg}`, meta ?? {}),
+    }),
+  });
   registerPaymentRoutes(app, {
     store,
     vaultSecret,
     fetchImpl: options.paymentFetch,
     startSchedulers: options.startSchedulers === true,
     syncDataPlane: syncDataPlaneBestEffort,
-    onOrderPaid: (order) =>
-      registry.emitPaymentSettled(
-        {
-          serviceVersion: "0.1.0",
-          logger: (msg, meta) => console.log(`[plugin] ${msg}`, meta ?? {}),
-        },
-        { orderId: order.id, userId: order.userId, provider: order.provider, amountNanoUsd: order.creditNanoUsd },
-      ),
+    onOrderPaid: async (order) => {
+      await paymentNotifier.dispatchOrder(order.id);
+    },
+  });
+  if (options.startSchedulers) {
+    const notifyTimer = setInterval(() => {
+      paymentNotifier.dispatchDue().catch((err) => console.warn(`[slipgate-bff] payment notification sweep failed: ${String(err)}`));
+    }, 60_000);
+    (notifyTimer as { unref?: () => void }).unref?.();
+  }
+
+  app.get("/api/v1/admin/payments/notifications", async (c) => {
+    const query = PaymentNotificationQuerySchema.parse(c.req.query());
+    return c.json({ items: await paymentNotifier.list(query) });
+  });
+
+  /** Re-sends a paid order's notification (one plugin or all); never re-delivers or re-credits the order. */
+  app.post("/api/v1/admin/payments/notifications/:orderId/replay", async (c) => {
+    const parsed = ReplayPaymentNotificationRequestSchema.safeParse(await readJsonBody(c.req.raw));
+    if (!parsed.success) return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
+    return c.json({ item: await paymentNotifier.replay(c.req.param("orderId"), parsed.data.plugin) });
   });
 
   return app;

@@ -30,6 +30,7 @@ BEGIN
             legacy := (legacy #>> '{}')::jsonb;
         END IF;
         IF jsonb_typeof(legacy) = 'object' THEN
+            -- Limits saved before MAX_FIAT_MINOR existed are clamped to it (the INTEGER maximum).
             INSERT INTO commerce.payment_settings (
                 id, enabled, currency, custom_amount_enabled, minor_per_usd,
                 min_amount_minor, max_amount_minor, order_timeout_minutes, max_pending_orders,
@@ -40,8 +41,8 @@ BEGIN
                 COALESCE(NULLIF(legacy->>'currency', ''), 'CNY'),
                 COALESCE((legacy->>'customAmountEnabled')::boolean, TRUE),
                 COALESCE((legacy->>'minorPerUsd')::integer, 720),
-                COALESCE((legacy->>'minAmountMinor')::integer, 100),
-                COALESCE((legacy->>'maxAmountMinor')::integer, 1000000),
+                LEAST(COALESCE((legacy->>'minAmountMinor')::numeric, 100), 2147483647)::integer,
+                LEAST(COALESCE((legacy->>'maxAmountMinor')::numeric, 1000000), 2147483647)::integer,
                 COALESCE((legacy->>'orderTimeoutMinutes')::integer, 30),
                 COALESCE((legacy->>'maxPendingOrders')::integer, 5),
                 COALESCE(legacy->>'callbackBaseUrl', ''),

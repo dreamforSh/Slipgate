@@ -97,10 +97,35 @@ export class PluginRegistry {
     }
   }
 
+  /**
+   * Every enabled plugin gets the event even when an earlier one throws; the first failure is
+   * rethrown afterwards. (The BFF delivers payments per plugin, see deliverPaymentSettled.)
+   */
   async emitPaymentSettled(ctx: PluginContext, event: PaymentSettledEvent): Promise<void> {
+    let failure: unknown = null;
     for (const plugin of this.active()) {
-      await plugin.onPaymentSettled?.(this.ctxFor(plugin, ctx), event);
+      try {
+        await plugin.onPaymentSettled?.(this.ctxFor(plugin, ctx), event);
+      } catch (err) {
+        failure ??= err;
+      }
     }
+    if (failure !== null) throw failure;
+  }
+
+  /** Enabled plugins that handle settled payments (a payment notification's subscribers). */
+  paymentSubscribers(): string[] {
+    return this.active()
+      .filter((p) => typeof p.onPaymentSettled === "function")
+      .map((p) => p.name);
+  }
+
+  /** Delivers a settled payment to one plugin; false when it is unknown, disabled or not subscribed. */
+  async deliverPaymentSettled(ctx: PluginContext, event: PaymentSettledEvent, name: string): Promise<boolean> {
+    const plugin = this.active().find((p) => p.name === name);
+    if (!plugin?.onPaymentSettled) return false;
+    await plugin.onPaymentSettled(this.ctxFor(plugin, ctx), event);
+    return true;
   }
 
   async emitExitHealthChanged(ctx: PluginContext, event: ExitHealthChangedEvent): Promise<void> {

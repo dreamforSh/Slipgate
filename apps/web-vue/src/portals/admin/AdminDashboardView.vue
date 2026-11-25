@@ -13,6 +13,7 @@ import type {
   StoredCompositeRoute,
   UsageLogItem,
   VmSlotSummary,
+  DataPlaneSyncStatus,
 } from "@slipgate/contracts";
 import { recognizeEndpoint } from "@slipgate/contracts";
 import { useI18n } from "vue-i18n";
@@ -309,6 +310,7 @@ interface AttentionItem {
   icon: IconName;
   to?: string;
   action?: () => void;
+  title?: string;
 }
 
 const ATTENTION_TONE: Record<AttentionItem["tone"], string> = {
@@ -316,6 +318,33 @@ const ATTENTION_TONE: Record<AttentionItem["tone"], string> = {
   warning: "bg-warning/10 text-warning ring-warning/20 hover:bg-warning/15",
   info: "bg-info/10 text-info ring-info/20 hover:bg-info/15",
 };
+
+/**
+ * Config publish (GET /api/v1/admin/system/dataplane-sync): a change counts as live only once
+ * slipgate-core acknowledged it; while the core is offline it stays "pending". A snapshot on its
+ * way to the edge (pending_edge) is normal for a moment, so only one older than a few seconds is shown.
+ */
+const dataPlaneSync = ref<DataPlaneSyncStatus | null>(null);
+const PUBLISH_LAG_MS = 10_000;
+const publishPending = computed(() => {
+  const s = dataPlaneSync.value;
+  if (!s) return false;
+  if (s.state === "pending_core" || s.state === "unreachable") return true;
+  // The desired revision is its export time: a pending_edge only counts once it has had time to land.
+  return s.state === "pending_edge" && s.desiredRevisionUnixMs !== null && Date.parse(s.checkedAtIso) - s.desiredRevisionUnixMs > PUBLISH_LAG_MS;
+});
+const publishLabel = computed(() =>
+  dataPlaneSync.value?.state === "unreachable" ? t("dashboard.attention.publishUnreachable") : t("dashboard.attention.publishPending"),
+);
+
+async function loadDataPlaneSync() {
+  try {
+    const res = await auth.apiFetch("/api/v1/admin/system/dataplane-sync");
+    dataPlaneSync.value = res.ok ? ((await res.json()) as DataPlaneSyncStatus) : null;
+  } catch {
+    dataPlaneSync.value = null;
+  }
+}
 
 function scrollToRisk() {
   document.getElementById("dashboard-risk")?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -335,6 +364,15 @@ const attention = computed<AttentionItem[]>(() => {
     { key: "expiring", label: t("dashboard.attention.expiring"), count: (a?.expiringSoon ?? 0) + (a?.expired ?? 0), tone: "warning", icon: "calendar", to: "/admin/accounts?status=expiring" },
     { key: "risk", label: t("dashboard.attention.risk"), count: riskEvents.value.length, tone: "warning", icon: "shield-alert", action: scrollToRisk },
     { key: "update", label: t("dashboard.attention.update"), count: systemUpdate.updateAvailable ? 1 : 0, tone: "info", icon: "download", to: "/admin/updates" },
+    {
+      key: "publish",
+      label: publishLabel.value,
+      count: publishPending.value ? 1 : 0,
+      tone: dataPlaneSync.value?.state === "unreachable" ? "danger" : "warning",
+      icon: "refresh",
+      to: "/admin/ops",
+      title: dataPlaneSync.value?.error ?? undefined,
+    },
   ];
   return items.filter((i) => i.count > 0);
 });
@@ -410,6 +448,7 @@ async function loadOverview() {
       auth.apiFetch("/api/v1/admin/risk/events"),
       fetch("/readyz"),
       systemUpdate.loadStatus(true),
+      loadDataPlaneSync(),
     ]);
     if (grpRes.ok) {
       const grpData = (await grpRes.json()) as { groups: GroupItem[] };
@@ -566,6 +605,7 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
           :to="item.to"
           class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset transition-colors"
           :class="ATTENTION_TONE[item.tone]"
+          :title="item.title"
         >
           <UiIcon :name="item.icon" :size="12" />
           {{ item.label }}

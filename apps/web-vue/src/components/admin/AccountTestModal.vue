@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { AccountTestEvent, UpstreamAccount } from "@slipgate/contracts";
+import { accountTestKinds, type AccountTestEvent, type AccountTestKind, type UpstreamAccount } from "@slipgate/contracts";
 import CopyButton from "../ui/CopyButton.vue";
+import SegmentedControl from "../ui/SegmentedControl.vue";
 import UiBadge from "../ui/UiBadge.vue";
 import UiIcon from "../ui/UiIcon.vue";
 import UiModal from "../ui/UiModal.vue";
@@ -30,6 +31,11 @@ interface OutputLine {
 
 const model = ref("");
 const prompt = ref("");
+/** Endpoint the test calls (sub2api-style split): text, image, embedding or speech. */
+const kind = ref<AccountTestKind>("text");
+/** Images / audio the test produced. */
+const media = ref<{ kind: AccountTestKind; url: string; mime: string }[]>([]);
+const lightbox = ref<string | null>(null);
 const running = ref(false);
 const hasRun = ref(false);
 const lines = ref<OutputLine[]>([]);
@@ -37,8 +43,22 @@ const terminal = ref<HTMLElement | null>(null);
 let controller: AbortController | null = null;
 
 const isVm = computed(() => props.account?.executionMode === "vm_slot");
+const kinds = computed(() => accountTestKinds(props.account?.platform ?? ""));
+const kindOptions = computed(() => kinds.value.map((k) => ({ value: k, label: t(`accounts.test.kinds.${k}`) })));
 const models = useAccountModels();
-const modelSuggestions = computed(() => models.suggestions(props.account?.platform));
+
+/** Which listed models fit a test kind (by name): image / embedding / speech models vs the rest. */
+const KIND_PATTERNS: Record<Exclude<AccountTestKind, "text">, RegExp> = {
+  image: /image|imagen|dall-e/i,
+  embedding: /embed/i,
+  speech: /tts|speech/i,
+};
+function fitsKind(id: string, k: AccountTestKind): boolean {
+  if (k !== "text") return KIND_PATTERNS[k].test(id);
+  return !Object.values(KIND_PATTERNS).some((re) => re.test(id));
+}
+const modelSuggestions = computed(() => models.suggestions(props.account?.platform).filter((m) => fitsKind(m, kind.value)));
+const promptPlaceholder = computed(() => t(`accounts.test.promptPlaceholder.${kind.value}`));
 
 async function fetchModels() {
   const account = props.account;
@@ -55,10 +75,25 @@ const outputText = computed(() => lines.value.map((l) => l.text).join("\n"));
 
 function reset() {
   lines.value = [];
+  media.value = [];
+  lightbox.value = null;
   hasRun.value = false;
   prompt.value = "";
+  kind.value = "text";
   models.show(props.account?.id);
   model.value = modelSuggestions.value[0] ?? "";
+}
+
+// A new kind starts from a model that fits it (or the server's default for that kind).
+watch(kind, () => {
+  if (!fitsKind(model.value, kind.value)) model.value = modelSuggestions.value[0] ?? "";
+  media.value = [];
+});
+
+function formatBytes(dataUrl: string): string {
+  const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  const bytes = Math.floor((b64.length * 3) / 4);
+  return bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function push(kind: LineKind, text: string) {
@@ -91,13 +126,29 @@ function friendlyError(code: string | undefined, message: string | undefined): s
 function handleEvent(ev: AccountTestEvent): boolean {
   switch (ev.type) {
     case "start":
-      push("info", t("accounts.test.connected", { model: ev.model ?? model.value }));
+      push("info", t("accounts.test.connected", { model: ev.model ?? model.value, kind: t(`accounts.test.kinds.${ev.kind ?? kind.value}`) }));
+      return false;
+    case "media":
+      if (ev.mediaUrl) {
+        media.value.push({ kind: ev.kind ?? kind.value, url: ev.mediaUrl, mime: ev.mimeType ?? "" });
+        push("info", t("accounts.test.mediaReceived", { mime: ev.mimeType || "-", size: ev.mediaUrl.startsWith("data:") ? formatBytes(ev.mediaUrl) : "URL" }));
+      }
       return false;
     case "delta":
       if (ev.text) appendText(ev.text);
       return false;
     case "done":
-      if (ev.success) {
+      if (ev.success && (ev.kind ?? "text") !== "text") {
+        const k = ev.kind ?? kind.value;
+        push(
+          "ok",
+          k === "embedding"
+            ? t("accounts.test.successEmbedding", { dims: ev.dimensions ?? 0, input: ev.inputTokens ?? 0, duration: formatMs(ev.durationMs) })
+            : k === "image"
+              ? t("accounts.test.successImage", { n: media.value.length, duration: formatMs(ev.durationMs) })
+              : t("accounts.test.successSpeech", { duration: formatMs(ev.durationMs) }),
+        );
+      } else if (ev.success) {
         push(
           "ok",
           t("accounts.test.success", {
@@ -130,6 +181,7 @@ async function start() {
   running.value = true;
   hasRun.value = true;
   lines.value = [];
+  media.value = [];
   push("info", t("accounts.test.connecting"));
 
   let finished = false;
@@ -141,6 +193,7 @@ async function start() {
         Authorization: `Bearer ${auth.token}`,
       },
       body: JSON.stringify({
+        kind: kind.value === "text" ? undefined : kind.value,
         model: model.value.trim() || undefined,
         prompt: prompt.value.trim() || undefined,
       }),
@@ -256,6 +309,11 @@ const lineClass: Record<LineKind, string> = {
         <UiBadge :tone="healthTone(account.status)" dot>{{ accountStatusLabel(account.status) }}</UiBadge>
       </div>
 
+      <div v-if="kinds.length > 1" class="flex flex-wrap items-center justify-between gap-2">
+        <span class="label !mb-0">{{ t("accounts.test.kind") }}</span>
+        <SegmentedControl v-model="kind" :options="kindOptions" :aria-label="t('accounts.test.kind')" />
+      </div>
+
       <div class="grid gap-3 sm:grid-cols-2">
         <div class="min-w-0">
           <div class="label flex items-center justify-between gap-2">
@@ -277,6 +335,7 @@ const lineClass: Record<LineKind, string> = {
             class="input font-mono text-xs"
             :list="datalistId"
             :disabled="running"
+            :placeholder="t('accounts.test.modelDefault')"
             spellcheck="false"
             autocomplete="off"
           />
@@ -300,8 +359,8 @@ const lineClass: Record<LineKind, string> = {
           </p>
         </div>
         <label class="block min-w-0">
-          <span class="label">{{ t("accounts.test.prompt") }}</span>
-          <input v-model="prompt" type="text" class="input" placeholder="Hi" :disabled="running" />
+          <span class="label">{{ t(`accounts.test.promptLabel.${kind}`) }}</span>
+          <input v-model="prompt" type="text" class="input" :placeholder="promptPlaceholder" :disabled="running" />
         </label>
       </div>
 
@@ -324,7 +383,42 @@ const lineClass: Record<LineKind, string> = {
           />
         </p>
       </div>
+
+      <!-- What an image / speech test produced -->
+      <div v-if="media.length" class="space-y-2">
+        <p class="text-xs font-medium text-fg-muted">{{ t("accounts.test.result") }}</p>
+        <div v-if="media.some((m) => m.kind === 'image')" class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <button
+            v-for="(m, i) in media.filter((x) => x.kind === 'image')"
+            :key="i"
+            type="button"
+            class="group overflow-hidden rounded-lg border border-line bg-surface-2/50 text-left transition-colors hover:border-accent"
+            :title="t('accounts.test.enlarge')"
+            @click="lightbox = m.url"
+          >
+            <img :src="m.url" :alt="t('accounts.test.imageAlt', { n: i + 1 })" class="aspect-square w-full object-cover" />
+            <span class="block border-t border-line px-2 py-1 text-2xs text-fg-subtle">{{ m.mime || "image/*" }}</span>
+          </button>
+        </div>
+        <audio v-for="(m, i) in media.filter((x) => x.kind === 'speech')" :key="`a${i}`" :src="m.url" controls class="w-full" />
+      </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="lightbox"
+        class="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-6"
+        role="dialog"
+        :aria-label="t('accounts.test.enlarge')"
+        @click.self="lightbox = null"
+        @keydown.esc="lightbox = null"
+      >
+        <button type="button" class="absolute right-4 top-4 rounded-full bg-black/50 p-2 text-white hover:bg-black/70" :aria-label="t('common.close')" @click="lightbox = null">
+          <UiIcon name="x" :size="18" />
+        </button>
+        <img :src="lightbox" alt="" class="max-h-full max-w-full rounded-lg shadow-2xl" />
+      </div>
+    </Teleport>
 
     <template #footer>
       <CopyButton v-if="lines.length > 0" :text="outputText" :label="t('accounts.test.copy')" size="sm" class="mr-auto" />

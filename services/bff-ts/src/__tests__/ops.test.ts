@@ -688,3 +688,31 @@ describe("admin usage statistics", () => {
     expect((await call("GET", "/api/v1/admin/usage/stats", gina.headers)).status).toBe(403);
   });
 });
+
+describe("usage list sorting and dimensions", () => {
+  it("orders rows server-side by time, model, cost, tokens or latency and returns reasoning effort / service tier", async () => {
+    const { call, admin, register, settle } = await bootstrap();
+    const sam = await register("sam.sort@ops.test");
+    const rows = [
+      { requestId: "srt_a", publicModel: "m-b", inputTokens: 10, outputTokens: 5, costNanoUsd: "300", durationMs: 900 },
+      { requestId: "srt_b", publicModel: "m-a", inputTokens: 500, outputTokens: 50, costNanoUsd: "100", durationMs: 200, reasoningEffort: "high", serviceTier: "priority" },
+      { requestId: "srt_c", publicModel: "m-c", inputTokens: 40, outputTokens: 4, costNanoUsd: "200", durationMs: 5000 },
+    ];
+    for (const r of rows) {
+      await settle({ ...r, userId: sam.id, apiKeyId: "key_sort", groupId: "grp_default", upstreamModel: r.publicModel });
+    }
+    const ids = async (qs: string) =>
+      (await call<UsagePageResponse>("GET", `/api/v1/admin/usage/query?userId=${sam.id}${qs}`, admin)).body.items.map((i) => i.requestId);
+    expect(await ids("")).toEqual(["srt_c", "srt_b", "srt_a"]); // newest first
+    expect(await ids("&sortBy=time&sortDir=asc")).toEqual(["srt_a", "srt_b", "srt_c"]);
+    expect(await ids("&sortBy=model&sortDir=asc")).toEqual(["srt_b", "srt_a", "srt_c"]);
+    expect(await ids("&sortBy=cost&sortDir=desc")).toEqual(["srt_a", "srt_c", "srt_b"]);
+    expect(await ids("&sortBy=tokens&sortDir=desc")).toEqual(["srt_b", "srt_c", "srt_a"]);
+    expect(await ids("&sortBy=latency&sortDir=desc")).toEqual(["srt_c", "srt_a", "srt_b"]);
+    expect(await ids("&sortBy=bogus")).toEqual(["srt_c", "srt_b", "srt_a"]);
+    const page = await call<UsagePageResponse>("GET", `/api/v1/admin/usage/query?userId=${sam.id}&sortBy=model&sortDir=asc&pageSize=1`, admin);
+    expect(page.body.items[0]).toMatchObject({ requestId: "srt_b", reasoningEffort: "high", serviceTier: "priority" });
+    const own = await call<UsagePageResponse>("GET", "/api/v1/user/usage/query?sortBy=cost&sortDir=asc", sam.headers);
+    expect(own.body.items.map((i) => i.requestId)).toEqual(["srt_b", "srt_c", "srt_a"]);
+  });
+});

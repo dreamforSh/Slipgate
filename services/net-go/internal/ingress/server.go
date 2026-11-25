@@ -188,6 +188,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /internal/supervisor/update/rollback", s.handleInternalUpdateRollback)
 	mux.HandleFunc("POST /internal/supervisor/update/restart", s.handleInternalUpdateRestart)
 	mux.HandleFunc("POST /internal/net/dataplane/sync", s.handleInternalDataPlaneSync)
+	mux.HandleFunc("GET /internal/net/dataplane/sync-status", s.handleInternalDataPlaneSyncStatus)
 	s.registerClashInternalRoutes(mux)
 	s.registerVmInternalRoutes(mux)
 	s.registerAccountInternalRoutes(mux)
@@ -536,16 +537,33 @@ func (s *Server) handleInternalDataPlaneSync(w http.ResponseWriter, r *http.Requ
 	}
 	ack, err := s.dpCoord.SyncSnapshot(r.Context(), snap)
 	if err != nil {
+		// Applied on the edge but not (yet) in slipgate-core: the caller must not treat this as
+		// published; coreApplied=false and the status endpoint say so until the core catches up.
 		writeJSON(w, http.StatusAccepted, map[string]any{
-			"ok":               true,
-			"degradedCoreSync": true,
-			"warning":          err.Error(),
-			"vaultAccounts":    ack.VaultAccounts,
-			"revisionUnixMs":   ack.RevisionUnixMs,
+			"ok":                 true,
+			"degradedCoreSync":   true,
+			"coreApplied":        false,
+			"warning":            err.Error(),
+			"vaultAccounts":      ack.VaultAccounts,
+			"revisionUnixMs":     ack.RevisionUnixMs,
+			"coreRevisionUnixMs": ack.CoreRevisionUnixMs,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, ack)
+}
+
+// handleInternalDataPlaneSyncStatus reports the config revision applied on the edge and the one
+// slipgate-core has acknowledged (dataplane.SyncStatus), for the control plane's publish view.
+func (s *Server) handleInternalDataPlaneSyncStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.dpCoord == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "dataplane_coordinator_unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.dpCoord.SyncStatus())
 }
 
 // dataPlaneAliasPatterns are the routes SDKs reach when their base URL omits /v1, plus Codex CLI

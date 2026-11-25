@@ -13,10 +13,12 @@ import (
 
 // ProbeEvent is one message of the admin "test account" stream (sent to the console as SSE `data:` lines).
 //
-//	start → delta* → done   (success, or an upstream error reported in done.success=false)
-//	error                   (the probe could not be dispatched at all)
+//	start → delta* → done           (text: success, or an upstream error reported in done.success=false)
+//	start → media* → done           (image / speech: one media event per image or the audio clip)
+//	error                           (the probe could not be dispatched at all)
 type ProbeEvent struct {
 	Type         string `json:"type"`
+	Kind         string `json:"kind,omitempty"`
 	Model        string `json:"model,omitempty"`
 	Text         string `json:"text,omitempty"`
 	Success      bool   `json:"success,omitempty"`
@@ -27,10 +29,17 @@ type ProbeEvent struct {
 	DurationMs   int64  `json:"durationMs,omitempty"`
 	InputTokens  uint64 `json:"inputTokens,omitempty"`
 	OutputTokens uint64 `json:"outputTokens,omitempty"`
+	// MediaURL is a generated image (URL or data: URL) or the speech audio (data: URL).
+	MediaURL string `json:"mediaUrl,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+	// Dimensions is the vector length an embedding test returned.
+	Dimensions int `json:"dimensions,omitempty"`
 }
 
-// ProbeRequest selects the model and prompt used to test one upstream account.
+// ProbeRequest selects the kind of test (text by default; see ProbeKindsFor), the model and the
+// prompt (the embedding / speech input for those kinds) used to test one upstream account.
 type ProbeRequest struct {
+	Kind   string `json:"kind"`
 	Model  string `json:"model"`
 	Prompt string `json:"prompt"`
 }
@@ -106,6 +115,11 @@ func (c *Coordinator) ProbeAccount(ctx context.Context, accountID string, req Pr
 		emit(ProbeEvent{Type: "error", Code: "cloud_auth_failed", Message: prepErr.Error()})
 		return
 	}
+	kind := normalizeProbeKind(req.Kind)
+	if !probeKindSupported(meta.Platform, kind) {
+		emit(ProbeEvent{Type: "error", Kind: kind, Code: "probe_kind_unsupported", Message: fmt.Sprintf("%s accounts cannot run a %s test", meta.Platform, kind)})
+		return
+	}
 	if strings.EqualFold(strings.TrimSpace(meta.Platform), "typesafe") {
 		c.probeTypeSafeAccount(ctx, accountID, meta, secret, req, emit)
 		return
@@ -113,14 +127,18 @@ func (c *Coordinator) ProbeAccount(ctx context.Context, accountID string, req Pr
 
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
-		model = DefaultProbeModel(meta.Platform)
+		model = DefaultProbeModelFor(kind, meta.Platform)
 	}
 	prompt := strings.TrimSpace(req.Prompt)
 	if prompt == "" {
-		prompt = defaultProbePrompt
+		prompt = defaultProbePromptFor(kind)
 	}
 	if r := []rune(prompt); len(r) > probeMaxPromptRunes {
 		prompt = string(r[:probeMaxPromptRunes])
+	}
+	if kind != ProbeKindText {
+		c.probeMediaAccount(ctx, accountID, meta, secret, c.probePersona(accountID, meta, secret), kind, model, prompt, emit)
+		return
 	}
 
 	body, _ := json.Marshal(map[string]any{
@@ -135,21 +153,10 @@ func (c *Coordinator) ProbeAccount(ctx context.Context, accountID string, req Pr
 		return
 	}
 
-	requestID := fmt.Sprintf("probe_%s_%d", accountID, time.Now().UnixNano())
-	pctx := OutboundPersonaContext{
-		Provider:         meta.Platform,
-		AuthKind:         meta.AuthKind,
-		SubscriptionTier: meta.SubscriptionTier,
-		TierMultiplier:   meta.TierMultiplier,
-		ExecutionMode:    meta.ExecutionMode,
-		AccountID:        accountID,
-		CleanseMode:      "zero",
-		RequestID:        requestID,
-		UTLSProfileID:    c.resolveAccountUTLSProfileID(accountID, meta.Platform, meta.AuthKind, secret),
-	}
+	pctx := c.probePersona(accountID, meta, secret)
 
 	startedAt := time.Now()
-	emit(ProbeEvent{Type: "start", Model: model})
+	emit(ProbeEvent{Type: "start", Model: model, Kind: ProbeKindText})
 
 	// Report a missing/unhealthy exit explicitly; executeOutbound enforces the same fail-closed guard.
 	if meta.ExecutionMode == "stealth_http" && c.pool != nil {
@@ -192,6 +199,21 @@ func (c *Coordinator) ProbeAccount(ctx context.Context, accountID string, req Pr
 		done.Success = true
 	}
 	emit(done)
+}
+
+// probePersona is the outbound persona of a test: the account's own, with a probe request id.
+func (c *Coordinator) probePersona(accountID string, meta accountMeta, secret AccountSecret) OutboundPersonaContext {
+	return OutboundPersonaContext{
+		Provider:         meta.Platform,
+		AuthKind:         meta.AuthKind,
+		SubscriptionTier: meta.SubscriptionTier,
+		TierMultiplier:   meta.TierMultiplier,
+		ExecutionMode:    meta.ExecutionMode,
+		AccountID:        accountID,
+		CleanseMode:      "zero",
+		RequestID:        fmt.Sprintf("probe_%s_%d", accountID, time.Now().UnixNano()),
+		UTLSProfileID:    c.resolveAccountUTLSProfileID(accountID, meta.Platform, meta.AuthKind, secret),
+	}
 }
 
 type accountMeta struct {

@@ -42,6 +42,11 @@ const en: typeof zh = {
       duration: "Avg. duration",
     },
     table: {
+      reasoning: "Reasoning",
+      serviceTier: "Service tier",
+      requestIdColumn: "Request ID",
+      images: "{n} image(s)",
+      videoSeconds: "{n}s video",
       endpoint: "Endpoint",
       endpointTitle: "Inbound codec {inbound} → upstream codec {upstream}",
       time: "Time",

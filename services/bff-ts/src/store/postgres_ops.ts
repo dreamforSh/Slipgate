@@ -70,6 +70,9 @@ import type { ApiKeyLabel, ApiKeyLookupRecord } from "./ops_types.ts";
 import { StoreError } from "./types.ts";
 import { viewerDayStartMs } from "./user_limits_types.ts";
 import {
+  DASHBOARD_USAGE_TIMEOUT_MS,
+  dashboardTopUserIds,
+  emptyDashboardUsage,
   emptyScopedUsageAggregate,
   codecPairKey,
   emptyUsageStatsAggregate,
@@ -81,6 +84,7 @@ import {
   USAGE_STATS_TIMEOUT_MS,
   type ChannelStatusAggregate,
   type ChannelStatusQuery,
+  type DashboardUsageAggregate,
   type OpsGroupSums,
   type OpsUsageAggregate,
   type OpsUsageQuery,
@@ -2371,20 +2375,40 @@ export class PostgresOpsStore implements OpsStore {
     return and(sql, parts);
   }
 
-  private usageRows(where: Fragment, limit: number, offset: number): Fragment {
+  /** ORDER BY of a usage listing (UsageQuery.sortBy / sortDir); ties newest first, then id. */
+  private usageOrder(q: Pick<UsageQuery, "sortBy" | "sortDir">): Fragment {
+    const sql = this.sql;
+    const dir = q.sortDir === "asc" ? sql`ASC` : sql`DESC`;
+    switch (q.sortBy) {
+      case "model":
+        return sql`l.public_model ${dir}, l.created_at DESC, l.id DESC`;
+      case "cost":
+        return sql`l.cost_nano_usd ${dir}, l.created_at DESC, l.id DESC`;
+      case "tokens":
+        return sql`(l.input_tokens + l.output_tokens) ${dir}, l.created_at DESC, l.id DESC`;
+      case "latency":
+        return sql`COALESCE(l.duration_ms, 0) ${dir}, l.created_at DESC, l.id DESC`;
+      default:
+        return sql`l.created_at ${dir}, l.id ${dir}`;
+    }
+  }
+
+  private usageRows(where: Fragment, limit: number, offset: number, order: Fragment = this.usageOrder({})): Fragment {
     return this.sql`
       SELECT l.id, l.request_id, l.user_id, l.api_key_id, l.account_id, l.group_id, l.platform, l.public_model,
              l.upstream_model, l.ingress_codec, l.egress_codec, l.input_tokens::int, l.output_tokens::int,
              l.cache_read_tokens::int, l.cache_write_tokens::int, l.cost_nano_usd::text, COALESCE(l.ttft_ms, 0) AS ttft_ms,
              COALESCE(l.duration_ms, 0) AS duration_ms, l.status_code, l.created_at,
+             COALESCE(l.service_tier, '') AS service_tier, COALESCE(l.reasoning_effort, '') AS reasoning_effort,
+             COALESCE(l.image_count, 0)::int AS image_count, COALESCE(l.video_seconds, 0)::float8 AS video_seconds,
              COALESCE(u.email, '') AS user_email, COALESCE(k.name, '') AS api_key_name,
              COALESCE(g.name, '') AS group_name, COALESCE(a.name, '') AS account_name
-        FROM (SELECT * FROM core.usage_logs l WHERE ${where} ORDER BY l.created_at DESC LIMIT ${limit} OFFSET ${offset}) l
+        FROM (SELECT * FROM core.usage_logs l WHERE ${where} ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}) l
         LEFT JOIN commerce.users u ON u.id = l.user_id
         LEFT JOIN core.api_keys k ON k.id = l.api_key_id
         LEFT JOIN core.groups g ON g.id = l.group_id
         LEFT JOIN core.accounts a ON a.id = l.account_id
-       ORDER BY l.created_at DESC
+       ORDER BY ${order}
     `;
   }
 
@@ -2412,6 +2436,10 @@ export class PostgresOpsStore implements OpsStore {
       window5hUsedBps: 0,
       window7dUsedBps: 0,
       statusCode: Number(r.status_code),
+      ...(r.service_tier ? { serviceTier: String(r.service_tier) } : {}),
+      ...(r.reasoning_effort ? { reasoningEffort: String(r.reasoning_effort) } : {}),
+      ...(Number(r.image_count ?? 0) > 0 ? { imageCount: Number(r.image_count) } : {}),
+      ...(Number(r.video_seconds ?? 0) > 0 ? { videoSeconds: Number(r.video_seconds) } : {}),
       formattedCostUsd: formatNanoUsd(BigInt(cost)),
       createdAtIso: iso(r.created_at as Date),
       userEmail: String(r.user_email ?? ""),
@@ -2426,11 +2454,11 @@ export class PostgresOpsStore implements OpsStore {
     const { offset, limit } = clampPage(query.page, query.pageSize);
     if (query.summary === false) {
       // Rows only: no COUNT/SUM over every matching row (the summary is unbounded in time).
-      const rows = await this.sql<Record<string, unknown>[]>`${this.usageRows(where, limit, offset)}`;
+      const rows = await this.sql<Record<string, unknown>[]>`${this.usageRows(where, limit, offset, this.usageOrder(query))}`;
       return { items: rows.map((r) => this.toRow(r)), total: offset + rows.length, summary: null };
     }
     const [rows, summary] = await Promise.all([
-      this.sql<Record<string, unknown>[]>`${this.usageRows(where, limit, offset)}`,
+      this.sql<Record<string, unknown>[]>`${this.usageRows(where, limit, offset, this.usageOrder(query))}`,
       this.sql<
         { requests: number; errors: number; input: string; output: string; cache_read: string; cache_write: string; cost: string; avg_duration: number | null; avg_ttft: number | null }[]
       >`
@@ -2526,7 +2554,7 @@ export class PostgresOpsStore implements OpsStore {
   }
 
   async exportUsage(query: UsageExportQuery): Promise<UsageRow[]> {
-    const rows = await this.sql<Record<string, unknown>[]>`${this.usageRows(this.usageWhere(query), query.limit, 0)}`;
+    const rows = await this.sql<Record<string, unknown>[]>`${this.usageRows(this.usageWhere(query), query.limit, 0, this.usageOrder(query))}`;
     return rows.map((r) => this.toRow(r));
   }
 
@@ -2593,6 +2621,101 @@ export class PostgresOpsStore implements OpsStore {
       else if (r.g === 14 && r.today === true) agg.today = sumsOf(r);
     }
     return agg;
+  }
+
+  async dashboardUsage(win: import("../dashboard.ts").DashboardWindow, nowMs: number): Promise<DashboardUsageAggregate> {
+    const sql = this.sql;
+    const bucketMs = win.granularity === "hour" ? 3_600_000 : 86_400_000;
+    const since = new Date(win.sinceMs);
+    const now = new Date(nowMs);
+    const period = new Date(win.periodStartMs);
+    const count = win.bucketStarts.length;
+    type DashRow = SumsRow & {
+      g: number;
+      b: number | null;
+      public_model: string | null;
+      user_id: string | null;
+      group_id: string | null;
+      day: string | null;
+      in_period: boolean | null;
+      active_users: number;
+      recent_requests: number;
+      recent_tokens: string;
+    };
+    return pgReadWithTimeout(sql, DASHBOARD_USAGE_TIMEOUT_MS, async (tx) => {
+      // One scan of the window (idx_core_usage_logs_time), seven groupings: the grand total (last
+      // minute), local days, the period, buckets and the period's model / user / group breakdowns.
+      const rows = await tx<DashRow[]>`
+        SELECT GROUPING(x.b, x.public_model, x.user_id, x.group_id, x.day, x.in_period)::int AS g,
+               x.b, x.public_model, x.user_id, x.group_id, x.day, x.in_period,
+               ${this.sumsColumns()},
+               COUNT(DISTINCT x.user_id)::int AS active_users,
+               COUNT(*) FILTER (WHERE x.recent)::int AS recent_requests,
+               COALESCE(SUM(x.input_tokens + x.output_tokens) FILTER (WHERE x.recent), 0)::text AS recent_tokens
+          FROM (
+            SELECT CASE WHEN l.created_at >= ${period} THEN ${this.bucketOf(win.periodStartMs, bucketMs)} END AS b,
+                   l.public_model, l.user_id, l.group_id,
+                   CASE WHEN l.created_at >= ${new Date(win.todayStartMs)} THEN 'today'
+                        WHEN l.created_at >= ${new Date(win.yesterdayStartMs)} THEN 'yesterday'
+                        ELSE 'earlier' END AS day,
+                   l.created_at >= ${period} AS in_period,
+                   l.created_at > ${new Date(nowMs - 60_000)} AS recent,
+                   l.status_code, l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cost_nano_usd, l.duration_ms, l.ttft_ms
+              FROM core.usage_logs l
+             WHERE l.created_at >= ${since} AND l.created_at <= ${now}
+          ) x
+         GROUP BY GROUPING SETS ((), (x.day), (x.in_period), (x.b), (x.in_period, x.public_model),
+                                 (x.in_period, x.user_id), (x.in_period, x.group_id))
+      `;
+      const agg = emptyDashboardUsage();
+      for (const r of rows) {
+        // GROUPING bits (b, model, user, group, day, in_period), 1 = rolled up: 63 = total,
+        // 61 = day, 62 = in_period, 31 = bucket, 46 / 54 / 58 = period model / user / group.
+        if (r.g === 63) {
+          agg.lastMinuteRequests = r.recent_requests;
+          agg.lastMinuteTokens = Number(r.recent_tokens);
+        } else if (r.g === 61 && r.day === "today") {
+          agg.today = sumsOf(r);
+          agg.activeToday = r.active_users;
+        } else if (r.g === 61 && r.day === "yesterday") agg.yesterday = sumsOf(r);
+        else if (r.g === 62 && r.in_period === true) agg.period = sumsOf(r);
+        else if (r.g === 31 && r.b !== null && r.b >= 0 && r.b < count) agg.buckets.set(r.b, sumsOf(r));
+        else if (r.g === 46 && r.in_period === true && r.public_model !== null) agg.models.set(r.public_model, sumsOf(r));
+        else if (r.g === 54 && r.in_period === true && r.user_id !== null) agg.users.set(r.user_id, sumsOf(r));
+        else if (r.g === 58 && r.in_period === true && r.group_id !== null) agg.groups.set(r.group_id, sumsOf(r));
+      }
+      const top = dashboardTopUserIds(agg.users);
+      if (top.length > 0) {
+        // Only the charted users' buckets (idx_core_usage_logs_user_time), not every user's.
+        const perUser = await tx<(SumsRow & { user_id: string; b: number })[]>`
+          SELECT x.user_id, x.b, ${this.sumsColumns()}
+            FROM (
+              SELECT l.user_id, ${this.bucketOf(win.periodStartMs, bucketMs)} AS b, l.status_code,
+                     l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cost_nano_usd, l.duration_ms, l.ttft_ms
+                FROM core.usage_logs l
+               WHERE l.user_id = ANY(${top}) AND l.created_at >= ${period} AND l.created_at <= ${now}
+            ) x
+           GROUP BY x.user_id, x.b
+        `;
+        for (const r of perUser) {
+          if (r.b < 0 || r.b >= count) continue;
+          let m = agg.userBuckets.get(r.user_id);
+          if (!m) {
+            m = new Map();
+            agg.userBuckets.set(r.user_id, m);
+          }
+          m.set(r.b, sumsOf(r));
+        }
+      }
+      return agg;
+    });
+  }
+
+  async countApiKeys(): Promise<{ total: number; enabled: number }> {
+    const rows = await this.sql<{ total: number; enabled: number }[]>`
+      SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE enabled)::int AS enabled FROM core.api_keys
+    `;
+    return { total: rows[0]?.total ?? 0, enabled: rows[0]?.enabled ?? 0 };
   }
 
   async channelStatusUsage(q: ChannelStatusQuery): Promise<ChannelStatusAggregate> {

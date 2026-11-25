@@ -8,8 +8,10 @@ import SegmentedControl from "../ui/SegmentedControl.vue";
 import UiCard from "../ui/UiCard.vue";
 import UiIcon from "../ui/UiIcon.vue";
 import UiPagination from "../ui/UiPagination.vue";
+import ColumnPicker from "../admin/users/ColumnPicker.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import { useNow } from "../../composables/useNow";
+import { usePersistentState } from "../../composables/usePersistentState";
 import { formatCompact } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 import UsageErrorsTab from "./UsageErrorsTab.vue";
@@ -18,6 +20,7 @@ import UsageStatsCharts from "./UsageStatsCharts.vue";
 import UsageSummaryCards from "./UsageSummaryCards.vue";
 import UsageTable from "./UsageTable.vue";
 import UsageUserRanking from "./UsageUserRanking.vue";
+import { isUsageColumnList, USAGE_DEFAULT_HIDDEN, usageColumns, type UsageColumnKey } from "./usageColumns";
 import { useUsageLogs } from "./useUsageLogs";
 import { useUsageStats } from "./useUsageStats";
 
@@ -46,7 +49,15 @@ const usage = useUsageLogs({
   errorLoad: t("usageLogs.errors.load"),
   errorExport: t("usageLogs.errors.export"),
 });
-const { filters, page, pageSize, items, total, summary, loading, loaded, exporting, rangeInvalid, hasFilters } = usage;
+const { filters, page, pageSize, items, total, summary, loading, loaded, exporting, rangeInvalid, hasFilters, sort } = usage;
+
+/** Column settings (sub2api-style), remembered per page in this browser. */
+const hiddenColumns = usePersistentState<UsageColumnKey[]>(
+  `slipgate.usage.${props.mode}.hiddenColumns.v1`,
+  [...USAGE_DEFAULT_HIDDEN],
+  isUsageColumnList,
+);
+const columnOptions = computed(() => usageColumns(props.mode).map((c) => ({ key: c.key, label: t(c.labelKey) })));
 
 const toast = useFeedbackToasts(usage.error);
 
@@ -155,6 +166,7 @@ refresh();
     <UiCard :icon="tabMeta.icon" :title="tabMeta.title" flush>
       <template #actions>
         <span v-if="loaded && tab === 'records'" class="font-mono text-xs tabular-nums text-fg-subtle">{{ formatCompact(total) }}</span>
+        <ColumnPicker v-if="tab === 'records'" v-model:hidden="hiddenColumns" :columns="columnOptions" :defaults="USAGE_DEFAULT_HIDDEN" />
         <SegmentedControl v-if="statsPanel" v-model="tab" :options="tabOptions" :aria-label="t('usageLogs.tabs.label')" />
       </template>
 
@@ -205,6 +217,9 @@ refresh();
             :rows="items"
             :mode="mode"
             :now="now"
+            :hidden="hiddenColumns"
+            :sort="sort"
+            @sort="usage.toggleSort"
             @filter-user="(id) => patch({ userId: id })"
             @filter-group="(id) => patch({ groupId: id })"
             @filter-model="(m) => patch({ model: m })"

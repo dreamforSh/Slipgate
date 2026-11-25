@@ -15,7 +15,12 @@ import type {
 import { createBffApp } from "../app.ts";
 import { easypaySign, stripeSignatureHeader, stripeVerifySignature } from "../payments/providers.ts";
 import { MemoryControlStore } from "../store/memory_store.ts";
-import { PG_PAYMENTS_SCHEMA_SQL, pendingAuditSecretScrub, scrubStoredAuditSecrets } from "../store/postgres_payments.ts";
+import {
+  PG_PAYMENT_SETTINGS_SCHEMA_SQL,
+  PG_PAYMENTS_SCHEMA_SQL,
+  pendingAuditSecretScrub,
+  scrubStoredAuditSecrets,
+} from "../store/postgres_payments.ts";
 import type { ControlStore } from "../store/types.ts";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -534,6 +539,26 @@ describe("payment integrity", () => {
     expect(cfg.body.enabled).toBe(true);
     expect(cfg.body.minorPerUsd).toBe(700);
     expect(cfg.body.maxAmountMinor).toBe(2_147_483_647);
+  });
+
+  it("clamps an over-cap legacy limit when moving the config into payment_settings", async () => {
+    const factory = (globalThis as { __slipgateTestStoreFactory?: StoreFactory }).__slipgateTestStoreFactory;
+    if (!factory) return; // Only Postgres backfills the legacy portal_settings blob.
+    const store = await factory();
+    const sql = (store as unknown as { sql: postgres.Sql }).sql;
+    await sql`DELETE FROM commerce.payment_settings`;
+    await sql`
+      INSERT INTO commerce.portal_settings (key, value_json)
+      VALUES ('payment_config', ${sql.json({ enabled: true, minorPerUsd: 700, maxAmountMinor: 5_000_000_000 })})
+      ON CONFLICT (key) DO UPDATE SET value_json = EXCLUDED.value_json
+    `;
+    await sql.unsafe(PG_PAYMENT_SETTINGS_SCHEMA_SQL);
+    const blob = await store.payments.getConfigBlob();
+    expect(blob?.enabled).toBe(true);
+    expect(blob?.minorPerUsd).toBe(700);
+    expect(blob?.maxAmountMinor).toBe(2_147_483_647);
+    // A limit the legacy blob never set still gets its default, not the cap.
+    expect(blob?.minAmountMinor).toBe(100);
   });
 
   it("keeps the EasyPay merchant key out of the admin audit log", async () => {

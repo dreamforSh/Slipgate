@@ -1,5 +1,5 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import type { UsageOutcome, UsagePageResponse, UsageRow, UsageSummary } from "@slipgate/contracts";
+import type { UsageOutcome, UsagePageResponse, UsageRow, UsageSortBy, UsageSortDir, UsageSummary } from "@slipgate/contracts";
 import { apiJson, downloadFile, errorText, toQuery } from "../../lib/api";
 
 export type UsageRange = "24h" | "7d" | "30d" | "custom";
@@ -52,6 +52,8 @@ export function useUsageLogs(options: { base: string; initial?: Partial<UsageFil
   const filters = ref<UsageFilters>(blankUsageFilters(options.initial));
   const page = ref(1);
   const pageSize = ref(20);
+  /** Server-side row order (not part of the criteria: charts and totals do not depend on it). */
+  const sort = ref<{ by: UsageSortBy; dir: UsageSortDir }>({ by: "time", dir: "desc" });
 
   const items = ref<UsageRow[]>([]);
   const total = ref(0);
@@ -127,6 +129,18 @@ export function useUsageLogs(options: { base: string; initial?: Partial<UsageFil
     };
   }
 
+  /** Default order (newest first) is left implicit. */
+  function sortParams(): Record<string, string | undefined> {
+    const s = sort.value;
+    return s.by === "time" && s.dir === "desc" ? {} : { sortBy: s.by, sortDir: s.dir };
+  }
+
+  /** Clicking a column: a new column starts descending (time, cost, tokens, latency) or ascending (model); the same column flips. */
+  function toggleSort(by: UsageSortBy) {
+    const cur = sort.value;
+    sort.value = cur.by === by ? { by, dir: cur.dir === "desc" ? "asc" : "desc" } : { by, dir: by === "model" ? "asc" : "desc" };
+  }
+
   let seq = 0;
   let controller: AbortController | null = null;
 
@@ -151,7 +165,7 @@ export function useUsageLogs(options: { base: string; initial?: Partial<UsageFil
     error.value = null;
     try {
       const res = await apiJson<UsagePageResponse>(
-        `${options.base}/query${toQuery({ ...params(), page: page.value, pageSize: pageSize.value, summary: reuse ? false : undefined })}`,
+        `${options.base}/query${toQuery({ ...params(), ...sortParams(), page: page.value, pageSize: pageSize.value, summary: reuse ? false : undefined })}`,
         { signal: ctrl.signal, fallbackError: options.errorLoad },
       );
       if (id !== seq) return;
@@ -177,6 +191,11 @@ export function useUsageLogs(options: { base: string; initial?: Partial<UsageFil
     page.value = 1;
   });
   watch([criteriaKey, page, pageSize], ([key], [prevKey]) => void fetchPage(key === prevKey));
+  // A new order shows its first page; totals and summary are unaffected.
+  watch(sort, () => {
+    if (page.value !== 1) page.value = 1;
+    else void fetchPage(true);
+  });
 
   function reset(keep: Partial<UsageFilters> = {}) {
     window.clearTimeout(textTimer);
@@ -190,7 +209,7 @@ export function useUsageLogs(options: { base: string; initial?: Partial<UsageFil
     exporting.value = true;
     error.value = null;
     try {
-      await downloadFile(`${options.base}/export${toQuery(params())}`, "usage.csv");
+      await downloadFile(`${options.base}/export${toQuery({ ...params(), ...sortParams() })}`, "usage.csv");
       return true;
     } catch (err) {
       error.value = errorText(err, options.errorExport);
@@ -221,6 +240,8 @@ export function useUsageLogs(options: { base: string; initial?: Partial<UsageFil
     /** Value-compared criteria key and the matching query params (the stats panel reuses both). */
     criteriaKey,
     params,
+    sort,
+    toggleSort,
     load,
     reset,
     exportCsv,

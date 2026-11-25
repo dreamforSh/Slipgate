@@ -84,6 +84,8 @@ const en: typeof zh = {
       expiring: "Expired or expiring",
       risk: "Risk blocks",
       update: "Update available",
+      publishPending: "Config not yet applied in core",
+      publishUnreachable: "Data plane unreachable",
     },
     spark: {
       label: "{metric}, last {range}",

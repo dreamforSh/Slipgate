@@ -746,8 +746,34 @@ export const AccountBulkResultSchema = z.object({
 });
 export type AccountBulkResult = z.infer<typeof AccountBulkResultSchema>;
 
+/**
+ * Endpoint an account test calls: text streams a chat completion; image, embedding and speech call
+ * /v1/images/generations, /v1/embeddings and /v1/audio/speech through the same outbound path.
+ */
+export const AccountTestKindSchema = z.enum(["text", "image", "embedding", "speech"]);
+export type AccountTestKind = z.infer<typeof AccountTestKindSchema>;
+
+/** Test kinds an account of this provider offers (mirrors net-go ProbeKindsFor); text for all. */
+export function accountTestKinds(provider: string): AccountTestKind[] {
+  switch (provider) {
+    case "openai":
+      return ["text", "image", "embedding", "speech"];
+    case "gemini":
+      return ["text", "image", "embedding"];
+    case "grok":
+      return ["text", "image"];
+    case "qwen":
+      return ["text", "embedding"];
+    default:
+      return ["text"];
+  }
+}
+
 export const AccountTestRequestSchema = z.object({
+  /** Defaults to text. Only text tests are recorded as the account's last test. */
+  kind: AccountTestKindSchema.optional(),
   model: z.string().trim().max(128).optional(),
+  /** The prompt, or the embedding / speech input. */
   prompt: z.string().trim().max(2000).optional(),
 });
 export type AccountTestRequest = z.infer<typeof AccountTestRequestSchema>;
@@ -757,7 +783,9 @@ export type AccountTestRequest = z.infer<typeof AccountTestRequestSchema>;
  * Sequence: start, then delta events, then done; or a single error when the test cannot be dispatched.
  */
 export const AccountTestEventSchema = z.object({
-  type: z.enum(["start", "delta", "done", "error"]),
+  /** start, then delta (text) or media (image / speech) events, then done; or a single error. */
+  type: z.enum(["start", "delta", "media", "done", "error"]),
+  kind: AccountTestKindSchema.optional(),
   model: z.string().optional(),
   text: z.string().optional(),
   success: z.boolean().optional(),
@@ -768,6 +796,11 @@ export const AccountTestEventSchema = z.object({
   durationMs: z.number().optional(),
   inputTokens: z.number().optional(),
   outputTokens: z.number().optional(),
+  /** A generated image (URL or data: URL) or the speech audio (data: URL). */
+  mediaUrl: z.string().optional(),
+  mimeType: z.string().optional(),
+  /** Vector length of an embedding test. */
+  dimensions: z.number().int().optional(),
 });
 export type AccountTestEvent = z.infer<typeof AccountTestEventSchema>;
 

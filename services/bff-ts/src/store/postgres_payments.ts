@@ -25,11 +25,14 @@ import {
 } from "./memory_payments.ts";
 import { clampPage, likePattern } from "./ops_shared.ts";
 import {
+  clampConfigLimits,
+  paymentEventId,
   REFUNDABLE_STATUSES,
   type BeginRefundResult,
   type FulfillResult,
   type OrderInput,
   type OrderPaymentPatch,
+  type PaymentEventRecord,
   type PaymentsStore,
   type PlanInput,
   type RebatePolicy,
@@ -198,6 +201,7 @@ export const PG_PAYMENT_SETTINGS_SCHEMA_SQL = `
               legacy := (legacy #>> '{}')::jsonb;
           END IF;
           IF jsonb_typeof(legacy) = 'object' THEN
+              -- Limits saved before MAX_FIAT_MINOR existed are clamped to it (the INTEGER maximum).
               INSERT INTO commerce.payment_settings (
                   id, enabled, currency, custom_amount_enabled, minor_per_usd,
                   min_amount_minor, max_amount_minor, order_timeout_minutes, max_pending_orders,
@@ -208,8 +212,8 @@ export const PG_PAYMENT_SETTINGS_SCHEMA_SQL = `
                   COALESCE(NULLIF(legacy->>'currency', ''), 'CNY'),
                   COALESCE((legacy->>'customAmountEnabled')::boolean, TRUE),
                   COALESCE((legacy->>'minorPerUsd')::integer, 720),
-                  COALESCE((legacy->>'minAmountMinor')::integer, 100),
-                  COALESCE((legacy->>'maxAmountMinor')::integer, 1000000),
+                  LEAST(COALESCE((legacy->>'minAmountMinor')::numeric, 100), 2147483647)::integer,
+                  LEAST(COALESCE((legacy->>'maxAmountMinor')::numeric, 1000000), 2147483647)::integer,
                   COALESCE((legacy->>'orderTimeoutMinutes')::integer, 30),
                   COALESCE((legacy->>'maxPendingOrders')::integer, 5),
                   COALESCE(legacy->>'callbackBaseUrl', ''),
@@ -455,7 +459,8 @@ export class PostgresPaymentsStore implements PaymentsStore {
     return decoded && typeof decoded === "object" ? (decoded as Record<string, unknown>) : null;
   }
 
-  async saveConfigBlob(blob: Record<string, unknown>) {
+  async saveConfigBlob(saved: Record<string, unknown>) {
+    const blob = clampConfigLimits(saved);
     const enabled = Boolean(blob.enabled ?? DEFAULT_PAYMENT_CONFIG.enabled);
     const currency = typeof blob.currency === "string" && blob.currency ? blob.currency : DEFAULT_PAYMENT_CONFIG.currency;
     const customAmountEnabled = Boolean(blob.customAmountEnabled ?? DEFAULT_PAYMENT_CONFIG.customAmountEnabled);
@@ -769,6 +774,57 @@ export class PostgresPaymentsStore implements PaymentsStore {
     return rows[0]?.n ?? 0;
   }
 
+  async listPaymentEvents(query: {
+    status?: PaymentEventRecord["status"];
+    orderId?: string;
+    dueBeforeIso?: string;
+    limit: number;
+  }): Promise<PaymentEventRecord[]> {
+    const sql = this.sql;
+    const parts = [sql`event_type = 'payment.settled'`];
+    if (query.status) parts.push(sql`status = ${query.status}`);
+    if (query.orderId) parts.push(sql`aggregate_id = ${query.orderId}`);
+    if (query.dueBeforeIso) parts.push(sql`status = 'pending' AND next_retry_at <= ${new Date(query.dueBeforeIso)}`);
+    const where = parts.reduce((acc, part) => sql`${acc} AND ${part}`);
+    const order = query.dueBeforeIso ? sql`next_retry_at ASC` : sql`created_at DESC`;
+    const rows = await sql<
+      { id: string; aggregate_id: string; status: string; attempts: number; next_retry_at: Date; created_at: Date; dispatched_at: Date | null; payload: unknown }[]
+    >`
+      SELECT id, aggregate_id, status, attempts, next_retry_at, created_at, dispatched_at, payload
+        FROM commerce.outbox_events
+       WHERE ${where}
+       ORDER BY ${order}
+       LIMIT ${query.limit}
+    `;
+    return rows.map((r) => {
+      const payload = (typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload) as { deliveries?: PaymentEventRecord["deliveries"] } | null;
+      return {
+        id: r.id,
+        orderId: r.aggregate_id,
+        status: r.status as PaymentEventRecord["status"],
+        attempts: r.attempts,
+        nextRetryAtIso: new Date(r.next_retry_at).toISOString(),
+        createdAtIso: new Date(r.created_at).toISOString(),
+        dispatchedAtIso: r.dispatched_at ? new Date(r.dispatched_at).toISOString() : null,
+        deliveries: payload?.deliveries ?? {},
+      };
+    });
+  }
+
+  async savePaymentEvent(event: PaymentEventRecord): Promise<void> {
+    const rows = await this.sql<{ id: string }[]>`
+      UPDATE commerce.outbox_events
+         SET status = ${event.status},
+             attempts = ${event.attempts},
+             next_retry_at = ${new Date(event.nextRetryAtIso)},
+             dispatched_at = ${event.dispatchedAtIso ? new Date(event.dispatchedAtIso) : null},
+             payload = ${this.sql.json({ deliveries: event.deliveries } as never)}
+       WHERE id = ${event.id} AND event_type = 'payment.settled'
+       RETURNING id
+    `;
+    if (rows.length === 0) throw new StoreError("not_found", "Payment notification not found");
+  }
+
   async fulfillOrder(id: string, providerTradeNo: string | null, rebate: RebatePolicy): Promise<FulfillResult> {
     const outcome = await this.sql.begin(async (txRaw) => {
       const tx = txRaw as unknown as Sql;
@@ -818,6 +874,12 @@ export class PostgresPaymentsStore implements PaymentsStore {
         UPDATE commerce.payment_orders
            SET status = 'paid', paid_at = NOW(), provider_trade_no = COALESCE(${providerTradeNo}, provider_trade_no), updated_at = NOW()
          WHERE id = ${id}
+      `;
+      // The order's payment notification, in the transaction that marks it paid (once per order).
+      await tx`
+        INSERT INTO commerce.outbox_events (id, event_type, aggregate_id, payload, status, next_retry_at)
+        VALUES (${paymentEventId(id)}, 'payment.settled', ${id}, ${this.sql.json({ deliveries: {} })}, 'pending', NOW())
+        ON CONFLICT (id) DO NOTHING
       `;
       if (rebate.enabled && o.kind === "recharge" && credit > 0n) {
         const ref = await tx<{ referrer_id: string | null }[]>`SELECT referrer_id FROM commerce.users WHERE id = ${o.user_id}`;
