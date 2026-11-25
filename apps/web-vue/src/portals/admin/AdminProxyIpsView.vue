@@ -33,6 +33,7 @@ import { useNow } from "../../composables/useNow";
 import { usePersistentState } from "../../composables/usePersistentState";
 import { formatDateShort, healthLabel, healthTone, type Tone } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import { NODE_BIND_FILTERS, nodeBindState, type NodeBindFilter } from "../../components/admin/clash/nodeFilters";
 import UiSelect from "../../components/ui/UiSelect.vue";
 
 /**
@@ -78,6 +79,10 @@ type ProtocolFilter = "all" | StaticIpProtocol;
 type StatusFilter = "all" | "healthy" | "unhealthy" | "disabled" | "pending";
 const protocolFilter = ref<ProtocolFilter>("all");
 const statusFilter = ref<StatusFilter>("all");
+/** Occupancy filter and sort order, shared vocabulary with the Clash node list. */
+const bindFilter = ref<NodeBindFilter>("all");
+type IpSortKey = "created" | "name" | "latency" | "bound";
+const ipSort = ref<IpSortKey>("created");
 
 type ViewMode = "card" | "table";
 /** Cards by default, like the Clash node and subscription lists. */
@@ -161,10 +166,38 @@ const filtered = computed(() => {
   return rows.value.filter((r) => {
     if (protocolFilter.value !== "all" && r.protocol !== protocolFilter.value) return false;
     if (statusFilter.value !== "all" && rowStatus(r) !== statusFilter.value) return false;
+    if (bindFilter.value !== "all") {
+      const state = r.node ? nodeBindState(r.node) : "free";
+      if (bindFilter.value === "bound" && state === "free") return false;
+      if (bindFilter.value === "free" && state !== "free") return false;
+      if (bindFilter.value === "full" && state !== "full") return false;
+    }
     if (!q) return true;
     return [r.name, r.address, r.username, r.node?.exitIp ?? "", ...r.accountNames].some((v) => v.toLowerCase().includes(q));
+  }).sort((a, b) => {
+    switch (ipSort.value) {
+      case "name":
+        return a.name.localeCompare(b.name, undefined, { numeric: true });
+      case "latency": {
+        const lat = (r: IpRow) => (r.node && r.node.latencyMs > 0 ? r.node.latencyMs : Number.MAX_SAFE_INTEGER);
+        return lat(a) - lat(b);
+      }
+      case "bound":
+        return (b.node?.boundAccounts ?? 0) - (a.node?.boundAccounts ?? 0);
+      default:
+        return 0; // rows already come newest first
+    }
   });
 });
+const filtersActive = computed(
+  () => !!search.value.trim() || protocolFilter.value !== "all" || statusFilter.value !== "all" || bindFilter.value !== "all",
+);
+function clearFilters() {
+  search.value = "";
+  protocolFilter.value = "all";
+  statusFilter.value = "all";
+  bindFilter.value = "all";
+}
 
 const stats = computed(() => {
   const list = rows.value;
@@ -469,6 +502,20 @@ const uncheckedIds = computed(() => rows.value.filter((r) => r.node).map((r) => 
           <UiSelect v-model="statusFilter" class="select input-sm w-36" :aria-label="t('clash.ips.columns.status')">
             <option v-for="o in statusOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
           </UiSelect>
+          <UiSelect v-model="bindFilter" class="select input-sm w-32" :aria-label="t('clash.filters.bind')">
+            <option v-for="b in NODE_BIND_FILTERS" :key="b" :value="b">{{ t(`clash.filters.binds.${b}`) }}</option>
+          </UiSelect>
+          <UiSelect v-model="ipSort" class="select input-sm w-32" :aria-label="t('clash.filters.sort')">
+            <option value="created">{{ t("clash.ips.sortNewest") }}</option>
+            <option value="name">{{ t("clash.filters.sorts.name") }}</option>
+            <option value="latency">{{ t("clash.filters.sorts.latency") }}</option>
+            <option value="bound">{{ t("clash.filters.sorts.bound") }}</option>
+          </UiSelect>
+          <span class="text-2xs text-fg-subtle">{{ t("clash.filters.count", { shown: filtered.length, total: rows.length }) }}</span>
+          <button v-if="filtersActive" type="button" class="btn btn-ghost btn-xs" @click="clearFilters">
+            <UiIcon name="x" :size="12" />
+            {{ t("clash.filters.clear") }}
+          </button>
           <SegmentedControl v-model="viewMode" :options="viewOptions" />
         </div>
       </div>

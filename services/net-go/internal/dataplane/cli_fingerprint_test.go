@@ -43,10 +43,10 @@ func TestClaudeCodeUTF16BillingFingerprint(t *testing.T) {
 		text string
 		ver  string
 	}{
-		{name: "short_padded", text: "hi", ver: "2.1.321"},
-		{name: "mid_length", text: "hello world", ver: "2.1.321"},
-		{name: "exact_21_ascii", text: "01234567890123456789X", ver: "2.1.321"},
-		{name: "utf16_surrogate_pairs", text: "abc😀defghijklmnopqrsZ", ver: "2.1.321"},
+		{name: "short_padded", text: "hi", ver: "2.1.332"},
+		{name: "mid_length", text: "hello world", ver: "2.1.332"},
+		{name: "exact_21_ascii", text: "01234567890123456789X", ver: "2.1.332"},
+		{name: "utf16_surrogate_pairs", text: "abc😀defghijklmnopqrsZ", ver: "2.1.332"},
 	}
 
 	for _, tc := range cases {
@@ -87,46 +87,46 @@ func TestCLIVersionLockstepAndEnvOverrides(t *testing.T) {
 		t.Setenv(k, "")
 	}
 
-	if got := CLIClaudeVersion(); got != "2.1.321" {
-		t.Fatalf("default CLIClaudeVersion = %q, want 2.1.321", got)
+	if got := CLIClaudeVersion(); got != "2.1.332" {
+		t.Fatalf("default CLIClaudeVersion = %q, want 2.1.332", got)
 	}
-	if got := CLICodexVersion(); got != "0.146.0" {
-		t.Fatalf("default CLICodexVersion = %q, want 0.146.0", got)
+	if got := CLICodexVersion(); got != "0.172.0" {
+		t.Fatalf("default CLICodexVersion = %q, want 0.172.0", got)
 	}
 	if got := CLIAntigravityVersion(); got != "2.23.0" {
 		t.Fatalf("default CLIAntigravityVersion = %q, want 2.23.0", got)
 	}
-	if got := CLIGeminiVersion(); got != "0.73.0" {
-		t.Fatalf("default CLIGeminiVersion = %q, want 0.73.0", got)
+	if got := CLIGeminiVersion(); got != "0.71.1" {
+		t.Fatalf("default CLIGeminiVersion = %q, want 0.71.1", got)
 	}
-	if got := CLIQwenVersion(); got != "0.28.3" {
-		t.Fatalf("default CLIQwenVersion = %q, want 0.28.3", got)
+	if got := CLIQwenVersion(); got != "0.28.4" {
+		t.Fatalf("default CLIQwenVersion = %q, want 0.28.4", got)
 	}
-	if got := CLIGrokVersion(); got != "1.0.46" {
-		t.Fatalf("default CLIGrokVersion = %q, want 1.0.46", got)
+	if got := CLIGrokVersion(); got != "1.0.92" {
+		t.Fatalf("default CLIGrokVersion = %q, want 1.0.92", got)
 	}
-	if got := CLIOpenCodeVersion(); got != "1.0.0" {
-		t.Fatalf("default CLIOpenCodeVersion = %q, want 1.0.0", got)
+	if got := CLIOpenCodeVersion(); got != "1.19.6" {
+		t.Fatalf("default CLIOpenCodeVersion = %q, want 1.19.6", got)
 	}
-	if got := CLIClineVersion(); got != "3.17.0" {
-		t.Fatalf("default CLIClineVersion = %q, want 3.17.0", got)
+	if got := CLIClineVersion(); got != "4.1.27" {
+		t.Fatalf("default CLIClineVersion = %q, want 4.1.27", got)
 	}
 
 	// Downgrade and prerelease rejection.
 	t.Setenv("SLIPGATE_CLAUDE_CLI_VERSION", "2.1.280")
-	if got := CLIClaudeVersion(); got != "2.1.321" {
+	if got := CLIClaudeVersion(); got != "2.1.332" {
 		t.Fatalf("CLIClaudeVersion accepted downgrade %q", got)
 	}
 	t.Setenv("SLIPGATE_CLAUDE_CLI_VERSION", "2.1.350-rc.1")
-	if got := CLIClaudeVersion(); got != "2.1.321" {
+	if got := CLIClaudeVersion(); got != "2.1.332" {
 		t.Fatalf("CLIClaudeVersion accepted prerelease %q", got)
 	}
 	t.Setenv("SLIPGATE_CODEX_CLI_VERSION", "0.143.9")
-	if got := CLICodexVersion(); got != "0.146.0" {
+	if got := CLICodexVersion(); got != "0.172.0" {
 		t.Fatalf("CLICodexVersion accepted below-floor %q", got)
 	}
 	t.Setenv("SLIPGATE_GROK_CLI_VERSION", "1.0.12")
-	if got := CLIGrokVersion(); got != "1.0.46" {
+	if got := CLIGrokVersion(); got != "1.0.92" {
 		t.Fatalf("CLIGrokVersion accepted below-floor %q", got)
 	}
 
@@ -140,9 +140,9 @@ func TestCLIVersionLockstepAndEnvOverrides(t *testing.T) {
 	if got := CLIClaudeVersion(); got != "2.1.355" {
 		t.Fatalf("SLIPGATE_CLAUDE_CLI_VERSION = %q, want 2.1.355", got)
 	}
-	t.Setenv("SLIPGATE_CODEX_CLI_VERSION", "0.148.0")
-	if got := CLICodexVersion(); got != "0.148.0" {
-		t.Fatalf("SLIPGATE_CODEX_CLI_VERSION = %q, want 0.148.0", got)
+	t.Setenv("SLIPGATE_CODEX_CLI_VERSION", "0.180.0")
+	if got := CLICodexVersion(); got != "0.180.0" {
+		t.Fatalf("SLIPGATE_CODEX_CLI_VERSION = %q, want 0.180.0", got)
 	}
 	t.Setenv("SLIPGATE_ANTIGRAVITY_VERSION", "2.24.1")
 	if got := CLIAntigravityVersion(); got != "2.24.1" {
@@ -215,7 +215,7 @@ func TestClaudeRuntimeSwitchNode24VsBun21(t *testing.T) {
 		reqNode.Header.Get("X-Stainless-Package-Version") != "0.94.0" ||
 		reqNode.Header.Get("X-Stainless-Timeout") != "600" ||
 		reqNode.Header.Get("Accept") != "application/json" ||
-		reqNode.Header.Get("User-Agent") != "claude-cli/2.1.321 (external, cli)" {
+		reqNode.Header.Get("User-Agent") != "claude-cli/2.1.332 (external, cli)" {
 		t.Fatalf("unexpected Node 24 headers: %+v", reqNode.Header)
 	}
 	sessHeader := reqNode.Header.Get("X-Claude-Code-Session-Id")
@@ -228,7 +228,7 @@ func TestClaudeRuntimeSwitchNode24VsBun21(t *testing.T) {
 	// Legacy claude-bun-21 keeps bun runtime header when explicitly bound.
 	reqBun, _ := buildAndInspect(stealth.ClaudeBunProfileID)
 	if reqBun.Header.Get("X-Stainless-Runtime") != "bun" ||
-		reqBun.Header.Get("User-Agent") != "claude-cli/2.1.321 (external, cli)" {
+		reqBun.Header.Get("User-Agent") != "claude-cli/2.1.332 (external, cli)" {
 		t.Fatalf("unexpected Bun headers: %+v", reqBun.Header)
 	}
 

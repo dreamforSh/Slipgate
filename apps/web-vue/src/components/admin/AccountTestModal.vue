@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { ACCOUNT_TEST_MODELS, type AccountTestEvent, type UpstreamAccount } from "@slipgate/contracts";
+import type { AccountTestEvent, UpstreamAccount } from "@slipgate/contracts";
 import CopyButton from "../ui/CopyButton.vue";
 import UiBadge from "../ui/UiBadge.vue";
 import UiIcon from "../ui/UiIcon.vue";
 import UiModal from "../ui/UiModal.vue";
 import { PROVIDER_OPTIONS, accountStatusLabel, executionModeLabel, healthTone } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import { useAccountModels } from "./accounts/accountModels";
 
 const props = defineProps<{
   open: boolean;
@@ -36,7 +37,16 @@ const terminal = ref<HTMLElement | null>(null);
 let controller: AbortController | null = null;
 
 const isVm = computed(() => props.account?.executionMode === "vm_slot");
-const modelSuggestions = computed(() => (props.account ? (ACCOUNT_TEST_MODELS[props.account.platform] ?? []) : []));
+const models = useAccountModels();
+const modelSuggestions = computed(() => models.suggestions(props.account?.platform));
+
+async function fetchModels() {
+  const account = props.account;
+  if (!account || models.loading.value) return;
+  const answer = await models.load(account.id);
+  // Keep a model the admin typed; otherwise start from the first listed one.
+  if (answer && !model.value.trim()) model.value = modelSuggestions.value[0] ?? "";
+}
 const datalistId = computed(() => `test-models-${props.account?.id ?? "none"}`);
 const platformLabel = computed(
   () => PROVIDER_OPTIONS.find((p) => p.value === props.account?.platform)?.label ?? props.account?.platform ?? "",
@@ -47,6 +57,7 @@ function reset() {
   lines.value = [];
   hasRun.value = false;
   prompt.value = "";
+  models.show(props.account?.id);
   model.value = modelSuggestions.value[0] ?? "";
 }
 
@@ -246,9 +257,21 @@ const lineClass: Record<LineKind, string> = {
       </div>
 
       <div class="grid gap-3 sm:grid-cols-2">
-        <label class="block min-w-0">
-          <span class="label">{{ t("accounts.test.model") }}</span>
+        <div class="min-w-0">
+          <div class="label flex items-center justify-between gap-2">
+            <label :for="`${datalistId}-input`">{{ t("accounts.test.model") }}</label>
+            <button
+              type="button"
+              class="inline-flex items-center gap-1 text-2xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="running || isVm || models.loading.value"
+              @click="fetchModels"
+            >
+              <UiIcon :name="models.loading.value ? 'loader' : 'download'" :size="11" :spin="models.loading.value" />
+              {{ models.result.value ? t("accounts.models.refetch") : t("accounts.models.fetch") }}
+            </button>
+          </div>
           <input
+            :id="`${datalistId}-input`"
             v-model="model"
             type="text"
             class="input font-mono text-xs"
@@ -260,7 +283,22 @@ const lineClass: Record<LineKind, string> = {
           <datalist :id="datalistId">
             <option v-for="m in modelSuggestions" :key="m" :value="m" />
           </datalist>
-        </label>
+          <p v-if="models.error.value" class="mt-1 truncate text-2xs text-danger" :title="models.error.value">
+            {{ t("accounts.models.failed", { message: models.error.value }) }}
+          </p>
+          <p
+            v-else-if="models.result.value"
+            class="mt-1 truncate text-2xs"
+            :class="models.result.value.source === 'upstream' ? 'text-fg-subtle' : 'text-warning'"
+            :title="models.result.value.message || undefined"
+          >
+            {{
+              models.result.value.source === "upstream"
+                ? t("accounts.models.fromUpstream", { n: models.result.value.models.length })
+                : t("accounts.models.fallback", { message: models.result.value.message })
+            }}
+          </p>
+        </div>
         <label class="block min-w-0">
           <span class="label">{{ t("accounts.test.prompt") }}</span>
           <input v-model="prompt" type="text" class="input" placeholder="Hi" :disabled="running" />

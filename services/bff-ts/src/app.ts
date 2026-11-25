@@ -12,6 +12,9 @@ import {
   RefreshAccountOAuthResponseSchema,
   NetAccountPrivacyResultSchema,
   accountSupportsPrivacy,
+  ACCOUNT_TEST_MODELS,
+  CliFingerprintReportSchema,
+  type AccountModelsResponse,
   type SetAccountPrivacyResponse,
   canonicalCredentialText,
   DashboardRangeSchema,
@@ -1896,6 +1899,81 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   });
 
   /**
+   * Models one account can use: slipgate-net asks the provider over the account's own egress. When
+   * that is not possible (standalone BFF, VM slot, provider without a listing, upstream error) the
+   * answer falls back to the built-in suggestions with the reason, so the console always has a list.
+   */
+  app.get("/api/v1/admin/accounts/:accountId/models", async (c) => {
+    const accountId = c.req.param("accountId");
+    const account = await store.getAccount(accountId);
+    if (!account) {
+      return c.json({ error: "not_found", message: `Account ${accountId} not found` }, 404);
+    }
+    const fallback = (message: string): AccountModelsResponse => ({
+      models: [...(ACCOUNT_TEST_MODELS[account.platform] ?? [])],
+      source: "default",
+      message,
+      fetchedAtIso: new Date().toISOString(),
+    });
+    if (account.executionMode === "vm_slot") {
+      return c.json(fallback("VM slot accounts answer from their slot; showing the built-in list"));
+    }
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    if (!internalUrl || !internalToken) {
+      return c.json(fallback("The network service is not configured (standalone BFF mode)"));
+    }
+    await syncDataPlaneBestEffort();
+    try {
+      const res = await fetch(`${internalUrl}/internal/net/accounts/${encodeURIComponent(accountId)}/models`, {
+        method: "POST",
+        headers: { "X-Slipgate-Internal-Token": internalToken },
+        signal: AbortSignal.timeout(45_000),
+      });
+      const payload = (await res.json().catch(() => ({}))) as { models?: unknown; source?: unknown; message?: unknown };
+      if (!res.ok) {
+        return c.json(fallback(typeof payload.message === "string" ? payload.message : `HTTP ${res.status}`));
+      }
+      const models = Array.isArray(payload.models) ? payload.models.filter((m): m is string => typeof m === "string") : [];
+      if (payload.source !== "upstream" || models.length === 0) {
+        const base = fallback(typeof payload.message === "string" && payload.message ? payload.message : "The provider listed no models");
+        return c.json(models.length ? { ...base, models: [...new Set([...models, ...base.models])] } : base);
+      }
+      const body: AccountModelsResponse = { models, source: "upstream", message: "", fetchedAtIso: new Date().toISOString() };
+      return c.json(body);
+    } catch (err) {
+      return c.json(fallback(err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  /** The CLI versions / User-Agents slipgate-net impersonates, and an on-demand release sync. */
+  const cliFingerprint = async (c: Context<AuthEnv>, method: "GET" | "POST") => {
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    if (!internalUrl || !internalToken) {
+      return c.json(
+        { error: "net_supervisor_unconfigured", message: "CLI fingerprints live in the network service, which is not configured" },
+        503,
+      );
+    }
+    try {
+      const res = await fetch(`${internalUrl}/internal/net/cli-fingerprint${method === "POST" ? "/sync" : ""}`, {
+        method,
+        headers: { "X-Slipgate-Internal-Token": internalToken },
+        signal: AbortSignal.timeout(method === "POST" ? 90_000 : 10_000),
+      });
+      const payload = await res.json().catch(() => ({}));
+      const parsed = CliFingerprintReportSchema.safeParse(payload);
+      if (!res.ok || !parsed.success) {
+        return c.json({ error: "cli_fingerprint_failed", message: `HTTP ${res.status}` }, 502);
+      }
+      return c.json(parsed.data);
+    } catch (err) {
+      return c.json({ error: "net_supervisor_unreachable", message: err instanceof Error ? err.message : String(err) }, 502);
+    }
+  };
+  app.get("/api/v1/admin/cli-fingerprint", (c) => cliFingerprint(c, "GET"));
+  app.post("/api/v1/admin/cli-fingerprint/sync", (c) => cliFingerprint(c, "POST"));
+
+  /**
    * "Set privacy" for one OAuth account: ChatGPT / Codex training off, Antigravity telemetry and
    * marketing emails off. slipgate-net sends the provider calls over the account's own egress (bound
    * exit for stealth accounts, fail-closed); the outcome is stored as the account's privacy mode.
@@ -2969,10 +3047,16 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
   mail = registerMailRoutes(app, { store, vaultSecret, sessions, deliver: options.mailDelivery, guards });
   // Price rules travel in the data-plane snapshot, so an edit is pushed like any other change.
   pricing = registerPricingRoutes(app, store, () => void syncDataPlaneBestEffort());
-  const autoTester = new AccountAutoTester(store, () => {
-    const url = process.env.SLIPGATE_NET_INTERNAL_URL;
-    return url && internalToken ? { url, token: internalToken } : null;
-  });
+  const autoTester = new AccountAutoTester(
+    store,
+    () => {
+      const url = process.env.SLIPGATE_NET_INTERNAL_URL;
+      return url && internalToken ? { url, token: internalToken } : null;
+    },
+    fetch,
+    // A scheduled test that ended a cooldown changes what the data plane may schedule.
+    () => void syncDataPlaneBestEffort(),
+  );
   registerAutoTestRoutes(app, autoTester);
   const channelMonitorService = new ChannelMonitorService({
     store,

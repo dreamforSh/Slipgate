@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import type {
   AccountExitBinding,
@@ -13,6 +13,16 @@ import type {
 } from "@slipgate/contracts";
 import { isStaticIpSubscription } from "@slipgate/contracts";
 import ClashNodeCard from "../../components/admin/clash/ClashNodeCard.vue";
+import NodeFilterBar from "../../components/admin/clash/NodeFilterBar.vue";
+import {
+  EMPTY_NODE_FILTER,
+  NODE_SORT_KEYS,
+  compareNodes,
+  matchesNode,
+  nodeTypes,
+  type NodeFilter,
+  type NodeSortKey,
+} from "../../components/admin/clash/nodeFilters";
 import ClashSubscriptionCard from "../../components/admin/clash/ClashSubscriptionCard.vue";
 import ConfirmButton from "../../components/ui/ConfirmButton.vue";
 import EmptyState from "../../components/ui/EmptyState.vue";
@@ -127,6 +137,91 @@ const accountNamesByNode = computed(() => {
   }
   return map;
 });
+/* ---------------- Node filters, sorting and selection ---------------- */
+
+const nodeFilter = ref<NodeFilter>({ ...EMPTY_NODE_FILTER });
+const nodeSort = usePersistentState<NodeSortKey>("slipgate.clash.nodeSort", "recommended", (v): v is NodeSortKey =>
+  (NODE_SORT_KEYS as string[]).includes(v as string),
+);
+const nodeSortDir = usePersistentState<"asc" | "desc">("slipgate.clash.nodeSortDir", "asc", (v): v is "asc" | "desc" => v === "asc" || v === "desc");
+const nodeTypeOptions = computed(() => nodeTypes(clashNodes.value));
+const nodeSubscriptionOptions = computed(() => clashSubscriptions.value.map((s) => ({ id: s.id, name: s.name })));
+const filteredNodes = computed(() =>
+  clashNodes.value
+    .filter((n) =>
+      matchesNode(
+        n,
+        nodeFilter.value,
+        [subscriptionNameById.value.get(n.subscriptionId) ?? "", ...(accountNamesByNode.value.get(n.nodeId) ?? [])].join("\n"),
+      ),
+    )
+    .sort((a, b) => compareNodes(a, b, nodeSort.value, nodeSortDir.value)),
+);
+
+const selectedNodeIds = ref<Set<string>>(new Set());
+const allShownSelected = computed(
+  () => filteredNodes.value.length > 0 && filteredNodes.value.every((n) => selectedNodeIds.value.has(n.nodeId)),
+);
+function toggleNode(id: string) {
+  const next = new Set(selectedNodeIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  selectedNodeIds.value = next;
+}
+function toggleShownNodes() {
+  const next = new Set(selectedNodeIds.value);
+  if (allShownSelected.value) for (const n of filteredNodes.value) next.delete(n.nodeId);
+  else for (const n of filteredNodes.value) next.add(n.nodeId);
+  selectedNodeIds.value = next;
+}
+/** Drop selections of nodes that disappeared (resync, removed subscription). */
+watch(nodes, (list) => {
+  const ids = new Set(list.map((n) => n.nodeId));
+  const kept = [...selectedNodeIds.value].filter((id) => ids.has(id));
+  if (kept.length !== selectedNodeIds.value.size) selectedNodeIds.value = new Set(kept);
+});
+
+/** Enable or disable many nodes, one PATCH each. */
+async function setNodesEnabled(ids: string[], enabled: boolean) {
+  if (!ids.length) return;
+  busyAction.value = true;
+  errorMessage.value = null;
+  actionNotice.value = null;
+  try {
+    let failed = 0;
+    for (const id of ids) {
+      const res = await auth.apiFetch(`/api/v1/admin/clash/nodes/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!res.ok) failed++;
+    }
+    if (failed) errorMessage.value = t("clash.bulk.someFailed", { n: failed });
+    else {
+      actionNotice.value = enabled ? t("clash.bulk.enabled", { n: ids.length }) : t("clash.bulk.disabled", { n: ids.length });
+      selectedNodeIds.value = new Set();
+    }
+    await loadOverview();
+  } finally {
+    busyAction.value = false;
+  }
+}
+
+/* ---------------- Binding search ---------------- */
+
+const bindingQuery = ref("");
+const filteredBindings = computed(() => {
+  const q = bindingQuery.value.trim().toLowerCase();
+  if (!q) return bindings.value;
+  return bindings.value.filter((b) =>
+    [accountNameById.value.get(b.accountId) ?? "", b.accountId, nodeNameById.value.get(b.nodeId) ?? "", b.nodeId, b.boundExitIp, b.utlsProfileId]
+      .join("\n")
+      .toLowerCase()
+      .includes(q),
+  );
+});
+
 const nodesBySubscription = computed(() => {
   const map = new Map<string, ClashExitNode[]>();
   for (const n of clashNodes.value) map.set(n.subscriptionId, [...(map.get(n.subscriptionId) ?? []), n]);
@@ -609,9 +704,52 @@ onMounted(() => {
 
       <!-- Nodes -->
       <div v-if="activeTab === 'nodes'">
-        <div v-if="clashNodes.length" class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-3">
-          <span class="text-xs text-fg-muted">{{ t("clash.nodes.summary", { total: clashNodes.length, healthy: healthyCount }) }}</span>
-          <SegmentedControl v-model="viewMode" :options="viewOptions" />
+        <div v-if="clashNodes.length" class="space-y-3 border-b border-line px-5 py-3">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <span class="text-xs text-fg-muted">{{ t("clash.nodes.summary", { total: clashNodes.length, healthy: healthyCount }) }}</span>
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                class="btn btn-secondary btn-sm"
+                :disabled="busyAction || filteredNodes.length === 0"
+                @click="probeNodes(filteredNodes.map((n) => n.nodeId))"
+              >
+                <UiIcon name="radar" :size="13" />
+                {{ t("clash.bulk.checkShown", { n: filteredNodes.length }) }}
+              </button>
+              <SegmentedControl v-model="viewMode" :options="viewOptions" />
+            </div>
+          </div>
+          <NodeFilterBar
+            v-model="nodeFilter"
+            v-model:sort="nodeSort"
+            v-model:dir="nodeSortDir"
+            :types="nodeTypeOptions"
+            :subscriptions="nodeSubscriptionOptions"
+            :shown="filteredNodes.length"
+            :total="clashNodes.length"
+          />
+          <div
+            v-if="selectedNodeIds.size > 0"
+            class="flex flex-wrap items-center gap-2 rounded-lg bg-accent/[0.06] px-3 py-2 text-xs ring-1 ring-inset ring-accent/15"
+          >
+            <span class="font-medium text-fg">{{ t("clash.bulk.selected", { n: selectedNodeIds.size }) }}</span>
+            <button type="button" class="btn btn-ghost btn-xs" @click="selectedNodeIds = new Set()">{{ t("clash.bulk.clear") }}</button>
+            <div class="ml-auto flex flex-wrap items-center gap-1.5">
+              <button type="button" class="btn btn-secondary btn-xs" :disabled="busyAction" @click="probeNodes([...selectedNodeIds])">
+                <UiIcon name="radar" :size="12" />
+                {{ t("clash.bulk.check") }}
+              </button>
+              <button type="button" class="btn btn-secondary btn-xs" :disabled="busyAction" @click="setNodesEnabled([...selectedNodeIds], true)">
+                <UiIcon name="check" :size="12" />
+                {{ t("clash.bulk.enable") }}
+              </button>
+              <button type="button" class="btn btn-secondary btn-xs" :disabled="busyAction" @click="setNodesEnabled([...selectedNodeIds], false)">
+                <UiIcon name="pause" :size="12" />
+                {{ t("clash.bulk.disable") }}
+              </button>
+            </div>
+          </div>
         </div>
         <EmptyState v-if="clashNodes.length === 0" icon="radar" :title="t('clash.nodes.empty')">
           <button type="button" class="btn btn-primary btn-sm" @click="activeTab = 'subscriptions'; subDrawerOpen = true">
@@ -619,9 +757,14 @@ onMounted(() => {
             {{ t("clash.actions.addSubscription") }}
           </button>
         </EmptyState>
+        <EmptyState v-else-if="filteredNodes.length === 0" compact icon="search" :title="t('clash.filters.noMatch')">
+          <button type="button" class="btn btn-secondary btn-sm" @click="nodeFilter = { ...EMPTY_NODE_FILTER }">
+            {{ t("clash.filters.clear") }}
+          </button>
+        </EmptyState>
         <div v-else-if="viewMode === 'card'" class="grid gap-4 p-5 sm:grid-cols-2 xl:grid-cols-3">
           <ClashNodeCard
-            v-for="n in clashNodes"
+            v-for="n in filteredNodes"
             :key="n.nodeId"
             :node="n"
             :subscription-name="subscriptionNameById.get(n.subscriptionId) ?? n.subscriptionId"
@@ -637,6 +780,15 @@ onMounted(() => {
           <table class="data-table">
             <thead>
               <tr>
+                <th class="w-8">
+                  <input
+                    type="checkbox"
+                    class="checkbox"
+                    :checked="allShownSelected"
+                    :aria-label="t('clash.bulk.selectShown')"
+                    @change="toggleShownNodes"
+                  />
+                </th>
                 <th>{{ t("clash.nodes.columns.name") }}</th>
                 <th>{{ t("clash.nodes.columns.server") }}</th>
                 <th>{{ t("clash.nodes.columns.listener") }}</th>
@@ -648,7 +800,16 @@ onMounted(() => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="n in clashNodes" :key="n.nodeId" :class="(n.enabled ?? true) ? '' : 'opacity-60'">
+              <tr v-for="n in filteredNodes" :key="n.nodeId" :class="(n.enabled ?? true) ? '' : 'opacity-60'">
+                <td class="w-8">
+                  <input
+                    type="checkbox"
+                    class="checkbox"
+                    :checked="selectedNodeIds.has(n.nodeId)"
+                    :aria-label="t('clash.bulk.selectOne', { name: n.name })"
+                    @change="toggleNode(n.nodeId)"
+                  />
+                </td>
                 <td class="max-w-[14rem]">
                   <p class="truncate font-medium text-fg">{{ n.name }}</p>
                   <p v-if="n.lastError" class="mt-0.5 truncate text-2xs text-danger" :title="n.lastError">{{ n.lastError }}</p>
@@ -848,7 +1009,15 @@ onMounted(() => {
           </div>
 
           <EmptyState v-if="bindings.length === 0" compact icon="link" :title="t('clash.bindings.empty')" />
-          <div v-else class="table-wrap">
+          <div v-if="bindings.length > 0" class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2.5">
+            <div class="relative min-w-[12rem] flex-1 sm:max-w-xs">
+              <UiIcon name="search" :size="14" class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-subtle" />
+              <input v-model="bindingQuery" type="search" class="input input-sm pl-8" :placeholder="t('clash.bindings.search')" :aria-label="t('clash.bindings.search')" />
+            </div>
+            <span class="ml-auto text-2xs text-fg-subtle">{{ t("clash.filters.count", { shown: filteredBindings.length, total: bindings.length }) }}</span>
+          </div>
+          <EmptyState v-if="bindings.length > 0 && filteredBindings.length === 0" compact icon="search" :title="t('clash.filters.noMatch')" />
+          <div v-else-if="bindings.length > 0" class="table-wrap">
             <table class="data-table">
               <thead>
                 <tr>
@@ -860,7 +1029,7 @@ onMounted(() => {
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="b in bindings" :key="b.accountId">
+                <tr v-for="b in filteredBindings" :key="b.accountId">
                   <td class="max-w-[12rem]">
                     <p class="truncate text-sm text-fg">{{ accountNameById.get(b.accountId) ?? b.accountId }}</p>
                     <p class="mt-0.5 truncate font-mono text-2xs text-fg-subtle">{{ b.accountId }}</p>

@@ -127,8 +127,8 @@ func TestOpenCodeGoCommandCodeAndClineRouting(t *testing.T) {
 	if egress != CodecOpenAIResponses || req.URL.String() != "https://opencode.ai/zen/go/v1/responses" {
 		t.Fatalf("unexpected opencode_go grok route: egress=%s url=%s", egress, req.URL.String())
 	}
-	if req.Header.Get("X-OpenCode-Session") == "" || req.Header.Get("User-Agent") != "opencode/1.0.0" {
-		t.Fatalf("expected X-OpenCode-Session and opencode/1.0.0 UA, got %+v", req.Header)
+	if req.Header.Get("X-OpenCode-Session") == "" || req.Header.Get("User-Agent") != OpenCodeCLIUserAgent("") {
+		t.Fatalf("expected X-OpenCode-Session and %s UA, got %+v", OpenCodeCLIUserAgent(""), req.Header)
 	}
 	if req.Header.Get("originator") != "" {
 		t.Fatalf("unexpected Codex originator header on OpenCode Responses")

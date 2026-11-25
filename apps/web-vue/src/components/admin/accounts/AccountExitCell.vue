@@ -18,7 +18,10 @@ const props = defineProps<{
   ready: boolean;
   /** One line (cards) instead of two (table). */
   inline?: boolean;
+  /** Render as a button that asks to change the exit. */
+  editable?: boolean;
 }>();
+const emit = defineEmits<{ (e: "change"): void }>();
 
 const { t } = useI18n();
 
@@ -71,7 +74,17 @@ const title = computed(() => {
 </script>
 
 <template>
-  <div class="min-w-0" :class="inline ? 'flex items-center gap-1.5 text-xs' : ''" :title="title">
+  <component
+    :is="editable ? 'button' : 'div'"
+    :type="editable ? 'button' : undefined"
+    class="min-w-0 text-left"
+    :class="[
+      inline ? 'flex items-center gap-1.5 text-xs' : 'block',
+      editable ? 'group -mx-1 cursor-pointer rounded-md px-1 py-0.5 hover:bg-accent/[0.06] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent' : '',
+    ]"
+    :title="editable ? `${title}\n${t('accounts.exitPicker.clickToChange')}` : title"
+    @click="editable && emit('change')"
+  >
     <template v-if="state === 'bound' && node">
       <!-- Inline (cards): the name keeps up to 60% of the row, the IP / latency shrink first -->
       <span class="flex min-w-0 items-center gap-1.5" :class="inline ? 'max-w-[60%] shrink-0' : 'text-xs'">
@@ -101,5 +114,6 @@ const title = computed(() => {
       {{ t("accounts.exit.direct") }}
     </span>
     <span v-else class="text-xs text-fg-subtle">—</span>
-  </div>
+    <UiIcon v-if="editable" name="pencil" :size="10" class="ml-0.5 shrink-0 text-fg-subtle opacity-0 transition-opacity group-hover:opacity-100" />
+  </component>
 </template>

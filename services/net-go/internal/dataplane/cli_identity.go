@@ -14,16 +14,17 @@ import (
 )
 
 const (
-	defaultClaudeCLIVersion     = "2.1.321"
-	defaultCodexCLIVersion      = "0.146.0"
+	// Built-in pins (release versions as of 2026-11-25); CLIVersionSyncer follows newer releases.
+	defaultClaudeCLIVersion     = "2.1.332"
+	defaultCodexCLIVersion      = "0.172.0"
 	minCodexCLIVersion          = "0.144.0"
 	defaultAntigravityVersion   = "2.23.0"
-	defaultGeminiCLIVersion     = "0.73.0"
-	defaultQwenCLIVersion       = "0.28.3"
-	defaultGrokCLIVersion       = "1.0.46"
+	defaultGeminiCLIVersion     = "0.71.1"
+	defaultQwenCLIVersion       = "0.28.4"
+	defaultGrokCLIVersion       = "1.0.92"
 	minGrokCLIVersion           = "1.0.13"
-	defaultOpenCodeCLIVersion   = "1.0.0"
-	defaultClineCLIVersion      = "3.17.0"
+	defaultOpenCodeCLIVersion   = "1.19.6"
+	defaultClineCLIVersion      = "4.1.27"
 	claudeBillingSalt           = "59cf53e54c78"
 	claudeStainlessPkgVersion   = "0.94.0"
 	openaiJSUserAgent           = "OpenAI/JS 4.104.0"
@@ -38,6 +39,18 @@ const (
 	xaiCLIClientIdentifier      = "grok-pager"
 	xaiCLIClientMode            = "interactive"
 )
+
+// resolveCLIVersion: a valid env override (not below minVer), else the synced upstream release (see
+// CLIVersionSyncer; never below the pin), else the built-in pin.
+func resolveCLIVersion(key, minVer, defaultVer string, envKeys ...string) string {
+	if v := resolveSemverMin(minVer, "", envKeys...); v != "" {
+		return v
+	}
+	if v := syncedCLIVersion(key, defaultVer); v != "" {
+		return v
+	}
+	return defaultVer
+}
 
 func resolveSemverMin(minVer, defaultVer string, envKeys ...string) string {
 	for _, k := range envKeys {
@@ -58,44 +71,44 @@ func resolveSemverMin(minVer, defaultVer string, envKeys ...string) string {
 	return defaultVer
 }
 
-// CLIClaudeVersion returns the active official Claude Code CLI version (minimum 2.1.321).
+// CLIClaudeVersion returns the active official Claude Code CLI version (never below the pin).
 func CLIClaudeVersion() string {
-	return resolveSemverMin(defaultClaudeCLIVersion, defaultClaudeCLIVersion, "SLIPGATE_CLAUDE_CLI_VERSION", "SUB2API_CLAUDE_CLI_VERSION")
+	return resolveCLIVersion("claude", defaultClaudeCLIVersion, defaultClaudeCLIVersion, "SLIPGATE_CLAUDE_CLI_VERSION", "SUB2API_CLAUDE_CLI_VERSION")
 }
 
 // CLICodexVersion returns the active official OpenAI Codex CLI version (minimum 0.144.0).
 func CLICodexVersion() string {
-	return resolveSemverMin(minCodexCLIVersion, defaultCodexCLIVersion, "SLIPGATE_CODEX_CLI_VERSION")
+	return resolveCLIVersion("codex", minCodexCLIVersion, defaultCodexCLIVersion, "SLIPGATE_CODEX_CLI_VERSION")
 }
 
-// CLIAntigravityVersion returns the active Antigravity IDE version.
+// CLIAntigravityVersion returns the active Antigravity IDE version (pinned; no public registry).
 func CLIAntigravityVersion() string {
-	return resolveSemverMin("", defaultAntigravityVersion, "SLIPGATE_ANTIGRAVITY_VERSION", "ANTIGRAVITY_USER_AGENT_VERSION")
+	return resolveCLIVersion("antigravity", "", defaultAntigravityVersion, "SLIPGATE_ANTIGRAVITY_VERSION", "ANTIGRAVITY_USER_AGENT_VERSION")
 }
 
 // CLIGeminiVersion returns the active official Gemini CLI version.
 func CLIGeminiVersion() string {
-	return resolveSemverMin("", defaultGeminiCLIVersion, "SLIPGATE_GEMINI_CLI_VERSION")
+	return resolveCLIVersion("gemini", "", defaultGeminiCLIVersion, "SLIPGATE_GEMINI_CLI_VERSION")
 }
 
 // CLIQwenVersion returns the active official Qwen Code CLI version.
 func CLIQwenVersion() string {
-	return resolveSemverMin("", defaultQwenCLIVersion, "SLIPGATE_QWEN_CLI_VERSION")
+	return resolveCLIVersion("qwen", "", defaultQwenCLIVersion, "SLIPGATE_QWEN_CLI_VERSION")
 }
 
 // CLIGrokVersion returns the active official xAI Grok CLI version (minimum 1.0.13).
 func CLIGrokVersion() string {
-	return resolveSemverMin(minGrokCLIVersion, defaultGrokCLIVersion, "SLIPGATE_GROK_CLI_VERSION", "XAI_GROK_CLI_VERSION")
+	return resolveCLIVersion("grok", minGrokCLIVersion, defaultGrokCLIVersion, "SLIPGATE_GROK_CLI_VERSION", "XAI_GROK_CLI_VERSION")
 }
 
 // CLIOpenCodeVersion returns the active official OpenCode CLI version.
 func CLIOpenCodeVersion() string {
-	return resolveSemverMin("", defaultOpenCodeCLIVersion, "SLIPGATE_OPENCODE_CLI_VERSION")
+	return resolveCLIVersion("opencode", "", defaultOpenCodeCLIVersion, "SLIPGATE_OPENCODE_CLI_VERSION")
 }
 
-// CLIClineVersion returns the active official Cline client version.
+// CLIClineVersion returns the active Cline client (VS Code extension) version.
 func CLIClineVersion() string {
-	return resolveSemverMin("", defaultClineCLIVersion, "SLIPGATE_CLINE_CLI_VERSION")
+	return resolveCLIVersion("cline", "", defaultClineCLIVersion, "SLIPGATE_CLINE_CLI_VERSION")
 }
 
 // ClaudeCLIUserAgent formats the official Claude Code CLI User-Agent header.

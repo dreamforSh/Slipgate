@@ -3,6 +3,8 @@ package dataplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -173,12 +175,12 @@ func (c *Coordinator) fetchProviderModelsOnce(ctx context.Context, accountID str
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, nil
-	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, errors.New(privacyErrorSnippet(resp.StatusCode, raw))
 	}
 
 	if prov == "gemini" {
@@ -187,8 +189,8 @@ func (c *Coordinator) fetchProviderModelsOnce(ctx context.Context, accountID str
 				Name string `json:"name"`
 			} `json:"models"`
 		}
-		if json.Unmarshal(raw, &gem) != nil {
-			return nil, nil
+		if err := json.Unmarshal(raw, &gem); err != nil {
+			return nil, fmt.Errorf("decode model list: %w", err)
 		}
 		out := make([]string, 0, len(gem.Models))
 		for _, m := range gem.Models {
@@ -205,8 +207,8 @@ func (c *Coordinator) fetchProviderModelsOnce(ctx context.Context, accountID str
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if json.Unmarshal(raw, &oa) != nil {
-		return nil, nil
+	if err := json.Unmarshal(raw, &oa); err != nil {
+		return nil, fmt.Errorf("decode model list: %w", err)
 	}
 	out := make([]string, 0, len(oa.Data))
 	for _, m := range oa.Data {

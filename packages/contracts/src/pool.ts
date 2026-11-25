@@ -771,9 +771,62 @@ export const AccountTestEventSchema = z.object({
 });
 export type AccountTestEvent = z.infer<typeof AccountTestEventSchema>;
 
+/**
+ * `GET /api/v1/admin/accounts/:id/models`: models the account can use, asked from the provider over
+ * the account's egress (`upstream`), or the built-in suggestions (`default`, with the reason).
+ */
+export const AccountModelsResponseSchema = z.object({
+  models: z.array(z.string()),
+  source: z.enum(["upstream", "default"]),
+  message: z.string(),
+  fetchedAtIso: z.string(),
+});
+export type AccountModelsResponse = z.infer<typeof AccountModelsResponseSchema>;
+
+/** Per-account scheduled test (sub2api "定时测试"); runs whatever the account's status. */
+export const AccountTestScheduleSchema = z.object({
+  enabled: z.boolean(),
+  intervalMinutes: z.number().int().min(5).max(1440),
+  /** Empty = the platform's default test model. */
+  model: z.string().trim().max(128).default(""),
+  /** After a passing test, end the account's cooldown (temporary unschedulable state). */
+  autoRecover: z.boolean().default(false),
+});
+export type AccountTestSchedule = z.infer<typeof AccountTestScheduleSchema>;
+
+export const AccountTestScheduleItemSchema = AccountTestScheduleSchema.extend({
+  accountId: z.string(),
+  lastRunAtIso: z.string().nullable(),
+  nextRunAtIso: z.string().nullable(),
+});
+export type AccountTestScheduleItem = z.infer<typeof AccountTestScheduleItemSchema>;
+
+/** One impersonated client in the CLI fingerprint report (`GET /api/v1/admin/cli-fingerprint`). */
+export const CliFingerprintToolSchema = z.object({
+  key: z.string(),
+  name: z.string(),
+  effective: z.string(),
+  builtin: z.string(),
+  synced: z.string().default(""),
+  latest: z.string().default(""),
+  /** Where the effective version comes from: an env override, the hourly release sync, or the built-in pin. */
+  source: z.enum(["env", "synced", "builtin"]),
+  userAgent: z.string(),
+  syncable: z.boolean(),
+  error: z.string().default(""),
+});
+export type CliFingerprintTool = z.infer<typeof CliFingerprintToolSchema>;
+
+export const CliFingerprintReportSchema = z.object({
+  syncEnabled: z.boolean(),
+  lastSyncAtUnixMs: z.number().int().nonnegative().default(0),
+  tools: z.array(CliFingerprintToolSchema),
+});
+export type CliFingerprintReport = z.infer<typeof CliFingerprintReportSchema>;
+
 /** Suggested test models per provider (first entry matches the data-plane default). */
 export const ACCOUNT_TEST_MODELS: Record<Provider, string[]> = {
-  anthropic: ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1"],
+  anthropic: ["claude-sonnet-4-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-haiku-4-5"],
   codex: ["gpt-5-codex", "gpt-5"],
   openai: ["gpt-4o-mini", "gpt-4.1-mini", "gpt-5"],
   gemini: ["gemini-2.5-flash", "gemini-2.5-pro"],

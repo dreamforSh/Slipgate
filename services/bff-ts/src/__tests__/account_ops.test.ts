@@ -882,3 +882,78 @@ describe("credential previews", () => {
     expect(maskSecret('{"unknown_field":"value-value-value"}')).toBe('{"unkn...ue"}');
   });
 });
+
+describe("account models and CLI fingerprint", () => {
+  it("lists upstream models, falls back to the built-in list with a reason, and proxies the CLI report", async () => {
+    const savedUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    const behavior = new Map<string, "listed" | "refused">();
+    const netServer = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/internal/net/dataplane/sync") return Response.json({ ok: true });
+        if (req.headers.get("X-Slipgate-Internal-Token") !== "models-internal-token") return Response.json({}, { status: 401 });
+        const m = /^\/internal\/net\/accounts\/([^/]+)\/models$/.exec(url.pathname);
+        if (m) {
+          const mode = behavior.get(decodeURIComponent(m[1]!));
+          if (mode === "listed") return Response.json({ ok: true, source: "upstream", models: ["gpt-4.1", "gpt-4o-mini"] });
+          if (mode === "refused") return Response.json({ ok: true, source: "default", models: [], message: "upstream HTTP 401" });
+          return Response.json({ error: "account_not_synced", message: "not synced" }, { status: 404 });
+        }
+        if (url.pathname === "/internal/net/cli-fingerprint" || url.pathname === "/internal/net/cli-fingerprint/sync") {
+          return Response.json({
+            syncEnabled: true,
+            lastSyncAtUnixMs: url.pathname.endsWith("/sync") ? 1_900_000_000_000 : 0,
+            tools: [{ key: "claude", name: "Claude Code", effective: "2.1.332", builtin: "2.1.332", source: "builtin", userAgent: "claude-cli/2.1.332 (external, cli)", syncable: true }],
+          });
+        }
+        return Response.json({ error: "nope" }, { status: 404 });
+      },
+    });
+    try {
+      delete process.env.SLIPGATE_NET_INTERNAL_URL;
+      const env = await bootstrap("models-internal-token");
+      const { admin, call } = env;
+      const acc = await env.createAccount({ name: "models-openai", platform: "openai" });
+      type Models = { models: string[]; source: string; message: string; fetchedAtIso: string };
+
+      // Standalone: built-in list with the reason; CLI report unavailable.
+      const standalone = await call<Models>("GET", `/api/v1/admin/accounts/${acc.id}/models`, admin);
+      expect(standalone.status).toBe(200);
+      expect(standalone.body.source).toBe("default");
+      expect(standalone.body.models).toContain("gpt-4o-mini");
+      expect(standalone.body.message).toContain("standalone");
+      expect((await call("GET", "/api/v1/admin/cli-fingerprint", admin)).status).toBe(503);
+      expect((await call("GET", "/api/v1/admin/accounts/acc_missing/models", admin)).status).toBe(404);
+
+      process.env.SLIPGATE_NET_INTERNAL_URL = `http://127.0.0.1:${netServer.port}`;
+      const refused = await env.createAccount({ name: "models-refused", platform: "openai" });
+      behavior.set(acc.id, "listed");
+      behavior.set(refused.id, "refused");
+      const listed = await call<Models>("GET", `/api/v1/admin/accounts/${acc.id}/models`, admin);
+      expect(listed.body).toMatchObject({ source: "upstream", models: ["gpt-4.1", "gpt-4o-mini"], message: "" });
+      // A provider refusal: the built-in list with the provider's reason.
+      const fallback = await call<Models>("GET", `/api/v1/admin/accounts/${refused.id}/models`, admin);
+      expect(fallback.body.source).toBe("default");
+      expect(fallback.body.message).toBe("upstream HTTP 401");
+      expect(fallback.body.models).toContain("gpt-4o-mini");
+      // Unknown to the network service (404 account_not_synced): falls back too.
+      behavior.delete(acc.id);
+      expect((await call<Models>("GET", `/api/v1/admin/accounts/${acc.id}/models`, admin)).body).toMatchObject({
+        source: "default",
+        message: "not synced",
+      });
+
+      const report = await call<{ tools: { key: string; effective: string }[]; syncEnabled: boolean }>("GET", "/api/v1/admin/cli-fingerprint", admin);
+      expect(report.status).toBe(200);
+      expect(report.body.tools[0]).toMatchObject({ key: "claude", effective: "2.1.332" });
+      const synced = await call<{ lastSyncAtUnixMs: number }>("POST", "/api/v1/admin/cli-fingerprint/sync", admin);
+      expect(synced.body.lastSyncAtUnixMs).toBe(1_900_000_000_000);
+      expect((await call("GET", "/api/v1/admin/cli-fingerprint", env.user)).status).toBe(403);
+    } finally {
+      netServer.stop(true);
+      if (savedUrl === undefined) delete process.env.SLIPGATE_NET_INTERNAL_URL;
+      else process.env.SLIPGATE_NET_INTERNAL_URL = savedUrl;
+    }
+  });
+});

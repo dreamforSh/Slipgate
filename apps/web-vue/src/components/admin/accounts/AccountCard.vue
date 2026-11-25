@@ -33,6 +33,8 @@ const props = defineProps<{
   exitNode: ClashExitNode | null;
   /** The exit pool reflects slipgate-net (not standalone samples, not a failed load). */
   exitReady: boolean;
+  /** Interval of the account's enabled scheduled test, minutes. */
+  scheduledMinutes?: number | null;
 }>();
 
 const emit = defineEmits<{
@@ -41,6 +43,7 @@ const emit = defineEmits<{
   (e: "toggle-status" | "resume" | "test" | "edit" | "stats"): void;
   (e: "menu", anchor: HTMLElement): void;
   (e: "priority", value: number): void;
+  (e: "exit"): void;
 }>();
 
 const { t, te } = useI18n();
@@ -160,6 +163,8 @@ const lastTestClass = computed(() => {
         :binding="exitBinding"
         :node="exitNode"
         :ready="exitReady"
+        :editable="exitReady && acc.executionMode !== 'vm_slot'"
+        @change="emit('exit')"
       />
     </div>
 
@@ -233,6 +238,9 @@ const lastTestClass = computed(() => {
         <span class="truncate font-medium">
           {{ !acc.lastTest ? t("accounts.lastTest.never") : acc.lastTest.ok ? t("accounts.lastTest.ok") : t("accounts.lastTest.failed") }}
         </span>
+      </span>
+      <span v-if="scheduledMinutes" class="inline-flex shrink-0 items-center gap-0.5 text-2xs text-accent" :title="t('accounts.schedule.badge', { n: scheduledMinutes })">
+        <UiIcon name="clock" :size="10" />{{ scheduledMinutes }}m
       </span>
       <span v-if="acc.lastTest" class="shrink-0 font-mono text-2xs opacity-80">
         {{ formatRelative(acc.lastTest.atIso, now) }} · {{ formatDurationMs(acc.lastTest.durationMs) }}

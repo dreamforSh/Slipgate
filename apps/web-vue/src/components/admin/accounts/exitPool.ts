@@ -101,6 +101,18 @@ export function useExitPool() {
     return res.ok ? null : readError(res, "unbind failed");
   }
 
+  /** Re-check exits (latency, exit IP) through slipgate-net, then reload; error message or null. */
+  async function probe(nodeIds: string[]): Promise<string | null> {
+    const res = await auth.apiFetch("/api/v1/admin/clash/nodes/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ nodeIds, verifyExitIp: true }),
+    });
+    if (!res.ok) return readError(res, "probe failed");
+    await load();
+    return null;
+  }
+
   // reactive() unwraps the refs, so templates and props read `pool.nodes` directly.
   return reactive({
     nodes,
@@ -116,6 +128,7 @@ export function useExitPool() {
     load,
     bind,
     unbind,
+    probe,
   });
 }
 

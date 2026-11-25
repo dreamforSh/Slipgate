@@ -457,6 +457,8 @@ func run(cfg config.Config, build buildInfo, logFwd *syslogfwd.Forwarder, logger
 		}
 	})
 	dpCoord.StartBackgroundSync(rootCtx)
+	// Follow new releases of the impersonated CLIs (User-Agent / billing versions); SLIPGATE_CLI_VERSION_SYNC=off keeps the pins.
+	dataplane.DefaultCLIVersionSyncer.Start(rootCtx, logger)
 
 	edge, err := ingress.NewServer(cfg, build.version, pool, sup)
 	if err != nil {

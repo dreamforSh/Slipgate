@@ -19,6 +19,9 @@ func (s *Server) registerAccountInternalRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/net/accounts/{id}/test", s.handleTestAccount)
 	mux.HandleFunc("POST /internal/net/accounts/{id}/oauth/refresh", s.handleRefreshAccountOAuth)
 	mux.HandleFunc("POST /internal/net/accounts/{id}/privacy", s.handleSetAccountPrivacy)
+	mux.HandleFunc("POST /internal/net/accounts/{id}/models", s.handleFetchAccountModels)
+	mux.HandleFunc("GET /internal/net/cli-fingerprint", s.handleCLIFingerprint)
+	mux.HandleFunc("POST /internal/net/cli-fingerprint/sync", s.handleSyncCLIFingerprint)
 	mux.HandleFunc("GET /internal/net/models/discovered", s.handleGetDiscoveredModels)
 	mux.HandleFunc("POST /internal/net/models/sync", s.handleSyncDiscoveredModels)
 }
@@ -79,6 +82,56 @@ func (s *Server) handleSetAccountPrivacy(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": res.Mode, "status": res.Status, "message": res.Message})
+}
+
+// handleFetchAccountModels lists the models one account can use, asked over its own egress.
+func (s *Server) handleFetchAccountModels(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.dpCoord == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "dataplane_coordinator_unavailable"})
+		return
+	}
+	accountID := strings.TrimSpace(r.PathValue("id"))
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "message": "account id is required"})
+		return
+	}
+	res, err := s.dpCoord.FetchAccountModels(r.Context(), accountID)
+	switch {
+	case errors.Is(err, dataplane.ErrAccountNotSynced):
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account_not_synced", "message": err.Error()})
+		return
+	case errors.Is(err, dataplane.ErrAccountModelsUnsupported):
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "models_unsupported", "message": err.Error()})
+		return
+	case errors.Is(err, dataplane.ErrAccountSecretNotFound):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "account_secret_unavailable", "message": err.Error()})
+		return
+	case err != nil:
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "models_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": res.Models, "source": res.Source, "message": res.Message})
+}
+
+// handleCLIFingerprint reports the client versions and User-Agents the data plane impersonates.
+func (s *Server) handleCLIFingerprint(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	writeJSON(w, http.StatusOK, dataplane.DefaultCLIVersionSyncer.Report())
+}
+
+// handleSyncCLIFingerprint reads the latest client releases now (also when hourly sync is off).
+func (s *Server) handleSyncCLIFingerprint(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, dataplane.DefaultCLIVersionSyncer.SyncOnce(ctx))
 }
 
 func (s *Server) handleGetDiscoveredModels(w http.ResponseWriter, r *http.Request) {

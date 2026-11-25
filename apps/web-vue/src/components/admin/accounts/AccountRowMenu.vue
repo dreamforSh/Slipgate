@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { accountQuotaLimited, accountSupportsPrivacy, type UpstreamAccount } from "@slipgate/contracts";
+import {
+  accountQuotaLimited,
+  accountSupportsPrivacy,
+  type AccountTestScheduleItem,
+  type UpstreamAccount,
+} from "@slipgate/contracts";
 import UiIcon from "../../ui/UiIcon.vue";
 import { COOLDOWN_PRESETS_HOURS } from "./accountDisplay";
 
@@ -13,11 +18,15 @@ const props = defineProps<{
   open: boolean;
   account: UpstreamAccount | null;
   anchor: HTMLElement | null;
+  /** The account's scheduled test, if any (shown next to the menu item). */
+  schedule?: AccountTestScheduleItem | null;
+  /** Exits can be changed (slipgate-net attached and the pool loaded). */
+  exitReady?: boolean;
 }>();
 const emit = defineEmits<{
   (e: "update:open", value: boolean): void;
   (
-    e: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "reauth" | "reset-quota" | "delete",
+    e: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "reauth" | "reset-quota" | "schedule" | "exit" | "delete",
     account: UpstreamAccount,
   ): void;
   (e: "cooldown", account: UpstreamAccount, hours: number): void;
@@ -104,7 +113,19 @@ const canReauth = computed(() => {
 });
 const canResetQuota = computed(() => !!props.account && accountQuotaLimited(props.account.quota));
 
-type MenuAction = "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "reauth" | "reset-quota";
+type MenuAction = "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "reauth" | "reset-quota" | "schedule" | "exit";
+
+/** "every 30 min" style label of an enabled schedule; "" otherwise. */
+const scheduleLabel = computed(() => {
+  const s = props.schedule;
+  if (!s?.enabled) return "";
+  const m = s.intervalMinutes;
+  return m % 1440 === 0
+    ? t("accounts.schedule.everyDays", { n: m / 1440 })
+    : m % 60 === 0
+      ? t("accounts.schedule.everyHours", { n: m / 60 })
+      : t("accounts.schedule.everyMinutes", { n: m });
+});
 
 function pick(action: MenuAction) {
   const acc = props.account;
@@ -138,6 +159,12 @@ function pick(action: MenuAction) {
       break;
     case "reset-quota":
       emit("reset-quota", acc);
+      break;
+    case "schedule":
+      emit("schedule", acc);
+      break;
+    case "exit":
+      emit("exit", acc);
       break;
   }
 }
@@ -185,9 +212,18 @@ const cooldownLabel = (h: number) => t(`accounts.cooldown.h${h}`);
         <UiIcon name="play" :size="14" />
         {{ t("accounts.row.test") }}
       </button>
+      <button v-if="!isVm" type="button" role="menuitem" class="menu-item" @click="pick('schedule')">
+        <UiIcon name="clock" :size="14" />
+        <span class="flex-1">{{ t("accounts.row.schedule") }}</span>
+        <span v-if="scheduleLabel" class="text-2xs text-accent">{{ scheduleLabel }}</span>
+      </button>
       <button type="button" role="menuitem" class="menu-item" @click="pick('stats')">
         <UiIcon name="chart" :size="14" />
         {{ t("accounts.row.stats") }}
+      </button>
+      <button v-if="exitReady && !isVm" type="button" role="menuitem" class="menu-item" @click="pick('exit')">
+        <UiIcon name="network" :size="14" />
+        {{ t("accounts.row.changeExit") }}
       </button>
       <button type="button" role="menuitem" class="menu-item" @click="pick('edit')">
         <UiIcon name="pencil" :size="14" />

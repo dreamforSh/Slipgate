@@ -38,6 +38,7 @@ import UiModal from "../../ui/UiModal.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
 import type { IconName } from "../../ui/icons";
 import AccountFormSection from "./AccountFormSection.vue";
+import ExitNodePicker from "./ExitNodePicker.vue";
 import ImportResultSummary from "./ImportResultSummary.vue";
 import {
   ACCOUNT_STATUSES,
@@ -714,7 +715,6 @@ const staticExitOptions = computed(() => exitOptions(props.exitPool.staticNodes)
 const freeExitCount = computed(
   () => [...clashExitOptions.value, ...staticExitOptions.value].filter((o) => o.availability === "ok").length,
 );
-const selectedExit = computed(() => props.exitPool.nodeById.get(formExitNodeId.value) ?? null);
 
 watch(formExitNodeId, (nodeId) => {
   if (!nodeId) formUtlsProfileId.value = "";
@@ -1381,62 +1381,28 @@ const credentialPlaceholder = computed(() => {
         </div>
 
         <template v-else>
-          <div class="grid gap-4" :class="formExitNodeId ? 'sm:grid-cols-[minmax(0,1fr)_12rem]' : ''">
-            <div class="min-w-0">
-              <label class="label flex items-center justify-between gap-3" for="account-form-exit">
-                <span>{{ t("accounts.form.exit.node") }}</span>
-                <RouterLink to="/admin/proxy/ips" class="font-normal text-accent hover:underline" target="_blank">
-                  {{ t("accounts.form.exit.manage") }}
-                </RouterLink>
-              </label>
-              <UiSelect
-                id="account-form-exit"
-                v-model="formExitNodeId"
-                class="select"
-                :disabled="exitPickerDisabled"
-                :searchable="true"
-              >
-                <option value="">{{ t("accounts.form.exit.none") }}</option>
-                <optgroup v-if="clashExitOptions.length" :label="t('accounts.form.exit.groupClash')">
-                  <option
-                    v-for="o in clashExitOptions"
-                    :key="o.nodeId"
-                    :value="o.nodeId"
-                    :disabled="o.availability !== 'ok' && o.nodeId !== currentBinding?.nodeId"
-                  >
-                    {{ o.label }}
-                  </option>
-                </optgroup>
-                <optgroup v-if="staticExitOptions.length" :label="t('accounts.form.exit.groupStatic')">
-                  <option
-                    v-for="o in staticExitOptions"
-                    :key="o.nodeId"
-                    :value="o.nodeId"
-                    :disabled="o.availability !== 'ok' && o.nodeId !== currentBinding?.nodeId"
-                  >
-                    {{ o.label }}
-                  </option>
-                </optgroup>
-              </UiSelect>
-            </div>
-            <div v-if="formExitNodeId">
-              <label class="label" for="account-form-utls">{{ t("accounts.form.exit.profile") }}</label>
-              <UiSelect id="account-form-utls" v-model="formUtlsProfileId" class="select" :disabled="exitPickerDisabled">
-                <option value="">{{ t("accounts.form.exit.profileDefault") }}</option>
-                <option v-for="p in exitPool.profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
-              </UiSelect>
-            </div>
+          <div class="min-w-0">
+            <label class="label flex items-center justify-between gap-3" for="account-form-exit">
+              <span>{{ t("accounts.form.exit.node") }}</span>
+              <RouterLink to="/admin/proxy/clash" class="font-normal text-accent hover:underline" target="_blank">
+                {{ t("accounts.form.exit.manage") }}
+              </RouterLink>
+            </label>
+            <ExitNodePicker
+              v-model="formExitNodeId"
+              input-id="account-form-exit"
+              :pool="exitPool"
+              :current="currentBinding"
+              :disabled="exitPickerDisabled"
+            />
           </div>
-
-          <!-- What the pick means for this access mode -->
-          <p v-if="selectedExit" class="flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-fg-subtle">
-            <span class="inline-flex items-center gap-1">
-              <span class="h-1.5 w-1.5 rounded-full" :class="selectedExit.healthStatus === 'healthy' ? 'bg-success' : 'bg-warning'" />
-              {{ selectedExit.proxyType ? selectedExit.proxyType.toUpperCase() : "" }}
-              {{ selectedExit.server ? `${selectedExit.server}${selectedExit.serverPort ? `:${selectedExit.serverPort}` : ""}` : "" }}
-            </span>
-            <span class="font-mono">{{ t("accounts.form.exit.exitIp", { ip: selectedExit.exitIp || t("accounts.form.exit.unprobed") }) }}</span>
-          </p>
+          <div v-if="formExitNodeId" class="sm:max-w-xs">
+            <label class="label" for="account-form-utls">{{ t("accounts.form.exit.profile") }}</label>
+            <UiSelect id="account-form-utls" v-model="formUtlsProfileId" class="select" :disabled="exitPickerDisabled">
+              <option value="">{{ t("accounts.form.exit.profileDefault") }}</option>
+              <option v-for="p in exitPool.profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
+            </UiSelect>
+          </div>
           <UiAlert v-if="exitNeeded && !formExitNodeId && !exitPickerDisabled" tone="warning">
             {{ t("accounts.form.exit.requiredHint", { mode: executionModeLabel(formMode) }) }}
           </UiAlert>

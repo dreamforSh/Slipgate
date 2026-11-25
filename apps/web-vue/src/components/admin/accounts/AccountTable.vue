@@ -40,6 +40,8 @@ const props = defineProps<{
   exitPool: ExitPool;
   /** The exit pool reflects slipgate-net (not standalone samples, not a failed load). */
   exitReady: boolean;
+  /** Accounts with an enabled scheduled test → interval in minutes. */
+  scheduled?: ReadonlyMap<string, number>;
 }>();
 
 const emit = defineEmits<{
@@ -50,6 +52,7 @@ const emit = defineEmits<{
   (e: "toggle-status" | "resume" | "test" | "edit" | "stats", account: UpstreamAccount): void;
   (e: "menu", account: UpstreamAccount, anchor: HTMLElement): void;
   (e: "priority", account: UpstreamAccount, value: number): void;
+  (e: "exit", account: UpstreamAccount): void;
 }>();
 
 const { t, te } = useI18n();
@@ -189,7 +192,14 @@ function openMenu(acc: UpstreamAccount, ev: MouseEvent) {
           </td>
 
           <td v-if="visible.has('exit')" class="min-w-[9rem] max-w-[13rem]">
-            <AccountExitCell :mode="acc.executionMode" :binding="exitBinding(acc)" :node="exitNode(acc)" :ready="exitReady" />
+            <AccountExitCell
+              :mode="acc.executionMode"
+              :binding="exitBinding(acc)"
+              :node="exitNode(acc)"
+              :ready="exitReady"
+              :editable="exitReady && acc.executionMode !== 'vm_slot'"
+              @change="emit('exit', acc)"
+            />
           </td>
 
           <td v-if="visible.has('status')">
@@ -252,6 +262,10 @@ function openMenu(acc: UpstreamAccount, ev: MouseEvent) {
             </span>
             <p v-if="acc.lastTest" class="mt-0.5 font-mono text-2xs text-fg-subtle">
               {{ formatRelative(acc.lastTest.atIso, now) }} · {{ formatDurationMs(acc.lastTest.durationMs) }}
+            </p>
+            <p v-if="scheduled?.has(acc.id)" class="mt-0.5 inline-flex items-center gap-1 text-2xs text-accent">
+              <UiIcon name="clock" :size="10" />
+              {{ t("accounts.schedule.badge", { n: scheduled.get(acc.id) }) }}
             </p>
           </td>
 
