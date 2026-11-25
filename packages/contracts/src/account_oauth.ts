@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { SubscriptionTierSchema } from "./pool.ts";
+import { AccountPrivacyModeSchema, SubscriptionTierSchema, UpstreamAccountSchema } from "./pool.ts";
 
 export const AccountOAuthProviderSchema = z.enum([
   "anthropic",
@@ -58,3 +58,24 @@ export const RefreshAccountOAuthResponseSchema = z.object({
   expiresAtUnixMs: z.number().int().nonnegative().default(0),
 });
 export type RefreshAccountOAuthResponse = z.infer<typeof RefreshAccountOAuthResponseSchema>;
+
+/**
+ * `POST /api/v1/admin/accounts/:id/privacy`: slipgate-net asked the provider (over the account's own
+ * egress) to stop using the account's data. A provider refusal is still 200 with a *_failed /
+ * cf_blocked `mode`; `message` carries the provider's reason.
+ */
+export const SetAccountPrivacyResponseSchema = z.object({
+  ok: z.literal(true),
+  mode: AccountPrivacyModeSchema,
+  message: z.string().default(""),
+  account: UpstreamAccountSchema,
+});
+export type SetAccountPrivacyResponse = z.infer<typeof SetAccountPrivacyResponseSchema>;
+
+/** What slipgate-net's internal privacy endpoint answers. */
+export const NetAccountPrivacyResultSchema = z.object({
+  ok: z.literal(true),
+  mode: AccountPrivacyModeSchema,
+  status: z.number().int().default(0),
+  message: z.string().default(""),
+});

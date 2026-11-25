@@ -8,6 +8,7 @@ import {
   type AccountUsageSummaryResponse,
   type DataPlaneSyncSnapshot,
   type GroupItem,
+  type SetAccountPrivacyResponse,
   type UpstreamAccount,
 } from "@slipgate/contracts";
 import { createBffApp } from "../app.ts";
@@ -502,6 +503,137 @@ describe("manual OAuth token refresh", () => {
       if (savedUrl === undefined) delete process.env.SLIPGATE_NET_INTERNAL_URL;
       else process.env.SLIPGATE_NET_INTERNAL_URL = savedUrl;
     }
+  });
+});
+
+describe("account privacy", () => {
+  it("applies only to ChatGPT/Codex and Antigravity OAuth accounts and stores slipgate-net's outcome", async () => {
+    const savedUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    const seen: { path: string; token: string | null }[] = [];
+    const netServer = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/internal/net/dataplane/sync") return Response.json({ ok: true });
+        seen.push({ path: url.pathname, token: req.headers.get("X-Slipgate-Internal-Token") });
+        if (url.pathname.includes("/acc_gone/")) {
+          return Response.json({ error: "account_not_synced", message: "not synced" }, { status: 404 });
+        }
+        const antigravity = seen.length > 1;
+        return Response.json(
+          antigravity
+            ? { ok: true, mode: "privacy_set_failed", status: 200, message: "fetchUserInfo still reports telemetry" }
+            : { ok: true, mode: "training_off", status: 200, message: "" },
+        );
+      },
+    });
+    try {
+      delete process.env.SLIPGATE_NET_INTERNAL_URL;
+      // Runs against Postgres when a test preload provides a store factory (privacy_mode columns).
+      const factory = (globalThis as { __slipgateTestStoreFactory?: () => Promise<ControlStore> }).__slipgateTestStoreFactory;
+      const env = await bootstrap("privacy-internal-token", factory ? await factory() : undefined);
+      const { admin, call } = env;
+      const codex = await env.createAccount({
+        name: "codex",
+        platform: "codex",
+        authKind: "oauth",
+        executionMode: "stealth_http",
+        subscriptionTier: "plus",
+        credentialSecret: JSON.stringify({ access_token: "eyJ-codex", refresh_token: "rt" }),
+      });
+      const ag = await env.createAccount({
+        name: "ag",
+        platform: "antigravity",
+        authKind: "oauth",
+        executionMode: "direct_api",
+        subscriptionTier: "pro",
+        credentialSecret: JSON.stringify({ access_token: "ya29.x", refresh_token: "rt", project_id: "p" }),
+      });
+      const claude = await env.createAccount({
+        name: "claude",
+        authKind: "oauth",
+        executionMode: "stealth_http",
+        credentialSecret: JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-oat01-x", refreshToken: "sk-ant-ort01-y" } }),
+      });
+      const key = await env.createAccount({ name: "key", platform: "openai" });
+      expect(codex.privacyMode).toBeNull();
+      expect(codex.privacyCheckedAtIso).toBeNull();
+
+      expect((await call("POST", "/api/v1/admin/accounts/acc_missing/privacy", admin)).status).toBe(404);
+      for (const acc of [claude, key]) {
+        const res = await call<{ error: string }>("POST", `/api/v1/admin/accounts/${acc.id}/privacy`, admin);
+        expect(res.status).toBe(400);
+        expect(res.body.error).toBe("privacy_unsupported");
+      }
+      const standalone = await call<{ error: string }>("POST", `/api/v1/admin/accounts/${codex.id}/privacy`, admin);
+      expect(standalone.status).toBe(503);
+      expect(standalone.body.error).toBe("net_supervisor_unconfigured");
+      expect(seen).toEqual([]);
+
+      process.env.SLIPGATE_NET_INTERNAL_URL = `http://127.0.0.1:${netServer.port}`;
+      const ok = await call<SetAccountPrivacyResponse>("POST", `/api/v1/admin/accounts/${codex.id}/privacy`, admin);
+      expect(ok.status).toBe(200);
+      expect(ok.body.mode).toBe("training_off");
+      expect(ok.body.account.privacyMode).toBe("training_off");
+      expect(ok.body.account.privacyCheckedAtIso).not.toBeNull();
+      expect(seen.at(-1)).toEqual({ path: `/internal/net/accounts/${codex.id}/privacy`, token: "privacy-internal-token" });
+
+      // A provider refusal is still a stored outcome, not an HTTP error.
+      const failed = await call<SetAccountPrivacyResponse>("POST", `/api/v1/admin/accounts/${ag.id}/privacy`, admin);
+      expect(failed.status).toBe(200);
+      expect(failed.body.mode).toBe("privacy_set_failed");
+      expect(failed.body.message).toContain("telemetry");
+      const listed = await env.listAccounts();
+      expect(listed.find((a) => a.id === codex.id)?.privacyMode).toBe("training_off");
+      expect(listed.find((a) => a.id === ag.id)?.privacyMode).toBe("privacy_set_failed");
+
+      expect((await call("POST", `/api/v1/admin/accounts/${codex.id}/privacy`, env.user)).status).toBe(403);
+    } finally {
+      netServer.stop(true);
+      if (savedUrl === undefined) delete process.env.SLIPGATE_NET_INTERNAL_URL;
+      else process.env.SLIPGATE_NET_INTERNAL_URL = savedUrl;
+    }
+  });
+});
+
+describe("plan tiers", () => {
+  it("offers sub2api plan tiers per platform and maps slipgate-net plan reports per platform", async () => {
+    const env = await bootstrap("tiers-internal-token");
+    const { app } = env;
+    const internal = { ...JSON_HEADERS, "X-Slipgate-Internal-Token": "tiers-internal-token" };
+    const report = (id: string, subscriptionTier: string) =>
+      app.request(`/api/v1/internal/dataplane/accounts/${id}/credentials`, {
+        method: "POST",
+        headers: internal,
+        body: JSON.stringify({ credentialSecret: '{"access_token":"at","refresh_token":"rt"}', subscriptionTier }),
+      });
+    const tierOf = async (id: string) => (await env.listAccounts()).find((a) => a.id === id);
+
+    const team = await env.createAccount({ name: "chatgpt-team", platform: "codex", authKind: "oauth", subscriptionTier: "team" });
+    expect(team).toMatchObject({ subscriptionTier: "team", tierMultiplier: 1 });
+
+    // Raw ChatGPT plan names from refreshed id_tokens land on the matching tier.
+    const codex = await env.createAccount({ name: "chatgpt", platform: "codex", authKind: "oauth", subscriptionTier: "plus" });
+    expect((await report(codex.id, "promax")).status).toBe(200);
+    expect(await tierOf(codex.id)).toMatchObject({ subscriptionTier: "pro_25x", tierMultiplier: 25 });
+    // An unrecognized plan keeps the stored tier.
+    expect((await report(codex.id, "mystery-plan")).status).toBe(200);
+    expect((await tierOf(codex.id))?.subscriptionTier).toBe("pro_25x");
+
+    const claude = await env.createAccount({ name: "claude", platform: "anthropic", authKind: "oauth", subscriptionTier: "max" });
+    expect((await report(claude.id, "default_claude_max_20x")).status).toBe(200);
+    expect(await tierOf(claude.id)).toMatchObject({ subscriptionTier: "ultra", tierMultiplier: 20 });
+
+    // Tiers outside a platform's list are refused.
+    const bad = await env.call("POST", "/api/v1/admin/accounts", env.admin, {
+      name: "claude-go",
+      platform: "anthropic",
+      executionMode: "stealth_http",
+      authKind: "oauth",
+      subscriptionTier: "go",
+      credentialSecret: "mock://claude-go",
+    });
+    expect(bad.status).toBe(400);
   });
 });
 

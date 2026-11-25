@@ -1,6 +1,7 @@
 import postgres from "postgres";
 import {
   AccountAuthKindSchema,
+  AccountPrivacyModeSchema,
   effectiveAccountStatus,
   formatNanoUsd,
   parseUsdToNano,
@@ -9,6 +10,7 @@ import {
   TempUnschedRulesSchema,
   effectiveSubscriptionTier,
   subscriptionTierMultiplier,
+  type AccountPrivacyMode,
   type AccountTestResult,
   type AccountUsageSummaryItem,
   type ApiKeyItem,
@@ -461,7 +463,9 @@ export class PostgresControlStore implements ControlStore {
           ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
           ADD COLUMN IF NOT EXISTS auto_pause_on_expired BOOLEAN NOT NULL DEFAULT TRUE,
           ADD COLUMN IF NOT EXISTS credential_fingerprint TEXT,
-          ADD COLUMN IF NOT EXISTS temp_unsched_rules JSONB NOT NULL DEFAULT '[]'::jsonb;
+          ADD COLUMN IF NOT EXISTS temp_unsched_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
+          ADD COLUMN IF NOT EXISTS privacy_mode TEXT,
+          ADD COLUMN IF NOT EXISTS privacy_checked_at TIMESTAMPTZ;
 
       -- The group is optional: NULL = ungrouped (the FK still guards non-null ids).
       ALTER TABLE core.accounts ALTER COLUMN group_id DROP NOT NULL;
@@ -1253,6 +1257,8 @@ export class PostgresControlStore implements ControlStore {
         last_test_model: string | null;
         last_test_duration_ms: number | null;
         last_test_message: string | null;
+        privacy_mode: string | null;
+        privacy_checked_at: Date | null;
         created_at: Date;
       }[]
     >`
@@ -1285,6 +1291,8 @@ export class PostgresControlStore implements ControlStore {
         a.last_test_model,
         a.last_test_duration_ms,
         a.last_test_message,
+        a.privacy_mode,
+        a.privacy_checked_at,
         a.created_at
       FROM core.accounts a
       LEFT JOIN core.groups g ON g.id = a.group_id
@@ -1337,6 +1345,8 @@ export class PostgresControlStore implements ControlStore {
             : null,
         lastUsedAtIso: r.last_used_at ? toIso(r.last_used_at) : null,
         tempUnschedRules: parseTempUnschedRules(r.temp_unsched_rules),
+        privacyMode: AccountPrivacyModeSchema.nullable().catch(null).parse(r.privacy_mode),
+        privacyCheckedAtIso: r.privacy_checked_at ? toIso(r.privacy_checked_at) : null,
         createdAtIso: toIso(r.created_at),
       };
     });
@@ -1463,6 +1473,18 @@ export class PostgresControlStore implements ControlStore {
   async deleteAccount(accountId: string): Promise<void> {
     const rows = await this.sql<{ id: string }[]>`
       DELETE FROM core.accounts WHERE id = ${accountId} RETURNING id
+    `;
+    if (rows.length === 0) {
+      throw new StoreError("not_found", `Account ${accountId} not found`);
+    }
+  }
+
+  async recordAccountPrivacy(accountId: string, mode: AccountPrivacyMode, checkedAtIso: string): Promise<void> {
+    const rows = await this.sql<{ id: string }[]>`
+      UPDATE core.accounts
+      SET privacy_mode = ${mode}, privacy_checked_at = ${new Date(checkedAtIso)}
+      WHERE id = ${accountId}
+      RETURNING id
     `;
     if (rows.length === 0) {
       throw new StoreError("not_found", `Account ${accountId} not found`);

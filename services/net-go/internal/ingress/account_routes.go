@@ -18,6 +18,7 @@ const accountProbeTimeout = 90 * time.Second
 func (s *Server) registerAccountInternalRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/net/accounts/{id}/test", s.handleTestAccount)
 	mux.HandleFunc("POST /internal/net/accounts/{id}/oauth/refresh", s.handleRefreshAccountOAuth)
+	mux.HandleFunc("POST /internal/net/accounts/{id}/privacy", s.handleSetAccountPrivacy)
 	mux.HandleFunc("GET /internal/net/models/discovered", s.handleGetDiscoveredModels)
 	mux.HandleFunc("POST /internal/net/models/sync", s.handleSyncDiscoveredModels)
 }
@@ -45,6 +46,39 @@ func (s *Server) handleRefreshAccountOAuth(w http.ResponseWriter, r *http.Reques
 		"subscriptionTier": sec.SubscriptionTier,
 		"expiresAtUnixMs":  sec.ExpiresAtUnixMs,
 	})
+}
+
+// handleSetAccountPrivacy turns off provider-side data sharing for one OAuth account (ChatGPT
+// training, Antigravity telemetry) and reports the resulting privacy mode.
+func (s *Server) handleSetAccountPrivacy(w http.ResponseWriter, r *http.Request) {
+	if !s.requireInternalAuth(w, r) {
+		return
+	}
+	if s.dpCoord == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "dataplane_coordinator_unavailable"})
+		return
+	}
+	accountID := strings.TrimSpace(r.PathValue("id"))
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "message": "account id is required"})
+		return
+	}
+	res, err := s.dpCoord.SetAccountPrivacy(r.Context(), accountID)
+	switch {
+	case errors.Is(err, dataplane.ErrPrivacyAccountNotSynced):
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account_not_synced", "message": err.Error()})
+		return
+	case errors.Is(err, dataplane.ErrPrivacyUnsupported):
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "privacy_unsupported", "message": err.Error()})
+		return
+	case errors.Is(err, dataplane.ErrAccountSecretNotFound):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "account_secret_unavailable", "message": err.Error()})
+		return
+	case err != nil:
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "privacy_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": res.Mode, "status": res.Status, "message": res.Message})
 }
 
 func (s *Server) handleGetDiscoveredModels(w http.ResponseWriter, r *http.Request) {

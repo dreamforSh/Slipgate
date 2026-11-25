@@ -297,11 +297,18 @@ func ParseAccountSecret(raw string) AccountSecret {
 			)
 			refresh := firstNonEmpty(envelope.RefreshToken, envelope.AltRefreshToken, claudeRef, codexRef)
 			jwtExpMs, jwtEmail, jwtAccID, jwtPlan := parseJWTTokenHints(firstNonEmpty(codexIDTok, key))
-			tier := NormalizeSubscriptionTier(firstNonEmpty(
+			// Explicit tiers and Claude's rateLimitTier keep the generic mapping; ChatGPT plan_type
+			// fields (auth.json / id_token) use the Codex SKU mapping ("pro" = Pro 200).
+			tier := ""
+			if rawTier := firstNonEmpty(
 				envelope.SubscriptionTier, envelope.AltSubTier,
 				envelope.PlanType, envelope.AltPlanType,
-				claudeTier, codexPlan, jwtPlan,
-			))
+				claudeTier,
+			); rawTier != "" {
+				tier = NormalizeSubscriptionTier(rawTier)
+			} else {
+				tier = NormalizeChatGPTPlanTier(firstNonEmpty(codexPlan, jwtPlan))
+			}
 			chatgptAcc := firstNonEmpty(envelope.ChatGPTAccountID, envelope.AltChatGPTAccID, codexAcc, envelope.AccountID, envelope.AltAccountID, jwtAccID)
 			proj := firstNonEmpty(envelope.ProjectID, envelope.AltProjectID, envelope.CompanionProject)
 			org := firstNonEmpty(envelope.OrganizationID, envelope.AltOrgID)
@@ -459,15 +466,17 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// NormalizeSubscriptionTier canonicalizes upstream plan/rateLimitTier strings into Slipgate's tier taxonomy:
-// Codex: plus (1x), pro_5x (5x), pro_10x (10x), pro_25x (25x); Claude: pro (1x), max (5x), ultra (20x).
+// NormalizeSubscriptionTier canonicalizes upstream plan/rateLimitTier strings into Slipgate's tier taxonomy
+// (SubscriptionTierSchema in @slipgate/contracts): Codex: free, go, plus (1x), pro_5x (5x), pro_10x (10x),
+// pro_25x (25x), team, enterprise, edu; Claude: pro (1x), max (5x), ultra (20x), team, enterprise.
+// ChatGPT plan_type values ("pro" = Pro 200, ...) go through NormalizeChatGPTPlanTier instead.
 func NormalizeSubscriptionTier(raw string) string {
 	s := strings.ToLower(strings.TrimSpace(raw))
 	if s == "" {
 		return ""
 	}
 	switch s {
-	case "standard", "plus", "pro", "pro_5x", "pro_10x", "pro_25x", "max", "ultra":
+	case "standard", "free", "go", "plus", "pro", "pro_5x", "pro_10x", "pro_25x", "max", "ultra", "premium", "super", "team", "enterprise", "edu":
 		return s
 	case "default_claude_max_20x", "claude_max_20x", "max_20x", "20x", "claude_ultra":
 		return "ultra"
@@ -499,6 +508,36 @@ func NormalizeSubscriptionTier(raw string) string {
 	}
 }
 
+// NormalizeChatGPTPlanTier maps a ChatGPT plan_type (Codex id_token / auth.json) to a tier, matching
+// normalizeChatGptPlan in @slipgate/contracts: prolite = Pro 100 (pro_5x), pro = Pro 200 (pro_10x),
+// promax = Pro 500 (pro_25x); business / team plans are team, ent26 / CBP plans enterprise.
+// Tier ids pass through; anything else returns "".
+func NormalizeChatGPTPlanTier(raw string) string {
+	key := strings.NewReplacer(" ", "", "_", "", "-", "").Replace(strings.ToLower(strings.TrimSpace(raw)))
+	switch key {
+	case "":
+		return ""
+	case "free", "go", "plus", "team", "enterprise", "edu":
+		return key
+	case "prolite", "pro100", "pro5x":
+		return "pro_5x"
+	case "pro", "chatgptpro", "pro200", "pro10x":
+		return "pro_10x"
+	case "promax", "pro500", "pro25x":
+		return "pro_25x"
+	case "business", "selfservebusinessusagebased", "selfservebusinessprolite":
+		return "team"
+	case "ent26", "enterprisecbpusagebased", "enterprisecbpautomation":
+		return "enterprise"
+	case "eduplus", "edupro":
+		return "edu"
+	case "standard":
+		return "standard"
+	default:
+		return ""
+	}
+}
+
 // SubscriptionTierMultiplier returns the integer quota capacity weight for a (provider, tier) pair.
 func SubscriptionTierMultiplier(provider, tier string) uint16 {
 	switch NormalizeSubscriptionTier(tier) {
@@ -506,7 +545,15 @@ func SubscriptionTierMultiplier(provider, tier string) uint16 {
 		return 5
 	case "pro_10x":
 		return 10
+	case "premium":
+		return 4
+	case "super":
+		return 15
 	case "ultra":
+		// XPass (grok) Ultra is 50x Plus; Claude / Google Ultra is 20x.
+		if strings.EqualFold(strings.TrimSpace(provider), "grok") {
+			return 50
+		}
 		return 20
 	case "pro_25x":
 		return 25

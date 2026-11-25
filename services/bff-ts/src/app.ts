@@ -10,6 +10,9 @@ import {
   AccountTestEventSchema,
   AccountTestRequestSchema,
   RefreshAccountOAuthResponseSchema,
+  NetAccountPrivacyResultSchema,
+  accountSupportsPrivacy,
+  type SetAccountPrivacyResponse,
   canonicalCredentialText,
   DashboardRangeSchema,
   AuthLoginRequestSchema,
@@ -43,7 +46,6 @@ import {
   SetupInitializeRequestSchema,
   SLIPGATE_ACCOUNT_EXPORT_TYPE,
   SlotSeedSnapshotSchema,
-  SubscriptionTierSchema,
   SystemUpdateStatusSchema,
   TurnSettlementEventSchema,
   UpdateAccountRequestSchema,
@@ -53,7 +55,7 @@ import {
   UpdateVmSeedRequestSchema,
   UpdateVmTelemetryRequestSchema,
   VmSlotSummarySchema,
-  isSubscriptionTierAllowedForProvider,
+  resolveTierForPlatform,
   type AccountBulkResult,
   type AccountExportFile,
   type AccountImportResult,
@@ -1349,11 +1351,11 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       return c.json({ error: "not_found", message: `Account ${accountId} not found` }, 404);
     }
     const patch: z.infer<typeof UpdateAccountRequestSchema> = {};
+    // slipgate-net reports the plan it saw (tier id or raw plan name); map it per platform and
+    // never downgrade a known plan to "standard" just because the hint was unrecognized.
     if (typeof raw?.subscriptionTier === "string") {
-      const tier = SubscriptionTierSchema.safeParse(raw.subscriptionTier);
-      if (tier.success && tier.data !== "standard" && isSubscriptionTierAllowedForProvider(current.platform, tier.data)) {
-        patch.subscriptionTier = tier.data;
-      }
+      const tier = resolveTierForPlatform(current.platform, raw.subscriptionTier);
+      if (tier !== "standard") patch.subscriptionTier = tier;
     }
     const account = await store.updateAccount(accountId, patch, await sealCredential(credentialSecret));
     scheduleDataPlaneSync(250);
@@ -1873,6 +1875,76 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     }
     const body = RefreshAccountOAuthResponseSchema.safeParse(payload);
     return c.json(body.success ? body.data : { ok: true, subscriptionTier: "", expiresAtUnixMs: 0 });
+  });
+
+  /**
+   * "Set privacy" for one OAuth account: ChatGPT / Codex training off, Antigravity telemetry and
+   * marketing emails off. slipgate-net sends the provider calls over the account's own egress (bound
+   * exit for stealth accounts, fail-closed); the outcome is stored as the account's privacy mode.
+   */
+  app.post("/api/v1/admin/accounts/:accountId/privacy", async (c) => {
+    const accountId = c.req.param("accountId");
+    const account = await store.getAccount(accountId);
+    if (!account) {
+      return c.json({ error: "not_found", message: `Account ${accountId} not found` }, 404);
+    }
+    if (!accountSupportsPrivacy(account)) {
+      return c.json(
+        {
+          error: "privacy_unsupported",
+          message: "Privacy settings apply to ChatGPT / Codex and Antigravity OAuth accounts outside VM slots",
+        },
+        400,
+      );
+    }
+    const internalUrl = process.env.SLIPGATE_NET_INTERNAL_URL;
+    if (!internalUrl || !internalToken) {
+      return c.json(
+        {
+          error: "net_supervisor_unconfigured",
+          message: "Privacy settings are sent by the network service, which is not configured in standalone BFF mode",
+        },
+        503,
+      );
+    }
+    // The vault must hold this account (and its latest credential) first.
+    await syncDataPlaneBestEffort();
+    let upstream: Response;
+    try {
+      upstream = await fetch(`${internalUrl}/internal/net/accounts/${encodeURIComponent(accountId)}/privacy`, {
+        method: "POST",
+        headers: { "X-Slipgate-Internal-Token": internalToken },
+        signal: AbortSignal.timeout(60_000),
+      });
+    } catch (err) {
+      return c.json(
+        { error: "net_supervisor_unreachable", message: err instanceof Error ? err.message : String(err) },
+        502,
+      );
+    }
+    const payload = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!upstream.ok) {
+      return c.json(
+        {
+          error: typeof payload.error === "string" ? payload.error : "privacy_failed",
+          message: typeof payload.message === "string" ? payload.message : `HTTP ${upstream.status}`,
+        },
+        toForwardStatus(upstream.status),
+      );
+    }
+    const result = NetAccountPrivacyResultSchema.safeParse(payload);
+    if (!result.success) {
+      return c.json({ error: "privacy_failed", message: "Unexpected answer from the network service" }, 502);
+    }
+    await store.recordAccountPrivacy(accountId, result.data.mode, new Date().toISOString());
+    const updated = (await store.getAccount(accountId)) ?? account;
+    const body: SetAccountPrivacyResponse = {
+      ok: true,
+      mode: result.data.mode,
+      message: result.data.message,
+      account: updated,
+    };
+    return c.json(body);
   });
 
   /**

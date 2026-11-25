@@ -206,8 +206,20 @@ export const PLATFORM_MULTI_PROTOCOL_CATALOG: Partial<Record<Provider, PlatformM
   },
 };
 
+/**
+ * Plan tiers (sub2api naming per platform; ids are stable storage values):
+ * - ChatGPT / Codex: free, go, plus, pro_5x = Pro 100, pro_10x = Pro 200, pro_25x = Pro 500, team
+ *   (Business), enterprise, edu.
+ * - Claude: pro, max = Max 5x, ultra (20x), team, enterprise.
+ * - XPass (provider id `grok`): plus 1x, premium 4x, super 15x, ultra 50x (usage vs Plus).
+ * - Gemini: free = Google One Free, pro = Google AI Pro, ultra = Google AI Ultra, standard = GCP
+ *   Standard, enterprise = GCP Enterprise. Antigravity: free, pro, ultra.
+ * - standard = no plan (API keys) or unknown.
+ */
 export const SubscriptionTierSchema = z.enum([
   "standard",
+  "free",
+  "go",
   "plus",
   "pro",
   "pro_5x",
@@ -215,6 +227,11 @@ export const SubscriptionTierSchema = z.enum([
   "pro_25x",
   "max",
   "ultra",
+  "premium",
+  "super",
+  "team",
+  "enterprise",
+  "edu",
 ]);
 export type SubscriptionTier = z.infer<typeof SubscriptionTierSchema>;
 
@@ -227,26 +244,53 @@ export interface SubscriptionTierOption {
 export function allowedSubscriptionTiersForProvider(platform: Provider): SubscriptionTierOption[] {
   if (platform === "codex" || platform === "openai") {
     return [
+      { tier: "free", label: "Free (1x)", multiplier: 1 },
+      { tier: "go", label: "Go (1x)", multiplier: 1 },
       { tier: "plus", label: "Plus (1x)", multiplier: 1 },
-      { tier: "pro_5x", label: "Pro 5x (5x)", multiplier: 5 },
-      { tier: "pro_10x", label: "Pro 10x (10x)", multiplier: 10 },
-      { tier: "pro_25x", label: "Pro 25x (25x)", multiplier: 25 },
+      { tier: "pro_5x", label: "Pro 100 (5x)", multiplier: 5 },
+      { tier: "pro_10x", label: "Pro 200 (10x)", multiplier: 10 },
+      { tier: "pro_25x", label: "Pro 500 (25x)", multiplier: 25 },
+      { tier: "team", label: "Business / Team (1x)", multiplier: 1 },
+      { tier: "enterprise", label: "Enterprise (1x)", multiplier: 1 },
+      { tier: "edu", label: "Edu (1x)", multiplier: 1 },
       { tier: "standard", label: "Standard / API Key (1x)", multiplier: 1 },
     ];
   }
   if (platform === "anthropic") {
     return [
       { tier: "pro", label: "Pro (1x)", multiplier: 1 },
-      { tier: "max", label: "Max (5x)", multiplier: 5 },
+      { tier: "max", label: "Max 5x (5x)", multiplier: 5 },
       { tier: "ultra", label: "Ultra (20x)", multiplier: 20 },
+      { tier: "team", label: "Team (1x)", multiplier: 1 },
+      { tier: "enterprise", label: "Enterprise (1x)", multiplier: 1 },
       { tier: "standard", label: "Standard / API Key (1x)", multiplier: 1 },
     ];
   }
   if (platform === "antigravity") {
     return [
+      { tier: "free", label: "Free (1x)", multiplier: 1 },
       { tier: "pro", label: "Pro (5x)", multiplier: 5 },
       { tier: "ultra", label: "Ultra (20x)", multiplier: 20 },
       { tier: "standard", label: "Standard (1x)", multiplier: 1 },
+    ];
+  }
+  if (platform === "grok") {
+    // XPass plans: usage relative to Plus (shared pool).
+    return [
+      { tier: "plus", label: "Plus (1x)", multiplier: 1 },
+      { tier: "premium", label: "Premium (4x)", multiplier: 4 },
+      { tier: "super", label: "Super (15x)", multiplier: 15 },
+      { tier: "ultra", label: "Ultra (50x)", multiplier: 50 },
+      { tier: "standard", label: "Standard / API Key (1x)", multiplier: 1 },
+    ];
+  }
+  if (platform === "gemini") {
+    return [
+      { tier: "free", label: "Google One Free (1x)", multiplier: 1 },
+      { tier: "pro", label: "Google AI Pro (1x)", multiplier: 1 },
+      { tier: "ultra", label: "Google AI Ultra (20x)", multiplier: 20 },
+      { tier: "standard", label: "GCP Standard / API Key (1x)", multiplier: 1 },
+      { tier: "enterprise", label: "GCP Enterprise (1x)", multiplier: 1 },
     ];
   }
   return [
@@ -279,14 +323,17 @@ export function subscriptionTierMultiplier(platform: Provider, tier: Subscriptio
       return 5;
     case "pro_10x":
       return 10;
+    case "premium":
+      return 4;
+    case "super":
+      return 15;
     case "ultra":
-      return 20;
+      return platform === "grok" ? 50 : 20;
     case "pro_25x":
       return 25;
     case "pro":
       return platform === "antigravity" ? 5 : 1;
-    case "plus":
-    case "standard":
+    // free / go / plus / team / enterprise / edu / standard
     default:
       return 1;
   }
@@ -464,6 +511,39 @@ export const AccountTestResultSchema = z.object({
 });
 export type AccountTestResult = z.infer<typeof AccountTestResultSchema>;
 
+/**
+ * Result of the admin "set privacy" action on an OAuth account:
+ * - ChatGPT / Codex: training_off (model training on the account's data switched off),
+ *   training_set_failed, training_set_cf_blocked (chatgpt.com answered with a Cloudflare challenge).
+ * - Antigravity: privacy_set (telemetry and marketing emails off, verified), privacy_set_failed.
+ */
+export const AccountPrivacyModeSchema = z.enum([
+  "training_off",
+  "training_set_failed",
+  "training_set_cf_blocked",
+  "privacy_set",
+  "privacy_set_failed",
+]);
+export type AccountPrivacyMode = z.infer<typeof AccountPrivacyModeSchema>;
+
+/** Privacy modes that mean the provider no longer uses the account's data. */
+export function isPrivacyApplied(mode: AccountPrivacyMode | null | undefined): boolean {
+  return mode === "training_off" || mode === "privacy_set";
+}
+
+/**
+ * Whether "set privacy" applies: OAuth accounts of ChatGPT / Codex (training) and Antigravity
+ * (telemetry), sent from the network service, so not VM-slot accounts.
+ */
+export function accountSupportsPrivacy(account: {
+  platform: string;
+  authKind: string;
+  executionMode: string;
+}): boolean {
+  if (account.authKind !== "oauth" || account.executionMode === "vm_slot") return false;
+  return account.platform === "codex" || account.platform === "openai" || account.platform === "antigravity";
+}
+
 export const UpstreamAccountSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -498,6 +578,9 @@ export const UpstreamAccountSchema = z.object({
   lastUsedAtIso: z.string().nullable(),
   /** Error rules that put the account into a temporary cooldown (see TempUnschedRuleSchema). */
   tempUnschedRules: z.array(TempUnschedRuleSchema),
+  /** Last "set privacy" outcome; `null` = never set. */
+  privacyMode: AccountPrivacyModeSchema.nullable(),
+  privacyCheckedAtIso: z.string().nullable(),
   createdAtIso: z.string(),
 });
 export type UpstreamAccount = z.infer<typeof UpstreamAccountSchema>;

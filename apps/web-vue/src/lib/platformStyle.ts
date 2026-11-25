@@ -167,7 +167,8 @@ const SHORT_LABELS: Record<GroupPlatform, string> = {
   codex: "Codex",
   gemini: "Gemini",
   antigravity: "Antigravity",
-  grok: "Grok",
+  // Shown as XPass (X's Grok subscription); the provider id stays `grok`.
+  grok: "XPass",
   deepseek: "DeepSeek",
   glm: "GLM",
   kimi: "Kimi",
@@ -199,7 +200,12 @@ export const AUTH_KIND_BADGE: Record<AccountAuthKind, { label: string; icon: Ico
  * is unknown show no plan row). The multiplier is spelled out wherever the name hides it.
  */
 export function planBadge(tier: SubscriptionTier, multiplier: number, platform: string): { label: string; class: string } | null {
+  const chatgpt = platform === "codex" || platform === "openai";
   switch (tier) {
+    case "free":
+      return { label: "Free", class: "bg-slate-100 text-slate-600 dark:bg-slate-800/60 dark:text-slate-300" };
+    case "go":
+      return { label: "Go", class: "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300" };
     case "plus":
       return { label: "Plus", class: "bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-300" };
     case "pro":
@@ -207,12 +213,13 @@ export function planBadge(tier: SubscriptionTier, multiplier: number, platform: 
         label: multiplier > 1 ? `Pro ${multiplier}x` : "Pro",
         class: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300",
       };
+    // ChatGPT Pro SKUs as sub2api names them (Pro 100 / 200 / 500), with the weight spelled out.
     case "pro_5x":
-      return { label: "Pro 5x", class: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300" };
+      return { label: "Pro 100 · 5x", class: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300" };
     case "pro_10x":
-      return { label: "Pro 10x", class: "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300" };
+      return { label: "Pro 200 · 10x", class: "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300" };
     case "pro_25x":
-      return { label: "Pro 25x", class: "bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-900/30 dark:text-fuchsia-300" };
+      return { label: "Pro 500 · 25x", class: "bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-900/30 dark:text-fuchsia-300" };
     case "max":
       return { label: `Max ${multiplier}x`, class: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300" };
     case "ultra":
@@ -223,6 +230,17 @@ export function planBadge(tier: SubscriptionTier, multiplier: number, platform: 
             ? "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300"
             : "bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-900/30 dark:text-fuchsia-300",
       };
+    // XPass plans (Premium 4x, Super 15x).
+    case "premium":
+      return { label: `Premium ${multiplier}x`, class: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300" };
+    case "super":
+      return { label: `Super ${multiplier}x`, class: "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300" };
+    case "team":
+      return { label: chatgpt ? "Business" : "Team", class: "bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-300" };
+    case "enterprise":
+      return { label: "Enterprise", class: "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200" };
+    case "edu":
+      return { label: "Edu", class: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300" };
     default:
       return null;
   }

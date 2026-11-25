@@ -8,6 +8,7 @@ import UsageMeter from "../../ui/UsageMeter.vue";
 import AccountExitCell from "./AccountExitCell.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
 import PlatformTypeBadge from "./PlatformTypeBadge.vue";
+import AccountPrivacyBadge from "./AccountPrivacyBadge.vue";
 import PriorityStepper from "./PriorityStepper.vue";
 import type { ExitPool } from "./exitPool";
 import {
@@ -183,6 +184,7 @@ function openMenu(acc: UpstreamAccount, ev: MouseEvent) {
             <div class="mt-1 flex items-center gap-1.5 text-2xs text-fg-subtle" :title="authKindLabel(acc.authKind)">
               <UiIcon :name="MODE_ICON[acc.executionMode]" :size="11" />
               <span>{{ executionModeLabel(acc.executionMode) }}</span>
+              <AccountPrivacyBadge :account="acc" />
             </div>
           </td>
 

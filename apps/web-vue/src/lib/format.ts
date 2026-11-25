@@ -84,7 +84,7 @@ export const PROVIDER_OPTIONS: { value: Provider; label: string }[] = [
   { value: "antigravity", label: "Google Antigravity" },
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Gemini" },
-  { value: "grok", label: "Grok" },
+  { value: "grok", label: "XPass" },
   { value: "deepseek", label: "DeepSeek" },
   { value: "glm", label: "GLM" },
   { value: "kimi", label: "Kimi" },

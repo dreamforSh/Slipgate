@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { UpstreamAccount } from "@slipgate/contracts";
+import { accountSupportsPrivacy, type UpstreamAccount } from "@slipgate/contracts";
 import UiIcon from "../../ui/UiIcon.vue";
 import { COOLDOWN_PRESETS_HOURS } from "./accountDisplay";
 
@@ -16,7 +16,10 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   (e: "update:open", value: boolean): void;
-  (e: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "delete", account: UpstreamAccount): void;
+  (
+    e: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "delete",
+    account: UpstreamAccount,
+  ): void;
   (e: "cooldown", account: UpstreamAccount, hours: number): void;
 }>();
 
@@ -91,8 +94,10 @@ onBeforeUnmount(() => bind(false));
 
 /** Only OAuth credentials carry a refresh token (setup tokens and API keys do not). */
 const canRefresh = computed(() => props.account?.authKind === "oauth");
+/** ChatGPT / Codex training and Antigravity telemetry can be switched off. */
+const canPrivacy = computed(() => !!props.account && accountSupportsPrivacy(props.account));
 
-function pick(action: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh") {
+function pick(action: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy") {
   const acc = props.account;
   if (!acc) return;
   close();
@@ -115,6 +120,9 @@ function pick(action: "test" | "stats" | "edit" | "duplicate" | "resume" | "refr
       break;
     case "refresh":
       emit("refresh", acc);
+      break;
+    case "privacy":
+      emit("privacy", acc);
       break;
   }
 }
@@ -177,6 +185,10 @@ const cooldownLabel = (h: number) => t(`accounts.cooldown.h${h}`);
       <button v-if="canRefresh" type="button" role="menuitem" class="menu-item" @click="pick('refresh')">
         <UiIcon name="rotate-ccw" :size="14" />
         {{ t("accounts.row.refreshToken") }}
+      </button>
+      <button v-if="canPrivacy" type="button" role="menuitem" class="menu-item" @click="pick('privacy')">
+        <UiIcon name="shield" :size="14" />
+        {{ t("accounts.row.privacy") }}
       </button>
 
       <div v-if="canCooldown || canResume" class="my-1 border-t border-line/70" />

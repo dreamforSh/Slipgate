@@ -5,6 +5,7 @@ import {
   isSubscriptionTierAllowedForProvider,
   effectiveSubscriptionTier,
   subscriptionTierMultiplier,
+  type AccountPrivacyMode,
   type AccountTestResult,
   type AccountUsageSummaryItem,
   type ApiKeyItem,
@@ -591,6 +592,8 @@ export class MemoryControlStore implements ControlStore {
       lastTest: null,
       lastUsedAtIso: null,
       tempUnschedRules: cloneRules(req.tempUnschedRules),
+      privacyMode: null,
+      privacyCheckedAtIso: null,
       createdAtIso: new Date().toISOString(),
     };
     this.accounts.set(id, record);
@@ -653,6 +656,13 @@ export class MemoryControlStore implements ControlStore {
   async recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void> {
     const acc = this.accounts.get(accountId);
     if (acc) acc.lastTest = { ...result };
+  }
+
+  async recordAccountPrivacy(accountId: string, mode: AccountPrivacyMode, checkedAtIso: string): Promise<void> {
+    const acc = this.accounts.get(accountId);
+    if (!acc) throw new StoreError("not_found", `Account ${accountId} not found`);
+    acc.privacyMode = mode;
+    acc.privacyCheckedAtIso = checkedAtIso;
   }
 
   async listAccountSecrets(accountIds?: string[]): Promise<AccountSecretRecord[]> {

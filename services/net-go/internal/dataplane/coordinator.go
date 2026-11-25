@@ -273,6 +273,8 @@ type Coordinator struct {
 	upstreamTimeouts      UpstreamTimeouts
 	bffClient             *http.Client
 	allowPrivateUpstreams bool
+	// privacyBaseURLForTest redirects the account privacy calls to a local server (tests only).
+	privacyBaseURLForTest string
 	trustedProxies        *netguard.TrustedProxies
 	logger                *log.Logger
 	streamSeq             atomic.Uint32

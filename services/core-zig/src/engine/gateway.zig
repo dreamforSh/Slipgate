@@ -16,8 +16,12 @@ pub const ExecutionMode = enum {
     direct_api,
 };
 
+/// Mirrors SubscriptionTierSchema in @slipgate/contracts (sub2api plan names per platform).
+/// The BFF always sends tierMultiplier; defaultMultiplier only covers snapshots without it.
 pub const SubscriptionTier = enum {
     standard,
+    free,
+    go,
     plus,
     pro,
     pro_5x,
@@ -25,15 +29,23 @@ pub const SubscriptionTier = enum {
     pro_25x,
     max,
     ultra,
+    premium,
+    super,
+    team,
+    enterprise,
+    edu,
 
     pub fn defaultMultiplier(self: SubscriptionTier, provider: composite.Provider) u16 {
         return switch (self) {
             .pro_5x, .max => 5,
             .pro_10x => 10,
-            .ultra => 20,
+            .premium => 4,
+            .super => 15,
+            // XPass (grok) Ultra is 50x Plus; Claude / Google Ultra is 20x.
+            .ultra => if (provider == .grok) 50 else 20,
             .pro_25x => 25,
             .pro => if (provider == .antigravity) 5 else 1,
-            .plus, .standard => 1,
+            .plus, .standard, .free, .go, .team, .enterprise, .edu => 1,
         };
     }
 };
@@ -2136,6 +2148,12 @@ test "subscription tier weights schedule Claude ultra(20x)/max(5x) and Codex pro
     try std.testing.expectEqual(@as(u16, 5), SubscriptionTier.pro_5x.defaultMultiplier(.codex));
     try std.testing.expectEqual(@as(u16, 10), SubscriptionTier.pro_10x.defaultMultiplier(.codex));
     try std.testing.expectEqual(@as(u16, 25), SubscriptionTier.pro_25x.defaultMultiplier(.codex));
+    try std.testing.expectEqual(@as(u16, 1), SubscriptionTier.team.defaultMultiplier(.codex));
+    try std.testing.expectEqual(@as(u16, 1), SubscriptionTier.enterprise.defaultMultiplier(.anthropic));
+    try std.testing.expectEqual(@as(u16, 4), SubscriptionTier.premium.defaultMultiplier(.grok));
+    try std.testing.expectEqual(@as(u16, 15), SubscriptionTier.super.defaultMultiplier(.grok));
+    try std.testing.expectEqual(@as(u16, 50), SubscriptionTier.ultra.defaultMultiplier(.grok));
+    try std.testing.expectEqual(SubscriptionTier.go, std.meta.stringToEnum(SubscriptionTier, "go") orelse .standard);
 
     var engine = GatewayEngine.init(std.testing.allocator);
     defer engine.deinit();

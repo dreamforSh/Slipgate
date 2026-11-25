@@ -8,6 +8,7 @@ import UsageMeter from "../../ui/UsageMeter.vue";
 import AccountExitCell from "./AccountExitCell.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
 import PlatformTypeBadge from "./PlatformTypeBadge.vue";
+import AccountPrivacyBadge from "./AccountPrivacyBadge.vue";
 import PriorityStepper from "./PriorityStepper.vue";
 import { EXPIRY_TONE, MODE_ICON, expiryState } from "./accountDisplay";
 import { modeUsesExit } from "./exitPool";
@@ -142,6 +143,7 @@ const lastTestClass = computed(() => {
         <UiIcon :name="MODE_ICON[acc.executionMode]" :size="11" />
         {{ executionModeLabel(acc.executionMode) }}
       </span>
+      <AccountPrivacyBadge :account="acc" />
     </div>
 
     <!-- Exit proxy -->

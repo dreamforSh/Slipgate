@@ -1,9 +1,11 @@
-import type {
-  AccountAuthKind,
-  AccountStatus,
-  AccountUsageSummaryItem,
-  ExecutionMode,
-  UpstreamAccount,
+import {
+  accountSupportsPrivacy,
+  isPrivacyApplied,
+  type AccountAuthKind,
+  type AccountStatus,
+  type AccountUsageSummaryItem,
+  type ExecutionMode,
+  type UpstreamAccount,
 } from "@slipgate/contracts";
 import type { Tone } from "../../../lib/format";
 import type { IconName } from "../../ui/icons";
@@ -60,8 +62,11 @@ export function matchesGroupFilter(acc: Pick<UpstreamAccount, "groupId">, filter
 }
 
 export type AttentionFilter = "failed_test" | "expiring" | "never_tested" | "missing_exit";
-export type StatusFilter = "all" | AccountStatus | AttentionFilter;
+/** "Set privacy" state of the accounts it applies to (ChatGPT / Codex and Antigravity OAuth). */
+export type PrivacyFilter = "privacy_unset" | "privacy_set" | "privacy_failed";
+export type StatusFilter = "all" | AccountStatus | AttentionFilter | PrivacyFilter;
 export const ATTENTION_FILTERS: AttentionFilter[] = ["failed_test", "expiring", "never_tested", "missing_exit"];
+export const PRIVACY_FILTERS: PrivacyFilter[] = ["privacy_unset", "privacy_set", "privacy_failed"];
 
 /**
  * `hasExit` answers whether an account has an exit binding; without it (exit pool unknown)
@@ -82,6 +87,12 @@ export function matchesStatusFilter(
       return acc.lastTest === null && acc.executionMode !== "vm_slot";
     case "missing_exit":
       return !!hasExit && modeUsesExit(acc.executionMode) && !hasExit(acc.id);
+    case "privacy_unset":
+      return accountSupportsPrivacy(acc) && !acc.privacyMode;
+    case "privacy_set":
+      return isPrivacyApplied(acc.privacyMode);
+    case "privacy_failed":
+      return !!acc.privacyMode && !isPrivacyApplied(acc.privacyMode);
     case "expiring": {
       const state = expiryState(acc, nowMs);
       return state === "soon" || state === "expired";
@@ -95,7 +106,9 @@ export function isStatusFilter(value: unknown): value is StatusFilter {
   return (
     value === "all" ||
     (typeof value === "string" &&
-      ((ACCOUNT_STATUSES as string[]).includes(value) || (ATTENTION_FILTERS as string[]).includes(value)))
+      ((ACCOUNT_STATUSES as string[]).includes(value) ||
+        (ATTENTION_FILTERS as string[]).includes(value) ||
+        (PRIVACY_FILTERS as string[]).includes(value)))
   );
 }
 

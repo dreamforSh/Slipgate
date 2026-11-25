@@ -164,6 +164,14 @@ describe("IAM, Pool and API Key contracts", () => {
     expect(subscriptionTierMultiplier("codex", "pro_10x")).toBe(10);
     expect(subscriptionTierMultiplier("codex", "pro_25x")).toBe(25);
     expect(isSubscriptionTierAllowedForProvider("codex", "pro_25x")).toBe(true);
+    // XPass (grok): Plus 1x, Premium 4x, Super 15x, Ultra 50x; Claude Ultra stays 20x.
+    expect(subscriptionTierMultiplier("grok", "plus")).toBe(1);
+    expect(subscriptionTierMultiplier("grok", "premium")).toBe(4);
+    expect(subscriptionTierMultiplier("grok", "super")).toBe(15);
+    expect(subscriptionTierMultiplier("grok", "ultra")).toBe(50);
+    expect(subscriptionTierMultiplier("anthropic", "ultra")).toBe(20);
+    expect(isSubscriptionTierAllowedForProvider("grok", "super")).toBe(true);
+    expect(isSubscriptionTierAllowedForProvider("anthropic", "super")).toBe(false);
     expect(isSubscriptionTierAllowedForProvider("codex", "max")).toBe(false);
 
     const apiKey = CreateApiKeyRequestSchema.parse({

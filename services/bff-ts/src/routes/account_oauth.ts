@@ -158,11 +158,9 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
   }
 }
 
+/** ChatGPT plan_type → tier with the shared mapping (pro = Pro 200 / 10x, team = Business, …). */
 function inferCodexTier(planRaw: string): SubscriptionTier {
-  const p = planRaw.trim().toLowerCase();
-  if (p === "pro") return "pro_5x";
-  if (p === "plus" || p === "team" || p === "business" || p === "enterprise") return "plus";
-  return resolveTierForPlatform("codex", p);
+  return resolveTierForPlatform("codex", planRaw);
 }
 
 async function readJsonBody(c: Context): Promise<unknown> {

@@ -1,4 +1,5 @@
 import type {
+  AccountPrivacyMode,
   AccountTestResult,
   AccountUsageSummaryItem,
   ApiKeyItem,
@@ -203,6 +204,8 @@ export interface ControlStore {
   updateAccount(accountId: string, req: UpdateAccountRequest, credential?: StoredCredential): Promise<UpstreamAccount>;
   deleteAccount(accountId: string): Promise<void>;
   recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void>;
+  /** Stores the outcome of the "set privacy" action (see AccountPrivacyModeSchema). */
+  recordAccountPrivacy(accountId: string, mode: AccountPrivacyMode, checkedAtIso: string): Promise<void>;
   /** Encrypted credentials for export and fingerprint backfill; every account when `accountIds` is omitted. */
   listAccountSecrets(accountIds?: string[]): Promise<AccountSecretRecord[]>;
   /** Maps each known fingerprint to the id of an account holding it. */

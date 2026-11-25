@@ -216,16 +216,66 @@ export function normalizeSubscriptionTier(raw: string | null | undefined): Subsc
   if (s.includes("claude") && s.includes("5x")) return "max";
   if (s.includes("5x")) return "pro_5x";
   const words = s.split(/[^a-z0-9]+/);
+  if (words.includes("supergrok") || words.includes("super")) return "super";
+  if (words.includes("premium")) return "premium";
+  if (words.includes("enterprise") || words.includes("ent26")) return "enterprise";
+  if (words.includes("team") || words.includes("business")) return "team";
+  if (words.includes("edu")) return "edu";
   if (words.includes("max")) return "max";
   if (words.includes("plus")) return "plus";
   if (words.includes("pro")) return "pro";
-  if (words.includes("free") || words.includes("standard")) return "standard";
+  if (words.includes("free")) return "free";
+  if (words.includes("standard")) return "standard";
+  return null;
+}
+
+/**
+ * ChatGPT `plan_type` (Codex id_token / auth.json) to a tier, following the Codex SKU names sub2api
+ * shows: prolite = Pro 100 (5x), pro = Pro 200 (10x), promax = Pro 500 (25x); self-serve business
+ * and team plans are Business, ent26 / CBP plans Enterprise. `null` when it is not a ChatGPT plan.
+ */
+export function normalizeChatGptPlan(raw: string | null | undefined): SubscriptionTier | null {
+  const key = (raw ?? "").trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (!key) return null;
+  switch (key) {
+    case "free":
+      return "free";
+    case "go":
+      return "go";
+    case "plus":
+      return "plus";
+    case "prolite":
+    case "pro100":
+      return "pro_5x";
+    case "pro":
+    case "chatgptpro":
+    case "pro200":
+      return "pro_10x";
+    case "promax":
+    case "pro500":
+      return "pro_25x";
+    case "team":
+    case "business":
+    case "selfservebusinessusagebased":
+    case "selfservebusinessprolite":
+      return "team";
+    case "enterprise":
+    case "ent26":
+    case "enterprisecbpusagebased":
+    case "enterprisecbpautomation":
+      return "enterprise";
+    case "edu":
+    case "eduplus":
+    case "edupro":
+      return "edu";
+  }
   return null;
 }
 
 /** A tier the platform accepts: the normalized hint when allowed, else `standard`. */
 export function resolveTierForPlatform(platform: Provider, hint: string | null | undefined): SubscriptionTier {
-  const normalized = normalizeSubscriptionTier(hint);
+  const chatgpt = platform === "codex" || platform === "openai" ? normalizeChatGptPlan(hint) : null;
+  const normalized = chatgpt ?? normalizeSubscriptionTier(hint);
   const allowed = allowedSubscriptionTiersForProvider(platform);
   if (normalized && allowed.some((o) => o.tier === normalized)) return normalized;
   return "standard";

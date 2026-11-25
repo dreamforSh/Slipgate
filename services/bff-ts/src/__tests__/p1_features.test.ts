@@ -145,7 +145,8 @@ describe("P1 gateway, pricing, window reset & payment features", () => {
     const codexResult = (await okCodex.json()) as { credentialSecret: string; email: string; accountIdHint?: string; subscriptionTier: string };
     assert.equal(codexResult.email, "codex-pro@example.com");
     assert.equal(codexResult.accountIdHint, "acct_codex_777");
-    assert.equal(codexResult.subscriptionTier, "pro_5x");
+    // ChatGPT "pro" is Pro 200 (10x); Pro 100 arrives as "prolite" (see normalizeChatGptPlan).
+    assert.equal(codexResult.subscriptionTier, "pro_10x");
   });
 
   it("unlocks saturated 5h/7d account quota windows once windowResetAtUnixMs elapses ([H-04]) and handles internal credential/cooldown callbacks", async () => {

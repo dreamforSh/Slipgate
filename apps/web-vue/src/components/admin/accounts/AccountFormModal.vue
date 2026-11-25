@@ -84,7 +84,19 @@ const toast = useToastStore();
 /* ---------------- Account types ---------------- */
 
 type Tone = "orange" | "purple" | "emerald" | "sky" | "fuchsia";
-type KindKey = "claude_code" | "console" | "chatgpt" | "antigravity" | "gemini_oauth" | "qwen_oauth" | "vm_seed" | "api_key";
+type KindKey =
+  | "claude_code"
+  | "console"
+  | "chatgpt"
+  | "antigravity"
+  | "gemini_oauth"
+  | "qwen_oauth"
+  | "xpass_sub"
+  | "vm_seed"
+  | "api_key";
+
+/** XPass subscriptions call Grok through the Grok CLI proxy (slipgate-net adds the CLI identity there). */
+const XPASS_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
 
 interface KindOption {
   key: KindKey;
@@ -173,6 +185,11 @@ const kindOptions = computed<KindOption[]>(() => {
         { key: "qwen_oauth", title: "Qwen OAuth", desc: t("accounts.form.types.qwenDesc"), icon: "globe", tone: "emerald", authKind: "oauth", mode: "stealth_http" },
         apiKey("Qwen API"),
       ];
+    case "grok":
+      return [
+        { key: "xpass_sub", title: t("accounts.form.types.xpass"), desc: t("accounts.form.types.xpassDesc"), icon: "sparkles", tone: "sky", authKind: "oauth", mode: "stealth_http" },
+        apiKey("XPass API"),
+      ];
     default:
       return [apiKey(`${platformShortLabel(formPlatform.value)} API`)];
   }
@@ -230,8 +247,10 @@ const authKind = computed<AccountAuthKind>(() =>
   kind.value.key === "claude_code" && addMethod.value === "setup_token" ? "setup_token" : kind.value.authKind,
 );
 const isApiKey = computed(() => authKind.value === "api_key");
+/** XPass subscription: a Grok CLI token plus the CLI proxy base URL, stored as JSON. */
+const isXPassSub = computed(() => kind.value.key === "xpass_sub");
 /** OAuth and VM seeds are pasted as JSON; API keys and setup tokens are single strings. */
-const takesJson = computed(() => authKind.value === "oauth" || authKind.value === "vm_cli_seed");
+const takesJson = computed(() => (authKind.value === "oauth" || authKind.value === "vm_cli_seed") && !isXPassSub.value);
 const OAUTH_PLATFORMS: ReadonlySet<string> = new Set(["anthropic", "codex", "antigravity", "gemini", "qwen"]);
 const supportsInteractiveOAuth = computed(
   () => (authKind.value === "oauth" || authKind.value === "setup_token") && OAUTH_PLATFORMS.has(formPlatform.value),
@@ -392,7 +411,13 @@ function defaultTierFor(platform: Provider): SubscriptionTier {
   if (platform === "anthropic") return "max";
   if (platform === "codex" || platform === "openai") return "pro_5x";
   if (platform === "antigravity") return "pro";
+  if (platform === "grok") return "plus";
   return "standard";
+}
+
+function xpassSecret(token: string): string {
+  const base = (formBaseUrl.value.trim() || XPASS_CLI_BASE_URL).replace(/\/+$/, "");
+  return JSON.stringify({ api_key: token.trim(), base_url: base });
 }
 
 function applyKind(key: KindKey) {
@@ -492,6 +517,7 @@ function kindFor(src: UpstreamAccount): KindKey {
   if (src.platform === "antigravity") return "antigravity";
   if (src.platform === "gemini") return "gemini_oauth";
   if (src.platform === "qwen") return "qwen_oauth";
+  if (src.platform === "grok") return "xpass_sub";
   if (src.platform === "anthropic") return "claude_code";
   return "api_key";
 }
@@ -576,6 +602,7 @@ const batchBlock = computed(() => parseCredentialBlock(batchText.value));
 const batchCredentials = computed(() =>
   batchBlock.value.credentials.map((c) => {
     if (isApiKey.value) return c.startsWith("{") ? c : apiKeySecret(c);
+    if (isXPassSub.value) return c.startsWith("{") ? c : xpassSecret(c);
     return takesJson.value ? inspectCredential(c)?.credentialSecret ?? c : c;
   }),
 );
@@ -679,6 +706,7 @@ const effectiveTier = computed<SubscriptionTier>(() => (isApiKey.value ? "standa
 
 const singleSecret = computed(() => {
   if (isApiKey.value) return formApiKey.value.trim() ? apiKeySecret(formApiKey.value) : "";
+  if (isXPassSub.value) return formApiKey.value.trim() ? xpassSecret(formApiKey.value) : "";
   if (takesJson.value) return insight.value?.credentialSecret ?? formSecret.value.trim();
   return formSecret.value.trim();
 });
@@ -1138,6 +1166,40 @@ const credentialPlaceholder = computed(() => {
             </div>
           </div>
 
+          <div v-else-if="isXPassSub" class="space-y-4">
+            <div>
+              <label class="label" for="account-form-xpass-base">{{ t("accounts.form.baseUrl") }}</label>
+              <input
+                id="account-form-xpass-base"
+                v-model="formBaseUrl"
+                type="url"
+                spellcheck="false"
+                autocomplete="off"
+                :placeholder="XPASS_CLI_BASE_URL"
+                class="input font-mono text-xs"
+              />
+              <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.xpassBaseUrlHint") }}</p>
+            </div>
+            <div>
+              <label class="label flex items-center justify-between gap-3" for="account-form-xpass-token">
+                <span>{{ t("accounts.form.xpassToken") }} <span v-if="!editing" class="text-danger">*</span></span>
+                <span v-if="editing" class="truncate font-mono font-normal text-fg-muted">
+                  {{ t("accounts.form.credentialsCurrent", { preview: editing.credentialPreview }) }}
+                </span>
+              </label>
+              <input
+                id="account-form-xpass-token"
+                v-model="formApiKey"
+                type="password"
+                :required="!editing"
+                autocomplete="new-password"
+                :placeholder="editing ? t('accounts.form.credentialsKeepPlaceholder') : 'xai-...'"
+                class="input font-mono"
+              />
+              <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.xpassTokenHint") }}</p>
+            </div>
+          </div>
+
           <div v-else-if="authKind === 'setup_token'">
             <label class="label flex items-center justify-between gap-3" for="account-form-setup-token">
               <span>Setup Token <span v-if="!editing" class="text-danger">*</span></span>
@@ -1195,10 +1257,19 @@ const credentialPlaceholder = computed(() => {
 
         <!-- Credentials: batch -->
         <div v-else class="space-y-2">
-          <div v-if="isApiKey">
+          <div v-if="isApiKey || isXPassSub">
             <label class="label" for="account-form-batch-base-url">{{ t("accounts.form.baseUrl") }}</label>
-            <input id="account-form-batch-base-url" v-model="formBaseUrl" type="url" spellcheck="false" placeholder="https://" class="input font-mono text-xs" />
-            <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.baseUrlHint") }}</p>
+            <input
+              id="account-form-batch-base-url"
+              v-model="formBaseUrl"
+              type="url"
+              spellcheck="false"
+              :placeholder="isXPassSub ? XPASS_CLI_BASE_URL : 'https://'"
+              class="input font-mono text-xs"
+            />
+            <p class="mt-1 text-2xs text-fg-subtle">
+              {{ isXPassSub ? t("accounts.form.xpassBaseUrlHint") : t("accounts.form.baseUrlHint") }}
+            </p>
           </div>
           <label class="block min-w-0">
             <span class="label flex items-center justify-between gap-3">
@@ -1210,12 +1281,22 @@ const credentialPlaceholder = computed(() => {
               rows="8"
               spellcheck="false"
               autocomplete="off"
-              :placeholder="isApiKey ? 'sk-...\nsk-...' : authKind === 'setup_token' ? 'sk-ant-oat01-...\nsk-ant-oat01-...' : '{...}\n{...}'"
+              :placeholder="
+                isApiKey ? 'sk-...\nsk-...' : isXPassSub ? 'xai-...\nxai-...' : authKind === 'setup_token' ? 'sk-ant-oat01-...\nsk-ant-oat01-...' : '{...}\n{...}'
+              "
               class="textarea font-mono text-xs"
             />
           </label>
           <p v-if="batchBlock.invalidJson" class="text-xs text-danger">{{ t("accounts.form.batchInvalidJson") }}</p>
-          <p class="text-2xs text-fg-subtle">{{ isApiKey ? t("accounts.form.batchKeysHint") : t("accounts.form.batchCredentialsHint") }}</p>
+          <p class="text-2xs text-fg-subtle">
+            {{
+              isApiKey
+                ? t("accounts.form.batchKeysHint")
+                : isXPassSub
+                  ? t("accounts.form.xpassBatchHint")
+                  : t("accounts.form.batchCredentialsHint")
+            }}
+          </p>
           <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-fg-muted">
             <input v-model="batchSkipDup" type="checkbox" class="checkbox" />
             {{ t("accounts.form.skipDuplicates") }}

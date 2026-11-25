@@ -141,7 +141,8 @@ func (c *Coordinator) RefreshAccountOAuth(ctx context.Context, accountID string,
 			if jwtAcc != "" {
 				updated.ChatGPTAccountID = jwtAcc
 			}
-			if tier := NormalizeSubscriptionTier(jwtPlan); tier != "" {
+			// The id_token claim is a ChatGPT plan_type: "pro" means Pro 200 (pro_10x), not Claude Pro.
+			if tier := NormalizeChatGPTPlanTier(jwtPlan); tier != "" && tier != "standard" {
 				updated.SubscriptionTier = tier
 			}
 		}

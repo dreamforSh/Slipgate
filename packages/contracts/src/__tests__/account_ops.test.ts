@@ -6,6 +6,7 @@ import {
   draftToCreateRequest,
   inspectCredential,
   effectiveAccountStatus,
+  normalizeChatGptPlan,
   normalizeSubscriptionTier,
   parseAccountImportFile,
   parseAccountImportSources,
@@ -51,13 +52,39 @@ describe("subscription tier hints", () => {
     expect(normalizeSubscriptionTier("chatgpt plus")).toBe("plus");
     expect(normalizeSubscriptionTier("g1-pro-tier")).toBe("pro");
     expect(normalizeSubscriptionTier("")).toBeNull();
-    expect(normalizeSubscriptionTier("enterprise")).toBeNull();
+    expect(normalizeSubscriptionTier("enterprise")).toBe("enterprise");
+    expect(normalizeSubscriptionTier("Claude Team")).toBe("team");
+    expect(normalizeSubscriptionTier("free")).toBe("free");
+    expect(normalizeSubscriptionTier("totally unknown")).toBeNull();
+  });
+
+  it("maps ChatGPT plan_type values like sub2api's Codex SKU names", () => {
+    expect(normalizeChatGptPlan("prolite")).toBe("pro_5x");
+    expect(normalizeChatGptPlan("pro")).toBe("pro_10x");
+    expect(normalizeChatGptPlan("ProMax")).toBe("pro_25x");
+    expect(normalizeChatGptPlan("self_serve_business_usage_based")).toBe("team");
+    expect(normalizeChatGptPlan("ent26")).toBe("enterprise");
+    expect(normalizeChatGptPlan("edu_plus")).toBe("edu");
+    expect(normalizeChatGptPlan("go")).toBe("go");
+    expect(normalizeChatGptPlan("unknown")).toBeNull();
+    // Codex reads "pro" as Pro 200; Claude keeps its own Pro.
+    expect(resolveTierForPlatform("codex", "pro")).toBe("pro_10x");
+    expect(resolveTierForPlatform("openai", "Pro-10x")).toBe("pro_10x");
+    expect(resolveTierForPlatform("anthropic", "pro")).toBe("pro");
+    expect(resolveTierForPlatform("anthropic", "team")).toBe("team");
+    expect(resolveTierForPlatform("gemini", "free")).toBe("free");
+    expect(resolveTierForPlatform("gemini", "enterprise")).toBe("enterprise");
+    expect(resolveTierForPlatform("grok", "SuperGrok")).toBe("super");
+    expect(resolveTierForPlatform("grok", "premium")).toBe("premium");
+    expect(resolveTierForPlatform("anthropic", "premium")).toBe("standard");
   });
 
   it("falls back to standard when the platform does not offer the tier", () => {
     expect(resolveTierForPlatform("anthropic", "max_5x")).toBe("max");
     expect(resolveTierForPlatform("codex", "max_5x")).toBe("standard");
     expect(resolveTierForPlatform("codex", "plus")).toBe("plus");
+    expect(resolveTierForPlatform("gemini", "max")).toBe("standard");
+    expect(resolveTierForPlatform("anthropic", "go")).toBe("standard");
     expect(resolveTierForPlatform("deepseek", null)).toBe("standard");
   });
 });

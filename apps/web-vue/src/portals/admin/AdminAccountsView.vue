@@ -5,12 +5,16 @@ import { useRoute, useRouter } from "vue-router";
 import {
   ExecutionModeSchema,
   ProviderSchema,
+  accountSupportsPrivacy,
+  isPrivacyApplied,
   type AccountBulkResult,
+  type AccountPrivacyMode,
   type AccountUsageSummaryItem,
   type AccountUsageSummaryResponse,
   type ExecutionMode,
   type GroupItem,
   type Provider,
+  type SetAccountPrivacyResponse,
   type UpdateAccountRequest,
   type UpstreamAccount,
 } from "@slipgate/contracts";
@@ -31,6 +35,7 @@ import {
   COOLDOWN_PRESETS_HOURS,
   DEFAULT_COLUMNS,
   EXECUTION_MODES,
+  PRIVACY_FILTERS,
   SORT_DEFAULT_DIR,
   SORT_KEYS,
   UNGROUPED_FILTER,
@@ -308,6 +313,7 @@ const selected = ref<Set<string>>(new Set());
 const selectedAccounts = computed(() => accounts.value.filter((a) => selected.value.has(a.id)));
 const selectedIds = computed(() => selectedAccounts.value.map((a) => a.id));
 const selectedOauth = computed(() => selectedAccounts.value.filter((a) => a.authKind === "oauth"));
+const selectedPrivacy = computed(() => selectedAccounts.value.filter((a) => accountSupportsPrivacy(a)));
 const selectedMissingExit = computed(() =>
   exitReady.value ? selectedAccounts.value.filter((a) => modeUsesExit(a.executionMode) && !hasExit(a.id)) : [],
 );
@@ -532,6 +538,64 @@ async function bulkRefreshTokens() {
     await refreshPool(true);
   } finally {
     refreshingTokens.value = false;
+  }
+}
+
+/* ---------------- Set privacy ---------------- */
+
+const settingPrivacy = ref(false);
+
+type PrivacyOutcome = { ok: true; mode: AccountPrivacyMode; message: string } | { ok: false; message: string };
+
+async function setPrivacyOne(acc: UpstreamAccount): Promise<PrivacyOutcome> {
+  setBusy(acc.id, true);
+  try {
+    const res = await auth.apiFetch(`/api/v1/admin/accounts/${encodeURIComponent(acc.id)}/privacy`, { method: "POST" });
+    const data = (await res.json().catch(() => ({}))) as Partial<SetAccountPrivacyResponse> & { message?: string };
+    if (!res.ok || !data.mode) return { ok: false, message: data.message ?? t("accounts.privacy.failed") };
+    return { ok: true, mode: data.mode, message: data.message ?? "" };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : t("accounts.privacy.failed") };
+  } finally {
+    setBusy(acc.id, false);
+  }
+}
+
+/** Toast text for one outcome; `applied` tells success from a provider refusal. */
+function privacyToast(acc: UpstreamAccount, out: PrivacyOutcome): { applied: boolean; text: string } {
+  if (!out.ok) return { applied: false, text: t("accounts.privacy.failedFor", { name: acc.name, message: out.message }) };
+  const reason = out.message || t("accounts.privacy.noReason");
+  return {
+    applied: isPrivacyApplied(out.mode),
+    text: t(`accounts.privacy.result.${out.mode}`, { name: acc.name, message: reason }),
+  };
+}
+
+async function setPrivacy(acc: UpstreamAccount) {
+  const toastView = privacyToast(acc, await setPrivacyOne(acc));
+  if (toastView.applied) toast.success(toastView.text);
+  else toast.error(toastView.text);
+  await refreshPool(true);
+}
+
+/** Selected ChatGPT / Codex and Antigravity OAuth accounts, one after another. */
+async function bulkSetPrivacy() {
+  const targets = selectedPrivacy.value;
+  if (!targets.length || settingPrivacy.value) return;
+  settingPrivacy.value = true;
+  try {
+    let ok = 0;
+    const failures: string[] = [];
+    for (const acc of targets) {
+      const toastView = privacyToast(acc, await setPrivacyOne(acc));
+      if (toastView.applied) ok += 1;
+      else failures.push(toastView.text);
+    }
+    if (ok) toast.success(t("accounts.privacy.bulkDone", { n: ok }));
+    if (failures.length) toast.error(t("accounts.privacy.bulkFailed", { n: failures.length, first: failures[0] }));
+    await refreshPool(true);
+  } finally {
+    settingPrivacy.value = false;
   }
 }
 
@@ -923,6 +987,9 @@ onMounted(() => {
           <optgroup :label="t('accounts.filters.attentionGroup')">
             <option v-for="f in ATTENTION_FILTERS" :key="f" :value="f">{{ t(`accounts.filters.attention.${f}`) }}</option>
           </optgroup>
+          <optgroup :label="t('accounts.filters.privacyGroup')">
+            <option v-for="f in PRIVACY_FILTERS" :key="f" :value="f">{{ t(`accounts.filters.privacy.${f}`) }}</option>
+          </optgroup>
         </UiSelect>
         <div v-if="viewMode === 'card'" class="flex items-center gap-1">
           <UiSelect v-model="sort.key" class="select input-sm w-auto" :aria-label="t('accounts.sort.label')">
@@ -1024,6 +1091,17 @@ onMounted(() => {
           >
             <UiIcon :name="refreshingTokens ? 'loader' : 'rotate-ccw'" :size="13" :spin="refreshingTokens" />
             {{ t("accounts.refresh.bulk", { n: selectedOauth.length }) }}
+          </button>
+          <button
+            v-if="selectedPrivacy.length > 0"
+            type="button"
+            class="btn btn-secondary btn-sm"
+            :disabled="bulkBusy || settingPrivacy"
+            :title="t('accounts.privacy.bulkHint')"
+            @click="bulkSetPrivacy"
+          >
+            <UiIcon :name="settingPrivacy ? 'loader' : 'shield'" :size="13" :spin="settingPrivacy" />
+            {{ t("accounts.privacy.bulk", { n: selectedPrivacy.length }) }}
           </button>
           <button
             v-if="exitReady && selectedMissingExit.length > 0"
@@ -1180,6 +1258,7 @@ onMounted(() => {
       @cooldown="cooldownAccount"
       @resume="resumeAccount"
       @refresh="refreshToken"
+      @privacy="setPrivacy"
       @delete="removeAccount"
     />
 
