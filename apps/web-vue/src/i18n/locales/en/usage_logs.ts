@@ -74,6 +74,13 @@ const en: typeof zh = {
       label: "Detail view",
       records: "Requests",
       ranking: "User ranking",
+      errors: "Errors",
+    },
+    errorsTab: {
+      subtitle: "Request errors matching the current filters (time, user, key, group, model)",
+      count: "{n} errors",
+      empty: "No request errors for the current filters",
+      loadFailed: "Could not load request errors",
     },
     charts: {
       modelTitle: "Model distribution",

@@ -33,6 +33,8 @@ func VerifyGuestExitHealth(ctx context.Context, endpoint, token, expectedMachine
 	if ep == "" {
 		return GuestDirective{}, errors.New("vmslot: empty guestd endpoint")
 	}
+	// Counted so a graceful restart never retires the daemon under this exchange.
+	defer beginGuestCall(ep)()
 	reply, err := dpbridge.ExchangeAuth(ctx, ep, token, dpbridge.Frame{
 		StreamID: 1,
 		Type:     dpbridge.FrameExitHealth,
@@ -51,6 +53,8 @@ func HandoffGuestTurn(ctx context.Context, endpoint, token, expectedMachineID st
 	if ep == "" {
 		return GuestDirective{}, false, errors.New("vmslot: empty guestd endpoint")
 	}
+	// Counted so a graceful restart never retires the daemon under this exchange.
+	defer beginGuestCall(ep)()
 	reply, err := dpbridge.ExchangeAuth(ctx, ep, token, dpbridge.Frame{
 		StreamID: 1,
 		Type:     dpbridge.FrameReqHeaders,

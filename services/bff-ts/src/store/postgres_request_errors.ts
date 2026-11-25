@@ -113,8 +113,10 @@ function whereOf(sql: Sql, f: RequestErrorFilter): Fragment {
   if (f.accountId) parts.push(sql`re.account_id = ${f.accountId}`);
   if (f.userId) parts.push(sql`re.user_id = ${f.userId}`);
   if (f.apiKeyId) parts.push(sql`re.api_key_id = ${f.apiKeyId}`);
+  if (f.groupId) parts.push(sql`re.group_id = ${f.groupId}`);
   if (f.platform) parts.push(sql`re.platform = ${f.platform}`);
   if (f.model) parts.push(sql`re.model = ${f.model}`);
+  if (f.modelContains) parts.push(sql`re.model ILIKE ${likePattern(f.modelContains)}`);
   if (f.requestId) parts.push(sql`re.request_id = ${f.requestId}`);
   if (f.resolved === "open") parts.push(sql`re.resolved = FALSE`);
   if (f.resolved === "resolved") parts.push(sql`re.resolved = TRUE`);

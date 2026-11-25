@@ -11,6 +11,8 @@ import UiPagination from "../ui/UiPagination.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import { useNow } from "../../composables/useNow";
 import { formatCompact } from "../../lib/format";
+import { useAuthStore } from "../../stores/auth";
+import UsageErrorsTab from "./UsageErrorsTab.vue";
 import UsageFilterBar from "./UsageFilterBar.vue";
 import UsageStatsCharts from "./UsageStatsCharts.vue";
 import UsageSummaryCards from "./UsageSummaryCards.vue";
@@ -22,8 +24,8 @@ import { useUsageStats } from "./useUsageStats";
 /**
  * Whole usage-log page body shared by /admin/usage and /usage: header with CSV export,
  * filters, summary tiles and the paginated request table. The admin page adds the sub2api charts
- * (model / group distribution, token trend) and a user-ranking tab beside the request list, all
- * over the same filters.
+ * (model / group distribution, token trend) plus user-ranking and (admins only) request-error tabs
+ * beside the request list, all over the same filters.
  */
 const props = defineProps<{
   mode: "admin" | "user";
@@ -48,8 +50,9 @@ const { filters, page, pageSize, items, total, summary, loading, loaded, exporti
 
 const toast = useFeedbackToasts(usage.error);
 
-const isAdmin = props.mode === "admin";
-const statsPanel = isAdmin
+const adminMode = props.mode === "admin";
+const auth = useAuthStore();
+const statsPanel = adminMode
   ? useUsageStats({
       base,
       criteriaKey: usage.criteriaKey,
@@ -60,12 +63,21 @@ const statsPanel = isAdmin
   : null;
 if (statsPanel) useFeedbackToasts(statsPanel.error);
 
-type Tab = "records" | "ranking";
+type Tab = "records" | "ranking" | "errors";
 const tab = ref<Tab>("records");
+/** The request-error center is admin-only; group managers get records and ranking. */
+const showErrors = computed(() => adminMode && auth.isAdmin);
 const tabOptions = computed(() => [
   { value: "records" as const, label: t("usageLogs.tabs.records") },
   { value: "ranking" as const, label: t("usageLogs.tabs.ranking") },
+  ...(showErrors.value ? [{ value: "errors" as const, label: t("usageLogs.tabs.errors") }] : []),
 ]);
+const tabMeta = computed(() => {
+  if (tab.value === "ranking") return { icon: "crown" as const, title: t("usageLogs.tabs.ranking") };
+  if (tab.value === "errors") return { icon: "alert" as const, title: t("usageLogs.tabs.errors") };
+  return { icon: "list" as const, title: t("usageLogs.list.title") };
+});
+const errorsTab = ref<InstanceType<typeof UsageErrorsTab> | null>(null);
 
 function selectUser(userId: string) {
   patch({ userId });
@@ -75,6 +87,7 @@ function selectUser(userId: string) {
 function refresh() {
   void usage.load();
   void statsPanel?.load();
+  void errorsTab.value?.load();
 }
 
 watch(
@@ -139,7 +152,7 @@ refresh();
       @select-group="(g) => patch({ groupId: g })"
     />
 
-    <UiCard :icon="tab === 'ranking' ? 'crown' : 'list'" :title="tab === 'ranking' ? t('usageLogs.tabs.ranking') : t('usageLogs.list.title')" flush>
+    <UiCard :icon="tabMeta.icon" :title="tabMeta.title" flush>
       <template #actions>
         <span v-if="loaded && tab === 'records'" class="font-mono text-xs tabular-nums text-fg-subtle">{{ formatCompact(total) }}</span>
         <SegmentedControl v-if="statsPanel" v-model="tab" :options="tabOptions" :aria-label="t('usageLogs.tabs.label')" />
@@ -152,6 +165,14 @@ refresh();
         :stats="statsPanel.stats.value"
         :loading="statsPanel.loading.value"
         @select-user="selectUser"
+      />
+      <UsageErrorsTab
+        v-else-if="showErrors && tab === 'errors'"
+        ref="errorsTab"
+        :criteria-key="usage.criteriaKey.value"
+        :params="usage.params"
+        :now="now"
+        @error="(m) => toast.error(m)"
       />
       <template v-else>
         <div v-if="!loaded && loading" class="divide-y divide-line/60" aria-busy="true">

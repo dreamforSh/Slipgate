@@ -43,8 +43,11 @@ export interface RequestErrorFilter {
   accountId?: string;
   userId?: string;
   apiKeyId?: string;
+  groupId?: string;
   platform?: string;
   model?: string;
+  /** Case-insensitive substring of the model. */
+  modelContains?: string;
   requestId?: string;
   resolved?: RequestErrorResolvedFilter;
   q?: string;

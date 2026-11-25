@@ -116,7 +116,10 @@ type LocalSlotDriver struct {
 	mu sync.Mutex
 	// guestdBin can be swapped by a hot update while slots start; read it through GuestdBin.
 	guestdBin string
-	procs     map[string]*exec.Cmd
+	procs     map[string]*guestProc
+
+	// Graceful-retire timings (see guestd_proc.go); tests shorten them.
+	settle, drain, term time.Duration
 }
 
 func NewLocalSlotDriver(vmDataDir, guestdBin string) *LocalSlotDriver {
@@ -126,7 +129,10 @@ func NewLocalSlotDriver(vmDataDir, guestdBin string) *LocalSlotDriver {
 	return &LocalSlotDriver{
 		vmDataDir: vmDataDir,
 		guestdBin: strings.TrimSpace(guestdBin),
-		procs:     make(map[string]*exec.Cmd),
+		procs:     make(map[string]*guestProc),
+		settle:    defaultGuestdSettle,
+		drain:     defaultGuestdDrain,
+		term:      defaultGuestdTerm,
 	}
 }
 
@@ -138,7 +144,8 @@ func (d *LocalSlotDriver) GuestdBin() string {
 }
 
 // SetGuestdBin switches the slipgate-guestd binary used by slots started from now on (a hot
-// update delivering a new guestd); running daemons keep their binary until restarted.
+// update delivering a new guestd); running daemons keep their binary until restarted (the
+// coordinator rolls them onto it, see Coordinator.RollLocalDaemons).
 func (d *LocalSlotDriver) SetGuestdBin(bin string) {
 	d.mu.Lock()
 	d.guestdBin = strings.TrimSpace(bin)
@@ -147,6 +154,17 @@ func (d *LocalSlotDriver) SetGuestdBin(bin string) {
 
 func (d *LocalSlotDriver) GuestdAvailable() bool {
 	return guestdUsable(d.GuestdBin())
+}
+
+// runningBin reports the binary the slot's supervised daemon runs, if one is running.
+func (d *LocalSlotDriver) runningBin(slotID string) (string, bool) {
+	d.mu.Lock()
+	p := d.procs[slotID]
+	d.mu.Unlock()
+	if p == nil || !p.alive() {
+		return "", false
+	}
+	return p.bin, true
 }
 
 func guestdUsable(bin string) bool {
@@ -250,7 +268,20 @@ func (d *LocalSlotDriver) SyncSeed(_ context.Context, _ ClusterNode, slot Slot, 
 	return writeRuntimeHomeFiles(rootDir, slot, seed)
 }
 
+// StartSlot starts the slot's slipgate-guestd, replacing a running one gracefully (see
+// RestartSlot); the caller points traffic at the returned endpoint, so the replaced daemon is
+// retired in the background.
 func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slot) (Slot, error) {
+	return d.RestartSlot(ctx, slot, nil)
+}
+
+// RestartSlot starts the slot's slipgate-guestd with the current binary. A running daemon is
+// replaced blue/green: the new one is spawned and health-checked on a fresh port first, and when
+// that fails the running one keeps serving and the error is returned. `publish`, when set, points
+// traffic at the new daemon (manager + store) before the old one is retired, synchronously;
+// without it the old one is retired in the background, after the settle delay that lets the
+// caller publish the new endpoint.
+func (d *LocalSlotDriver) RestartSlot(ctx context.Context, slot Slot, publish func(Slot) error) (Slot, error) {
 	if slot.RootDir == "" {
 		var err error
 		slot.RootDir, err = d.slotRootDir(slot.ID)
@@ -258,12 +289,11 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 			return slot, err
 		}
 	}
-
-	_ = d.StopSlot(ctx, ClusterNode{}, slot)
 	now := time.Now().UTC()
 
 	guestdBin := d.GuestdBin()
 	if !guestdUsable(guestdBin) {
+		d.retireSlot(slot.ID)
 		slot.State = StateReady
 		slot.GuestPID = 0
 		slot.DaemonVersion = "sandbox-ready"
@@ -274,6 +304,7 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		d.retireSlot(slot.ID)
 		slot.State = StateReady
 		slot.DaemonVersion = "sandbox-ready"
 		slot.GuestUDSPath = "sandbox://" + slot.ID
@@ -304,11 +335,12 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 	if guestToken != "" {
 		cmd.Env = append(cmd.Env, "SLIPGATE_GUEST_TOKEN="+guestToken)
 	}
-	if err := cmd.Start(); err != nil {
+	endpoint := "tcp://" + addr
+	proc, err := startGuestProc(cmd, guestdBin, endpoint)
+	if err != nil {
 		return slot, fmt.Errorf("vmslot: spawn slipgate-guestd: %w", err)
 	}
 
-	endpoint := "tcp://" + addr
 	pingCtx, cancel := context.WithTimeout(ctx, 1800*time.Millisecond)
 	defer cancel()
 
@@ -325,35 +357,64 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 		}
 	}
 	if pingErr != nil {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
-		}
+		proc.kill()
 		return slot, fmt.Errorf("vmslot: slipgate-guestd failed health ping on %s: %w", endpoint, pingErr)
 	}
 
+	started := slot
+	started.State = StateReady
+	started.GuestPID = cmd.Process.Pid
+	started.GuestUDSPath = endpoint
+	started.DaemonVersion = "slipgate-guestd/0.2.0"
+	started.LastHeartbeat = &now
+
 	d.mu.Lock()
-	d.procs[slot.ID] = cmd
+	old := d.procs[slot.ID]
+	d.procs[slot.ID] = proc
 	d.mu.Unlock()
 
-	slot.State = StateReady
-	slot.GuestPID = cmd.Process.Pid
-	slot.GuestUDSPath = endpoint
-	slot.DaemonVersion = "slipgate-guestd/0.2.0"
-	slot.LastHeartbeat = &now
-	return slot, nil
+	if publish != nil {
+		if err := publish(started); err != nil {
+			// Traffic still goes to the old daemon: keep it and drop the new one.
+			d.mu.Lock()
+			if d.procs[slot.ID] == proc {
+				if old != nil {
+					d.procs[slot.ID] = old
+				} else {
+					delete(d.procs, slot.ID)
+				}
+			}
+			d.mu.Unlock()
+			proc.kill()
+			return slot, err
+		}
+		if old != nil {
+			old.retire(d.settle, d.drain, d.term)
+		}
+		return started, nil
+	}
+	if old != nil {
+		go old.retire(d.settle, d.drain, d.term)
+	}
+	return started, nil
 }
 
+// StopSlot stops the slot's daemon gracefully: in-flight exchanges finish, then SIGTERM, then
+// SIGKILL after the term timeout.
 func (d *LocalSlotDriver) StopSlot(_ context.Context, _ ClusterNode, slot Slot) error {
-	d.mu.Lock()
-	cmd, ok := d.procs[slot.ID]
-	delete(d.procs, slot.ID)
-	d.mu.Unlock()
-	if ok && cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	}
+	d.retireSlot(slot.ID)
 	return nil
+}
+
+// retireSlot detaches the slot's daemon and retires it (synchronously).
+func (d *LocalSlotDriver) retireSlot(slotID string) {
+	d.mu.Lock()
+	p := d.procs[slotID]
+	delete(d.procs, slotID)
+	d.mu.Unlock()
+	if p != nil {
+		p.retire(d.settle, d.drain, d.term)
+	}
 }
 
 func (d *LocalSlotDriver) DestroySlot(ctx context.Context, node ClusterNode, slot Slot) error {

@@ -44,8 +44,10 @@ function matches(row: MemoryRequestErrorRow, f: RequestErrorFilter): boolean {
   if (f.accountId && row.accountId !== f.accountId) return false;
   if (f.userId && row.userId !== f.userId) return false;
   if (f.apiKeyId && row.apiKeyId !== f.apiKeyId) return false;
+  if (f.groupId && row.groupId !== f.groupId) return false;
   if (f.platform && row.platform !== f.platform) return false;
   if (f.model && row.model !== f.model) return false;
+  if (f.modelContains && !row.model.toLowerCase().includes(f.modelContains.toLowerCase())) return false;
   if (f.requestId && row.requestId !== f.requestId) return false;
   if (f.resolved === "open" && row.resolved) return false;
   if (f.resolved === "resolved" && !row.resolved) return false;

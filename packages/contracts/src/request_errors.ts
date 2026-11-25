@@ -149,8 +149,11 @@ export const RequestErrorQuerySchema = z
     accountId: filterText(64),
     userId: filterText(64),
     apiKeyId: filterText(64),
+    groupId: filterText(64),
     platform: filterText(64),
     model: filterText(160),
+    /** Case-insensitive substring of the model (the usage page's model filter); `model` is exact. */
+    modelContains: filterText(160),
     requestId: filterText(128),
     resolved: RequestErrorResolvedFilterSchema.optional().catch("all").default("all"),
     q: filterText(200),

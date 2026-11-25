@@ -189,4 +189,32 @@ describe("Request & Upstream Error Center (Lane O1)", () => {
     const after = await call<RequestErrorListResponse>("GET", "/api/v1/admin/ops/request-errors", admin);
     expect(after.body.total).toBe(0);
   });
+
+  it("filters by group and by a model substring (the usage page's errors tab)", async () => {
+    const { call, admin } = await bootstrap();
+    const internalHeaders = { ...JSON_HEADERS, "X-Slipgate-Internal-Token": INTERNAL_TOKEN };
+    for (const [requestId, groupId, model] of [
+      ["req_g1_opus", "grp_default", "claude-opus-4-6"],
+      ["req_g1_mini", "grp_default", "gpt-4.1-mini"],
+      ["req_g2_opus", "grp_other", "claude-opus-4-6"],
+    ] as const) {
+      const res = await call("POST", "/api/v1/internal/dataplane/request-errors", internalHeaders, {
+        requestId,
+        groupId,
+        phase: "upstream_http",
+        kind: "upstream_status",
+        statusCode: 502,
+        upstreamStatus: 529,
+        model,
+        errorMessage: "overloaded",
+      });
+      expect(res.status).toBeLessThan(300);
+    }
+    const ids = async (qs: string) =>
+      (await call<RequestErrorListResponse>("GET", `/api/v1/admin/ops/request-errors?${qs}`, admin)).body.items.map((i) => i.requestId).sort();
+    expect(await ids("groupId=grp_default")).toEqual(["req_g1_mini", "req_g1_opus"]);
+    expect(await ids("modelContains=OPUS")).toEqual(["req_g1_opus", "req_g2_opus"]);
+    expect(await ids("groupId=grp_default&modelContains=opus")).toEqual(["req_g1_opus"]);
+    expect(await ids("model=opus")).toEqual([]);
+  });
 });

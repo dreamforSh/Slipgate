@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dreamforSh/slipgate/services/net-go/internal/clashpool"
@@ -126,6 +127,11 @@ type Coordinator struct {
 
 	ticketMu sync.Mutex
 	tickets  map[string]TerminalTicket
+
+	// rollMu serialises rolling guestd restarts (and Shutdown waits for the one in progress);
+	// closing stops a roll between slots once the edge is shutting down.
+	rollMu  sync.Mutex
+	closing atomic.Bool
 }
 
 func NewCoordinator(opts CoordinatorOptions) *Coordinator {
@@ -232,16 +238,77 @@ func slotRunsDaemon(state SlotState) bool {
 	return false
 }
 
-// SetGuestdBin switches the slipgate-guestd binary for local slots started from now on.
+// SetGuestdBin switches the slipgate-guestd binary (a hot update, rollback or baseline reset)
+// and rolls the running local daemons onto it in the background (RollLocalDaemons).
 func (c *Coordinator) SetGuestdBin(bin string) {
 	c.localDrv.SetGuestdBin(bin)
+	if c.closing.Load() {
+		return
+	}
+	go c.RollLocalDaemons(context.Background())
 }
 
-// Shutdown stops locally spawned slipgate-guestd processes cleanly.
-func (c *Coordinator) Shutdown() {
-	for _, s := range c.mgr.Snapshot() {
-		_ = c.localDrv.StopSlot(context.Background(), ClusterNode{ID: s.ClusterNodeID}, s)
+// RollLocalDaemons restarts, one slot at a time and blue/green, every serving local slot whose
+// slipgate-guestd runs another binary than the current one: the new daemon is health-checked on
+// a fresh port, the slot's endpoint is switched to it (manager and store), then the old daemon
+// drains its in-flight exchanges and is stopped. A slot whose new daemon fails keeps serving on
+// the old one. Runs are serialised, so a second binary switch during a roll is picked up by the
+// next run. It returns how many daemons were replaced and how many failed.
+func (c *Coordinator) RollLocalDaemons(ctx context.Context) (restarted, failed int) {
+	c.rollMu.Lock()
+	defer c.rollMu.Unlock()
+	if !c.localDrv.GuestdAvailable() {
+		return 0, 0
 	}
+	bin := c.localDrv.GuestdBin()
+	for _, s := range c.mgr.Snapshot() {
+		if c.closing.Load() || ctx.Err() != nil {
+			break
+		}
+		if s.ClusterNodeID != LocalNodeID || !slotRunsDaemon(s.State) {
+			continue
+		}
+		if running, ok := c.localDrv.runningBin(s.ID); !ok || running == bin {
+			continue
+		}
+		_, err := c.localDrv.RestartSlot(ctx, s, func(next Slot) error {
+			updated, err := c.mgr.UpdateGuestRuntime(next.ID, next.RootDir, next.GuestUDSPath, next.DaemonVersion, next.GuestPID, next.LastHeartbeat)
+			if err != nil {
+				return err
+			}
+			if err := c.store.UpsertSlot(ctx, updated); err != nil {
+				c.logger.Printf("[vmslot] slot %s: persist restarted daemon: %v", s.ID, err)
+			}
+			return nil
+		})
+		if err != nil {
+			failed++
+			c.logger.Printf("[vmslot] slot %s: new slipgate-guestd did not come up (%v); the running one keeps serving", s.ID, err)
+			continue
+		}
+		restarted++
+	}
+	if restarted > 0 || failed > 0 {
+		c.logger.Printf("[vmslot] rolled slipgate-guestd onto %s: %d restarted, %d failed", bin, restarted, failed)
+	}
+	return restarted, failed
+}
+
+// Shutdown stops the locally spawned slipgate-guestd processes gracefully and in parallel, after
+// letting a rolling restart in progress finish the slot it is on.
+func (c *Coordinator) Shutdown() {
+	c.closing.Store(true)
+	c.rollMu.Lock()
+	defer c.rollMu.Unlock()
+	var wg sync.WaitGroup
+	for _, s := range c.mgr.Snapshot() {
+		wg.Add(1)
+		go func(s Slot) {
+			defer wg.Done()
+			_ = c.localDrv.StopSlot(context.Background(), ClusterNode{ID: s.ClusterNodeID}, s)
+		}(s)
+	}
+	wg.Wait()
 }
 
 func (c *Coordinator) Overview(ctx context.Context) (Overview, error) {

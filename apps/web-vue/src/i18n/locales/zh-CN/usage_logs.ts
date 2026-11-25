@@ -73,6 +73,13 @@ export default {
       label: "明细视图",
       records: "使用记录",
       ranking: "用户排行",
+      errors: "错误",
+    },
+    errorsTab: {
+      subtitle: "按当前筛选条件（时间、用户、密钥、分组、模型）列出请求错误",
+      count: "共 {n} 条",
+      empty: "当前筛选下没有请求错误",
+      loadFailed: "加载请求错误失败",
     },
     charts: {
       modelTitle: "模型分布",
