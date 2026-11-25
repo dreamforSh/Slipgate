@@ -2,8 +2,9 @@
 import { computed, ref } from "vue";
 import type { SystemReleaseItem } from "@slipgate/contracts";
 import { useI18n } from "vue-i18n";
-import { formatBytes, formatDateTime, shortHash } from "../../../lib/format";
+import { formatBytes, formatDateTime, formatRelative, shortHash } from "../../../lib/format";
 import EmptyState from "../../ui/EmptyState.vue";
+import UiAlert from "../../ui/UiAlert.vue";
 import MarkdownView from "../../ui/MarkdownView.vue";
 import SegmentedControl from "../../ui/SegmentedControl.vue";
 import UiBadge from "../../ui/UiBadge.vue";
@@ -13,8 +14,12 @@ import UiIcon from "../../ui/UiIcon.vue";
 const props = defineProps<{
   releases: SystemReleaseItem[];
   loading: boolean;
+  /** The last catalog fetch failed (GitHub unreachable, rate limit …); the list may be stale. */
+  error?: string | null;
+  fetchedAtIso?: string | null;
   busy: boolean;
   standalone: boolean;
+  stepUpRequired?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -38,6 +43,18 @@ const filteredReleases = computed(() => {
   return props.releases.filter((r) => r.channel === channelFilter.value);
 });
 
+// GitHub lists releases newest first: the first one of each channel is that channel's latest.
+const latestTags = computed(() => {
+  const out = new Set<string>();
+  const seen = new Set<string>();
+  for (const rel of props.releases) {
+    if (seen.has(rel.channel)) continue;
+    seen.add(rel.channel);
+    out.add(rel.tag);
+  }
+  return out;
+});
+
 function toggleNotes(tag: string) {
   expandedTags.value = {
     ...expandedTags.value,
@@ -55,6 +72,20 @@ function toggleNotes(tag: string) {
         {{ t("updates.releases.refresh") }}
       </button>
     </template>
+
+    <div class="mb-3 flex flex-wrap items-center justify-between gap-2 text-2xs text-fg-subtle">
+      <span v-if="fetchedAtIso" :title="formatDateTime(fetchedAtIso)">
+        {{ t("updates.releases.fetchedAt", { time: formatRelative(fetchedAtIso) }) }}
+      </span>
+      <span v-if="stepUpRequired && !standalone" class="inline-flex items-center gap-1">
+        <UiIcon name="shield" :size="12" />
+        {{ t("updates.releases.stepUpNote") }}
+      </span>
+    </div>
+
+    <UiAlert v-if="error" tone="warning" class="mb-3">
+      <span class="text-xs">{{ t("updates.releases.fetchFailed", { message: error }) }}</span>
+    </UiAlert>
 
     <div v-if="loading && releases.length === 0" class="py-10 text-center text-xs text-fg-muted">
       {{ t("common.loading") }}
@@ -83,6 +114,9 @@ function toggleNotes(tag: string) {
               </code>
               <UiBadge v-if="rel.current" tone="success" dot>
                 {{ t("updates.releases.currentBadge") }}
+              </UiBadge>
+              <UiBadge v-else-if="latestTags.has(rel.tag)" tone="info">
+                {{ t("updates.releases.latestBadge") }}
               </UiBadge>
               <UiBadge :tone="rel.channel === 'dev' ? 'warning' : 'accent'">
                 {{ rel.prerelease ? t("updates.releases.prereleaseBadge") : t(`updates.channels.${rel.channel === "dev" ? "shortDev" : "shortStable"}`) }}
@@ -134,8 +168,9 @@ function toggleNotes(tag: string) {
               :disabled="busy || standalone || !rel.installable"
               @click="emit('install', rel)"
             >
-              <UiIcon name="download" :size="13" />
+              <UiIcon :name="rel.current ? 'refresh' : 'download'" :size="13" />
               {{ rel.current ? t("updates.releases.reinstall") : t("updates.releases.install") }}
+              <UiIcon v-if="stepUpRequired" name="shield" :size="12" class="opacity-80" />
             </button>
           </div>
         </div>

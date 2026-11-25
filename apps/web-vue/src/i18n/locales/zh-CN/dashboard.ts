@@ -87,6 +87,7 @@ export default {
       devChannel: "开发通道 · 自动更新",
       stable: "正式版",
       available: "有新版本",
+      restarting: "正在重启",
       check: "检查更新",
       now: "立即更新",
       repo: "仓库",

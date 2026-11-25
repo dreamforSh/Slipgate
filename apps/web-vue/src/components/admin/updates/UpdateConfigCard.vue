@@ -25,35 +25,59 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 
-const form = reactive<{
+interface PolicyForm {
   channel: SystemUpdateChannel;
   autoSyncEnabled: boolean;
   intervalSeconds: number;
   autoRestartAfterUpdate: boolean;
   drainTimeoutSeconds: number;
   strategy: DevSyncStrategy;
-}>({
+}
+
+const DEFAULT_POLICY: PolicyForm = {
   channel: "stable",
   autoSyncEnabled: false,
   intervalSeconds: 3600,
   autoRestartAfterUpdate: true,
   drainTimeoutSeconds: 30,
   strategy: "auto",
+};
+
+function policyOf(status: SystemUpdateStatus | null): PolicyForm {
+  if (!status) return { ...DEFAULT_POLICY };
+  return {
+    channel: status.channel,
+    autoSyncEnabled: status.autoSyncEnabled,
+    intervalSeconds: status.intervalSeconds > 0 ? status.intervalSeconds : 3600,
+    autoRestartAfterUpdate: status.autoRestartAfterUpdate ?? true,
+    drainTimeoutSeconds: status.drainTimeoutSeconds > 0 ? status.drainTimeoutSeconds : 30,
+    strategy: status.strategy,
+  };
+}
+
+function samePolicy(a: PolicyForm, b: PolicyForm): boolean {
+  return (Object.keys(a) as (keyof PolicyForm)[]).every((key) => a[key] === b[key]);
+}
+
+const serverPolicy = computed(() => policyOf(props.status));
+const form = reactive<PolicyForm>({ ...serverPolicy.value });
+const dirty = computed(() => !samePolicy(form, serverPolicy.value));
+
+// Status is polled while the page is open: follow server-side policy changes, but never
+// overwrite edits the admin has not saved yet.
+watch(serverPolicy, (next, prev) => {
+  if (!prev || samePolicy(form, prev)) Object.assign(form, next);
 });
 
-watch(
-  () => props.status,
-  (next) => {
-    if (!next) return;
-    form.channel = next.channel;
-    form.autoSyncEnabled = next.autoSyncEnabled;
-    form.intervalSeconds = next.intervalSeconds > 0 ? next.intervalSeconds : 3600;
-    form.autoRestartAfterUpdate = next.autoRestartAfterUpdate ?? true;
-    form.drainTimeoutSeconds = next.drainTimeoutSeconds > 0 ? next.drainTimeoutSeconds : 30;
-    form.strategy = next.strategy;
-  },
-  { immediate: true },
-);
+function resetForm() {
+  Object.assign(form, serverPolicy.value);
+}
+
+/** What scheduled runs do with the selected channel in this deployment mode. */
+const autoSyncHint = computed(() => {
+  if (props.status?.mode !== "dev") return t("updates.policy.autoSyncHintRelease");
+  return form.channel === "dev" ? t("updates.policy.autoSyncHintDevApply") : t("updates.policy.autoSyncHintDevCheckOnly");
+});
 
 const drainPresets = [15, 30, 60, 120];
 
@@ -131,13 +155,7 @@ function submit() {
             <span class="text-xs font-semibold text-fg">{{ t("updates.policy.autoSyncLabel") }}</span>
             <UiSwitch v-model="form.autoSyncEnabled" :disabled="saving" />
           </div>
-          <p class="text-xs leading-relaxed text-fg-muted">
-            {{
-              status?.mode === "dev"
-                ? t("updates.policy.autoSyncHintDev")
-                : t("updates.policy.autoSyncHintRelease")
-            }}
-          </p>
+          <p class="text-xs leading-relaxed text-fg-muted">{{ autoSyncHint }}</p>
         </div>
 
         <FormField :label="t('updates.policy.intervalLabel')">
@@ -237,8 +255,15 @@ function submit() {
         </dl>
       </div>
 
-      <div class="flex justify-end">
-        <button type="submit" class="btn btn-primary" :disabled="saving">
+      <div class="flex flex-wrap items-center justify-end gap-2">
+        <span v-if="dirty && !saving" class="mr-auto inline-flex items-center gap-1.5 text-2xs text-warning">
+          <span class="h-1.5 w-1.5 rounded-full bg-warning" />
+          {{ t("updates.policy.unsaved") }}
+        </span>
+        <button type="button" class="btn btn-secondary" :disabled="!dirty || saving" @click="resetForm">
+          {{ t("updates.policy.reset") }}
+        </button>
+        <button type="submit" class="btn btn-primary" :disabled="!dirty || saving">
           <UiIcon :name="saving ? 'loader' : 'check'" :size="15" :spin="saving" />
           {{ saving ? t("common.saving") : t("updates.policy.save") }}
         </button>

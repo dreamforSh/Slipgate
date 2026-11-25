@@ -18,7 +18,8 @@ const { t } = useI18n();
 <template>
   <UiCard icon="file" :title="t('updates.notes.title')">
     <template #actions>
-      <UiBadge tone="success">
+      <!-- Only a matched release asset is installed, and only after its SHA-256 checks out. -->
+      <UiBadge v-if="status?.assetName" tone="success">
         <UiIcon name="badge-check" :size="12" />
         {{ t("updates.notes.verifiedSha") }}
       </UiBadge>

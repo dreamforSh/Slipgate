@@ -920,7 +920,10 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
               : t("dashboard.update.stable")
           }}
         </UiBadge>
-        <UiBadge v-if="systemUpdate.needsEdgeRestart" tone="warning" dot>
+        <UiBadge v-if="systemUpdate.restartActive" tone="info" dot pulse>
+          {{ t("dashboard.update.restarting") }}
+        </UiBadge>
+        <UiBadge v-else-if="systemUpdate.needsEdgeRestart" tone="warning" dot>
           {{ t("dashboard.update.edgeRestartNeeded") }}
         </UiBadge>
         <UiBadge v-else-if="systemUpdate.updateAvailable" tone="accent" dot>

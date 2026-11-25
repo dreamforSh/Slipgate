@@ -11,6 +11,7 @@ defineProps<{
   history: SystemUpdateHistoryEntry[];
   busy: boolean;
   standalone: boolean;
+  stepUpRequired?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -18,6 +19,14 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+
+/**
+ * The boot guard records the rollback it performed for a release that never became healthy as a
+ * succeeded rollback carrying the reason in `error`.
+ */
+function isAutoRollback(entry: SystemUpdateHistoryEntry): boolean {
+  return entry.action === "rollback" && entry.succeeded && Boolean(entry.error);
+}
 </script>
 
 <template>
@@ -47,13 +56,19 @@ const { t } = useI18n();
             class="icon-chip mt-0.5 h-8 w-8"
             :class="entry.action === 'rollback' ? 'bg-warning/10 text-warning' : 'icon-chip-accent'"
           >
-            <UiIcon :name="entry.action === 'rollback' ? 'rotate-ccw' : 'download'" :size="15" />
+            <UiIcon :name="isAutoRollback(entry) ? 'shield' : entry.action === 'rollback' ? 'rotate-ccw' : 'download'" :size="15" />
           </span>
 
           <div class="min-w-0 space-y-1">
             <div class="flex flex-wrap items-center gap-2">
               <span class="text-xs font-semibold text-fg">
-                {{ entry.action === "rollback" ? t("updates.history.actionRollback") : t("updates.history.actionApply") }}
+                {{
+                  isAutoRollback(entry)
+                    ? t("updates.history.actionAutoRollback")
+                    : entry.action === "rollback"
+                      ? t("updates.history.actionRollback")
+                      : t("updates.history.actionApply")
+                }}
               </span>
               <span class="inline-flex items-center gap-1 font-mono text-xs text-fg-muted">
                 <span>{{ entry.fromVersion }}</span>
@@ -78,7 +93,7 @@ const { t } = useI18n();
               <span>{{ formatDateTime(entry.createdAtIso) }}</span>
             </div>
 
-            <p v-if="entry.error" class="font-mono text-2xs text-danger">
+            <p v-if="entry.error" class="text-2xs" :class="isAutoRollback(entry) ? 'text-warning' : 'font-mono text-danger'">
               {{ entry.error }}
             </p>
           </div>
@@ -93,6 +108,7 @@ const { t } = useI18n();
           >
             <UiIcon name="rotate-ccw" :size="13" />
             {{ t("updates.history.restore") }}
+            <UiIcon v-if="stepUpRequired" name="shield" :size="12" class="opacity-80" />
           </button>
         </div>
       </li>

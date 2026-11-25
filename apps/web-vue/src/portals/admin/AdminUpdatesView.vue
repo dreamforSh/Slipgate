@@ -10,7 +10,7 @@ import type {
 } from "@slipgate/contracts";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
-import AdminStepUpModal from "../../components/admin/AdminStepUpModal.vue";
+import UpdateActionDialog, { type UpdateActionSummary } from "../../components/admin/updates/UpdateActionDialog.vue";
 import UpdateComponentsGrid from "../../components/admin/updates/UpdateComponentsGrid.vue";
 import UpdateConfigCard from "../../components/admin/updates/UpdateConfigCard.vue";
 import UpdateHeroCard from "../../components/admin/updates/UpdateHeroCard.vue";
@@ -22,8 +22,13 @@ import UiAlert from "../../components/ui/UiAlert.vue";
 import UiIcon from "../../components/ui/UiIcon.vue";
 import UiTabs from "../../components/ui/UiTabs.vue";
 import { errorText } from "../../lib/api";
-import { useSystemUpdateStore } from "../../stores/systemUpdate";
+import { frontendBuildChanged, stashFlash, takeFlash, type FlashMessage } from "../../lib/appBuild";
+import { formatDurationMs, shortHash } from "../../lib/format";
+import { useSystemUpdateStore, type RestartEvent } from "../../stores/systemUpdate";
 import { useToastStore } from "../../stores/toast";
+
+/** The dialog stays open this long for a password / code refusal, then lets a long update run. */
+const STEP_UP_GRACE_MS = 2000;
 
 const { t } = useI18n();
 const route = useRoute();
@@ -53,25 +58,223 @@ watch(activeTab, (value) => {
   void router.replace({ query });
 });
 
+// ---- Action confirmation -------------------------------------------------------------------
+
 type PendingAction =
   | { kind: "apply"; channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; label?: string }
   | { kind: "rollback"; releaseId?: string; label: string }
   | { kind: "restart" };
 
-const stepUpOpen = ref(false);
+const dialogOpen = ref(false);
 const pendingAction = ref<PendingAction | null>(null);
 
-const stepUpTitle = computed(() => {
+function openAction(action: PendingAction) {
+  pendingAction.value = action;
+  dialogOpen.value = true;
+}
+
+function channelName(channel: SystemUpdateChannel | undefined): string {
+  return channel === "dev" ? t("updates.channels.shortDev") : t("updates.channels.shortStable");
+}
+
+const dialogTitle = computed(() => {
   const act = pendingAction.value;
-  if (!act) return t("updates.stepUp.applyTitle");
-  if (act.kind === "rollback") {
-    return t("updates.stepUp.rollbackTitle", { target: act.label });
-  }
-  if (act.kind === "restart") {
-    return t("updates.stepUp.restartTitle");
-  }
-  return t("updates.stepUp.applyTitle");
+  if (!act) return "";
+  if (act.kind === "rollback") return t("updates.confirm.rollbackTitle", { target: act.label });
+  if (act.kind === "restart") return t("updates.confirm.restartTitle");
+  if (act.force) return t("updates.confirm.reinstallTitle", { target: act.label ?? "" });
+  return t("updates.confirm.applyTitle");
 });
+
+const dialogConfirmLabel = computed(() => {
+  const act = pendingAction.value;
+  if (act?.kind === "rollback") return t("updates.confirm.rollbackConfirm");
+  if (act?.kind === "restart") return t("updates.confirm.restartConfirm");
+  return t("updates.confirm.applyConfirm");
+});
+
+const dialogSummary = computed<UpdateActionSummary | null>(() => {
+  const act = pendingAction.value;
+  const st = store.status;
+  if (!act || !st) return null;
+  const current = `${st.version} (${shortHash(st.activeCommit, 8)})`;
+  const drain = st.drainTimeoutSeconds || 30;
+  const restartEffect = t("updates.confirm.effectRestart", { seconds: drain });
+  const caution = t("updates.confirm.cautionDrain", { seconds: drain });
+
+  if (act.kind === "restart") {
+    const rows: UpdateActionSummary["rows"] = [{ label: t("updates.confirm.currentVersion"), value: current }];
+    if (st.edgeBinaryStaged && st.edgeBinaryPath) {
+      // The last path segments identify the staged bundle; the full path is on the component card.
+      const tail = st.edgeBinaryPath.split(/[\\/]/).filter(Boolean).slice(-2).join("/");
+      rows.push({ label: t("updates.confirm.stagedEdge"), value: tail, accent: true });
+    }
+    return {
+      icon: "zap",
+      rows,
+      effects: [restartEffect, t("updates.confirm.effectHealth")],
+      caution,
+    };
+  }
+
+  const effects =
+    act.kind === "apply" ? [t("updates.confirm.effectDownload")] : [t("updates.confirm.effectRollbackBundle")];
+  effects.push(st.autoRestartAfterUpdate ? restartEffect : t("updates.confirm.effectReloadOnly"));
+  if (st.autoRestartAfterUpdate) effects.push(t("updates.confirm.effectAutoRollback"));
+
+  const target =
+    act.kind === "rollback"
+      ? act.label
+      : (act.label ?? st.remoteVersion ?? st.remoteTag ?? shortHash(st.remoteCommit, 9));
+  const rows: UpdateActionSummary["rows"] = [
+    { label: t("updates.confirm.currentVersion"), value: current },
+    { label: t("updates.confirm.targetVersion"), value: target, accent: true },
+  ];
+  if (act.kind === "apply") rows.push({ label: t("updates.confirm.channel"), value: channelName(act.channel ?? st.channel) });
+  return {
+    icon: act.kind === "rollback" ? "rotate-ccw" : "download",
+    rows,
+    effects,
+    caution: st.autoRestartAfterUpdate ? caution : undefined,
+  };
+});
+
+function reportFailure(err: unknown) {
+  toast.error(errorText(err, t("common.requestFailed")));
+}
+
+function startAction(act: PendingAction, confirm: AdminStepUp | undefined): Promise<SystemUpdateStatus | null> {
+  if (act.kind === "apply") {
+    return store.applyUpdate({ channel: act.channel, targetTag: act.targetTag, force: act.force, confirm });
+  }
+  if (act.kind === "rollback") return store.rollback({ releaseId: act.releaseId, confirm });
+  return store.restart({ confirm });
+}
+
+function onAccepted(act: PendingAction, next: SystemUpdateStatus | null) {
+  // A restart that follows is reported by the restart banner and announced when it completes.
+  if (next === null || next.restartScheduled || next.state === "restarting") {
+    toast.info(t("updates.toast.restarting"));
+    return;
+  }
+  if (act.kind === "rollback") toast.success(t("updates.toast.rolledBack", { version: next.version }));
+  else if (act.kind === "apply") toast.success(t("updates.toast.applied", { version: next.version }));
+}
+
+/**
+ * Runs the confirmed action. The dialog waits only as long as the password or code could still
+ * be refused; a long download then continues with its progress shown on the page.
+ */
+async function submitAction(confirm: AdminStepUp | undefined) {
+  const act = pendingAction.value;
+  if (!act) return;
+  const request = startAction(act, confirm);
+  const early = await Promise.race([
+    request.then(
+      (next) => ({ next }),
+      (err: unknown) => ({ err }),
+    ),
+    new Promise<null>((resolve) => window.setTimeout(() => resolve(null), STEP_UP_GRACE_MS)),
+  ]);
+  if (early === null) {
+    void request.then((next) => onAccepted(act, next)).catch(reportFailure);
+    return;
+  }
+  if ("err" in early) throw early.err;
+  onAccepted(act, early.next);
+}
+
+function requestApply(opts: { channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; label?: string } = {}) {
+  openAction({ kind: "apply", ...opts });
+}
+
+function requestInstallRelease(rel: SystemReleaseItem) {
+  requestApply({ channel: rel.channel, targetTag: rel.tag, force: rel.current, label: rel.tag });
+}
+
+function requestRollbackLatest() {
+  const prev = store.status?.previousRelease;
+  openAction({ kind: "rollback", releaseId: prev?.id, label: prev?.tag ?? prev?.version ?? "-" });
+}
+
+function requestRestoreHistory(entry: SystemUpdateHistoryEntry) {
+  openAction({ kind: "rollback", releaseId: entry.id, label: entry.tag ?? entry.toVersion });
+}
+
+function requestRestart() {
+  openAction({ kind: "restart" });
+}
+
+// ---- Restart announcements -----------------------------------------------------------------
+
+/** The build this tab's console belongs to, for when the served entry script cannot be compared. */
+const loadedBuild = ref<{ version: string; commit: string } | null>(null);
+
+function showFlash(flash: FlashMessage) {
+  if (flash.tone === "warning") toast.warning(flash.message);
+  else if (flash.tone === "info") toast.info(flash.message);
+  else toast.success(flash.message);
+}
+
+async function announceRestart(ev: RestartEvent) {
+  const result = ev.result;
+  if (result.kind === "timeout") {
+    toast.warning(t("updates.toast.restartTimeout"));
+    return;
+  }
+  if (result.kind === "error") {
+    toast.error(result.message);
+    return;
+  }
+  if (result.kind === "signed_out") {
+    // Sessions did not survive the restart (memory store): sign in again on the new process.
+    stashFlash({ tone: "info", message: t("updates.toast.restartedSignedOut") });
+    window.location.reload();
+    return;
+  }
+
+  const next = result.status;
+  const report = next.lastRestart && next.lastRestart.id !== ev.previous.lastRestartId ? next.lastRestart : null;
+  let flash: FlashMessage;
+  if (report?.outcome === "rolled_back") {
+    flash = { tone: "warning", message: t("updates.toast.restartRolledBack", { version: next.version }) };
+  } else if (report?.outcome === "degraded") {
+    flash = { tone: "warning", message: t("updates.toast.restartDegraded", { message: report.message ?? "" }) };
+  } else {
+    const key = ev.external ? "updates.toast.restartedExternal" : "updates.toast.restarted";
+    const duration = report ? formatDurationMs(report.durationMs) : "—";
+    flash = { tone: "success", message: t(key, { version: next.version, duration }) };
+  }
+
+  const changed = await frontendBuildChanged();
+  const built = loadedBuild.value;
+  const newConsole =
+    changed === true || (changed === null && built !== null && (built.version !== next.version || built.commit !== next.activeCommit));
+  if (newConsole && !ev.external) {
+    stashFlash({ ...flash, message: `${flash.message} ${t("updates.toast.consoleReloaded")}` });
+    window.setTimeout(() => window.location.reload(), 400);
+    return;
+  }
+  // A restart this admin did not ask for must not reload under their hands (unsaved edits):
+  // offer the reload instead.
+  if (newConsole) consoleUpdateReady.value = true;
+  showFlash(flash);
+}
+
+const consoleUpdateReady = ref(false);
+
+function reloadConsole() {
+  window.location.reload();
+}
+
+watch(
+  () => store.restartEvent,
+  (ev) => {
+    if (ev) void announceRestart(ev);
+  },
+);
+
+// ---- Misc ----------------------------------------------------------------------------------
 
 async function refreshAll() {
   await Promise.all([store.loadStatus(), store.loadReleases(true)]);
@@ -88,143 +291,34 @@ async function handleCheck() {
   void store.loadReleases(true);
 }
 
-/** Toast for a completed full-service restart, then reload so the console runs the new web UI. */
-function announceRestart(next: SystemUpdateStatus) {
-  const last = next.lastRestart;
-  if (last?.outcome === "rolled_back") {
-    toast.warning(t("updates.toast.restartRolledBack", { version: next.version }));
-  } else if (last?.outcome === "degraded") {
-    toast.warning(t("updates.toast.restartDegraded", { message: last.message ?? "" }));
-  } else {
-    toast.success(t("updates.toast.restarted", { version: next.version }));
-  }
-  const reloadDelay = last && last.outcome !== "succeeded" ? 3000 : 1000;
-  window.setTimeout(() => window.location.reload(), reloadDelay);
-}
-
-function handlePostMutationFeedback(next: SystemUpdateStatus, beforeBootId: string, defaultMsg: string) {
-  if (store.restartTimedOut || next.state === "restarting" || next.restartScheduled) {
-    toast.warning(t("updates.toast.restartTimeout"));
-    return;
-  }
-  if (beforeBootId && next.bootId && next.bootId !== beforeBootId) {
-    announceRestart(next);
-    return;
-  }
-  toast.success(defaultMsg);
-}
-
-async function runApply(opts: { channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; confirm?: AdminStepUp }) {
-  const beforeBootId = store.status?.bootId ?? "";
-  const next = await store.applyUpdate(opts);
-  handlePostMutationFeedback(next, beforeBootId, t("updates.toast.applied", { version: next.version }));
-}
-
-async function runRollback(opts: { releaseId?: string; confirm?: AdminStepUp }) {
-  const beforeBootId = store.status?.bootId ?? "";
-  const next = await store.rollback(opts);
-  handlePostMutationFeedback(next, beforeBootId, t("updates.toast.rolledBack", { version: next.version }));
-}
-
-async function runRestartEdge(opts: { confirm?: AdminStepUp } = {}) {
-  const beforeBootId = store.status?.bootId ?? "";
-  const next = await store.restartEdge(opts);
-  if (store.restartTimedOut || next.state === "restarting" || next.restartScheduled) {
-    toast.warning(t("updates.toast.restartTimeout"));
-    return;
-  }
-  if (!beforeBootId || !next.bootId || next.bootId !== beforeBootId) {
-    announceRestart(next);
-  }
-}
-
-function reportFailure(err: unknown) {
-  toast.error(errorText(err, t("common.requestFailed")));
-}
-
-function requestApply(opts: { channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; label?: string } = {}) {
-  if (store.requiresStepUp) {
-    pendingAction.value = { kind: "apply", ...opts };
-    stepUpOpen.value = true;
-    return;
-  }
-  void runApply(opts).catch(reportFailure);
-}
-
-function requestInstallRelease(rel: SystemReleaseItem) {
-  requestApply({
-    channel: rel.channel,
-    targetTag: rel.tag,
-    force: rel.current,
-    label: rel.tag,
-  });
-}
-
-function requestRollback(releaseId: string | undefined, label: string) {
-  if (store.requiresStepUp) {
-    pendingAction.value = { kind: "rollback", releaseId, label };
-    stepUpOpen.value = true;
-    return;
-  }
-  void runRollback({ releaseId }).catch(reportFailure);
-}
-
-function requestRollbackLatest() {
-  const prev = store.status?.previousRelease;
-  requestRollback(prev?.id, prev?.tag ?? prev?.version ?? "-");
-}
-
-function requestRestoreHistory(entry: SystemUpdateHistoryEntry) {
-  requestRollback(entry.id, entry.tag ?? entry.toVersion);
-}
-
-function requestRestartEdge() {
-  if (store.requiresStepUp) {
-    pendingAction.value = { kind: "restart" };
-    stepUpOpen.value = true;
-    return;
-  }
-  void runRestartEdge().catch(reportFailure);
-}
-
-async function executeStepUpAction(confirm: AdminStepUp) {
-  const act = pendingAction.value;
-  if (!act) return;
-  if (act.kind === "apply") {
-    await runApply({
-      channel: act.channel,
-      targetTag: act.targetTag,
-      force: act.force,
-      confirm,
-    });
-  } else if (act.kind === "restart") {
-    await runRestartEdge({ confirm });
-  } else {
-    await runRollback({
-      releaseId: act.releaseId,
-      confirm,
-    });
-  }
-  pendingAction.value = null;
-}
-
 async function handleSaveConfig(patch: UpdateSystemConfigRequest) {
+  const before = store.status;
+  // Only a different channel or strategy changes what "latest" means; skip the GitHub round trip otherwise.
+  const recheck = Boolean(before && (patch.channel !== before.channel || patch.strategy !== before.strategy));
   try {
     await store.saveConfig(patch);
     toast.success(t("updates.policy.saved"));
-    await store.checkForUpdates();
   } catch (err) {
-    toast.error(errorText(err, t("common.requestFailed")));
+    reportFailure(err);
+    return;
+  }
+  if (recheck) {
+    await store.checkForUpdates();
+    void store.loadReleases(true);
   }
 }
 
-onMounted(() => {
-  void store.loadStatus();
+onMounted(async () => {
+  const flash = takeFlash();
+  if (flash) showFlash(flash);
+  store.startWatching();
   void store.loadReleases(false);
+  const first = await store.loadStatus();
+  if (first) loadedBuild.value = { version: first.version, commit: first.activeCommit };
 });
 
 onBeforeUnmount(() => {
-  store.stopPolling();
+  store.stopWatching();
 });
 </script>
 
@@ -235,7 +329,12 @@ onBeforeUnmount(() => {
         <span class="hidden text-sm text-fg-subtle lg:inline">{{ t("updates.subtitle") }}</span>
       </template>
       <template #actions>
-        <button type="button" class="btn btn-secondary" :disabled="store.loading || store.releasesLoading" @click="refreshAll">
+        <button
+          type="button"
+          class="btn btn-secondary"
+          :disabled="store.loading || store.releasesLoading || store.restarting"
+          @click="refreshAll"
+        >
           <UiIcon name="refresh" :size="15" :spin="store.loading || store.releasesLoading" />
           {{ t("common.refresh") }}
         </button>
@@ -246,6 +345,16 @@ onBeforeUnmount(() => {
       {{ t("updates.standaloneBanner") }}
     </UiAlert>
 
+    <UiAlert v-if="consoleUpdateReady" tone="info">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <span class="text-xs">{{ t("updates.consoleUpdateReady") }}</span>
+        <button type="button" class="btn btn-primary btn-sm" @click="reloadConsole">
+          <UiIcon name="refresh" :size="14" />
+          {{ t("updates.reloadConsole") }}
+        </button>
+      </div>
+    </UiAlert>
+
     <UpdateHeroCard
       :status="store.status"
       :checking="store.checking"
@@ -253,13 +362,15 @@ onBeforeUnmount(() => {
       :rolling-back="store.rollingBack"
       :restarting="store.restarting"
       :restart-stage="store.restartStage"
+      :restart-started-at="store.restartStartedAt"
       :step-up-required="store.requiresStepUp"
       :busy="store.isBusy"
       :error="store.error"
       @check="handleCheck"
       @apply="requestApply()"
       @rollback="requestRollbackLatest"
-      @restart="requestRestartEdge"
+      @restart="requestRestart"
+      @dismiss-error="store.clearError()"
     />
 
     <div class="grid gap-6 lg:grid-cols-12">
@@ -274,8 +385,11 @@ onBeforeUnmount(() => {
           v-show="activeTab === 'releases'"
           :releases="store.releases"
           :loading="store.releasesLoading"
+          :error="store.releasesError"
+          :fetched-at-iso="store.releasesMeta.fetchedAtIso"
           :busy="store.isBusy"
           :standalone="Boolean(store.status?.standalone)"
+          :step-up-required="store.requiresStepUp"
           @refresh="store.loadReleases(true)"
           @install="requestInstallRelease"
         />
@@ -284,6 +398,7 @@ onBeforeUnmount(() => {
           :history="store.status?.history ?? []"
           :busy="store.isBusy"
           :standalone="Boolean(store.status?.standalone)"
+          :step-up-required="store.requiresStepUp"
           @restore="requestRestoreHistory"
         />
         <UpdateConfigCard
@@ -295,6 +410,13 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <AdminStepUpModal v-model:open="stepUpOpen" :title="stepUpTitle" :action="executeStepUpAction" />
+    <UpdateActionDialog
+      v-model:open="dialogOpen"
+      :title="dialogTitle"
+      :confirm-label="dialogConfirmLabel"
+      :summary="dialogSummary"
+      :require-step-up="store.requiresStepUp"
+      :submit="submitAction"
+    />
   </div>
 </template>

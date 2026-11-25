@@ -35,9 +35,12 @@ watch(
       document.addEventListener("keydown", onKeydown);
       document.body.style.overflow = "hidden";
       await nextTick();
-      panel.value
-        ?.querySelector<HTMLElement>("[autofocus], input, select, textarea, button:not([data-modal-close])")
-        ?.focus({ preventScroll: true });
+      // An explicit [autofocus] wins even when it comes later in the DOM (e.g. a footer confirm
+      // button after Cancel); a selector list alone would pick the first match in document order.
+      const target =
+        panel.value?.querySelector<HTMLElement>("[autofocus]") ??
+        panel.value?.querySelector<HTMLElement>("input, select, textarea, button:not([data-modal-close])");
+      target?.focus({ preventScroll: true });
     } else {
       document.removeEventListener("keydown", onKeydown);
       document.body.style.overflow = "";

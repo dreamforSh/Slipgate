@@ -88,6 +88,7 @@ const en: typeof zh = {
       devChannel: "Dev channel · auto-update",
       stable: "Stable release",
       available: "Update available",
+      restarting: "Restarting",
       check: "Check for updates",
       now: "Update now",
       repo: "Repository",

@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import type { SystemUpdateStatus } from "@slipgate/contracts";
 import { useI18n } from "vue-i18n";
+import { useNow } from "../../../composables/useNow";
 import CopyButton from "../../ui/CopyButton.vue";
 import UiAlert from "../../ui/UiAlert.vue";
 import UiBadge from "../../ui/UiBadge.vue";
@@ -15,6 +16,8 @@ const props = defineProps<{
   rollingBack: boolean;
   restarting?: boolean;
   restartStage?: "scheduled" | "draining" | "stopping" | "starting" | null;
+  /** When the console started following the current restart (epoch ms). */
+  restartStartedAt?: number | null;
   stepUpRequired?: boolean;
   busy: boolean;
   error: string | null;
@@ -25,9 +28,12 @@ const emit = defineEmits<{
   (e: "apply"): void;
   (e: "rollback"): void;
   (e: "restart"): void;
+  (e: "dismiss-error"): void;
 }>();
 
 const { t } = useI18n();
+// Drives the drain countdown, the restart's elapsed time and relative timestamps.
+const now = useNow(1000);
 
 const PIPELINE_STEPS = ["checking", "downloading", "applying", "reloading_planes", "done"] as const;
 
@@ -75,12 +81,34 @@ const restartStepIndex = computed(() => {
 
 const drainDetail = computed(() => {
   const prog = props.status?.restartProgress;
-  if (!prog || prog.phase !== "draining") return "";
-  return t("updates.hero.restartDrainDetail", {
-    count: prog.inflight,
-    deadline: prog.drainDeadlineIso ? formatDateTime(prog.drainDeadlineIso) : "—",
-  });
+  if (!prog || prog.phase !== "draining" || props.restartStage === "starting") return "";
+  const deadlineMs = prog.drainDeadlineIso ? Date.parse(prog.drainDeadlineIso) : Number.NaN;
+  const seconds = Number.isFinite(deadlineMs) ? Math.max(0, Math.ceil((deadlineMs - now.value) / 1000)) : null;
+  return seconds === null
+    ? t("updates.hero.restartDrainCount", { count: prog.inflight })
+    : t("updates.hero.restartDrainDetail", { count: prog.inflight, seconds });
 });
+
+const restartElapsed = computed(() => {
+  if (!props.restartStartedAt) return "";
+  const seconds = Math.max(0, Math.floor((now.value - props.restartStartedAt) / 1000));
+  const duration =
+    seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return t("updates.hero.restartElapsed", { duration });
+});
+
+// The store error clears itself on the next action; a backend lastError stays until the next
+// successful run, so the admin can hide one they have read.
+const dismissedError = ref<string | null>(null);
+const shownError = computed(() => {
+  const text = props.error ?? props.status?.lastError ?? null;
+  return text && text !== dismissedError.value ? text : null;
+});
+
+function dismissError() {
+  dismissedError.value = shownError.value;
+  emit("dismiss-error");
+}
 
 const lastRestart = computed(() => props.status?.lastRestart ?? null);
 
@@ -178,7 +206,7 @@ const stateTone = computed(() => {
               <span class="inline-flex items-center gap-1">
                 <UiIcon name="clock" :size="12" />
                 {{ t("updates.hero.lastChecked") }}:
-                {{ status?.lastCheckedAtIso ? `${formatRelative(status.lastCheckedAtIso)} (${formatDateTime(status.lastCheckedAtIso)})` : t("updates.hero.neverChecked") }}
+                {{ status?.lastCheckedAtIso ? `${formatRelative(status.lastCheckedAtIso, now)} (${formatDateTime(status.lastCheckedAtIso)})` : t("updates.hero.neverChecked") }}
               </span>
               <span class="inline-flex items-center gap-1">
                 <UiIcon name="branch" :size="12" />
@@ -197,7 +225,8 @@ const stateTone = computed(() => {
                 <template v-if="lastRestart.toVersion !== lastRestart.fromVersion"> → {{ lastRestart.toVersion }}</template>
               </span>
               <span>· {{ t("updates.hero.restartTook", { duration: formatDurationMs(lastRestart.durationMs) }) }}</span>
-              <span>· {{ formatRelative(lastRestart.completedAtIso) }}</span>
+              <span :title="formatDateTime(lastRestart.completedAtIso)">· {{ formatRelative(lastRestart.completedAtIso, now) }}</span>
+              <span v-if="lastRestart.coldBoots > 0">· {{ t("updates.hero.restartColdBoots", { count: lastRestart.coldBoots }) }}</span>
               <UiBadge :tone="lastRestartTone" dot>{{ t(`updates.hero.restartOutcomes.${lastRestart.outcome}`) }}</UiBadge>
             </div>
             <p v-if="lastRestart?.message && lastRestart.outcome !== 'succeeded'" class="text-2xs text-fg-muted">
@@ -270,11 +299,12 @@ const stateTone = computed(() => {
 
       <!-- Live pipeline stepper + progress bar -->
       <div v-if="showPipeline" class="mt-5 rounded-xl border border-line bg-surface-2/60 p-4 space-y-3">
-        <div class="grid grid-cols-3 gap-2 sm:grid-cols-6">
-          <div
+        <ol class="grid grid-cols-3 gap-2 sm:grid-cols-5">
+          <li
             v-for="(step, idx) in PIPELINE_STEPS"
             :key="step"
             class="flex flex-col gap-1.5"
+            :aria-current="idx === activeStepIndex ? 'step' : undefined"
           >
             <div
               class="h-1.5 w-full rounded-full transition-colors duration-300"
@@ -292,15 +322,22 @@ const stateTone = computed(() => {
             >
               {{ t(`updates.hero.pipeline.${step}`) }}
             </span>
-          </div>
-        </div>
+          </li>
+        </ol>
 
         <div v-if="status?.progress" class="space-y-1">
           <div class="flex items-center justify-between text-2xs text-fg-muted">
             <span class="font-medium">{{ t(`updates.states.${status.progress.stage}`) }}</span>
             <span class="font-mono tabular-nums">{{ progressLabel }}</span>
           </div>
-          <div class="h-2 w-full overflow-hidden rounded-full bg-surface-3">
+          <div
+            class="h-2 w-full overflow-hidden rounded-full bg-surface-3"
+            role="progressbar"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            :aria-valuenow="progressPercent"
+            :aria-valuetext="progressLabel"
+          >
             <div
               class="h-full rounded-full bg-accent transition-all duration-200"
               :style="{ width: `${Math.max(4, progressPercent)}%` }"
@@ -311,15 +348,23 @@ const stateTone = computed(() => {
 
       <!-- Live graceful restart banner -->
       <UiAlert v-if="showRestartBanner" tone="info" class="mt-4">
-        <div class="flex items-start gap-2.5">
+        <div class="flex items-start gap-2.5" role="status" aria-live="polite">
           <UiIcon name="loader" :size="16" spin class="mt-0.5 text-accent" />
           <div class="min-w-0 flex-1 space-y-2.5">
             <div class="space-y-1">
-              <p class="font-semibold text-fg">{{ t("updates.hero.restartingTitle") }}</p>
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <p class="font-semibold text-fg">{{ t("updates.hero.restartingTitle") }}</p>
+                <span v-if="restartElapsed" class="font-mono text-2xs tabular-nums text-fg-subtle">{{ restartElapsed }}</span>
+              </div>
               <p class="text-xs leading-relaxed text-fg-muted">{{ t("updates.hero.restartingDesc") }}</p>
             </div>
-            <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <div v-for="(step, idx) in RESTART_STEPS" :key="step" class="flex flex-col gap-1.5">
+            <ol class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <li
+                v-for="(step, idx) in RESTART_STEPS"
+                :key="step"
+                class="flex flex-col gap-1.5"
+                :aria-current="idx === restartStepIndex ? 'step' : undefined"
+              >
                 <div
                   class="h-1.5 w-full rounded-full transition-colors duration-300"
                   :class="
@@ -336,9 +381,9 @@ const stateTone = computed(() => {
                 >
                   {{ t(`updates.hero.restartSteps.${step}`) }}
                 </span>
-              </div>
-            </div>
-            <p v-if="drainDetail" class="font-mono text-2xs text-fg-muted">{{ drainDetail }}</p>
+              </li>
+            </ol>
+            <p v-if="drainDetail" class="font-mono text-2xs tabular-nums text-fg-muted">{{ drainDetail }}</p>
           </div>
         </div>
       </UiAlert>
@@ -375,8 +420,19 @@ const stateTone = computed(() => {
       </UiAlert>
 
       <!-- Error alert -->
-      <UiAlert v-if="error || status?.lastError" tone="danger" class="mt-4">
-        <span class="font-mono text-xs">{{ error ?? status?.lastError }}</span>
+      <UiAlert v-if="shownError" tone="danger" class="mt-4">
+        <div class="flex items-start justify-between gap-3">
+          <span class="break-all font-mono text-xs">{{ shownError }}</span>
+          <button
+            type="button"
+            class="btn btn-ghost btn-xs shrink-0"
+            :aria-label="t('updates.hero.dismissError')"
+            :title="t('updates.hero.dismissError')"
+            @click="dismissError"
+          >
+            <UiIcon name="x" :size="13" />
+          </button>
+        </div>
       </UiAlert>
     </div>
   </section>
