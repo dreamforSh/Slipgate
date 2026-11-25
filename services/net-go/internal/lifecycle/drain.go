@@ -57,9 +57,16 @@ func (d *Drainer) Middleware(next http.Handler) http.Handler {
 		}
 
 		d.mu.Lock()
-		if d.draining && (d.exempt == nil || !d.exempt(r)) {
+		if d.draining {
+			if d.exempt == nil || !d.exempt(r) {
+				d.mu.Unlock()
+				d.reject(w)
+				return
+			}
+			// Exempt requests (probes, the restart status poll) are short and served on purpose
+			// while draining; counting them would show the poll itself as work the drain waits for.
 			d.mu.Unlock()
-			d.reject(w)
+			next.ServeHTTP(w, r)
 			return
 		}
 		d.inflight++

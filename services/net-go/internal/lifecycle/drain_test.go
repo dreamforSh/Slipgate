@@ -103,3 +103,33 @@ func TestDrainerDoesNotTrackUpgradedConnections(t *testing.T) {
 	}
 	close(release)
 }
+
+func TestDrainerExemptDoesNotPinInflight(t *testing.T) {
+	t.Parallel()
+
+	d := NewDrainer(func(r *http.Request) bool { return r.URL.Path == "/healthz" })
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	h := d.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	d.BeginDrain(time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	}()
+	<-entered
+	if got := d.Inflight(); got != 0 {
+		t.Fatalf("an exempt request served while draining must not count as in flight, got %d", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if remaining := d.Wait(ctx, nil); remaining != 0 {
+		t.Fatalf("drain must not wait for exempt requests, %d left", remaining)
+	}
+	close(release)
+	<-done
+}

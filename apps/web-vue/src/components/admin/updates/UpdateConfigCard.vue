@@ -17,6 +17,8 @@ import UiSwitch from "../../ui/UiSwitch.vue";
 const props = defineProps<{
   status: SystemUpdateStatus | null;
   saving: boolean;
+  /** Release deployments confirm a policy change with the password (the page opens the dialog). */
+  stepUpRequired: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -81,10 +83,15 @@ const autoSyncHint = computed(() => {
 
 const drainPresets = [15, 30, 60, 120];
 
+/** Git builds need a source checkout and git on the host; keep a saved "git" selectable as-is. */
+const gitBlocked = computed(
+  () => props.status !== null && !props.status.gitAvailable && serverPolicy.value.strategy !== "git",
+);
+
 const strategyOptions = computed(() => [
   { value: "auto" as const, label: t("updates.strategies.auto") },
   { value: "release" as const, label: t("updates.strategies.release") },
-  { value: "git" as const, label: t("updates.strategies.git") },
+  { value: "git" as const, label: t("updates.strategies.git"), disabled: gitBlocked.value },
 ]);
 
 const intervalPresets = computed(() => [
@@ -146,6 +153,10 @@ function submit() {
         <span class="label">{{ t("updates.policy.strategyLabel") }}</span>
         <SegmentedControl v-model="form.strategy" :options="strategyOptions" size="md" />
         <p class="text-xs text-fg-subtle">{{ t("updates.policy.strategyHint") }}</p>
+        <p v-if="gitBlocked" class="flex items-center gap-1.5 text-2xs text-fg-subtle">
+          <UiIcon name="info" :size="12" />
+          {{ t("updates.policy.gitUnavailable") }}
+        </p>
       </div>
 
       <!-- Auto-check/sync toggle & interval -->
@@ -259,6 +270,10 @@ function submit() {
         <span v-if="dirty && !saving" class="mr-auto inline-flex items-center gap-1.5 text-2xs text-warning">
           <span class="h-1.5 w-1.5 rounded-full bg-warning" />
           {{ t("updates.policy.unsaved") }}
+        </span>
+        <span v-if="stepUpRequired" class="inline-flex items-center gap-1 text-2xs text-fg-subtle">
+          <UiIcon name="shield" :size="12" />
+          {{ t("updates.policy.stepUpOnSave") }}
         </span>
         <button type="button" class="btn btn-secondary" :disabled="!dirty || saving" @click="resetForm">
           {{ t("updates.policy.reset") }}

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 // Server exposes the unified single-port Slipgate edge gateway.
 type Server struct {
 	cfg        config.Config
+	buildMu    sync.RWMutex
 	version    string
 	commit     string
 	pool       *clashpool.Manager
@@ -55,7 +57,28 @@ func (s *Server) WithClashCoordinator(coord *clashpool.Coordinator) {
 
 // WithCommit sets the build commit hash reported in health/readiness endpoints.
 func (s *Server) WithCommit(commit string) {
+	s.buildMu.Lock()
 	s.commit = commit
+	s.buildMu.Unlock()
+}
+
+// SetBuildInfo updates the release version/commit reported by health/readiness endpoints, e.g.
+// after a hot update that swapped planes without restarting the edge.
+func (s *Server) SetBuildInfo(version, commit string) {
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
+	if strings.TrimSpace(version) != "" {
+		s.version = strings.TrimSpace(version)
+	}
+	if strings.TrimSpace(commit) != "" {
+		s.commit = strings.TrimSpace(commit)
+	}
+}
+
+func (s *Server) buildInfo() (string, string) {
+	s.buildMu.RLock()
+	defer s.buildMu.RUnlock()
+	return s.version, s.commit
 }
 
 // WithHotUpdater attaches the dev-mode hot-update manager exposed via internal endpoints.
@@ -218,11 +241,12 @@ func isInternalPath(p string) bool {
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	version, commit := s.buildInfo()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"service": "slipgate-net",
-		"version": s.version,
-		"commit":  s.commit,
+		"version": version,
+		"commit":  commit,
 		"mode":    s.cfg.Mode,
 	})
 }
@@ -261,13 +285,14 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		clashRuntime = s.clashCoord.RuntimeStatusSnapshot()
 	}
 
+	version, commit := s.buildInfo()
 	writeJSON(w, status, map[string]any{
-		"ready":         ready && !draining,
-		"degraded":      !ready,
-		"draining":      draining,
-		"version":       s.version,
-		"commit":        s.commit,
-		"mode":          s.cfg.Mode,
+		"ready":    ready && !draining,
+		"degraded": !ready,
+		"draining": draining,
+		"version":  version,
+		"commit":   commit,
+		"mode":     s.cfg.Mode,
 		"planes": map[string]string{
 			"net":  "up",
 			"core": upDown(coreUp),

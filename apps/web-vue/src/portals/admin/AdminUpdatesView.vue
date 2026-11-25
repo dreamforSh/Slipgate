@@ -27,8 +27,12 @@ import { formatDurationMs, shortHash } from "../../lib/format";
 import { useSystemUpdateStore, type RestartEvent } from "../../stores/systemUpdate";
 import { useToastStore } from "../../stores/toast";
 
-/** The dialog stays open this long for a password / code refusal, then lets a long update run. */
-const STEP_UP_GRACE_MS = 2000;
+/**
+ * Server states only a request that already passed the password / code check can cause (release
+ * deployments never apply or restart on their own): seeing one, the dialog can close and let a
+ * long download continue with its progress on the page.
+ */
+const EXECUTING_STATES = new Set(["downloading", "applying", "reloading_planes", "restarting", "rolling_back"]);
 
 const { t } = useI18n();
 const route = useRoute();
@@ -63,7 +67,8 @@ watch(activeTab, (value) => {
 type PendingAction =
   | { kind: "apply"; channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; label?: string }
   | { kind: "rollback"; releaseId?: string; label: string }
-  | { kind: "restart" };
+  | { kind: "restart" }
+  | { kind: "policy"; patch: UpdateSystemConfigRequest };
 
 const dialogOpen = ref(false);
 const pendingAction = ref<PendingAction | null>(null);
@@ -82,6 +87,7 @@ const dialogTitle = computed(() => {
   if (!act) return "";
   if (act.kind === "rollback") return t("updates.confirm.rollbackTitle", { target: act.label });
   if (act.kind === "restart") return t("updates.confirm.restartTitle");
+  if (act.kind === "policy") return t("updates.confirm.policyTitle");
   if (act.force) return t("updates.confirm.reinstallTitle", { target: act.label ?? "" });
   return t("updates.confirm.applyTitle");
 });
@@ -90,6 +96,7 @@ const dialogConfirmLabel = computed(() => {
   const act = pendingAction.value;
   if (act?.kind === "rollback") return t("updates.confirm.rollbackConfirm");
   if (act?.kind === "restart") return t("updates.confirm.restartConfirm");
+  if (act?.kind === "policy") return t("updates.confirm.policyConfirm");
   return t("updates.confirm.applyConfirm");
 });
 
@@ -101,6 +108,8 @@ const dialogSummary = computed<UpdateActionSummary | null>(() => {
   const drain = st.drainTimeoutSeconds || 30;
   const restartEffect = t("updates.confirm.effectRestart", { seconds: drain });
   const caution = t("updates.confirm.cautionDrain", { seconds: drain });
+
+  if (act.kind === "policy") return policySummary(st, act.patch);
 
   if (act.kind === "restart") {
     const rows: UpdateActionSummary["rows"] = [{ label: t("updates.confirm.currentVersion"), value: current }];
@@ -139,11 +148,39 @@ const dialogSummary = computed<UpdateActionSummary | null>(() => {
   };
 });
 
+/** The policy fields a save changes, as "before → after" rows. */
+function policySummary(st: SystemUpdateStatus, patch: UpdateSystemConfigRequest): UpdateActionSummary {
+  const onOff = (on: boolean) => (on ? t("common.enabled") : t("common.disabled"));
+  const seconds = (n: number) => t("updates.policy.drainPreset", { seconds: n });
+  const rows: UpdateActionSummary["rows"] = [];
+  const add = (label: string, before: string, after: string) => {
+    if (before !== after) rows.push({ label, value: `${before} → ${after}`, accent: true });
+  };
+  if (patch.channel !== undefined) add(t("updates.confirm.channel"), channelName(st.channel), channelName(patch.channel));
+  if (patch.strategy !== undefined) {
+    add(t("updates.policy.strategyLabel"), t(`updates.strategies.${st.strategy}`), t(`updates.strategies.${patch.strategy}`));
+  }
+  if (patch.autoSyncEnabled !== undefined) {
+    add(t("updates.confirm.autoSyncRow"), onOff(st.autoSyncEnabled), onOff(patch.autoSyncEnabled));
+  }
+  if (patch.intervalSeconds !== undefined) {
+    add(t("updates.confirm.intervalRow"), seconds(st.intervalSeconds), seconds(patch.intervalSeconds));
+  }
+  if (patch.autoRestartAfterUpdate !== undefined) {
+    add(t("updates.confirm.autoRestartRow"), onOff(st.autoRestartAfterUpdate), onOff(patch.autoRestartAfterUpdate));
+  }
+  if (patch.drainTimeoutSeconds !== undefined) {
+    add(t("updates.policy.drainLabel"), seconds(st.drainTimeoutSeconds), seconds(patch.drainTimeoutSeconds));
+  }
+  return { icon: "sliders", rows, effects: [t("updates.confirm.policyEffect")] };
+}
+
 function reportFailure(err: unknown) {
   toast.error(errorText(err, t("common.requestFailed")));
 }
 
 function startAction(act: PendingAction, confirm: AdminStepUp | undefined): Promise<SystemUpdateStatus | null> {
+  if (act.kind === "policy") return store.saveConfig({ ...act.patch, confirm });
   if (act.kind === "apply") {
     return store.applyUpdate({ channel: act.channel, targetTag: act.targetTag, force: act.force, confirm });
   }
@@ -151,7 +188,11 @@ function startAction(act: PendingAction, confirm: AdminStepUp | undefined): Prom
   return store.restart({ confirm });
 }
 
-function onAccepted(act: PendingAction, next: SystemUpdateStatus | null) {
+function onAccepted(act: PendingAction, next: SystemUpdateStatus | null, before: SystemUpdateStatus | null) {
+  if (act.kind === "policy") {
+    onPolicySaved(act.patch, before);
+    return;
+  }
   // A restart that follows is reported by the restart banner and announced when it completes.
   if (next === null || next.restartScheduled || next.state === "restarting") {
     toast.info(t("updates.toast.restarting"));
@@ -162,26 +203,43 @@ function onAccepted(act: PendingAction, next: SystemUpdateStatus | null) {
 }
 
 /**
- * Runs the confirmed action. The dialog waits only as long as the password or code could still
- * be refused; a long download then continues with its progress shown on the page.
+ * Runs the confirmed action. Without a password to check (dev mode) the dialog closes at once.
+ * Otherwise it stays until the server answers or visibly starts working (only a request that
+ * passed the password / code check gets that far), so a refusal always lands on its field, even
+ * on a slow link; a long download then continues with its progress on the page.
  */
 async function submitAction(confirm: AdminStepUp | undefined) {
   const act = pendingAction.value;
   if (!act) return;
+  const before = store.status;
   const request = startAction(act, confirm);
-  const early = await Promise.race([
+  const later = () => void request.then((next) => onAccepted(act, next, before)).catch(reportFailure);
+  if (!store.requiresStepUp) {
+    later();
+    return;
+  }
+  let stopWatch = () => {};
+  const started = new Promise<"started">((resolve) => {
+    stopWatch = watch(
+      () => store.status?.state,
+      (state) => {
+        if (state && EXECUTING_STATES.has(state)) resolve("started");
+      },
+    );
+  });
+  const first = await Promise.race([
     request.then(
       (next) => ({ next }),
       (err: unknown) => ({ err }),
     ),
-    new Promise<null>((resolve) => window.setTimeout(() => resolve(null), STEP_UP_GRACE_MS)),
-  ]);
-  if (early === null) {
-    void request.then((next) => onAccepted(act, next)).catch(reportFailure);
+    started,
+  ]).finally(() => stopWatch());
+  if (first === "started") {
+    later();
     return;
   }
-  if ("err" in early) throw early.err;
-  onAccepted(act, early.next);
+  if ("err" in first) throw first.err;
+  onAccepted(act, first.next, before);
 }
 
 function requestApply(opts: { channel?: SystemUpdateChannel; targetTag?: string; force?: boolean; label?: string } = {}) {
@@ -291,21 +349,28 @@ async function handleCheck() {
   void store.loadReleases(true);
 }
 
-async function handleSaveConfig(patch: UpdateSystemConfigRequest) {
-  const before = store.status;
+function onPolicySaved(patch: UpdateSystemConfigRequest, before: SystemUpdateStatus | null) {
+  toast.success(t("updates.policy.saved"));
   // Only a different channel or strategy changes what "latest" means; skip the GitHub round trip otherwise.
-  const recheck = Boolean(before && (patch.channel !== before.channel || patch.strategy !== before.strategy));
+  if (before && (patch.channel !== before.channel || patch.strategy !== before.strategy)) {
+    void store.checkForUpdates().then(() => store.loadReleases(true));
+  }
+}
+
+async function handleSaveConfig(patch: UpdateSystemConfigRequest) {
+  // Release deployments confirm a policy change like the update actions themselves.
+  if (store.requiresStepUp) {
+    openAction({ kind: "policy", patch });
+    return;
+  }
+  const before = store.status;
   try {
     await store.saveConfig(patch);
-    toast.success(t("updates.policy.saved"));
   } catch (err) {
     reportFailure(err);
     return;
   }
-  if (recheck) {
-    await store.checkForUpdates();
-    void store.loadReleases(true);
-  }
+  onPolicySaved(patch, before);
 }
 
 onMounted(async () => {
@@ -405,6 +470,7 @@ onBeforeUnmount(() => {
           v-show="activeTab === 'policy'"
           :status="store.status"
           :saving="store.savingConfig"
+          :step-up-required="store.requiresStepUp"
           @save="handleSaveConfig"
         />
       </div>

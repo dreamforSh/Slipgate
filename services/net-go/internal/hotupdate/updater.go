@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ var (
 	ErrInvalidUpdateConfig   = errors.New("hotupdate: invalid update configuration")
 	ErrUpdateBusy            = errors.New("hotupdate: another update operation is already in progress")
 	ErrRestartUnavailable    = errors.New("hotupdate: automatic edge restart is not configured")
+	ErrArchiveTooLarge       = errors.New("hotupdate: archive exceeds extraction limits")
 )
 
 const (
@@ -49,26 +51,32 @@ const (
 const (
 	maxManifestBytes = 4 << 20   // 4 MiB
 	maxArchiveBytes  = 512 << 20 // 512 MiB
-	maxExtractedFile = 256 << 20 // 256 MiB
-	maxHistoryItems  = 30
-	maxKeepReleases  = 5
-	releasesCacheTTL = 60 * time.Second
+	maxExtractedFile = 256 << 20 // 256 MiB per file
+	// maxExtractedTotal and maxArchiveEntries bound what one bundle may unpack to.
+	maxExtractedTotal = 1 << 30 // 1 GiB
+	maxArchiveEntries = 4096
+	maxHistoryItems   = 30
+	maxKeepReleases   = 5
+	releasesCacheTTL  = 60 * time.Second
 
 	defaultDrainTimeoutSec = config.DefaultDrainTimeoutSec
 )
 
 // Options configures the repo-synced hot-update manager.
 type Options struct {
-	Config             config.Config
-	Version            string
-	InitialCommit      string
-	Supervisor         *supervisor.Supervisor
-	Logger             *log.Logger
-	APIBaseURL         string
-	AllowCustomHost    bool
-	OnWebUIDir         func(string)
-	GetWebUIDir        func() string
-	OnGuestdBin        func(string)
+	Config          config.Config
+	Version         string
+	InitialCommit   string
+	Supervisor      *supervisor.Supervisor
+	Logger          *log.Logger
+	APIBaseURL      string
+	AllowCustomHost bool
+	OnWebUIDir      func(string)
+	GetWebUIDir     func() string
+	OnGuestdBin     func(string)
+	// OnBuildInfo reports the version/commit now in effect after an update that did not restart
+	// the edge (so health endpoints stop reporting the previous release).
+	OnBuildInfo        func(version, commit string)
 	OnPlanesRestarted  func(context.Context)
 	OnEdgeRestart      func(targetBinary string)
 	ValidateEdgeBin    func(ctx context.Context, binPath string) error
@@ -205,6 +213,7 @@ type StatusSnapshot struct {
 	EdgeBinaryPath         *string              `json:"edgeBinaryPath"`
 	GuestdUpdated          bool                 `json:"guestdUpdated"`
 	GitHubTokenConfigured  bool                 `json:"githubTokenConfigured"`
+	GitAvailable           bool                 `json:"gitAvailable"`
 	AllowReleaseApply      bool                 `json:"allowReleaseApply"`
 	CanRollback            bool                 `json:"canRollback"`
 	PreviousRelease        *PreviousReleaseInfo `json:"previousRelease"`
@@ -228,6 +237,7 @@ type Manager struct {
 	onWebUIDir        func(string)
 	getWebUIDir       func() string
 	onGuestdBin       func(string)
+	onBuildInfo       func(version, commit string)
 	onPlanesRestarted func(context.Context)
 	onEdgeRestart     func(string)
 	validateEdgeBin   func(context.Context, string) error
@@ -243,9 +253,15 @@ type Manager struct {
 	installExe string
 	// bootMarker is the restart this boot completes, settled by CompleteBoot.
 	bootMarker *RestartMarker
+	// bootActiveStamp is active.json as this process found it (see activeReleaseStamp).
+	bootActiveStamp string
+	// scheduledMarkerID is the restart.json this process wrote for its own scheduled restart.
+	scheduledMarkerID string
 	// pendingRestart remembers the rollback plan of an applied update whose restart was left to
 	// the operator (autoRestartAfterUpdate off), for TriggerRestart.
 	pendingRestart *restartRequest
+	// pendingPlaneBundle is the bundle whose planes an asynchronous reload is swapping in.
+	pendingPlaneBundle string
 
 	syncMu sync.Mutex
 	mu     sync.RWMutex
@@ -329,6 +345,7 @@ func NewManager(opts Options) *Manager {
 		onWebUIDir:        opts.OnWebUIDir,
 		getWebUIDir:       opts.GetWebUIDir,
 		onGuestdBin:       opts.OnGuestdBin,
+		onBuildInfo:       opts.OnBuildInfo,
 		onPlanesRestarted: opts.OnPlanesRestarted,
 		onEdgeRestart:     opts.OnEdgeRestart,
 		validateEdgeBin:   validateFn,
@@ -355,6 +372,7 @@ func NewManager(opts Options) *Manager {
 			State:                  StateIdle,
 			WebUIOverridden:        opts.Config.WebUIDir != "",
 			GitHubTokenConfigured:  strings.TrimSpace(opts.Config.GitHubToken) != "",
+			GitAvailable:           gitCheckoutUsable(repoDir),
 			AllowReleaseApply:      true,
 		},
 	}
@@ -493,6 +511,11 @@ func (m *Manager) SyncWithOptions(ctx context.Context, opts SyncOptions) (Status
 	if opts.TargetTag != "" || (m.cfg.Mode != "dev" && strategy == "auto") {
 		resolved = "release"
 	}
+	// A deployment without a source checkout cannot build from git: release deployments use
+	// published releases instead of failing every check; dev mode reports the problem (syncGit).
+	if resolved == "git" && !m.status.GitAvailable && m.cfg.Mode != "dev" {
+		resolved = "release"
+	}
 	now := isoNow()
 	m.status.LastCheckedAtIso = &now
 	m.status.ResolvedStrategy = resolved
@@ -518,11 +541,7 @@ func (m *Manager) SyncWithOptions(ctx context.Context, opts SyncOptions) (Status
 		return m.Status(), err
 	}
 
-	if m.isRestartScheduled() {
-		m.setState(StateRestarting, nil)
-	} else {
-		m.setState(StateIdle, nil)
-	}
+	m.finishOperationState()
 	return m.Status(), nil
 }
 
@@ -599,6 +618,7 @@ func (m *Manager) triggerEdgeRestart(req restartRequest) {
 		StartedAtIso: isoNow(),
 	}
 	m.pendingRestart = nil
+	m.scheduledMarkerID = marker.ID
 	m.mu.Unlock()
 
 	if err := saveRestartMarker(m.cfg.HotUpdateDir, marker); err != nil {
@@ -673,6 +693,11 @@ func (m *Manager) syncGit(ctx context.Context, checkOnly bool, asyncRestart bool
 	if _, err := runCmd(ctx, m.repoDir, "git", "pull", "--ff-only", "origin", branch); err != nil {
 		return fmt.Errorf("git pull --ff-only: %w", err)
 	}
+	// The pulled tree may bump VERSION; the build and the update center report that version.
+	newVersion := curVersion
+	if v := readRepoVersion(m.repoDir); v != "" {
+		newVersion = v
+	}
 
 	m.setState(StateApplying, nil)
 	ext := exeExt()
@@ -703,25 +728,28 @@ func (m *Manager) syncGit(ctx context.Context, checkOnly bool, asyncRestart bool
 		if _, err := runCmd(ctx, zigDir, "zig", "build", "--prefix", stageDir, "-Doptimize=ReleaseSafe"); err != nil {
 			return fmt.Errorf("rebuild slipgate-core: %w", err)
 		}
-		zigOutCore := filepath.Join(stageDir, "bin", "slipgate-core"+ext)
-		if _, statErr := os.Stat(zigOutCore); statErr == nil {
-			_ = os.Rename(zigOutCore, filepath.Join(stageDir, "slipgate-core"+ext))
+		// zig installs into <prefix>/bin; the bundle layout keeps binaries at its root.
+		for _, name := range []string{"slipgate-core", "slipgate-guestd"} {
+			built := filepath.Join(stageDir, "bin", name+ext)
+			if _, statErr := os.Stat(built); statErr == nil {
+				_ = os.Rename(built, filepath.Join(stageDir, name+ext))
+			}
 		}
 	}
 
 	if _, err := exec.LookPath("go"); err == nil {
 		goDir := filepath.Join(m.repoDir, "services", "net-go")
 		edgeOut := filepath.Join(stageDir, "slipgate"+ext)
-		ldflags := fmt.Sprintf("-s -w -X main.version=%s -X main.commit=%s", curVersion, remoteCommit)
+		ldflags := fmt.Sprintf("-s -w -X main.version=%s -X main.commit=%s", newVersion, remoteCommit)
 		if _, err := runCmd(ctx, goDir, "go", "build", "-trimpath", "-ldflags", ldflags, "-o", edgeOut, "./cmd/slipgate"); err != nil {
 			return fmt.Errorf("rebuild slipgate: %w", err)
 		}
 	}
 
-	_, err = m.applyExtractedBundle(ctx, applyBundleRequest{
+	applied, err := m.applyExtractedBundle(ctx, applyBundleRequest{
 		BundleRoot:   stageDir,
 		NewCommit:    remoteCommit,
-		NewVersion:   curVersion,
+		NewVersion:   newVersion,
 		Tag:          branch,
 		Channel:      channel,
 		Strategy:     "git",
@@ -730,8 +758,27 @@ func (m *Manager) syncGit(ctx context.Context, checkOnly bool, asyncRestart bool
 		FromVersion:  curVersion,
 		FromCommit:   curCommit,
 	})
+	if err == nil && applied {
+		m.pruneReleasesKeepingHistory(filepath.Join(hotDir, "git-builds"), maxKeepReleases, stageDir)
+	}
 	return err
 }
+
+// readRepoVersion returns the checkout's VERSION when it is a plain version string ("" otherwise,
+// it ends up in -ldflags).
+func readRepoVersion(repoDir string) string {
+	raw, err := os.ReadFile(filepath.Join(repoDir, "VERSION"))
+	if err != nil {
+		return ""
+	}
+	v := strings.TrimSpace(string(raw))
+	if !safeVersionRe.MatchString(v) {
+		return ""
+	}
+	return v
+}
+
+var safeVersionRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$`)
 
 func (m *Manager) setState(state string, lastErr *string) {
 	m.mu.Lock()
@@ -752,6 +799,15 @@ func resolveStrategy(configuredMode, repoDir string) string {
 		}
 		return "release"
 	}
+}
+
+// gitCheckoutUsable reports whether the git strategy can work here: a checkout and git itself.
+func gitCheckoutUsable(repoDir string) bool {
+	if strings.TrimSpace(repoDir) == "" || !hasTool("git") {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(repoDir, ".git"))
+	return err == nil
 }
 
 func hasTool(name string) bool {

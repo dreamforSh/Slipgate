@@ -97,3 +97,31 @@ func TestInheritedListenRejectsPortMismatch(t *testing.T) {
 		t.Fatalf("a socket bound to another port must not be adopted")
 	}
 }
+
+func TestInheritedListenRejectsHostMismatch(t *testing.T) {
+	orig, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := strconv.Itoa(orig.Addr().(*net.TCPAddr).Port)
+	h, err := PrepareHandoff(map[string]net.Listener{"public": orig})
+	if err != nil {
+		t.Fatalf("PrepareHandoff: %v", err)
+	}
+	defer h.Close()
+	_ = orig.Close()
+	inheritedFD := dupFD(t, h.fds["public"])
+	h.Close() // only the adopted copy keeps the socket open, as after exec
+
+	ln, inherited, err := Inherited{"public": inheritedFD}.Listen("public", "127.0.0.1:"+port)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+	if inherited {
+		t.Fatalf("an all-interfaces socket must not be adopted for a loopback-only listener")
+	}
+	if got := ln.Addr().(*net.TCPAddr); !got.IP.IsLoopback() {
+		t.Fatalf("expected a fresh loopback listener, got %v", got)
+	}
+}

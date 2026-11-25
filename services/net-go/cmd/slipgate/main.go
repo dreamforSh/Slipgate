@@ -85,57 +85,58 @@ func main() {
 			"Never expose this instance.", summary)
 	}
 
+	// An install upgraded outside the update center (new image, reinstall, rebuild) makes the
+	// hot-update overlay stale: drop it (and its restart marker and baseline) before anything
+	// reads it. The release's own edge, started through the handoff below, is never "upgraded".
+	hotupdate.ReconcileExternalUpgrade(cfg.HotUpdateDir, version, commit, hotupdate.ResolvedCurrentExecutable(), logger)
+
 	// Boot guard: a cold boot (crash restart by Docker/systemd, not an exec handoff) while a
 	// restart is still unconfirmed counts against the new release; after repeated failures
 	// active.json is restored to the previous release before the handoff below reads it.
 	hotupdate.PrepareBoot(cfg.HotUpdateDir, os.Getenv("SLIPGATE_REEXEC_GUARD") == "", logger)
 
+	// What health endpoints and the console report: the active release when one is in effect,
+	// even if this edge binary is older (a release that only replaced core / bff / web UI).
+	build := buildInfo{version: version, commit: commit}
 	if active, ok := hotupdate.LoadActiveRelease(cfg.HotUpdateDir); ok {
-		baseMismatch := active.BaseCommit != "" &&
-			!hotupdate.CommitsEqual(active.BaseCommit, commit) &&
-			!hotupdate.CommitsEqual(active.Commit, commit)
-		if baseMismatch {
-			logger.Printf(
-				"[hotupdate] detected external upgrade (binary commit=%s, active base=%s target=%s); clearing active release",
-				commit,
-				active.BaseCommit,
-				active.Commit,
-			)
-			_ = hotupdate.ClearActiveRelease(cfg.HotUpdateDir)
-		} else {
-			if active.EdgeBin != "" {
-				if info, stErr := os.Stat(active.EdgeBin); stErr == nil && !info.IsDir() {
-					curExe := hotupdate.ResolvedCurrentExecutable()
-					if !hotupdate.SameExecutablePath(curExe, active.EdgeBin) && os.Getenv("SLIPGATE_REEXEC_GUARD") != active.EdgeBin {
-						logger.Printf("[hotupdate] handing off startup to active release edge binary %s", active.EdgeBin)
-						if execErr := execSelf(active.EdgeBin); execErr != nil {
-							logger.Printf("[hotupdate] startup handoff to %s failed (continuing with current binary): %v", active.EdgeBin, execErr)
-						} else {
-							return
-						}
+		if active.EdgeBin != "" {
+			if info, stErr := os.Stat(active.EdgeBin); stErr == nil && !info.IsDir() {
+				curExe := hotupdate.ResolvedCurrentExecutable()
+				if !hotupdate.SameExecutablePath(curExe, active.EdgeBin) && os.Getenv("SLIPGATE_REEXEC_GUARD") != active.EdgeBin {
+					logger.Printf("[hotupdate] handing off startup to active release edge binary %s", active.EdgeBin)
+					if execErr := execSelf(active.EdgeBin); execErr != nil {
+						logger.Printf("[hotupdate] startup handoff to %s failed (continuing with current binary): %v", active.EdgeBin, execErr)
+					} else {
+						return
 					}
 				}
 			}
-			if active.CoreBin != "" {
-				if info, stErr := os.Stat(active.CoreBin); stErr == nil && !info.IsDir() {
-					cfg.CoreBin = active.CoreBin
-				}
+		}
+		if active.CoreBin != "" {
+			if info, stErr := os.Stat(active.CoreBin); stErr == nil && !info.IsDir() {
+				cfg.CoreBin = active.CoreBin
 			}
-			if active.BFFBin != "" {
-				if info, stErr := os.Stat(active.BFFBin); stErr == nil && !info.IsDir() {
-					cfg.BFFBin = active.BFFBin
-				}
+		}
+		if active.BFFBin != "" {
+			if info, stErr := os.Stat(active.BFFBin); stErr == nil && !info.IsDir() {
+				cfg.BFFBin = active.BFFBin
 			}
-			if active.GuestdBin != "" {
-				if info, stErr := os.Stat(active.GuestdBin); stErr == nil && !info.IsDir() {
-					cfg.GuestdBin = active.GuestdBin
-				}
+		}
+		if active.GuestdBin != "" {
+			if info, stErr := os.Stat(active.GuestdBin); stErr == nil && !info.IsDir() {
+				cfg.GuestdBin = active.GuestdBin
 			}
-			if active.WebUIDir != "" {
-				if info, stErr := os.Stat(filepath.Join(active.WebUIDir, "index.html")); stErr == nil && !info.IsDir() {
-					cfg.WebUIDir = active.WebUIDir
-				}
+		}
+		if active.WebUIDir != "" {
+			if info, stErr := os.Stat(filepath.Join(active.WebUIDir, "index.html")); stErr == nil && !info.IsDir() {
+				cfg.WebUIDir = active.WebUIDir
 			}
+		}
+		if strings.TrimSpace(active.Version) != "" {
+			build.version = strings.TrimSpace(active.Version)
+		}
+		if strings.TrimSpace(active.Commit) != "" {
+			build.commit = strings.TrimSpace(active.Commit)
 		}
 	}
 	_ = os.Unsetenv("SLIPGATE_REEXEC_GUARD")
@@ -143,7 +144,7 @@ func main() {
 	// forwards them untouched to the active release's edge).
 	inherited := lifecycle.TakeInherited()
 
-	res, err := run(cfg, logFwd, logger, inherited)
+	res, err := run(cfg, build, logFwd, logger, inherited)
 	if err != nil {
 		logger.Fatalf("%v", err)
 	}
@@ -158,6 +159,12 @@ func main() {
 			logger.Fatalf("[hotupdate] edge restart failed (%s): %v", res.target, execErr)
 		}
 	}
+}
+
+// buildInfo is the release version/commit reported to clients (see main).
+type buildInfo struct {
+	version string
+	commit  string
 }
 
 // restartResult is what run hands back to main when the edge should re-exec.
@@ -245,7 +252,7 @@ func withEnv(base []string, key, val string) []string {
 	return append(out, prefix+val)
 }
 
-func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inherited lifecycle.Inherited) (restartResult, error) {
+func run(cfg config.Config, build buildInfo, logFwd *syslogfwd.Forwarder, logger *log.Logger, inherited lifecycle.Inherited) (restartResult, error) {
 	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
@@ -366,7 +373,15 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inh
 	sup := supervisor.New(logger)
 	sup.SetLineHook(logFwd.ChildLineHook("core", "bff"))
 	logFwd.SetTarget(cfg.BFFAddr, cfg.InternalToken)
-	go logFwd.Run(rootCtx)
+	// Forwarding outlives the stop signal so the drain and shutdown lines reach the BFF too; it
+	// is stopped (with a final flush) just before the BFF itself.
+	logCtx, stopLogs := context.WithCancel(context.Background())
+	logDone := make(chan struct{})
+	go func() {
+		defer close(logDone)
+		logFwd.Run(logCtx)
+	}()
+	defer stopLogs()
 	internalURL := config.InternalOrigin(cfg.InternalListenAddr)
 
 	if cfg.Supervise {
@@ -388,8 +403,8 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inh
 					"SLIPGATE_MODE=" + cfg.Mode,
 					"SLIPGATE_DEV_SYNC_MODE=" + cfg.DevSyncMode,
 					fmt.Sprintf("SLIPGATE_DEV_SYNC_INTERVAL_SEC=%d", cfg.DevSyncIntervalSec),
-					"SLIPGATE_BUILD_VERSION=" + version,
-					"SLIPGATE_BUILD_COMMIT=" + commit,
+					"SLIPGATE_BUILD_VERSION=" + build.version,
+					"SLIPGATE_BUILD_COMMIT=" + build.commit,
 					"SLIPGATE_UPDATE_REPO=" + cfg.UpdateRepo,
 					"SLIPGATE_UPDATE_BRANCH=" + cfg.UpdateBranch,
 					"SLIPGATE_INTERNAL_TOKEN=" + cfg.InternalToken,
@@ -443,11 +458,11 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inh
 	})
 	dpCoord.StartBackgroundSync(rootCtx)
 
-	edge, err := ingress.NewServer(cfg, version, pool, sup)
+	edge, err := ingress.NewServer(cfg, build.version, pool, sup)
 	if err != nil {
 		return restartResult{}, fmt.Errorf("failed to initialize edge ingress: %w", err)
 	}
-	edge.WithCommit(commit)
+	edge.WithCommit(build.commit)
 	edge.WithClashCoordinator(clashCoord)
 	edge.WithVmSlotManager(vmSlots)
 	edge.WithVmCoordinator(vmCoord)
@@ -465,6 +480,8 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inh
 		Logger:        logger,
 		OnWebUIDir:    edge.SetWebUIOverrideDir,
 		GetWebUIDir:   edge.WebUIOverrideDir,
+		OnGuestdBin:   vmCoord.SetGuestdBin,
+		OnBuildInfo:   edge.SetBuildInfo,
 		OnPlanesRestarted: func(ctx context.Context) {
 			if err := dpCoord.ResyncCore(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Printf("[dataplane] warning: post-hotupdate core snapshot resync failed: %v", err)
@@ -526,8 +543,8 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inh
 			"[net] Slipgate unified edge listening on %s (mode=%s version=%s commit=%s core=%s bff=%s)",
 			cfg.ListenAddr,
 			cfg.Mode,
-			version,
-			commit,
+			build.version,
+			build.commit,
 			cfg.CoreIPC,
 			cfg.BFFAddr,
 		)
@@ -601,6 +618,7 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inh
 	if target != "" && stopRequested.Load() {
 		logger.Printf("[lifecycle] restart to %s aborted by a stop signal; exiting instead", target)
 		target = ""
+		updater.MarkRestartInterrupted()
 	}
 
 	// Keep the listening sockets alive across exec so the successor adopts them; connections
@@ -643,6 +661,13 @@ func run(cfg config.Config, logFwd *syslogfwd.Forwarder, logger *log.Logger, inh
 	dpCoord.FlushSettlements(flushCtx)
 	dpCoord.FlushRequestErrors(flushCtx)
 	cancelFlush()
+
+	// Last system-log flush while the BFF is still up (its own final post is bounded at 2s).
+	stopLogs()
+	select {
+	case <-logDone:
+	case <-time.After(3 * time.Second):
+	}
 
 	return restartResult{target: target, handoff: handoff}, nil
 }

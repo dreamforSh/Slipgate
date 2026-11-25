@@ -49,6 +49,8 @@ services:
       REDIS_URL: "redis://redis:6379"
     volumes:
       - slipgate_hotupdate:/var/run/slipgate/hotupdate
+      # VM slot directories (immutable machine-id, seeds) must survive container re-creation.
+      - slipgate_vms:/var/run/slipgate/vms
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,3 +61,4 @@ volumes:
   pg_data:
   redis_data:
   slipgate_hotupdate:
+  slipgate_vms:

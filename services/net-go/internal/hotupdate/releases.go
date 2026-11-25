@@ -70,16 +70,24 @@ func (m *Manager) syncRelease(ctx context.Context, opts SyncOptions, channel str
 	relHTMLURL := strings.TrimSpace(rel.HTMLURL)
 	relPublishedAt := strings.TrimSpace(rel.PublishedAt)
 
+	// SHA256SUMS.txt (small) is fetched up front: it vouches for BUILD_META.json here and for
+	// the archive below.
+	sumsAsset, hasSums := findAsset(rel.Assets, "SHA256SUMS.txt")
+	var sumsBytes []byte
+	if hasSums {
+		raw, err := m.downloadBytes(ctx, m.assetDownloadURL(sumsAsset), maxManifestBytes)
+		if err != nil && !opts.CheckOnly {
+			return fmt.Errorf("download SHA256SUMS.txt: %w", err)
+		}
+		sumsBytes = raw
+	}
 	if metaAsset, ok := findAsset(rel.Assets, "BUILD_META.json"); ok {
 		if metaRaw, err := m.downloadBytes(ctx, m.assetDownloadURL(metaAsset), maxManifestBytes); err == nil {
-			var meta buildMeta
-			if json.Unmarshal(metaRaw, &meta) == nil {
-				if strings.TrimSpace(meta.Commit) != "" {
-					remoteCommit = strings.TrimSpace(meta.Commit)
-				}
-				if strings.TrimSpace(meta.Version) != "" {
-					remoteVersion = strings.TrimSpace(meta.Version)
-				}
+			if expected, listed := lookupChecksum(sumsBytes, "BUILD_META.json"); listed && !sha256Matches(metaRaw, expected) {
+				m.logger.Printf("[hotupdate] BUILD_META.json of %s does not match SHA256SUMS.txt; ignoring it", remoteTag)
+			} else if meta, ok := parseBuildMeta(metaRaw); ok {
+				remoteCommit = nonEmptyOr(meta.Commit, remoteCommit)
+				remoteVersion = nonEmptyOr(meta.Version, remoteVersion)
 			}
 		}
 	}
@@ -155,13 +163,8 @@ func (m *Manager) syncRelease(ctx context.Context, opts SyncOptions, channel str
 
 	m.setState(StateDownloading, nil)
 
-	sumsAsset, hasSums := findAsset(rel.Assets, "SHA256SUMS.txt")
 	if !hasSums {
 		return fmt.Errorf("%w: missing SHA256SUMS.txt in release %s", ErrChecksumMismatch, remoteTag)
-	}
-	sumsBytes, err := m.downloadBytes(ctx, m.assetDownloadURL(sumsAsset), maxManifestBytes)
-	if err != nil {
-		return fmt.Errorf("download SHA256SUMS.txt: %w", err)
 	}
 
 	if chosenAsset == nil {
@@ -204,6 +207,13 @@ func (m *Manager) syncRelease(ctx context.Context, opts SyncOptions, channel str
 	}
 
 	bundleRoot := resolveBundleRoot(targetDir)
+	// The bundle's own BUILD_META.json is covered by the archive checksum: it has the last word.
+	if raw, readErr := os.ReadFile(filepath.Join(bundleRoot, "BUILD_META.json")); readErr == nil {
+		if meta, ok := parseBuildMeta(raw); ok {
+			remoteCommit = nonEmptyOr(meta.Commit, remoteCommit)
+			remoteVersion = nonEmptyOr(meta.Version, remoteVersion)
+		}
+	}
 	applied, err := m.applyExtractedBundle(ctx, applyBundleRequest{
 		BundleRoot:   bundleRoot,
 		NewCommit:    nonEmptyOr(remoteCommit, remoteTag),
@@ -221,7 +231,7 @@ func (m *Manager) syncRelease(ctx context.Context, opts SyncOptions, channel str
 		return err
 	}
 	if applied {
-		m.pruneReleasesKeepingHistory(releasesRoot, maxKeepReleases)
+		m.pruneReleasesKeepingHistory(releasesRoot, maxKeepReleases, bundleRoot)
 		m.invalidateReleasesCache()
 	}
 	return nil
@@ -798,14 +808,76 @@ func lookupChecksum(sumsBytes []byte, fileName string) (string, bool) {
 	return "", false
 }
 
-func extractArchive(archivePath, destDir string) error {
-	if strings.HasSuffix(strings.ToLower(archivePath), ".zip") {
-		return extractZip(archivePath, destDir)
+func parseBuildMeta(raw []byte) (buildMeta, bool) {
+	var meta buildMeta
+	if json.Unmarshal(raw, &meta) != nil {
+		return buildMeta{}, false
 	}
-	return extractTarGz(archivePath, destDir)
+	meta.Version = strings.TrimSpace(meta.Version)
+	meta.Commit = strings.TrimSpace(meta.Commit)
+	return meta, meta.Version != "" || meta.Commit != ""
 }
 
-func extractTarGz(archivePath, destDir string) error {
+func sha256Matches(data []byte, expectedHex string) bool {
+	sum := sha256.Sum256(data)
+	return strings.EqualFold(hex.EncodeToString(sum[:]), strings.TrimSpace(expectedHex))
+}
+
+// extractLimits bounds one bundle's extraction (see maxExtractedFile and friends).
+type extractLimits struct {
+	perFile int64
+	total   int64
+	entries int
+}
+
+var defaultExtractLimits = extractLimits{perFile: maxExtractedFile, total: maxExtractedTotal, entries: maxArchiveEntries}
+
+// extractBudget tracks what an extraction has used against its limits.
+type extractBudget struct {
+	limits  extractLimits
+	written int64
+	entries int
+}
+
+func (b *extractBudget) addEntry(name string) error {
+	b.entries++
+	if b.entries > b.limits.entries {
+		return fmt.Errorf("%w: more than %d entries (at %q)", ErrArchiveTooLarge, b.limits.entries, name)
+	}
+	return nil
+}
+
+// copyFile copies one entry, failing instead of silently truncating when the entry or the
+// archive as a whole exceeds its limit.
+func (b *extractBudget) copyFile(dst io.Writer, src io.Reader, name string) error {
+	allowed := min(b.limits.perFile, b.limits.total-b.written)
+	n, err := io.Copy(dst, io.LimitReader(src, allowed+1))
+	if err != nil {
+		return err
+	}
+	if n > allowed {
+		if allowed < b.limits.perFile {
+			return fmt.Errorf("%w: more than %d bytes in total (at %q)", ErrArchiveTooLarge, b.limits.total, name)
+		}
+		return fmt.Errorf("%w: %q is larger than %d bytes", ErrArchiveTooLarge, name, b.limits.perFile)
+	}
+	b.written += n
+	return nil
+}
+
+func extractArchive(archivePath, destDir string) error {
+	return extractArchiveWithLimits(archivePath, destDir, defaultExtractLimits)
+}
+
+func extractArchiveWithLimits(archivePath, destDir string, limits extractLimits) error {
+	budget := &extractBudget{limits: limits}
+	if strings.HasSuffix(strings.ToLower(archivePath), ".zip") {
+		return extractZip(archivePath, destDir, budget)
+	}
+	return extractTarGz(archivePath, destDir, budget)
+}
+
+func extractTarGz(archivePath, destDir string, budget *extractBudget) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -828,6 +900,9 @@ func extractTarGz(archivePath, destDir string) error {
 			return err
 		}
 
+		if err := budget.addEntry(hdr.Name); err != nil {
+			return err
+		}
 		target, err := safeJoin(destDir, hdr.Name)
 		if err != nil {
 			return err
@@ -850,7 +925,7 @@ func extractTarGz(archivePath, destDir string) error {
 			if err != nil {
 				return err
 			}
-			_, copyErr := io.Copy(out, io.LimitReader(tr, maxExtractedFile))
+			copyErr := budget.copyFile(out, tr, hdr.Name)
 			closeErr := out.Close()
 			if copyErr != nil {
 				return copyErr
@@ -865,7 +940,7 @@ func extractTarGz(archivePath, destDir string) error {
 	return nil
 }
 
-func extractZip(archivePath, destDir string) error {
+func extractZip(archivePath, destDir string, budget *extractBudget) error {
 	zr, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return err
@@ -873,6 +948,9 @@ func extractZip(archivePath, destDir string) error {
 	defer zr.Close()
 
 	for _, zf := range zr.File {
+		if err := budget.addEntry(zf.Name); err != nil {
+			return err
+		}
 		if zf.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: symlink entry %q rejected", ErrUnsafeArchivePath, zf.Name)
 		}
@@ -898,7 +976,7 @@ func extractZip(archivePath, destDir string) error {
 			_ = rc.Close()
 			return err
 		}
-		_, copyErr := io.Copy(out, io.LimitReader(rc, maxExtractedFile))
+		copyErr := budget.copyFile(out, rc, zf.Name)
 		closeOut := out.Close()
 		_ = rc.Close()
 		if copyErr != nil {

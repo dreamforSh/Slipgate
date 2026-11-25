@@ -105,3 +105,10 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   void shutdown();
 });
+// On Windows the edge stops its children with CTRL_BREAK (they run in their own process group),
+// which arrives as SIGBREAK rather than SIGINT.
+if (process.platform === "win32") {
+  process.on("SIGBREAK", () => {
+    void shutdown();
+  });
+}

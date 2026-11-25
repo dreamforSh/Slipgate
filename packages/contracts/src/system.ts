@@ -176,6 +176,8 @@ export const SystemUpdateStatusSchema = z.object({
   edgeBinaryPath: z.string().nullable().default(null),
   guestdUpdated: z.boolean().default(false),
   githubTokenConfigured: z.boolean().default(false),
+  /** The git strategy can work here: a source checkout and git on the host. */
+  gitAvailable: z.boolean().default(false),
   allowReleaseApply: z.boolean().default(true),
   canRollback: z.boolean().default(false),
   previousRelease: SystemUpdatePreviousReleaseSchema.nullable().default(null),
@@ -203,6 +205,8 @@ export const UpdateSystemConfigRequestSchema = z.object({
   autoRestartAfterUpdate: z.boolean().optional(),
   drainTimeoutSeconds: z.number().int().min(5).max(600).optional(),
   strategy: DevSyncStrategySchema.optional(),
+  /** Required outside dev mode: the update policy decides what code this deployment runs. */
+  confirm: AdminStepUpSchema.optional(),
 });
 export type UpdateSystemConfigRequest = z.infer<typeof UpdateSystemConfigRequestSchema>;
 

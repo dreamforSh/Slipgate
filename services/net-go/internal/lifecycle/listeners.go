@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"sort"
 	"strconv"
@@ -43,8 +44,8 @@ func TakeInherited() Inherited {
 	return out
 }
 
-// Listen returns the inherited listener called name when it is bound to addr's port, else a
-// fresh TCP listener on addr. inherited reports which one it was.
+// Listen returns the inherited listener called name when it is bound to exactly addr (same port
+// and same bind address), else a fresh TCP listener on addr. inherited reports which one it was.
 func (in Inherited) Listen(name, addr string) (ln net.Listener, inherited bool, err error) {
 	if fd, ok := in[name]; ok {
 		delete(in, name)
@@ -52,7 +53,7 @@ func (in Inherited) Listen(name, addr string) (ln net.Listener, inherited bool, 
 			candidate, fileErr := net.FileListener(f)
 			_ = f.Close()
 			if fileErr == nil {
-				if sameListenPort(candidate.Addr(), addr) {
+				if sameListenAddr(candidate.Addr(), addr) {
 					return candidate, true, nil
 				}
 				_ = candidate.Close()
@@ -139,14 +140,35 @@ func (h *Handoff) Close() {
 	}
 }
 
-func sameListenPort(got net.Addr, want string) bool {
+// sameListenAddr reports whether an inherited socket bound to got may serve addr. The port must
+// match and so must the bind address, so a successor configured for 127.0.0.1 never keeps serving
+// on an all-interfaces socket: a wildcard host ("", "*", "0.0.0.0", "::") wants a wildcard socket
+// (of the same family when the family is spelled out), a literal IP wants exactly that IP, and a
+// host name is never trusted to match (it may resolve differently now) so a fresh socket is bound.
+func sameListenAddr(got net.Addr, want string) bool {
 	tcp, ok := got.(*net.TCPAddr)
 	if !ok {
 		return false
 	}
-	_, port, err := net.SplitHostPort(strings.TrimSpace(want))
+	host, port, err := net.SplitHostPort(strings.TrimSpace(want))
+	if err != nil || port != strconv.Itoa(tcp.Port) {
+		return false
+	}
+	gotIP, ok := netip.AddrFromSlice(tcp.IP)
+	if !ok {
+		return false
+	}
+	gotIP = gotIP.Unmap()
+	if host == "" || host == "*" {
+		return gotIP.IsUnspecified()
+	}
+	wantIP, err := netip.ParseAddr(host)
 	if err != nil {
 		return false
 	}
-	return port == strconv.Itoa(tcp.Port)
+	wantIP = wantIP.Unmap()
+	if wantIP.IsUnspecified() {
+		return gotIP.IsUnspecified() && gotIP.Is4() == wantIP.Is4()
+	}
+	return gotIP == wantIP
 }

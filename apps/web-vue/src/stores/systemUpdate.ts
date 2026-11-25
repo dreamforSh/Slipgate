@@ -420,7 +420,8 @@ export const useSystemUpdateStore = defineStore("systemUpdate", () => {
       status.value = next;
       return next;
     } catch (err) {
-      error.value = errorText(err, tr("updates.errors.policy"));
+      // A refused password / passkey is shown on the confirmation dialog's fields.
+      if (!isStepUpRefusal(err)) error.value = errorText(err, tr("updates.errors.policy"));
       throw err;
     } finally {
       savingConfig.value = false;

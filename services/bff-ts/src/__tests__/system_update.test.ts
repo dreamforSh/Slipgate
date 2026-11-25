@@ -49,16 +49,25 @@ describe("admin system update routes", () => {
       expect(relBody.standalone).toBe(true);
       expect(relBody.releases).toEqual([]);
 
+      const policy = {
+        channel: "dev",
+        autoSyncEnabled: true,
+        intervalSeconds: 300,
+        autoRestartAfterUpdate: false,
+        strategy: "release",
+      };
+      const unconfirmedCfg = await app.request("/api/v1/admin/system/update/config", {
+        method: "PUT",
+        headers,
+        body: JSON.stringify(policy),
+      });
+      expect(unconfirmedCfg.status).toBe(403);
+      expect(((await unconfirmedCfg.json()) as { error: string }).error).toBe("step_up_required");
+
       const cfgRes = await app.request("/api/v1/admin/system/update/config", {
         method: "PUT",
         headers,
-        body: JSON.stringify({
-          channel: "dev",
-          autoSyncEnabled: true,
-          intervalSeconds: 300,
-          autoRestartAfterUpdate: false,
-          strategy: "release",
-        }),
+        body: JSON.stringify({ ...policy, confirm: { password: "AdminPassword123!" } }),
       });
       expect(cfgRes.status).toBe(200);
       const cfgBody = (await cfgRes.json()) as {
@@ -114,6 +123,7 @@ describe("admin system update routes", () => {
     const receivedSyncPayloads: Array<Record<string, unknown>> = [];
     const receivedRollbackPayloads: Array<Record<string, unknown>> = [];
     const receivedRestartPayloads: Array<Record<string, unknown>> = [];
+    const receivedConfigPayloads: Array<Record<string, unknown>> = [];
     let currentChannel = "stable";
     let autoRestartAfterUpdate = true;
 
@@ -192,6 +202,7 @@ describe("admin system update routes", () => {
           return;
         }
         if (req.method === "PUT" && req.url === "/internal/supervisor/update/config") {
+          receivedConfigPayloads.push(jsonBody);
           if (typeof jsonBody.channel === "string") currentChannel = jsonBody.channel;
           if (typeof jsonBody.autoRestartAfterUpdate === "boolean") {
             autoRestartAfterUpdate = jsonBody.autoRestartAfterUpdate;
@@ -276,15 +287,56 @@ describe("admin system update routes", () => {
       expect(relRes.status).toBe(200);
       expect(((await relRes.json()) as { releases: Array<{ tag: string }> }).releases[0]?.tag).toBe("v0.3.0");
 
-      const cfgRes = await app.request("/api/v1/admin/system/update/config", {
+      // Policy changes are confirmed like the update actions (release mode).
+      const blockedCfg = await app.request("/api/v1/admin/system/update/config", {
         method: "PUT",
         headers,
         body: JSON.stringify({ channel: "dev", autoRestartAfterUpdate: false }),
+      });
+      expect(blockedCfg.status).toBe(403);
+      expect(((await blockedCfg.json()) as { error: string }).error).toBe("step_up_required");
+      expect(receivedConfigPayloads.length).toBe(0);
+
+      const wrongPasswordCfg = await app.request("/api/v1/admin/system/update/config", {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ channel: "dev", confirm: { password: "not-the-password" } }),
+      });
+      expect(wrongPasswordCfg.status).toBe(403);
+      expect(receivedConfigPayloads.length).toBe(0);
+
+      const cfgRes = await app.request("/api/v1/admin/system/update/config", {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({
+          channel: "dev",
+          autoRestartAfterUpdate: false,
+          confirm: { password: "AdminPassword123!" },
+        }),
       });
       expect(cfgRes.status).toBe(200);
       const cfgPayload = (await cfgRes.json()) as { channel: string; autoRestartAfterUpdate: boolean };
       expect(cfgPayload.channel).toBe("dev");
       expect(cfgPayload.autoRestartAfterUpdate).toBe(false);
+      expect(receivedConfigPayloads.length).toBe(1);
+      expect(receivedConfigPayloads[0]).toEqual({ channel: "dev", autoRestartAfterUpdate: false });
+
+      // A static admin API key can never confirm, so it cannot change the policy either.
+      const minted = await app.request("/api/v1/admin/api-keys", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name: "Automation", expiresInDays: 30 }),
+      });
+      expect(minted.status).toBe(201);
+      const apiKey = ((await minted.json()) as { token: string }).token;
+      const keyCfg = await app.request("/api/v1/admin/system/update/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "X-Admin-Api-Key": apiKey },
+        body: JSON.stringify({ channel: "stable", confirm: { password: "AdminPassword123!" } }),
+      });
+      expect(keyCfg.status).toBe(403);
+      expect(((await keyCfg.json()) as { error: string }).error).toBe("step_up_not_allowed");
+      expect(receivedConfigPayloads.length).toBe(1);
 
       // Rollback enforces step-up & forwards releaseId
       const blockedRollback = await app.request("/api/v1/admin/system/update/rollback", {

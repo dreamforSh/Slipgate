@@ -112,10 +112,11 @@ type SlotDriver interface {
 // LocalSlotDriver manages local isolated VM/container slot directories, immutable machine-id files, and optional slipgate-guestd processes.
 type LocalSlotDriver struct {
 	vmDataDir string
-	guestdBin string
 
-	mu    sync.Mutex
-	procs map[string]*exec.Cmd
+	mu sync.Mutex
+	// guestdBin can be swapped by a hot update while slots start; read it through GuestdBin.
+	guestdBin string
+	procs     map[string]*exec.Cmd
 }
 
 func NewLocalSlotDriver(vmDataDir, guestdBin string) *LocalSlotDriver {
@@ -129,11 +130,30 @@ func NewLocalSlotDriver(vmDataDir, guestdBin string) *LocalSlotDriver {
 	}
 }
 
+// GuestdBin is the slipgate-guestd binary new slots start with.
+func (d *LocalSlotDriver) GuestdBin() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.guestdBin
+}
+
+// SetGuestdBin switches the slipgate-guestd binary used by slots started from now on (a hot
+// update delivering a new guestd); running daemons keep their binary until restarted.
+func (d *LocalSlotDriver) SetGuestdBin(bin string) {
+	d.mu.Lock()
+	d.guestdBin = strings.TrimSpace(bin)
+	d.mu.Unlock()
+}
+
 func (d *LocalSlotDriver) GuestdAvailable() bool {
-	if d.guestdBin == "" {
+	return guestdUsable(d.GuestdBin())
+}
+
+func guestdUsable(bin string) bool {
+	if bin == "" {
 		return false
 	}
-	info, err := os.Stat(d.guestdBin)
+	info, err := os.Stat(bin)
 	return err == nil && !info.IsDir()
 }
 
@@ -242,7 +262,8 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 	_ = d.StopSlot(ctx, ClusterNode{}, slot)
 	now := time.Now().UTC()
 
-	if !d.GuestdAvailable() {
+	guestdBin := d.GuestdBin()
+	if !guestdUsable(guestdBin) {
 		slot.State = StateReady
 		slot.GuestPID = 0
 		slot.DaemonVersion = "sandbox-ready"
@@ -265,7 +286,7 @@ func (d *LocalSlotDriver) StartSlot(ctx context.Context, _ ClusterNode, slot Slo
 	rp := effectiveRuntimeProfile(slot.RuntimeProfile)
 	guestHome := filepath.Join(slot.RootDir, "home", "runner")
 	guestToken := strings.TrimSpace(os.Getenv("SLIPGATE_GUEST_TOKEN"))
-	cmd := exec.Command(d.guestdBin)
+	cmd := exec.Command(guestdBin)
 	cmd.Dir = slot.RootDir
 	cmd.Env = append(os.Environ(),
 		"HOME="+guestHome,

@@ -2,7 +2,7 @@
 withDefaults(
   defineProps<{
     modelValue: V;
-    options: { value: V; label: string; count?: number }[];
+    options: { value: V; label: string; count?: number; disabled?: boolean }[];
     size?: "sm" | "md";
     block?: boolean;
   }>(),
@@ -20,6 +20,7 @@ const emit = defineEmits<{ (e: "update:modelValue", value: V): void }>();
       type="button"
       role="radio"
       :aria-checked="modelValue === opt.value"
+      :disabled="opt.disabled"
       class="inline-flex cursor-pointer items-center justify-center gap-1.5 whitespace-nowrap rounded-md font-medium transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
       :class="[
         size === 'sm' ? 'h-7 px-2.5 text-xs' : 'h-8 px-3 text-sm',
@@ -27,8 +28,9 @@ const emit = defineEmits<{ (e: "update:modelValue", value: V): void }>();
         modelValue === opt.value
           ? 'bg-surface text-fg shadow-sm ring-1 ring-fg/5 dark:bg-surface-3 dark:ring-white/10'
           : 'text-fg-subtle hover:text-fg',
+        opt.disabled ? 'cursor-not-allowed opacity-40 hover:text-fg-subtle' : '',
       ]"
-      @click="emit('update:modelValue', opt.value)"
+      @click="!opt.disabled && emit('update:modelValue', opt.value)"
     >
       {{ opt.label }}
       <span

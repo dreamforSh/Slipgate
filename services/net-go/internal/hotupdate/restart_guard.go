@@ -70,7 +70,10 @@ type RestartMarker struct {
 	ColdBoots   int           `json:"coldBoots"`
 	Rollback    *RollbackPlan `json:"rollback,omitempty"`
 	RolledBack  bool          `json:"rolledBack,omitempty"`
-	Note        string        `json:"note,omitempty"`
+	// Interrupted marks a restart a stop signal cut short after the release was already switched:
+	// the cold boot that follows is that release's first start, not a failed attempt.
+	Interrupted bool   `json:"interrupted,omitempty"`
+	Note        string `json:"note,omitempty"`
 }
 
 // LastRestart summarises the most recent full-service restart for the update center.
@@ -127,6 +130,19 @@ func saveRestartMarker(hotUpdateDir string, marker *RestartMarker) error {
 	return writeJSONAtomic(filepath.Join(hotUpdateDir, restartMarkerFile), marker)
 }
 
+// ClearRestartMarkerIfID removes <HotUpdateDir>/restart.json only while it still describes the
+// restart expectedID, so settling an old restart never deletes the marker of a newer one.
+func ClearRestartMarkerIfID(hotUpdateDir, expectedID string) error {
+	marker, ok := LoadRestartMarker(hotUpdateDir)
+	if !ok {
+		return nil
+	}
+	if expectedID != "" && marker.ID != expectedID {
+		return nil
+	}
+	return ClearRestartMarker(hotUpdateDir)
+}
+
 // ClearRestartMarker removes <HotUpdateDir>/restart.json.
 func ClearRestartMarker(hotUpdateDir string) error {
 	if strings.TrimSpace(hotUpdateDir) == "" {
@@ -167,7 +183,12 @@ func PrepareBoot(hotUpdateDir string, coldBoot bool, logger *log.Logger) BootDec
 		logger = log.Default()
 	}
 	if coldBoot {
-		marker.ColdBoots++
+		if marker.Interrupted {
+			// The previous process was stopped mid-restart: this is the release's first start.
+			marker.Interrupted = false
+		} else {
+			marker.ColdBoots++
+		}
 	}
 	decision := BootDecision{Marker: marker}
 	if coldBoot && !marker.RolledBack && marker.Rollback != nil && marker.ColdBoots >= maxColdBootAttempts {
@@ -296,6 +317,8 @@ func (m *Manager) HasPendingBoot() bool {
 // CompleteBoot settles the restart marker once the edge knows whether its planes came up:
 // it records the outcome, and when a restarted release never became ready it restores the
 // previous release and restarts into it (once — an automatic rollback is never rolled back).
+// It never touches state that changed after this boot: a newer restart's marker survives, and
+// no rollback happens once another restart was scheduled or the active release was changed.
 func (m *Manager) CompleteBoot(ctx context.Context, ready bool) {
 	m.mu.Lock()
 	marker := m.bootMarker
@@ -331,41 +354,9 @@ func (m *Manager) CompleteBoot(ctx context.Context, ready bool) {
 	case ready:
 		last.Outcome = RestartOutcomeSucceeded
 	case canRollback:
-		msg := fmt.Sprintf(
-			"version %s did not pass the post-restart health check; rolling back to %s",
-			nonEmptyOr(marker.ToVersion, shortCommitLabel(marker.ToCommit)),
-			rollbackLabel(marker.Rollback),
-		)
-		if err := applyRollbackPlan(m.cfg.HotUpdateDir, marker.Rollback); err != nil {
-			msg = fmt.Sprintf("post-restart health check failed and rollback could not be applied: %v", err)
-			last.Outcome = RestartOutcomeDegraded
-			last.Message = &msg
-			break
+		if m.autoRollback(marker, last) {
+			return
 		}
-		last.Outcome = RestartOutcomeRolledBack
-		last.Message = &msg
-		m.recordAutoRollback(marker, msg)
-		m.persistLastRestart(last)
-		_ = ClearRestartMarker(m.cfg.HotUpdateDir)
-		m.logger.Printf("[hotupdate] boot guard: %s", msg)
-		target := strings.TrimSpace(marker.Rollback.EdgeBin)
-		if target == "" {
-			target = m.currentExePath()
-		}
-		m.mu.Lock()
-		m.status.RestartScheduled = true
-		m.status.State = StateRestarting
-		m.status.Version = nonEmptyOr(marker.Rollback.Version, m.status.Version)
-		m.status.ActiveCommit = nonEmptyOr(marker.Rollback.Commit, m.status.ActiveCommit)
-		m.mu.Unlock()
-		m.triggerEdgeRestart(restartRequest{
-			Target:    target,
-			Async:     true,
-			Reason:    RestartReasonAutoRollback,
-			ToVersion: marker.Rollback.Version,
-			ToCommit:  marker.Rollback.Commit,
-		})
-		return
 	default:
 		last.Outcome = RestartOutcomeDegraded
 		msg := "planes did not report ready within the startup timeout"
@@ -373,11 +364,117 @@ func (m *Manager) CompleteBoot(ctx context.Context, ready bool) {
 	}
 
 	m.persistLastRestart(last)
-	if err := ClearRestartMarker(m.cfg.HotUpdateDir); err != nil {
+	if err := ClearRestartMarkerIfID(m.cfg.HotUpdateDir, marker.ID); err != nil {
 		m.logger.Printf("[hotupdate] boot guard: clear restart marker: %v", err)
 	}
 	m.logger.Printf("[hotupdate] restart %s (%s) finished: %s in %dms", last.ID, last.Reason, last.Outcome, last.DurationMs)
 	_ = ctx
+}
+
+// autoRollback restores marker's rollback plan and restarts into it. It reports false (leaving
+// a degraded outcome in last) when the rollback was skipped or could not be applied.
+func (m *Manager) autoRollback(marker *RestartMarker, last *LastRestart) bool {
+	failedVersion := nonEmptyOr(marker.ToVersion, shortCommitLabel(marker.ToCommit))
+	degraded := func(msg string) bool {
+		last.Outcome = RestartOutcomeDegraded
+		last.Message = &msg
+		m.logger.Printf("[hotupdate] boot guard: %s", msg)
+		return false
+	}
+	skipped := func(why string) bool {
+		return degraded(fmt.Sprintf("version %s did not pass the post-restart health check; automatic rollback skipped because %s", failedVersion, why))
+	}
+	// Holding syncMu keeps an update, rollback or manual restart from starting meanwhile.
+	if !m.syncMu.TryLock() {
+		return skipped("another update operation is running")
+	}
+	defer m.syncMu.Unlock()
+	if m.restartAlreadyScheduled() {
+		return skipped("a newer restart is already scheduled")
+	}
+	if activeReleaseStamp(m.cfg.HotUpdateDir) != m.bootActiveStamp {
+		return skipped("the active release changed after this boot")
+	}
+
+	msg := fmt.Sprintf(
+		"version %s did not pass the post-restart health check; rolling back to %s",
+		failedVersion,
+		rollbackLabel(marker.Rollback),
+	)
+	if err := applyRollbackPlan(m.cfg.HotUpdateDir, marker.Rollback); err != nil {
+		return degraded(fmt.Sprintf("post-restart health check failed and rollback could not be applied: %v", err))
+	}
+	last.Outcome = RestartOutcomeRolledBack
+	last.Message = &msg
+	m.recordAutoRollback(marker, msg)
+	m.persistLastRestart(last)
+	_ = ClearRestartMarkerIfID(m.cfg.HotUpdateDir, marker.ID)
+	m.logger.Printf("[hotupdate] boot guard: %s", msg)
+	target := strings.TrimSpace(marker.Rollback.EdgeBin)
+	if target == "" {
+		target = m.currentExePath()
+	}
+	m.mu.Lock()
+	m.status.RestartScheduled = true
+	m.status.State = StateRestarting
+	m.status.Version = nonEmptyOr(marker.Rollback.Version, m.status.Version)
+	m.status.ActiveCommit = nonEmptyOr(marker.Rollback.Commit, m.status.ActiveCommit)
+	m.mu.Unlock()
+	m.triggerEdgeRestart(restartRequest{
+		Target:    target,
+		Async:     true,
+		Reason:    RestartReasonAutoRollback,
+		ToVersion: marker.Rollback.Version,
+		ToCommit:  marker.Rollback.Commit,
+	})
+	return true
+}
+
+// restartAlreadyScheduled reports whether this process already scheduled a full restart.
+func (m *Manager) restartAlreadyScheduled() bool {
+	m.restartMu.Lock()
+	triggered := m.restartTriggered
+	m.restartMu.Unlock()
+	return triggered || m.isRestartScheduled()
+}
+
+// MarkRestartInterrupted is called when a stop signal aborts the restart this process
+// scheduled. A manual restart switched nothing, so its marker is dropped and the next start is an
+// ordinary boot. An update or rollback restart already switched active.json, so the next cold
+// boot is that release's first start: the marker stays (the boot guard still protects it) but
+// that boot does not count as a failed attempt.
+func (m *Manager) MarkRestartInterrupted() {
+	m.mu.Lock()
+	id := m.scheduledMarkerID
+	m.scheduledMarkerID = ""
+	m.mu.Unlock()
+	if id == "" {
+		return
+	}
+	marker, ok := LoadRestartMarker(m.cfg.HotUpdateDir)
+	if !ok || marker.ID != id {
+		return
+	}
+	if marker.Rollback == nil {
+		if err := ClearRestartMarkerIfID(m.cfg.HotUpdateDir, id); err != nil {
+			m.logger.Printf("[hotupdate] clear interrupted restart marker: %v", err)
+		}
+		return
+	}
+	marker.Interrupted = true
+	if err := saveRestartMarker(m.cfg.HotUpdateDir, marker); err != nil {
+		m.logger.Printf("[hotupdate] mark restart interrupted: %v", err)
+	}
+}
+
+// activeReleaseStamp identifies the content of active.json ("" when none), so the boot guard can
+// tell whether someone changed the active release after this process started.
+func activeReleaseStamp(hotUpdateDir string) string {
+	active, ok := LoadActiveRelease(hotUpdateDir)
+	if !ok {
+		return ""
+	}
+	return strings.Join([]string{active.UpdatedAt, active.Version, active.Commit, active.BundleDir, active.EdgeBin}, "|")
 }
 
 func (m *Manager) persistLastRestart(last *LastRestart) {

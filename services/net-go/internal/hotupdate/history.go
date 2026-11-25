@@ -55,11 +55,13 @@ type applyBundleRequest struct {
 }
 
 type rollbackPlaneSnapshot struct {
-	PrevCoreBin  string
-	HasCore      bool
-	PrevBFFBin   string
-	HasBFF       bool
-	PrevWebUIDir string
+	PrevCoreBin    string
+	HasCore        bool
+	PrevBFFBin     string
+	HasBFF         bool
+	PrevWebUIDir   string
+	PrevGuestdBin  string
+	GuestdSwitched bool
 }
 
 func (m *Manager) loadPersistedState() {
@@ -107,6 +109,7 @@ func (m *Manager) loadPersistedState() {
 		}
 	}
 
+	m.bootActiveStamp = activeReleaseStamp(m.cfg.HotUpdateDir)
 	active, hasActive := LoadActiveRelease(m.cfg.HotUpdateDir)
 	if hasActive && strings.TrimSpace(active.InstallExe) != "" {
 		m.installExe = active.InstallExe
@@ -249,6 +252,10 @@ func (m *Manager) UpdateConfig(patch ConfigPatch) (StatusSnapshot, error) {
 			m.mu.Unlock()
 			return m.Status(), fmt.Errorf("%w: invalid strategy %q", ErrInvalidUpdateConfig, st)
 		}
+		if st == "git" && st != m.cfg.DevSyncMode && !m.status.GitAvailable {
+			m.mu.Unlock()
+			return m.Status(), fmt.Errorf("%w: the git strategy needs a source checkout and git on this host", ErrInvalidUpdateConfig)
+		}
 		nextStrategy = st
 	}
 
@@ -330,13 +337,7 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 
 	m.mu.Lock()
 	m.captureBaselineLocked()
-	prevSnap := rollbackPlaneSnapshot{
-		PrevWebUIDir: m.currentWebUIDirLocked(),
-	}
-	if m.sup != nil {
-		prevSnap.PrevCoreBin, prevSnap.HasCore = m.sup.ChildBinary("core")
-		prevSnap.PrevBFFBin, prevSnap.HasBFF = m.sup.ChildBinary("bff")
-	}
+	prevSnap := m.planeSnapshotLocked()
 	autoRestartEnabled := m.status.AutoRestartAfterUpdate
 	plan := m.rollbackPlanLocked(prevActive)
 	installExe := m.installExeLocked(prevActive)
@@ -367,27 +368,15 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	webDir := filepath.Join(req.BundleRoot, "webui")
 	webOverridden := false
 	if info, err := os.Stat(filepath.Join(webDir, "index.html")); err == nil && !info.IsDir() {
-		if m.onWebUIDir != nil {
-			m.onWebUIDir(webDir)
-		}
 		webOverridden = true
 	}
 
+	// guestd also runs from the bundle directory, so every release keeps its own copy and a
+	// rollback really restores the previous one.
 	guestdUpdated := false
-	var stagedGuestdPath string
 	if info, err := os.Stat(guestdBin); err == nil && !info.IsDir() {
 		_ = os.Chmod(guestdBin, 0o755)
-		stagedGuestdPath = guestdBin
-		if m.cfg.HotUpdateDir != "" {
-			destGuestd := filepath.Join(m.cfg.HotUpdateDir, "staged", "slipgate-guestd"+ext)
-			if copyErr := copyFile(guestdBin, destGuestd, 0o755); copyErr == nil {
-				stagedGuestdPath = destGuestd
-			}
-		}
 		guestdUpdated = true
-		if m.onGuestdBin != nil {
-			m.onGuestdBin(stagedGuestdPath)
-		}
 	}
 
 	activeCoreBin := prevSnap.PrevCoreBin
@@ -410,9 +399,9 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 	} else if req.Action == "rollback" && req.BundleRoot == "" {
 		activeWebDir = ""
 	}
-	activeGuestd := m.guestdBin
+	activeGuestd := prevSnap.PrevGuestdBin
 	if guestdUpdated {
-		activeGuestd = stagedGuestdPath
+		activeGuestd = guestdBin
 	}
 	// A bundle without an edge binary keeps whichever edge the previous release ran.
 	activeEdge := newEdge
@@ -420,28 +409,26 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 		activeEdge = prevActive.EdgeBin
 	}
 	// BaseVersion/BaseCommit describe the installed binary (not the hot-updated edge running
-	// now), so carry them forward: main compares them to detect an external upgrade.
+	// now), so carry them forward: startup compares them to detect an external upgrade.
 	baseVersion, baseCommit := m.baseVersion, m.baseCommit
 	if prevActive != nil && strings.TrimSpace(prevActive.BaseCommit) != "" {
 		baseVersion, baseCommit = prevActive.BaseVersion, prevActive.BaseCommit
 	}
-
-	if err := saveActiveRelease(m.cfg.HotUpdateDir, &ActiveRelease{
-		Version:     req.NewVersion,
-		Commit:      req.NewCommit,
-		Tag:         req.Tag,
-		BaseVersion: baseVersion,
-		BaseCommit:  baseCommit,
-		InstallExe:  installExe,
-		BundleDir:   req.BundleRoot,
-		EdgeBin:     activeEdge,
-		CoreBin:     activeCoreBin,
-		BFFBin:      activeBFFBin,
-		GuestdBin:   activeGuestd,
-		WebUIDir:    activeWebDir,
-		UpdatedAt:   isoNow(),
-	}); err != nil {
-		return false, fmt.Errorf("persist active release: %w", err)
+	active := &ActiveRelease{
+		Version:            req.NewVersion,
+		Commit:             req.NewCommit,
+		Tag:                req.Tag,
+		BaseVersion:        baseVersion,
+		BaseCommit:         baseCommit,
+		InstallExe:         installExe,
+		InstallFingerprint: installFingerprintFor(prevActive, installExe, m.currentExePath()),
+		BundleDir:          req.BundleRoot,
+		EdgeBin:            activeEdge,
+		CoreBin:            activeCoreBin,
+		BFFBin:             activeBFFBin,
+		GuestdBin:          activeGuestd,
+		WebUIDir:           activeWebDir,
+		UpdatedAt:          isoNow(),
 	}
 
 	// Any changed binary means a full-service restart (edge re-exec + every supervised plane)
@@ -463,106 +450,223 @@ func (m *Manager) applyExtractedBundle(ctx context.Context, req applyBundleReque
 		Rollback:    plan,
 	}
 
-	reloaded := false
-	if fullRestart {
-		reloaded = true
-	} else if m.sup != nil {
-		updatedChild := false
-		if coreChanged {
-			if err := m.sup.UpdateChildBinary("core", coreBin); err == nil {
-				updatedChild = true
-			}
+	// record publishes the applied release in the status and history once it is in effect.
+	record := func(reloaded bool) {
+		updatedAt := isoNow()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.status.ActiveCommit = req.NewCommit
+		if req.NewVersion != "" {
+			m.status.Version = req.NewVersion
 		}
-		if bffChanged {
-			if err := m.sup.UpdateChildBinary("bff", bffBin); err == nil {
-				updatedChild = true
-			}
+		rc := req.NewCommit
+		m.status.RemoteCommit = &rc
+		m.status.UpdateAvailable = false
+		if webOverridden {
+			m.activeWebUIDir = webDir
+			m.status.WebUIOverridden = true
+		} else if req.Action == "rollback" && req.BundleRoot == "" {
+			m.activeWebUIDir = ""
+			m.status.WebUIOverridden = false
 		}
-		if updatedChild {
-			m.setState(StateReloadingPlanes, nil)
-			reloaded = true
-			if req.AsyncRestart {
-				time.AfterFunc(150*time.Millisecond, func() {
-					bgCtx := context.Background()
-					if err := m.sup.RestartAll(bgCtx, 5*time.Second); err != nil {
-						m.logger.Printf("[hotupdate] async plane restart failed (%v); rolling back supervised binaries", err)
-						m.restorePlaneSnapshot(prevSnap)
-						if rbErr := m.sup.RestartAll(bgCtx, 5*time.Second); rbErr != nil {
-							m.logger.Printf("[hotupdate] automatic rollback restart failed: %v", rbErr)
-						}
-						errText := fmt.Sprintf("plane restart failed (%v); automatically rolled back", err)
-						m.setState(StateError, &errText)
-						return
-					}
-					if m.onPlanesRestarted != nil {
-						m.onPlanesRestarted(bgCtx)
-					}
-				})
-			} else {
-				if err := m.sup.RestartAll(ctx, 5*time.Second); err != nil {
-					m.restorePlaneSnapshot(prevSnap)
-					_ = m.sup.RestartAll(context.Background(), 5*time.Second)
-					return false, fmt.Errorf("restart supervised planes (auto-rolled back): %w", err)
-				}
-				if m.onPlanesRestarted != nil {
-					m.onPlanesRestarted(ctx)
-				}
-			}
+		m.status.EdgeBinaryStaged = edgeStaged
+		m.status.EdgeBinaryPath = edgeStagedPtr
+		if guestdUpdated {
+			m.guestdBin = guestdBin
+			m.status.GuestdUpdated = true
 		}
+		m.status.LastUpdatedAtIso = &updatedAt
+		if reloaded || webOverridden {
+			m.status.ReloadCount++
+		}
+		if fullRestart {
+			m.status.RestartScheduled = true
+			m.status.State = StateRestarting
+			m.status.LastError = nil
+		} else if edgeStaged {
+			pending := restart
+			m.pendingRestart = &pending
+		}
+		m.activeBundleDir = req.BundleRoot
+		m.activeTag = req.Tag
+		m.appendHistoryLocked(buildHistoryEntry(req))
+		_ = m.savePersistedHistoryLocked()
 	}
 
-	updatedAt := isoNow()
+	if fullRestart {
+		// The restarted edge starts every plane (and the web UI) from active.json.
+		if err := saveActiveRelease(m.cfg.HotUpdateDir, active); err != nil {
+			return false, fmt.Errorf("persist active release: %w", err)
+		}
+		record(true)
+		m.triggerEdgeRestart(restart)
+		return true, nil
+	}
+
+	// No full restart: the web UI and guestd switch live, changed planes restart below, and
+	// active.json / history are written only once the new planes are actually running.
+	if webOverridden && m.onWebUIDir != nil {
+		m.onWebUIDir(webDir)
+	}
+	if guestdUpdated && m.onGuestdBin != nil {
+		m.onGuestdBin(guestdBin)
+		prevSnap.GuestdSwitched = true
+	}
+	planesChanged := false
+	if m.sup != nil {
+		if coreChanged && m.sup.UpdateChildBinary("core", coreBin) == nil {
+			planesChanged = true
+		}
+		if bffChanged && m.sup.UpdateChildBinary("bff", bffBin) == nil {
+			planesChanged = true
+		}
+	}
+	finish := func() error {
+		if err := saveActiveRelease(m.cfg.HotUpdateDir, active); err != nil {
+			return fmt.Errorf("persist active release: %w", err)
+		}
+		record(planesChanged)
+		m.notifyBuildInfo(req.NewVersion, req.NewCommit)
+		return nil
+	}
+	if !planesChanged {
+		if err := finish(); err != nil {
+			m.restorePlaneSnapshot(prevSnap)
+			return false, err
+		}
+		return true, nil
+	}
+	if err := m.reloadPlanes(ctx, req.AsyncRestart, req.BundleRoot, prevSnap, finish, func(err error) {
+		m.recordFailedApply(req, err)
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// planeSnapshotLocked captures what restorePlaneSnapshot puts back if a plane reload fails.
+func (m *Manager) planeSnapshotLocked() rollbackPlaneSnapshot {
+	snap := rollbackPlaneSnapshot{
+		PrevWebUIDir:  m.currentWebUIDirLocked(),
+		PrevGuestdBin: m.guestdBin,
+	}
+	if m.sup != nil {
+		snap.PrevCoreBin, snap.HasCore = m.sup.ChildBinary("core")
+		snap.PrevBFFBin, snap.HasBFF = m.sup.ChildBinary("bff")
+	}
+	return snap
+}
+
+// reloadPlanes restarts the supervised planes (already pointed at their new binaries) and runs
+// finish once they are up, so active.json and the history only ever record a release whose
+// planes actually started; on failure the previous binaries are restored and restarted. With
+// async the restart begins after a short delay, because the request that asked for it travels
+// through slipgate-bff, which is about to be restarted: failures are then reported through fail.
+func (m *Manager) reloadPlanes(
+	ctx context.Context,
+	async bool,
+	bundleDir string,
+	prev rollbackPlaneSnapshot,
+	finish func() error,
+	fail func(error),
+) error {
+	run := func(runCtx context.Context) error {
+		err := m.sup.RestartAll(runCtx, 5*time.Second)
+		if err == nil {
+			if m.onPlanesRestarted != nil {
+				m.onPlanesRestarted(runCtx)
+			}
+			if err = finish(); err == nil {
+				return nil
+			}
+		}
+		m.restorePlaneSnapshot(prev)
+		if rbErr := m.sup.RestartAll(context.Background(), 5*time.Second); rbErr != nil {
+			m.logger.Printf("[hotupdate] restarting the previous planes failed: %v", rbErr)
+		} else if m.onPlanesRestarted != nil {
+			m.onPlanesRestarted(context.Background())
+		}
+		return fmt.Errorf("restart supervised planes (rolled back to the previous binaries): %w", err)
+	}
+	if !async {
+		m.setState(StateReloadingPlanes, nil)
+		return run(ctx)
+	}
+
 	m.mu.Lock()
-	m.status.ActiveCommit = req.NewCommit
-	if req.NewVersion != "" {
-		m.status.Version = req.NewVersion
-	}
-	rc := req.NewCommit
-	m.status.RemoteCommit = &rc
-	m.status.UpdateAvailable = false
-	if webOverridden {
-		m.activeWebUIDir = webDir
-		m.status.WebUIOverridden = true
-	} else if req.Action == "rollback" && req.BundleRoot == "" {
-		m.activeWebUIDir = ""
-		m.status.WebUIOverridden = false
-	}
-	m.status.EdgeBinaryStaged = edgeStaged
-	m.status.EdgeBinaryPath = edgeStagedPtr
-	if guestdUpdated {
-		m.guestdBin = stagedGuestdPath
-		m.status.GuestdUpdated = true
-	}
-	m.status.LastUpdatedAtIso = &updatedAt
-	if reloaded || webOverridden {
-		m.status.ReloadCount++
-	}
-	if fullRestart {
-		m.status.RestartScheduled = true
-		m.status.State = StateRestarting
-		m.status.LastError = nil
-	} else if edgeStaged {
-		pending := restart
-		m.pendingRestart = &pending
-	}
-	m.activeBundleDir = req.BundleRoot
-	m.activeTag = req.Tag
+	m.pendingPlaneBundle = bundleDir
+	m.status.State = StateReloadingPlanes
+	m.status.LastError = nil
+	m.mu.Unlock()
+	time.AfterFunc(150*time.Millisecond, func() {
+		// No other update may start while the planes are being swapped.
+		m.syncMu.Lock()
+		defer m.syncMu.Unlock()
+		err := run(context.Background())
+		m.mu.Lock()
+		m.pendingPlaneBundle = ""
+		switch {
+		case err != nil:
+			msg := err.Error()
+			m.status.State = StateError
+			m.status.LastError = &msg
+		case m.status.RestartScheduled:
+			m.status.State = StateRestarting
+		default:
+			m.status.State = StateIdle
+		}
+		m.mu.Unlock()
+		if err != nil {
+			m.logger.Printf("[hotupdate] %v", err)
+			if fail != nil {
+				fail(err)
+			}
+		}
+	})
+	return nil
+}
 
+// recordFailedApply adds a failed history entry for an update or rollback whose planes never
+// came up (the active release is unchanged).
+func (m *Manager) recordFailedApply(req applyBundleRequest, err error) {
 	entry := buildHistoryEntry(req)
+	entry.Succeeded = false
+	msg := err.Error()
+	entry.Error = &msg
+	m.mu.Lock()
 	m.appendHistoryLocked(entry)
 	_ = m.savePersistedHistoryLocked()
 	m.mu.Unlock()
+}
 
-	if fullRestart {
-		m.triggerEdgeRestart(restart)
+// notifyBuildInfo reports the release now in effect without an edge restart (health endpoints).
+func (m *Manager) notifyBuildInfo(version, commit string) {
+	if m.onBuildInfo != nil {
+		m.onBuildInfo(version, commit)
 	}
+}
 
-	return true, nil
+// finishOperationState sets the state once an update, rollback or restart request returns.
+func (m *Manager) finishOperationState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch {
+	case m.status.RestartScheduled:
+		m.status.State = StateRestarting
+	case m.pendingPlaneBundle != "":
+		m.status.State = StateReloadingPlanes
+	default:
+		m.status.State = StateIdle
+	}
+	m.status.LastError = nil
 }
 
 func (m *Manager) restorePlaneSnapshot(snap rollbackPlaneSnapshot) {
 	if m.onWebUIDir != nil {
 		m.onWebUIDir(snap.PrevWebUIDir)
+	}
+	if snap.GuestdSwitched && m.onGuestdBin != nil {
+		m.onGuestdBin(snap.PrevGuestdBin)
 	}
 	if m.sup != nil {
 		if snap.HasCore {
@@ -656,11 +760,7 @@ func (m *Manager) Rollback(ctx context.Context, releaseID string, asyncRestart b
 		return m.Status(), applyErr
 	}
 
-	if m.isRestartScheduled() {
-		m.setState(StateRestarting, nil)
-	} else {
-		m.setState(StateIdle, nil)
-	}
+	m.finishOperationState()
 	return m.Status(), nil
 }
 
@@ -678,6 +778,7 @@ func (m *Manager) restoreBaseline(
 	autoRestartEnabled := m.status.AutoRestartAfterUpdate
 	plan := m.rollbackPlanLocked(prevActive)
 	installExe := m.installExeLocked(prevActive)
+	prevSnap := m.planeSnapshotLocked()
 	m.mu.RUnlock()
 
 	// Prefer the installed binary itself (its siblings are the baseline planes); fall back to the
@@ -709,17 +810,6 @@ func (m *Manager) restoreBaseline(
 		break
 	}
 
-	if err := ClearActiveRelease(m.cfg.HotUpdateDir); err != nil {
-		return fmt.Errorf("clear active release during baseline rollback: %w", err)
-	}
-
-	if m.onWebUIDir != nil {
-		m.onWebUIDir(base.WebUIDir)
-	}
-	if base.GuestdBin != "" && m.onGuestdBin != nil {
-		m.onGuestdBin(base.GuestdBin)
-	}
-
 	fullRestart := m.onEdgeRestart != nil && autoRestartEnabled && restartTarget != ""
 	restart := restartRequest{
 		Target:      restartTarget,
@@ -731,72 +821,7 @@ func (m *Manager) restoreBaseline(
 		ToCommit:    base.Commit,
 		Rollback:    plan,
 	}
-	reloaded := false
-	if fullRestart {
-		reloaded = true
-	} else if m.sup != nil {
-		updated := false
-		if base.CoreBin != "" {
-			if err := m.sup.UpdateChildBinary("core", base.CoreBin); err == nil {
-				updated = true
-			}
-		}
-		if base.BFFBin != "" {
-			if err := m.sup.UpdateChildBinary("bff", base.BFFBin); err == nil {
-				updated = true
-			}
-		}
-		if updated {
-			m.setState(StateReloadingPlanes, nil)
-			reloaded = true
-			if asyncRestart {
-				time.AfterFunc(150*time.Millisecond, func() {
-					bgCtx := context.Background()
-					if err := m.sup.RestartAll(bgCtx, 5*time.Second); err != nil {
-						m.logger.Printf("[hotupdate] baseline rollback async restart error: %v", err)
-						return
-					}
-					if m.onPlanesRestarted != nil {
-						m.onPlanesRestarted(bgCtx)
-					}
-				})
-			} else {
-				if err := m.sup.RestartAll(ctx, 5*time.Second); err != nil {
-					return fmt.Errorf("restart supervised planes during baseline rollback: %w", err)
-				}
-				if m.onPlanesRestarted != nil {
-					m.onPlanesRestarted(ctx)
-				}
-			}
-		}
-	}
-
-	updatedAt := isoNow()
-	m.mu.Lock()
-	m.status.Version = base.Version
-	m.status.ActiveCommit = base.Commit
-	m.status.WebUIOverridden = base.WebUIDir != ""
-	m.status.EdgeBinaryStaged = edgeStaged
-	m.status.EdgeBinaryPath = edgeStagedPtr
-	m.status.GuestdUpdated = false
-	m.status.UpdateAvailable = false
-	m.status.LastUpdatedAtIso = &updatedAt
-	m.activeWebUIDir = base.WebUIDir
-	m.guestdBin = base.GuestdBin
-	m.activeBundleDir = ""
-	m.activeTag = base.Tag
-	if reloaded {
-		m.status.ReloadCount++
-	}
-	if fullRestart {
-		m.status.RestartScheduled = true
-		m.status.State = StateRestarting
-		m.status.LastError = nil
-	} else if edgeStaged {
-		pending := restart
-		m.pendingRestart = &pending
-	}
-	m.appendHistoryLocked(buildHistoryEntry(applyBundleRequest{
+	historyReq := applyBundleRequest{
 		NewCommit:   base.Commit,
 		NewVersion:  base.Version,
 		Tag:         base.Tag,
@@ -805,14 +830,101 @@ func (m *Manager) restoreBaseline(
 		Action:      "rollback",
 		FromVersion: fromVersion,
 		FromCommit:  fromCommit,
-	}))
-	_ = m.savePersistedHistoryLocked()
-	m.mu.Unlock()
+	}
+	record := func(reloaded bool) {
+		updatedAt := isoNow()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.status.Version = base.Version
+		m.status.ActiveCommit = base.Commit
+		m.status.WebUIOverridden = base.WebUIDir != ""
+		m.status.EdgeBinaryStaged = edgeStaged
+		m.status.EdgeBinaryPath = edgeStagedPtr
+		m.status.GuestdUpdated = false
+		m.status.UpdateAvailable = false
+		m.status.LastUpdatedAtIso = &updatedAt
+		m.activeWebUIDir = base.WebUIDir
+		m.guestdBin = base.GuestdBin
+		m.activeBundleDir = ""
+		m.activeTag = base.Tag
+		if reloaded {
+			m.status.ReloadCount++
+		}
+		if fullRestart {
+			m.status.RestartScheduled = true
+			m.status.State = StateRestarting
+			m.status.LastError = nil
+		} else if edgeStaged {
+			pending := restart
+			m.pendingRestart = &pending
+		}
+		m.appendHistoryLocked(buildHistoryEntry(historyReq))
+		_ = m.savePersistedHistoryLocked()
+	}
 
 	if fullRestart {
+		if err := ClearActiveRelease(m.cfg.HotUpdateDir); err != nil {
+			return fmt.Errorf("clear active release during baseline rollback: %w", err)
+		}
+		record(true)
 		m.triggerEdgeRestart(restart)
+		return nil
 	}
-	return nil
+
+	if m.onWebUIDir != nil {
+		m.onWebUIDir(base.WebUIDir)
+	}
+	if base.GuestdBin != "" && m.onGuestdBin != nil {
+		m.onGuestdBin(base.GuestdBin)
+		prevSnap.GuestdSwitched = true
+	}
+	planesChanged := false
+	if m.sup != nil {
+		if base.CoreBin != "" && m.sup.UpdateChildBinary("core", base.CoreBin) == nil {
+			planesChanged = true
+		}
+		if base.BFFBin != "" && m.sup.UpdateChildBinary("bff", base.BFFBin) == nil {
+			planesChanged = true
+		}
+	}
+	finish := func() error {
+		if err := ClearActiveRelease(m.cfg.HotUpdateDir); err != nil {
+			return fmt.Errorf("clear active release during baseline rollback: %w", err)
+		}
+		record(planesChanged)
+		m.notifyBuildInfo(base.Version, base.Commit)
+		return nil
+	}
+	if !planesChanged {
+		if err := finish(); err != nil {
+			m.restorePlaneSnapshot(prevSnap)
+			return err
+		}
+		return nil
+	}
+	return m.reloadPlanes(ctx, asyncRestart, "baseline", prevSnap, finish, func(err error) {
+		m.recordFailedApply(historyReq, err)
+	})
+}
+
+// ResetBaseline forgets the captured baseline (history.json "baseline" and the backup edge in
+// <HotUpdateDir>/baseline). It runs after an external upgrade: the baseline's plane paths now
+// hold the new install's binaries, so restoring it would mix versions.
+func ResetBaseline(hotUpdateDir string) error {
+	if strings.TrimSpace(hotUpdateDir) == "" {
+		return nil
+	}
+	histPath := filepath.Join(hotUpdateDir, "history.json")
+	if raw, err := os.ReadFile(histPath); err == nil {
+		var ph persistedHistory
+		if json.Unmarshal(raw, &ph) == nil && ph.Baseline != nil {
+			ph.Baseline = nil
+			if err := writeJSONAtomic(histPath, ph); err != nil {
+				return err
+			}
+		}
+	}
+	return os.RemoveAll(filepath.Join(hotUpdateDir, "baseline"))
 }
 
 // TriggerRestart validates any staged edge binary (or the current executable) and schedules a
@@ -1161,7 +1273,7 @@ func (m *Manager) buildComponentsLocked() []ComponentStatus {
 	return components
 }
 
-func (m *Manager) pruneReleasesKeepingHistory(releasesRoot string, maxKeep int) {
+func (m *Manager) pruneReleasesKeepingHistory(releasesRoot string, maxKeep int, protect ...string) {
 	entries, err := os.ReadDir(releasesRoot)
 	if err != nil {
 		return
@@ -1169,9 +1281,12 @@ func (m *Manager) pruneReleasesKeepingHistory(releasesRoot string, maxKeep int) 
 
 	m.mu.RLock()
 	keepSet := make(map[string]struct{})
-	if m.activeBundleDir != "" {
-		keepSet[filepath.Clean(m.activeBundleDir)] = struct{}{}
-		keepSet[filepath.Clean(filepath.Dir(m.activeBundleDir))] = struct{}{}
+	for _, dir := range append([]string{m.activeBundleDir, m.pendingPlaneBundle}, protect...) {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		keepSet[filepath.Clean(dir)] = struct{}{}
+		keepSet[filepath.Clean(filepath.Dir(dir))] = struct{}{}
 	}
 	keptFromHistory := 0
 	for _, entry := range m.history {

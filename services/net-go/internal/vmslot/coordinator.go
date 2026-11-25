@@ -182,7 +182,59 @@ func (c *Coordinator) Bootstrap(ctx context.Context) error {
 	for _, s := range slots {
 		c.mgr.UpsertRestoredSlot(s)
 	}
+	c.restartLocalDaemons(ctx, localNode)
 	return nil
+}
+
+// restartLocalDaemons starts slipgate-guestd again for local slots that were serving before
+// this process started: the previous edge stopped their daemons on exit (Shutdown), and a
+// restored slot otherwise silently falls back to the sandbox endpoint. A slot whose daemon does
+// not come back is marked stopped (fail-closed) instead of serving without its guest; one bad
+// slot never blocks startup.
+func (c *Coordinator) restartLocalDaemons(ctx context.Context, localNode ClusterNode) {
+	if !c.localDrv.GuestdAvailable() {
+		return
+	}
+	var wg sync.WaitGroup
+	for _, s := range c.mgr.Snapshot() {
+		if s.ClusterNodeID != LocalNodeID || !slotRunsDaemon(s.State) {
+			continue
+		}
+		wg.Add(1)
+		go func(slot Slot) {
+			defer wg.Done()
+			started, err := c.localDrv.StartSlot(ctx, localNode, slot)
+			if err == nil {
+				started, err = c.mgr.UpdateGuestRuntime(slot.ID, started.RootDir, started.GuestUDSPath, started.DaemonVersion, started.GuestPID, started.LastHeartbeat)
+			}
+			if err != nil {
+				c.logger.Printf("[vmslot] slot %s: slipgate-guestd did not restart (%v); marking it stopped", slot.ID, err)
+				started, err = c.mgr.SetState(slot.ID, StateStopped)
+				if err != nil {
+					return
+				}
+			}
+			if upsertErr := c.store.UpsertSlot(ctx, started); upsertErr != nil {
+				c.logger.Printf("[vmslot] slot %s: persist restored daemon state: %v", slot.ID, upsertErr)
+			}
+		}(s)
+	}
+	wg.Wait()
+}
+
+// slotRunsDaemon reports whether a slot in this state had a live guest daemon (it was started
+// and not stopped, migrated away or still being provisioned).
+func slotRunsDaemon(state SlotState) bool {
+	switch state {
+	case StateReady, StateCooldown5h, StateCooldown7d, StateAuthExpired:
+		return true
+	}
+	return false
+}
+
+// SetGuestdBin switches the slipgate-guestd binary for local slots started from now on.
+func (c *Coordinator) SetGuestdBin(bin string) {
+	c.localDrv.SetGuestdBin(bin)
 }
 
 // Shutdown stops locally spawned slipgate-guestd processes cleanly.
@@ -218,7 +270,7 @@ func (c *Coordinator) Overview(ctx context.Context) (Overview, error) {
 		},
 		Runtime: OverviewRuntime{
 			VMDataDir:       c.localDrv.vmDataDir,
-			GuestdBin:       c.localDrv.guestdBin,
+			GuestdBin:       c.localDrv.GuestdBin(),
 			GuestdAvailable: c.localDrv.GuestdAvailable(),
 			LocalNodeID:     LocalNodeID,
 		},

@@ -132,9 +132,26 @@ fi
 tar -xzf "${TMP_DIR}/${ARCHIVE_NAME}" -C "$TMP_DIR"
 BUNDLE_DIR="${TMP_DIR}/slipgate-${ASSET_PREFIX}-linux-${ARCH}${MUSL_SUFFIX}"
 
-mkdir -p "$PREFIX" /etc/slipgate /var/lib/slipgate/hotupdate /var/run/slipgate
-cp -R "${BUNDLE_DIR}/." "${PREFIX}/"
-chmod 0755 "${PREFIX}/slipgate" "${PREFIX}/slipgate-core" "${PREFIX}/slipgate-guestd" "${PREFIX}/slipgate-bff"
+mkdir -p "$PREFIX" /etc/slipgate /var/lib/slipgate/hotupdate /var/lib/slipgate/vms /var/run/slipgate
+# The binaries may be running (re-running this script upgrades in place). Writing over a running
+# executable fails with "Text file busy", so each one is installed under a temporary name and
+# renamed over the old path: the running process keeps its old inode until it restarts.
+BINARIES=(slipgate slipgate-core slipgate-guestd slipgate-bff)
+for bin in "${BINARIES[@]}"; do
+  if [[ -f "${BUNDLE_DIR}/${bin}" ]]; then
+    install -m 0755 "${BUNDLE_DIR}/${bin}" "${PREFIX}/.${bin}.new"
+    mv -f "${PREFIX}/.${bin}.new" "${PREFIX}/${bin}"
+  fi
+done
+# Everything else (web UI, deploy files, migrations) is plain data.
+(
+  cd "$BUNDLE_DIR"
+  for entry in * .[!.]*; do
+    [[ -e "$entry" ]] || continue
+    case " ${BINARIES[*]} " in *" ${entry} "*) continue ;; esac
+    cp -R "$entry" "${PREFIX}/"
+  done
+)
 ln -sf "${PREFIX}/slipgate" /usr/local/bin/slipgate
 
 # Ensure PostgreSQL client tools (pg_dump / pg_restore / psql) are installed for DB backups & restores.
@@ -222,16 +239,29 @@ Environment=SLIPGATE_HOTUPDATE_DIR=/var/lib/slipgate/hotupdate
 # Undelivered settlements are money owed: keep them under StateDirectory, which (unlike the
 # RuntimeDirectory above) survives a service restart and a reboot.
 Environment=SLIPGATE_SETTLEMENT_SPOOL_DIR=/var/lib/slipgate/settlement-spool
+# VM slot directories hold each slot's immutable machine-id: keep them across restarts too.
+Environment=SLIPGATE_VM_DATA_DIR=/var/lib/slipgate/vms
 ExecStart=${PREFIX}/slipgate
 Restart=always
 RestartSec=3
+# Stop signals go to the edge alone: it drains in-flight requests, flushes settlements and then
+# stops core and the BFF itself (they must stay up meanwhile). Leftovers are killed after the
+# timeout, which leaves room for the default 30 s drain window.
+KillMode=mixed
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable slipgate.service
-  echo "==> Installed systemd unit slipgate.service. Start with: systemctl start slipgate"
+  if systemctl is-active --quiet slipgate.service; then
+    # An upgrade: the running service still executes the previous binaries until it restarts.
+    systemctl restart slipgate.service
+    echo "==> Installed systemd unit slipgate.service and restarted the running service on the new version"
+  else
+    echo "==> Installed systemd unit slipgate.service. Start with: systemctl start slipgate"
+  fi
 else
   echo "==> Installed Slipgate into ${PREFIX}. Run with: ${PREFIX}/slipgate"
 fi

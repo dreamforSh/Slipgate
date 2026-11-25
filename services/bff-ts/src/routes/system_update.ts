@@ -33,9 +33,10 @@ interface StandalonePolicy {
 }
 
 /**
- * Whether update actions (apply, rollback, restart) need the administrator to re-confirm with a
- * password or passkey. Dev-mode deployments (SLIPGATE_MODE=dev) are developer sandboxes that
- * auto-apply their own channel, so they skip it; release deployments always ask.
+ * Whether update actions (apply, rollback, restart) and update-policy changes need the
+ * administrator to re-confirm with a password or passkey (static admin API keys are refused).
+ * Dev-mode deployments (SLIPGATE_MODE=dev) are developer sandboxes that auto-apply their own
+ * channel, so they skip it; release deployments always ask.
  */
 export function updateStepUpRequired(mode: SystemUpdateMode): boolean {
   return mode !== "dev";
@@ -272,8 +273,13 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
       return c.json({ error: "invalid_request", issues: parsed.error.issues }, 400);
     }
 
+    // The policy decides what code this deployment runs (channel, strategy, automatic restarts),
+    // so it is confirmed like the update actions themselves; confirm is never forwarded.
+    const { confirm, ...policy } = parsed.data;
     const sup = supervisorCredentials();
     if (!sup) {
+      const denied = await confirmIfRequired(c, currentStandaloneStatus().mode, confirm);
+      if (denied) return denied;
       if (parsed.data.channel !== undefined) standalonePolicy.channel = parsed.data.channel;
       if (parsed.data.autoSyncEnabled !== undefined) standalonePolicy.autoSyncEnabled = parsed.data.autoSyncEnabled;
       if (parsed.data.intervalSeconds !== undefined) standalonePolicy.intervalSeconds = parsed.data.intervalSeconds;
@@ -288,7 +294,12 @@ export function registerSystemUpdateRoutes(app: Hono<AuthEnv>, deps: SystemUpdat
     }
 
     try {
-      return await forwardMutation(c, sup, "/internal/supervisor/update/config", "PUT", parsed.data, 10_000);
+      const current = await fetchSupervisorStatus(c, sup);
+      if (!current.ok) return current.response;
+      const denied = await confirmIfRequired(c, current.status.mode, confirm);
+      if (denied) return denied;
+
+      return await forwardMutation(c, sup, "/internal/supervisor/update/config", "PUT", policy, 10_000);
     } catch (err) {
       return unreachableResponse(c, err);
     }

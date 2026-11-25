@@ -23,13 +23,16 @@ type ActiveRelease struct {
 	BaseCommit  string `json:"baseCommit,omitempty"`
 	// InstallExe is the externally installed edge binary (what a cold boot runs before handing off).
 	InstallExe string `json:"installExe,omitempty"`
-	BundleDir  string `json:"bundleDir,omitempty"`
-	EdgeBin    string `json:"edgeBin,omitempty"`
-	CoreBin    string `json:"coreBin,omitempty"`
-	BFFBin     string `json:"bffBin,omitempty"`
-	GuestdBin  string `json:"guestdBin,omitempty"`
-	WebUIDir   string `json:"webUiDir,omitempty"`
-	UpdatedAt  string `json:"updatedAt"`
+	// InstallFingerprint is InstallExe's size and modification time when it was known to be the
+	// running binary; a different file there at boot means the install was upgraded externally.
+	InstallFingerprint string `json:"installFingerprint,omitempty"`
+	BundleDir          string `json:"bundleDir,omitempty"`
+	EdgeBin            string `json:"edgeBin,omitempty"`
+	CoreBin            string `json:"coreBin,omitempty"`
+	BFFBin             string `json:"bffBin,omitempty"`
+	GuestdBin          string `json:"guestdBin,omitempty"`
+	WebUIDir           string `json:"webUiDir,omitempty"`
+	UpdatedAt          string `json:"updatedAt"`
 }
 
 func activeReleasePath(hotUpdateDir string) string {

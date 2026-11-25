@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import type { AdminStepUp } from "@slipgate/contracts";
 import { useI18n } from "vue-i18n";
+import { isPasskeyCancellation, usePasskeyStepUp } from "../../../composables/usePasskeyStepUp";
 import { errorText } from "../../../lib/api";
 import UiAlert from "../../ui/UiAlert.vue";
 import UiIcon, { type IconName } from "../../ui/UiIcon.vue";
@@ -20,10 +21,11 @@ export interface UpdateActionSummary {
 }
 
 /**
- * Confirms an update-center action (apply, install, rollback, restart) with a summary of its
- * effects. Release deployments also ask for the password (plus the authenticator code when
- * two-factor sign-in is on); dev deployments confirm with one click. `submit` resolves once the
- * request is accepted; a refusal of the password or code stays on that field.
+ * Confirms an update-center action (apply, install, rollback, restart, policy change) with a
+ * summary of its effects. Release deployments also ask for the password (plus the authenticator
+ * code when two-factor sign-in is on) or one of the admin's passkeys; dev deployments confirm with
+ * one click. `submit` resolves once the request is accepted; a refusal of the password or code
+ * stays on that field.
  */
 const props = defineProps<{
   title: string;
@@ -36,23 +38,43 @@ const open = defineModel<boolean>("open", { required: true });
 
 const { t } = useI18n();
 const stepUp = useBackupStepUp();
+const passkey = usePasskeyStepUp();
 const busy = ref(false);
+/** The pending confirmation came from the passkey button (it shows the spinner then). */
+const viaPasskey = ref(false);
 const fields = ref<InstanceType<typeof BackupStepUpFields> | null>(null);
 
 watch(open, (isOpen) => {
   busy.value = false;
-  if (isOpen && props.requireStepUp) stepUp.reset();
-  else stepUp.dispose();
+  viaPasskey.value = false;
+  if (isOpen && props.requireStepUp) {
+    stepUp.reset();
+    void passkey.refresh();
+  } else {
+    stepUp.dispose();
+    passkey.dispose();
+  }
 });
 
 const canSubmit = computed(() => !busy.value && (!props.requireStepUp || stepUp.ready.value));
+const showPasskey = computed(() => props.requireStepUp && passkey.available.value);
 
-async function confirm() {
-  if (!canSubmit.value) return;
+/** Obtains the confirmation (password fields or passkey), then submits it. */
+async function run(obtain: () => Promise<AdminStepUp | undefined>, withPasskey: boolean) {
   busy.value = true;
+  viaPasskey.value = withPasskey;
   stepUp.clearErrors();
   try {
-    await props.submit(props.requireStepUp ? stepUp.payload() : undefined);
+    let confirmation: AdminStepUp | undefined;
+    try {
+      confirmation = await obtain();
+    } catch (err) {
+      stepUp.formError.value = isPasskeyCancellation(err)
+        ? t("updates.confirm.passkeyCancelled")
+        : errorText(err, t("updates.confirm.passkeyFailed"));
+      return;
+    }
+    await props.submit(confirmation);
     open.value = false;
   } catch (err) {
     if (!props.requireStepUp || !stepUp.absorb(err)) {
@@ -64,7 +86,18 @@ async function confirm() {
     }
   } finally {
     busy.value = false;
+    viaPasskey.value = false;
   }
+}
+
+function confirm() {
+  if (!canSubmit.value) return;
+  void run(async () => (props.requireStepUp ? stepUp.payload() : undefined), false);
+}
+
+function confirmWithPasskey() {
+  if (busy.value) return;
+  void run(async () => ({ passkeyStepUpToken: await passkey.confirm() }), true);
 }
 </script>
 
@@ -115,6 +148,17 @@ async function confirm() {
           :code-error="stepUp.codeError.value"
           @complete="confirm"
         />
+        <template v-if="showPasskey">
+          <div class="flex items-center gap-3" aria-hidden="true">
+            <span class="h-px flex-1 bg-line" />
+            <span class="text-2xs text-fg-subtle">{{ t("updates.confirm.passkeyOr") }}</span>
+            <span class="h-px flex-1 bg-line" />
+          </div>
+          <button type="button" class="btn btn-secondary w-full" :disabled="busy" @click="confirmWithPasskey">
+            <UiIcon :name="viaPasskey ? 'loader' : 'fingerprint'" :size="15" :spin="viaPasskey" />
+            {{ viaPasskey ? t("updates.confirm.passkeyWorking") : t("updates.confirm.passkeyButton") }}
+          </button>
+        </template>
       </template>
       <p v-else class="flex items-center gap-1.5 text-2xs text-fg-subtle">
         <UiIcon name="unlock" :size="12" />
@@ -134,8 +178,12 @@ async function confirm() {
         :disabled="!canSubmit"
         :autofocus="!requireStepUp || undefined"
       >
-        <UiIcon :name="busy ? 'loader' : requireStepUp ? 'shield' : (summary?.icon ?? 'check')" :size="15" :spin="busy" />
-        {{ busy ? t("updates.confirm.working") : confirmLabel }}
+        <UiIcon
+          :name="busy && !viaPasskey ? 'loader' : requireStepUp ? 'shield' : (summary?.icon ?? 'check')"
+          :size="15"
+          :spin="busy && !viaPasskey"
+        />
+        {{ busy && !viaPasskey ? t("updates.confirm.working") : confirmLabel }}
       </button>
     </template>
   </UiModal>
