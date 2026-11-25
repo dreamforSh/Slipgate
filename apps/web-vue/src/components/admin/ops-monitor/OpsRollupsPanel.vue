@@ -177,9 +177,10 @@ async function runCleanup(dryRun: boolean) {
   runningCleanup.value = true;
   try {
     const body: Record<string, unknown> = { dryRun };
-    const override = Number.parseInt(cleanupOverrideDays.value.trim(), 10);
-    if (Number.isFinite(override) && override >= 7 && override <= 3650) {
-      body.retentionDays = override;
+    // Not named `override`: that contextual keyword trips JetBrains' parser on `override <= …`.
+    const overrideDays = Number.parseInt(cleanupOverrideDays.value.trim(), 10);
+    if (Number.isFinite(overrideDays) && overrideDays >= 7 && overrideDays <= 3650) {
+      body.retentionDays = overrideDays;
     }
     const res = await apiJson<UsageRollupCleanupResponse>("/api/v1/admin/usage-rollups/cleanup", {
       method: "POST",
