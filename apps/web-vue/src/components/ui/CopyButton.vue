@@ -39,7 +39,11 @@ onBeforeUnmount(() => window.clearTimeout(timer));
     :aria-label="copied ? t('common.copied') : t('common.copy')"
     @click="copy"
   >
-    <UiIcon :name="copied ? 'check' : 'copy'" :size="13" />
-    <span v-if="label">{{ copied ? t("common.copied") : label }}</span>
+    <Transition name="swap" mode="out-in">
+      <UiIcon :key="copied ? 'done' : 'copy'" :name="copied ? 'check' : 'copy'" :size="13" :stroke-width="copied ? 2.4 : 1.85" />
+    </Transition>
+    <Transition v-if="label" name="text-swap" mode="out-in">
+      <span :key="copied ? 'done' : 'copy'">{{ copied ? t("common.copied") : label }}</span>
+    </Transition>
   </button>
 </template>

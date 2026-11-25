@@ -22,8 +22,8 @@ const features = computed<{ icon: IconName; label: string }[]>(() => [
     <!-- Backdrop: soft wash, glow orbs and a faded grid -->
     <div class="backdrop absolute inset-0" aria-hidden="true" />
     <div class="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">
-      <div class="orb absolute -right-40 -top-40 h-96 w-96 rounded-full blur-3xl" />
-      <div class="orb orb-soft absolute -bottom-48 -left-40 h-96 w-96 rounded-full blur-3xl" />
+      <div class="orb absolute -right-40 -top-40 h-96 w-96 rounded-full blur-3xl motion-safe:animate-drift" />
+      <div class="orb orb-soft absolute -bottom-48 -left-40 h-96 w-96 rounded-full blur-3xl motion-safe:animate-drift [animation-delay:-11s] [animation-direction:reverse]" />
       <div class="bg-grid absolute inset-0 [mask-image:radial-gradient(ellipse_at_center,black_30%,transparent_75%)]" />
     </div>
 
@@ -35,19 +35,20 @@ const features = computed<{ icon: IconName; label: string }[]>(() => [
     <main class="relative z-10 flex flex-1 items-center justify-center px-4 pb-16">
       <div class="w-full max-w-md">
         <div class="mb-8 flex flex-col items-center text-center">
-          <BrandMark :size="56" glow class="mb-4" />
-          <p class="text-gradient text-3xl font-bold tracking-tight">{{ siteName || "Slipgate" }}</p>
+          <BrandMark :size="56" glow draw class="mb-4 animate-pop-in" />
+          <p class="text-gradient animate-fade-up text-3xl font-bold tracking-tight [animation-delay:80ms]">{{ siteName || "Slipgate" }}</p>
         </div>
 
-        <div class="card glass animate-slide-up p-6 shadow-card-hover sm:p-8">
+        <div class="card glass animate-fade-up p-6 shadow-card-hover [animation-delay:140ms] sm:p-8">
           <slot />
         </div>
 
         <ul class="mt-6 flex flex-wrap items-center justify-center gap-2">
           <li
-            v-for="f in features"
+            v-for="(f, i) in features"
             :key="f.icon"
-            class="inline-flex items-center gap-1.5 rounded-full bg-surface/70 px-3 py-1 text-xs text-fg-muted ring-1 ring-inset ring-line backdrop-blur"
+            class="inline-flex animate-fade-up items-center gap-1.5 rounded-full bg-surface/70 px-3 py-1 text-xs text-fg-muted ring-1 ring-inset ring-line backdrop-blur transition-colors duration-200 hover:text-fg hover:ring-accent/30"
+            :style="{ animationDelay: `${260 + i * 70}ms` }"
           >
             <UiIcon :name="f.icon" :size="13" class="text-accent" />
             {{ f.label }}

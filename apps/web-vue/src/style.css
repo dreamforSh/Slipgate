@@ -37,6 +37,20 @@
     /* Chart series (dataviz reference palette, validated on these surfaces) */
     --viz-1: 42 120 214;
     --viz-2: 235 104 52;
+    /* Skeleton shimmer highlight */
+    --shimmer: 255 255 255;
+    --shimmer-alpha: 0.65;
+
+    /* Motion: one vocabulary for every transition in the app. */
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+    --ease-in: cubic-bezier(0.4, 0, 1, 1);
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --ease-spring-soft: cubic-bezier(0.34, 1.3, 0.64, 1);
+    --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+    --dur-fast: 120ms;
+    --dur-base: 200ms;
+    --dur-slow: 360ms;
   }
 
   .dark {
@@ -63,6 +77,7 @@
     --shadow: 0 0 0;
     --viz-1: 57 135 229;
     --viz-2: 217 89 38;
+    --shimmer-alpha: 0.05;
   }
 
   html {
@@ -130,7 +145,10 @@
     *::before,
     *::after {
       animation-duration: 0.01ms !important;
+      animation-delay: 0ms !important;
       transition-duration: 0.01ms !important;
+      transition-delay: 0ms !important;
+      scroll-behavior: auto !important;
     }
   }
 }
@@ -144,7 +162,7 @@
     @apply rounded-xl border border-line/80 bg-surface shadow-card transition-[border-color,box-shadow,transform] duration-200 ease-out dark:bg-surface/70;
   }
   .card-hover {
-    @apply hover:-translate-y-0.5 hover:border-line-strong/80 hover:shadow-card-hover;
+    @apply duration-300 ease-out hover:-translate-y-0.5 hover:border-line-strong/80 hover:shadow-card-hover active:translate-y-0 active:duration-100;
   }
   .glass {
     @apply bg-surface/80 backdrop-blur-xl backdrop-saturate-150;
@@ -195,20 +213,22 @@
   .btn-icon.btn-xs {
     @apply w-7 px-0;
   }
+  /* Solid fills carry a faint top highlight and pick up a soft glow on hover. */
   .btn-primary {
-    @apply bg-accent-solid text-accent-fg shadow-sm hover:bg-accent-hover;
+    @apply bg-accent-solid text-accent-fg shadow-[inset_0_1px_0_0_rgb(255_255_255/0.12),0_1px_2px_0_rgb(var(--shadow)/0.1)];
+    @apply hover:bg-accent-hover hover:shadow-glow-sm disabled:hover:bg-accent-solid disabled:hover:shadow-none;
   }
   .btn-secondary {
     @apply border-line bg-surface text-fg shadow-sm hover:border-line-strong hover:bg-surface-2 dark:bg-surface-2/60 dark:hover:bg-surface-2;
   }
   .btn-ghost {
-    @apply text-fg-muted hover:bg-surface-2 hover:text-fg;
+    @apply text-fg-muted hover:bg-surface-2 hover:text-fg active:bg-surface-3/70;
   }
   .btn-danger {
     @apply bg-danger/10 text-danger hover:bg-danger/15;
   }
   .btn-danger-solid {
-    @apply bg-danger text-white shadow-sm hover:bg-danger/90 dark:text-bg;
+    @apply bg-danger text-white shadow-[inset_0_1px_0_0_rgb(255_255_255/0.14),0_1px_2px_0_rgb(var(--shadow)/0.1)] hover:bg-danger/90 hover:shadow-glow-danger dark:text-bg;
   }
   .btn-success {
     @apply bg-success/10 text-success hover:bg-success/15;
@@ -224,9 +244,14 @@
   .input,
   .select,
   .textarea {
-    @apply block h-9 w-full rounded-lg border border-line bg-surface px-3 text-sm text-fg shadow-sm outline-none transition-[border-color,box-shadow] duration-150;
-    @apply placeholder:text-fg-subtle hover:border-line-strong focus:border-accent focus:ring-2 focus:ring-accent/20;
+    @apply block h-9 w-full rounded-lg border border-line bg-surface px-3 text-sm text-fg shadow-sm outline-none transition-[border-color,box-shadow,background-color] duration-200 ease-out;
+    @apply placeholder:text-fg-subtle placeholder:transition-opacity focus:placeholder:opacity-60 hover:border-line-strong focus:border-accent focus:ring-[3px] focus:ring-accent/15;
     @apply disabled:cursor-not-allowed disabled:bg-surface-2 disabled:opacity-70 dark:bg-surface-2/50;
+  }
+  .input[aria-invalid="true"],
+  .select[aria-invalid="true"],
+  .textarea[aria-invalid="true"] {
+    @apply border-danger/70 hover:border-danger focus:border-danger focus:ring-danger/15;
   }
   .input-sm {
     @apply h-8 rounded-md px-2.5 text-xs;
@@ -242,11 +267,11 @@
     @apply h-auto min-h-[4.5rem] py-2 leading-relaxed;
   }
   .checkbox {
-    @apply h-4 w-4 cursor-pointer rounded border-line-strong;
+    @apply h-4 w-4 cursor-pointer rounded border-line-strong transition-transform duration-150 ease-spring active:scale-90;
     accent-color: rgb(var(--accent-solid));
   }
   .radio {
-    @apply h-4 w-4 cursor-pointer border-line-strong;
+    @apply h-4 w-4 cursor-pointer border-line-strong transition-transform duration-150 ease-spring active:scale-90;
     accent-color: rgb(var(--accent-solid));
   }
 
@@ -295,7 +320,25 @@
   }
   .menu-item {
     @apply flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm text-fg-muted transition-colors;
-    @apply hover:bg-surface-2 hover:text-fg focus:outline-none focus-visible:bg-surface-2;
+    @apply hover:bg-surface-2 hover:text-fg focus:outline-none focus-visible:bg-surface-2 active:scale-[0.98] motion-reduce:active:scale-100;
+    transition-property: color, background-color, transform;
+  }
+
+  /* Loading placeholder with a sweeping highlight (respects reduced motion). */
+  .skeleton {
+    @apply relative block overflow-hidden rounded-md bg-surface-2;
+  }
+  .skeleton::after {
+    content: "";
+    @apply absolute inset-0 motion-reduce:hidden;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgb(var(--shimmer) / var(--shimmer-alpha)) 50%,
+      transparent 100%
+    );
+    animation: shimmer 1.6s var(--ease-standard) infinite;
   }
 
   /* Section label used inside forms and cards */
@@ -324,4 +367,256 @@
       linear-gradient(90deg, rgb(var(--accent-glow) / 0.05) 1px, transparent 1px);
     background-size: 56px 56px;
   }
+}
+
+/* ------------------------------------------------------------------
+ * Motion system
+ *
+ * Kept outside @layer so Tailwind never purges it: these classes are
+ * mostly applied at runtime by Vue <Transition name="…"> (e.g.
+ * `menu-enter-from`), which the content scanner cannot see. Zero-
+ * specificity :where() selectors let any explicit utility win.
+ * ------------------------------------------------------------------ */
+
+@keyframes shimmer {
+  to {
+    transform: translateX(100%);
+  }
+}
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+@keyframes row-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* Route content: the view fades, then its top-level sections rise in one after another.
+ * `backwards` fill means no transform lingers once the entrance ends, so sticky/fixed
+ * descendants and hover lifts behave normally afterwards. */
+:where(.route-stagger > * > *) {
+  animation: rise-in 460ms var(--ease-out) backwards;
+}
+:where(.route-stagger > * > :nth-child(2)) {
+  animation-delay: 50ms;
+}
+:where(.route-stagger > * > :nth-child(3)) {
+  animation-delay: 100ms;
+}
+:where(.route-stagger > * > :nth-child(4)) {
+  animation-delay: 150ms;
+}
+:where(.route-stagger > * > :nth-child(5)) {
+  animation-delay: 190ms;
+}
+:where(.route-stagger > * > :nth-child(n + 6)) {
+  animation-delay: 230ms;
+}
+
+.route-enter-active {
+  transition: opacity 220ms var(--ease-standard);
+}
+.route-leave-active {
+  transition: opacity 110ms var(--ease-in);
+}
+.route-enter-from,
+.route-leave-to {
+  opacity: 0;
+}
+
+/* Table rows cascade in when a page of data mounts (pagination, filters, first load). */
+:where(.data-table tbody tr) {
+  animation: row-in 360ms var(--ease-out) backwards;
+}
+:where(.data-table tbody tr:nth-child(2)) {
+  animation-delay: 20ms;
+}
+:where(.data-table tbody tr:nth-child(3)) {
+  animation-delay: 40ms;
+}
+:where(.data-table tbody tr:nth-child(4)) {
+  animation-delay: 60ms;
+}
+:where(.data-table tbody tr:nth-child(5)) {
+  animation-delay: 80ms;
+}
+:where(.data-table tbody tr:nth-child(6)) {
+  animation-delay: 100ms;
+}
+:where(.data-table tbody tr:nth-child(7)) {
+  animation-delay: 120ms;
+}
+:where(.data-table tbody tr:nth-child(8)) {
+  animation-delay: 140ms;
+}
+:where(.data-table tbody tr:nth-child(9)) {
+  animation-delay: 160ms;
+}
+:where(.data-table tbody tr:nth-child(n + 10)) {
+  animation-delay: 180ms;
+}
+
+/* fade — generic opacity crossfade */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity var(--dur-base) var(--ease-standard);
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+/* menu — anchored popovers and dropdowns (pair with an origin-* class) */
+.menu-enter-active {
+  transition:
+    opacity 150ms ease-out,
+    transform 240ms var(--ease-out);
+}
+.menu-leave-active {
+  transition:
+    opacity 110ms var(--ease-in),
+    transform 110ms var(--ease-in);
+}
+.menu-enter-from,
+.menu-leave-to {
+  opacity: 0;
+  transform: translateY(-6px) scale(0.96);
+}
+
+/* swap — icon/label crossfade; use with mode="out-in" */
+.swap-enter-active,
+.swap-leave-active {
+  transition:
+    opacity 140ms ease,
+    transform 200ms var(--ease-out);
+}
+.swap-enter-from {
+  opacity: 0;
+  transform: scale(0.4) rotate(-60deg);
+}
+.swap-leave-to {
+  opacity: 0;
+  transform: scale(0.4) rotate(60deg);
+}
+
+/* text-swap — vertical roll for changing labels; use with mode="out-in" */
+.text-swap-enter-active,
+.text-swap-leave-active {
+  transition:
+    opacity 160ms ease,
+    transform 220ms var(--ease-out);
+}
+.text-swap-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.text-swap-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+/* collapse — height auto ⇄ 0 via grid rows. The transitioned element needs exactly one
+ * child; put spacing inside that child as padding (margins would jump). */
+.collapse-enter-active,
+.collapse-leave-active {
+  display: grid;
+  transition:
+    grid-template-rows 280ms var(--ease-standard),
+    opacity 220ms ease;
+}
+.collapse-enter-from,
+.collapse-leave-to {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+.collapse-enter-to,
+.collapse-leave-from {
+  grid-template-rows: 1fr;
+}
+.collapse-enter-active > *,
+.collapse-leave-active > * {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* modal — backdrop fades, panel springs up (slides up as a bottom sheet on phones) */
+.modal-enter-active {
+  transition: opacity 240ms var(--ease-standard);
+}
+.modal-leave-active {
+  transition: opacity 180ms var(--ease-in);
+}
+.modal-enter-from,
+.modal-leave-to {
+  opacity: 0;
+}
+.modal-enter-active .modal-panel {
+  transition:
+    transform 380ms var(--ease-spring-soft),
+    opacity 200ms ease-out;
+}
+.modal-leave-active .modal-panel {
+  transition:
+    transform 180ms var(--ease-in),
+    opacity 160ms var(--ease-in);
+}
+.modal-enter-from .modal-panel {
+  opacity: 0;
+  transform: translateY(16px) scale(0.95);
+}
+.modal-leave-to .modal-panel {
+  opacity: 0;
+  transform: translateY(8px) scale(0.97);
+}
+@media (max-width: 639px) {
+  .modal-enter-active .modal-panel {
+    transition:
+      transform 420ms var(--ease-drawer),
+      opacity 200ms ease-out;
+  }
+  .modal-enter-from .modal-panel,
+  .modal-leave-to .modal-panel {
+    opacity: 1;
+    transform: translateY(100%);
+  }
+}
+
+/* drawer — panel glides in from the right; its body follows a beat later */
+.drawer-enter-active {
+  transition: transform 460ms var(--ease-drawer);
+}
+.drawer-leave-active {
+  transition: transform 260ms var(--ease-in);
+}
+.drawer-enter-from,
+.drawer-leave-to {
+  transform: translateX(100%);
+}
+.drawer-enter-active .drawer-body {
+  transition:
+    opacity 320ms ease-out 120ms,
+    transform 420ms var(--ease-out) 120ms;
+}
+.drawer-enter-from .drawer-body {
+  opacity: 0;
+  transform: translateX(16px);
+}
+
+/* Theme switch: the View Transitions API snapshot is revealed with a growing circle from
+ * the switcher (see stores/theme.ts); the browser's default crossfade is turned off. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+.theme-switching,
+.theme-switching *,
+.theme-switching *::before,
+.theme-switching *::after {
+  transition: none !important;
 }

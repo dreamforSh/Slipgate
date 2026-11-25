@@ -29,8 +29,8 @@ const toneClass = {
 </script>
 
 <template>
-  <div class="flex gap-2.5 rounded-lg border px-3.5 py-3 text-sm" :class="toneClass[tone]" role="status">
-    <UiIcon :name="icon" :size="16" class="mt-0.5" />
+  <div class="flex animate-fade-down gap-2.5 rounded-lg border px-3.5 py-3 text-sm" :class="toneClass[tone]" role="status">
+    <UiIcon :name="icon" :size="16" class="mt-0.5 shrink-0" :class="tone === 'danger' || tone === 'warning' ? 'animate-pop-in' : ''" />
     <div class="min-w-0 flex-1 text-fg">
       <p v-if="title" class="font-medium">{{ title }}</p>
       <div :class="title ? 'mt-1 text-fg-muted' : ''" class="break-words">

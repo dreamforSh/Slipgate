@@ -44,7 +44,7 @@ onBeforeUnmount(() => window.clearTimeout(timer));
 <template>
   <button
     type="button"
-    class="btn"
+    class="btn relative overflow-hidden"
     :class="[
       size === 'xs' ? 'btn-xs' : 'btn-sm',
       armed ? 'btn-danger-solid' : 'btn-ghost hover:!bg-danger/10 hover:!text-danger',
@@ -56,7 +56,15 @@ onBeforeUnmount(() => window.clearTimeout(timer));
     @click="onClick"
     @blur="armed = false"
   >
-    <UiIcon :name="armed ? 'alert' : icon" :size="13" />
+    <Transition name="swap" mode="out-in">
+      <UiIcon :key="armed ? 'armed' : 'idle'" :name="armed ? 'alert' : icon" :size="13" />
+    </Transition>
     <span v-if="!iconOnly || armed">{{ armed ? confirmText : labelText }}</span>
+    <!-- Drains over the 3s confirm window, then the button disarms. -->
+    <span
+      v-if="armed"
+      class="pointer-events-none absolute inset-x-0 bottom-0 h-0.5 origin-left animate-countdown bg-white/70 dark:bg-bg/60"
+      aria-hidden="true"
+    />
   </button>
 </template>

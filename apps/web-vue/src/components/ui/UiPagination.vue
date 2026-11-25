@@ -95,9 +95,15 @@ function onSize(ev: Event) {
 
 <style scoped>
 .pg-btn {
-  @apply inline-flex h-7 min-w-[1.75rem] items-center justify-center rounded-md px-1.5 text-xs font-medium text-fg-muted transition-colors duration-150 hover:bg-surface-2 hover:text-fg disabled:pointer-events-none disabled:opacity-40;
+  @apply inline-flex h-7 min-w-[1.75rem] items-center justify-center rounded-md px-1.5 text-xs font-medium text-fg-muted transition-[color,background-color,box-shadow,transform] duration-150 hover:bg-surface-2 hover:text-fg active:scale-90 disabled:pointer-events-none disabled:opacity-40 motion-reduce:active:scale-100;
 }
 .pg-btn-active {
   @apply bg-accent/10 text-accent ring-1 ring-inset ring-accent/25 hover:bg-accent/15 hover:text-accent;
+  animation: pg-pop 320ms var(--ease-spring);
+}
+@keyframes pg-pop {
+  from {
+    transform: scale(0.8);
+  }
 }
 </style>

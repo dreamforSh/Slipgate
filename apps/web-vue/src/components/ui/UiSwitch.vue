@@ -21,16 +21,23 @@ const emit = defineEmits<{ (e: "update:modelValue", value: boolean): void }>();
     :aria-checked="modelValue"
     :aria-label="label"
     :disabled="disabled"
-    class="inline-flex cursor-pointer items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
+    class="group inline-flex cursor-pointer items-center gap-2 rounded-full disabled:cursor-not-allowed disabled:opacity-50"
     @click="emit('update:modelValue', !modelValue)"
   >
     <span
-      class="relative inline-flex h-[18px] w-8 shrink-0 items-center rounded-full transition-colors duration-200"
-      :class="modelValue ? (tone === 'success' ? 'bg-success' : 'bg-accent') : 'bg-surface-3 ring-1 ring-inset ring-line-strong'"
+      class="relative inline-flex h-[18px] w-8 shrink-0 items-center rounded-full transition-[background-color,box-shadow] duration-200"
+      :class="
+        modelValue
+          ? tone === 'success'
+            ? 'bg-success shadow-[inset_0_1px_2px_rgb(0_0_0/0.12)]'
+            : 'bg-accent shadow-[inset_0_1px_2px_rgb(0_0_0/0.12)]'
+          : 'bg-surface-3 ring-1 ring-inset ring-line-strong'
+      "
     >
+      <!-- The knob stretches toward its destination while pressed, then springs across. -->
       <span
-        class="inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform duration-200 ease-out"
-        :class="modelValue ? 'translate-x-[15px]' : 'translate-x-[2px]'"
+        class="inline-block h-3.5 w-3.5 rounded-full bg-white shadow-[0_1px_3px_rgb(0_0_0/0.25)] transition-[transform,width] duration-300 ease-spring group-active:w-[18px] motion-reduce:transition-none"
+        :class="modelValue ? 'translate-x-[15px] group-active:translate-x-[11px]' : 'translate-x-[2px]'"
       />
     </span>
     <span v-if="(label || $slots.default) && !hideLabel" class="whitespace-nowrap text-xs text-fg-muted"><slot>{{ label }}</slot></span>

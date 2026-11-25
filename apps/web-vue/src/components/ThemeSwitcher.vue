@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { useThemeStore, type ThemeMode } from "../stores/theme";
+import { useThemeStore, type ThemeMode, type ThemeOrigin } from "../stores/theme";
 import UiIcon, { type IconName } from "./ui/UiIcon.vue";
 
 /**
@@ -34,6 +34,13 @@ const current = computed(() => options.value[index.value]!);
 
 const buttons = ref<HTMLButtonElement[]>([]);
 
+/** Where the theme reveal starts: the pointer, or the control's center for keyboard use. */
+function originOf(ev: MouseEvent | KeyboardEvent): ThemeOrigin {
+  if (ev instanceof MouseEvent && (ev.clientX || ev.clientY)) return { x: ev.clientX, y: ev.clientY };
+  const rect = (ev.currentTarget as HTMLElement | null)?.getBoundingClientRect();
+  return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : { x: 0, y: 0 };
+}
+
 /** Radio-group keys: arrows move the selection (and focus), Home/End jump to the ends. */
 function onKeydown(ev: KeyboardEvent) {
   const last = options.value.length - 1;
@@ -44,7 +51,7 @@ function onKeydown(ev: KeyboardEvent) {
   else if (ev.key === "End") next = last;
   else return;
   ev.preventDefault();
-  theme.setMode(options.value[next]!.value);
+  theme.setMode(options.value[next]!.value, originOf(ev));
   buttons.value[next]?.focus();
 }
 </script>
@@ -56,7 +63,7 @@ function onKeydown(ev: KeyboardEvent) {
     class="theme-cycle btn btn-ghost btn-icon btn-sm"
     :title="t('theme.current', { name: current.label })"
     :aria-label="`${t('theme.toggle')} (${current.label})`"
-    @click="theme.cycle()"
+    @click="theme.cycle(originOf($event))"
   >
     <Transition name="theme-icon" mode="out-in">
       <UiIcon :key="current.value" :name="current.icon" :size="16" :class="current.tint" />
@@ -88,7 +95,7 @@ function onKeydown(ev: KeyboardEvent) {
       :aria-label="opt.label"
       class="relative z-10 inline-flex h-7 min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-md px-1.5 text-xs font-medium transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
       :class="theme.mode === opt.value ? 'text-fg' : 'text-fg-subtle hover:text-fg'"
-      @click="theme.setMode(opt.value)"
+      @click="theme.setMode(opt.value, originOf($event))"
     >
       <UiIcon
         :name="opt.icon"

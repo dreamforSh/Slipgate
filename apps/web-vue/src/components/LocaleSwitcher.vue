@@ -44,8 +44,10 @@ onBeforeUnmount(() => {
       :title="current.name"
       @click="open = !open"
     >
-      <UiIcon name="globe" :size="16" />
-      <span class="text-xs">{{ current.short }}</span>
+      <UiIcon name="globe" :size="16" class="transition-transform duration-500 ease-out" :class="{ 'rotate-[30deg]': open }" />
+      <Transition name="text-swap" mode="out-in">
+        <span :key="current.short" class="text-xs">{{ current.short }}</span>
+      </Transition>
       <UiIcon
         name="chevron-down"
         :size="12"
@@ -53,7 +55,8 @@ onBeforeUnmount(() => {
         :class="{ 'rotate-180': open }"
       />
     </button>
-    <div v-if="open" class="menu-panel absolute right-0 top-full z-50 mt-2 w-40 origin-top-right animate-scale-in" role="menu">
+    <Transition name="menu">
+    <div v-if="open" class="menu-panel absolute right-0 top-full z-50 mt-2 w-40 origin-top-right" role="menu">
       <button
         v-for="l in availableLocales"
         :key="l.code"
@@ -65,8 +68,9 @@ onBeforeUnmount(() => {
         @click="choose(l.code)"
       >
         {{ l.name }}
-        <UiIcon v-if="l.code === locale" name="check" :size="14" />
+        <UiIcon v-if="l.code === locale" name="check" :size="14" class="animate-pop-in" />
       </button>
     </div>
+    </Transition>
   </div>
 </template>

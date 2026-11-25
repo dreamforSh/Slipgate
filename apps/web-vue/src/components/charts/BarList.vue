@@ -45,8 +45,8 @@ function share(v: number) {
       </div>
       <div class="ml-6 mt-1.5 h-1.5 overflow-hidden rounded-full bg-surface-2">
         <div
-          class="h-full rounded-full transition-[width] duration-500 ease-out"
-          :style="{ width: `${pct(item.value)}%`, background: 'rgb(var(--viz-1))' }"
+          class="h-full origin-left animate-grow-x rounded-full transition-[width] duration-500 ease-out"
+          :style="{ width: `${pct(item.value)}%`, background: 'rgb(var(--viz-1))', animationDelay: `${Math.min(idx, 10) * 45}ms` }"
         />
       </div>
       <p v-if="item.meta" class="ml-6 mt-1 truncate text-2xs text-fg-subtle">{{ item.meta }}</p>

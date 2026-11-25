@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { Tone } from "../../lib/format";
+import AnimatedNumber from "./AnimatedNumber.vue";
 import UiIcon, { type IconName } from "./UiIcon.vue";
 
 const props = withDefaults(
@@ -32,6 +33,17 @@ const iconTone: Record<Tone, string> = {
   violet: "icon-chip-violet",
 };
 
+/** Corner wash on hover, tinted like the icon chip. */
+const glowTone: Record<Tone, string> = {
+  neutral: "from-fg-subtle/[0.07]",
+  accent: "from-accent/[0.09]",
+  success: "from-success/[0.09]",
+  warning: "from-warning/[0.09]",
+  danger: "from-danger/[0.09]",
+  info: "from-info/[0.09]",
+  violet: "from-violet/[0.09]",
+};
+
 const deltaChip = computed(() => {
   const d = props.delta;
   if (d === null || d === undefined || !Number.isFinite(d)) return null;
@@ -49,23 +61,32 @@ const deltaChip = computed(() => {
 </script>
 
 <template>
-  <div class="card flex min-w-0 flex-col p-4">
-    <div class="flex min-w-0 items-center gap-2.5">
-      <span v-if="icon" class="icon-chip h-7 w-7" :class="iconTone[tone]">
+  <div class="card group relative flex min-w-0 flex-col overflow-hidden p-4 hover:border-line-strong/70">
+    <span
+      class="pointer-events-none absolute -right-10 -top-10 h-28 w-28 rounded-full bg-gradient-to-bl to-transparent opacity-0 blur-xl transition-opacity duration-500 group-hover:opacity-100"
+      :class="glowTone[tone]"
+      aria-hidden="true"
+    />
+    <div class="relative flex min-w-0 items-center gap-2.5">
+      <span
+        v-if="icon"
+        class="icon-chip h-7 w-7 transition-transform duration-300 ease-spring group-hover:-rotate-6 group-hover:scale-110"
+        :class="iconTone[tone]"
+      >
         <UiIcon :name="icon" :size="15" />
       </span>
       <p class="truncate text-xs font-medium text-fg-subtle">{{ label }}</p>
     </div>
-    <div class="mt-3 flex min-w-0 items-baseline gap-2">
+    <div class="relative mt-3 flex min-w-0 items-baseline gap-2">
       <p
         class="truncate text-[26px] font-semibold leading-8 tracking-tight text-fg"
         :class="mono ? 'tabular-nums' : ''"
       >
-        {{ value }}
+        <AnimatedNumber :value="value" />
       </p>
       <span
         v-if="deltaChip"
-        class="inline-flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-2xs font-semibold tabular-nums"
+        class="inline-flex shrink-0 animate-pop-in items-center gap-0.5 rounded-full px-1.5 py-0.5 text-2xs font-semibold tabular-nums [animation-delay:350ms]"
         :class="deltaChip.cls"
         :title="deltaLabel"
       >
@@ -74,7 +95,7 @@ const deltaChip = computed(() => {
         <span v-if="deltaLabel" class="sr-only">{{ deltaLabel }}</span>
       </span>
     </div>
-    <div v-if="hint || $slots.hint" class="mt-1 truncate text-xs text-fg-subtle">
+    <div v-if="hint || $slots.hint" class="relative mt-1 truncate text-xs text-fg-subtle">
       <slot name="hint">{{ hint }}</slot>
     </div>
     <slot name="footer" />

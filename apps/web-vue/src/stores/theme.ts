@@ -1,7 +1,17 @@
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 
 export type ThemeMode = "system" | "light" | "dark";
+
+/** Viewport point (e.g. the switcher's click position) the theme reveal grows from. */
+export interface ThemeOrigin {
+  x: number;
+  y: number;
+}
+
+type ViewTransitionDocument = Document & {
+  startViewTransition?: (update: () => Promise<void> | void) => { ready: Promise<void>; finished: Promise<void> };
+};
 
 const STORAGE_KEY = "slipgate_theme";
 
@@ -26,24 +36,66 @@ export const useThemeStore = defineStore("theme", () => {
     document.documentElement.classList.toggle("dark", isDark.value);
   }
 
-  function setMode(next: ThemeMode) {
+  /**
+   * Applies the palette with every CSS transition suspended for a frame, so hundreds of
+   * `transition-colors` elements flip at once instead of fading out of sync. Where the View
+   * Transitions API exists, the new theme is revealed as a circle growing from `origin`.
+   */
+  function applyAnimated(origin?: ThemeOrigin) {
+    const root = document.documentElement;
+    const flip = () => {
+      root.classList.add("theme-switching");
+      apply();
+      // Force a style flush so the class swap lands while transitions are off.
+      void root.offsetWidth;
+      requestAnimationFrame(() => root.classList.remove("theme-switching"));
+    };
+
+    const doc = document as ViewTransitionDocument;
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!doc.startViewTransition || reduced) {
+      flip();
+      return;
+    }
+    const x = origin?.x ?? window.innerWidth - 48;
+    const y = origin?.y ?? 32;
+    const radius = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
+    const transition = doc.startViewTransition(async () => {
+      flip();
+      await nextTick();
+    });
+    transition.ready
+      .then(() => {
+        root.animate(
+          { clipPath: [`circle(0px at ${x}px ${y}px)`, `circle(${radius}px at ${x}px ${y}px)`] },
+          { duration: 520, easing: "cubic-bezier(0.4, 0, 0.2, 1)", pseudoElement: "::view-transition-new(root)" },
+        );
+      })
+      .catch(() => {
+        // Skipped transitions (tab hidden, another one started) already applied the theme.
+      });
+  }
+
+  function setMode(next: ThemeMode, origin?: ThemeOrigin) {
+    const wasDark = isDark.value;
     mode.value = next;
     try {
       localStorage.setItem(STORAGE_KEY, next);
     } catch {
       // ignore
     }
-    apply();
+    if (wasDark === isDark.value) apply();
+    else applyAnimated(origin);
   }
 
-  function cycle() {
+  function cycle(origin?: ThemeOrigin) {
     const order: ThemeMode[] = ["system", "light", "dark"];
-    setMode(order[(order.indexOf(mode.value) + 1) % order.length]!);
+    setMode(order[(order.indexOf(mode.value) + 1) % order.length]!, origin);
   }
 
   media.addEventListener("change", (ev) => {
     systemDark.value = ev.matches;
-    apply();
+    applyAnimated();
   });
 
   apply();

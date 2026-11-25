@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, ref } from "vue";
 
 /** Horizontal usage bar for basis-point (0–10000) or ratio values. */
 const props = withDefaults(
@@ -31,6 +31,10 @@ const barClass = computed(() => {
   return "bg-accent";
 });
 
+/** Starts empty and fills to its value once mounted, so meters visibly load. */
+const ready = ref(false);
+onMounted(() => requestAnimationFrame(() => (ready.value = true)));
+
 const text = computed(() =>
   props.max !== undefined ? `${props.value ?? 0}/${props.max}` : `${pct.value.toFixed(1)}%`,
 );
@@ -43,7 +47,11 @@ const text = computed(() =>
       <span class="font-mono tabular-nums text-fg-muted">{{ text }}</span>
     </div>
     <div class="mt-1 h-1.5 overflow-hidden rounded-full bg-surface-3">
-      <div class="h-full rounded-full transition-[width] duration-500 ease-out" :class="barClass" :style="{ width: `${pct}%` }" />
+      <div
+        class="h-full rounded-full transition-[width,background-color] duration-700 ease-out"
+        :class="barClass"
+        :style="{ width: ready ? `${pct}%` : '0%' }"
+      />
     </div>
   </div>
 </template>

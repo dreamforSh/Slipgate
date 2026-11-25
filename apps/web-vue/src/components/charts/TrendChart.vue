@@ -188,9 +188,26 @@ const axisFmt = (v: number) => (props.axisFormat ?? props.format)(v);
         {{ labels[i] }}
       </text>
       <!-- series -->
-      <g v-for="p in paths" :key="p.key">
-        <path v-if="series.length === 1" :d="p.area" :fill="p.color" fill-opacity="0.1" />
-        <path :d="p.line" fill="none" :stroke="p.color" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
+      <g v-for="(p, pi) in paths" :key="p.key">
+        <path
+          v-if="series.length === 1"
+          :d="p.area"
+          :fill="p.color"
+          fill-opacity="0.1"
+          class="animate-fade-in [animation-delay:450ms] [animation-duration:600ms] [animation-fill-mode:backwards]"
+        />
+        <path
+          :d="p.line"
+          fill="none"
+          :stroke="p.color"
+          stroke-width="2"
+          stroke-linejoin="round"
+          stroke-linecap="round"
+          pathLength="1"
+          stroke-dasharray="1"
+          class="animate-draw"
+          :style="{ animationDelay: `${pi * 120}ms` }"
+        />
       </g>
       <!-- crosshair -->
       <g v-if="tooltip">
@@ -206,6 +223,7 @@ const axisFmt = (v: number) => (props.axisFormat ?? props.format)(v);
         <circle
           v-for="p in paths"
           :key="`m${p.key}`"
+          class="chart-dot"
           :cx="tooltip.x"
           :cy="yAt(p.values[tooltip.i] ?? 0)"
           r="4"
@@ -232,3 +250,18 @@ const axisFmt = (v: number) => (props.axisFormat ?? props.format)(v);
     </div>
   </div>
 </template>
+
+<style scoped>
+/* Crosshair markers glide between points instead of jumping. */
+.chart-dot {
+  transition: cy 160ms var(--ease-out);
+  animation: chart-dot-in 220ms var(--ease-spring);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+@keyframes chart-dot-in {
+  from {
+    transform: scale(0);
+  }
+}
+</style>

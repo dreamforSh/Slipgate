@@ -9,6 +9,7 @@ import AnnouncementBell from "./AnnouncementBell.vue";
 import BrandMark from "./BrandMark.vue";
 import LocaleSwitcher from "./LocaleSwitcher.vue";
 import ThemeSwitcher from "./ThemeSwitcher.vue";
+import AnimatedNumber from "./ui/AnimatedNumber.vue";
 import UiIcon, { type IconName } from "./ui/UiIcon.vue";
 
 const { t } = useI18n();
@@ -257,6 +258,13 @@ function toggleCollapsed() {
   }
 }
 
+/* ---------------- Header elevation ---------------- */
+// Flat while the page is at the top; picks up a hairline shadow once content scrolls under it.
+const scrolled = ref(false);
+function onScroll() {
+  scrolled.value = window.scrollY > 4;
+}
+
 /* ---------------- User menu ---------------- */
 const menuOpen = ref(false);
 const menuRoot = ref<HTMLElement | null>(null);
@@ -276,6 +284,8 @@ onMounted(() => {
   desktopQuery.addEventListener("change", onDesktopChange);
   document.addEventListener("pointerdown", onPointerDown);
   document.addEventListener("keydown", onKeydown);
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
 });
 watch(
   () => auth.isAdmin,
@@ -290,6 +300,7 @@ onBeforeUnmount(() => {
   desktopQuery.removeEventListener("change", onDesktopChange);
   document.removeEventListener("pointerdown", onPointerDown);
   document.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("scroll", onScroll);
 });
 
 watch(
@@ -392,19 +403,23 @@ async function handleLogout() {
                     />
                   </span>
                 </button>
-                <ul v-if="!rail && isGroupExpanded(item)" class="mb-1 ml-[1.35rem] mt-1 space-y-0.5 border-l border-line/80 pl-2">
-                  <li v-for="child in item.children" :key="child.to">
-                    <RouterLink
-                      :to="child.to"
-                      class="nav-link nav-link-child"
-                      :class="{ 'nav-link-active': isActive(child) }"
-                      :aria-current="isActive(child) ? 'page' : undefined"
-                    >
-                      <UiIcon :name="child.icon" :size="15" />
-                      <span class="truncate">{{ child.label }}</span>
-                    </RouterLink>
-                  </li>
-                </ul>
+                <Transition name="collapse">
+                  <div v-if="!rail && isGroupExpanded(item)">
+                    <ul class="ml-[1.35rem] space-y-0.5 border-l border-line/80 py-1 pl-2">
+                      <li v-for="(child, ci) in item.children" :key="child.to" class="nav-child" :style="{ '--i': ci }">
+                        <RouterLink
+                          :to="child.to"
+                          class="nav-link nav-link-child"
+                          :class="{ 'nav-link-active': isActive(child) }"
+                          :aria-current="isActive(child) ? 'page' : undefined"
+                        >
+                          <UiIcon :name="child.icon" :size="15" />
+                          <span class="truncate">{{ child.label }}</span>
+                        </RouterLink>
+                      </li>
+                    </ul>
+                  </div>
+                </Transition>
               </template>
               <a
                 v-else-if="item.href"
@@ -493,7 +508,10 @@ async function handleLogout() {
 
     <!-- Content column -->
     <div class="content relative min-h-screen" :class="rail ? 'lg:pl-[72px]' : 'lg:pl-64'">
-      <header class="glass sticky top-0 z-30 border-b border-line/70">
+      <header
+        class="glass sticky top-0 z-30 border-b transition-[border-color,box-shadow,background-color] duration-300"
+        :class="scrolled ? 'border-line/80 shadow-[0_8px_24px_-18px_rgb(var(--shadow)/0.35)]' : 'border-line/50 !bg-surface/60'"
+      >
         <div class="flex h-16 items-center justify-between gap-3 px-4 sm:px-6 lg:px-8">
           <div class="flex min-w-0 items-center gap-2.5">
             <button
@@ -518,7 +536,9 @@ async function handleLogout() {
                 <span class="whitespace-nowrap text-fg-subtle">{{ activeGroup.label }}</span>
                 <UiIcon name="chevron-right" :size="14" class="text-fg-subtle/70" />
               </template>
-              <span class="truncate font-semibold tracking-tight text-fg">{{ pageTitle }}</span>
+              <Transition name="text-swap" mode="out-in">
+                <span :key="pageTitle" class="truncate font-semibold tracking-tight text-fg">{{ pageTitle }}</span>
+              </Transition>
             </nav>
           </div>
 
@@ -528,11 +548,11 @@ async function handleLogout() {
             <RouterLink
               v-if="balance"
               to="/dashboard"
-              class="hidden items-center gap-2 rounded-lg bg-accent/10 px-2.5 py-1.5 text-accent ring-1 ring-inset ring-accent/20 transition-colors hover:bg-accent/15 sm:inline-flex"
+              class="group hidden items-center gap-2 rounded-lg bg-accent/10 px-2.5 py-1.5 text-accent ring-1 ring-inset ring-accent/20 transition-[background-color,box-shadow] duration-200 hover:bg-accent/15 hover:shadow-glow-sm sm:inline-flex"
               :title="t('shell.balance')"
             >
-              <UiIcon name="wallet" :size="15" />
-              <span class="font-mono text-sm font-semibold tabular-nums">{{ balance }}</span>
+              <UiIcon name="wallet" :size="15" class="transition-transform duration-300 ease-spring group-hover:-rotate-12 group-hover:scale-110" />
+              <AnimatedNumber :value="balance" :from-zero="false" class="font-mono text-sm font-semibold" />
             </RouterLink>
 
             <span class="hidden h-6 w-px bg-line sm:block" aria-hidden="true" />
@@ -547,7 +567,8 @@ async function handleLogout() {
                 @click="menuOpen = !menuOpen"
               >
                 <span
-                  class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent-solid text-xs font-semibold text-accent-fg ring-2 ring-surface"
+                  class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-accent-solid to-accent-hover text-xs font-semibold text-accent-fg ring-2 ring-surface transition-shadow duration-200"
+                  :class="menuOpen ? 'shadow-glow-sm' : ''"
                 >
                   {{ initials }}
                 </span>
@@ -563,9 +584,10 @@ async function handleLogout() {
                 />
               </button>
 
+              <Transition name="menu">
               <div
                 v-if="menuOpen"
-                class="menu-panel absolute right-0 top-full mt-2 w-64 origin-top-right animate-scale-in"
+                class="menu-panel absolute right-0 top-full mt-2 w-64 origin-top-right"
                 role="menu"
               >
                 <div class="flex items-center gap-3 px-2.5 pb-3 pt-2">
@@ -609,6 +631,7 @@ async function handleLogout() {
                   </button>
                 </div>
               </div>
+              </Transition>
             </div>
           </div>
         </div>
@@ -675,11 +698,35 @@ async function handleLogout() {
   @apply focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/40;
   padding-left: 0.8125rem;
 }
+.nav-link {
+  transition-property: color, background-color, transform;
+}
+.nav-link:active {
+  transform: scale(0.98);
+}
 .nav-link > svg {
-  @apply text-fg-subtle transition-colors;
+  @apply text-fg-subtle;
+  transition:
+    color 150ms ease,
+    transform 300ms var(--ease-spring);
 }
 .nav-link:hover > svg {
   @apply text-fg-muted;
+  transform: translateX(1px) scale(1.08);
+}
+.nav-link-rail:hover > svg {
+  transform: scale(1.12);
+}
+/* Children of a group cascade in as it expands. */
+.collapse-enter-active .nav-child {
+  animation: nav-child-in 320ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 35ms + 40ms);
+}
+@keyframes nav-child-in {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
 }
 .nav-link-child {
   @apply h-8 gap-2.5 text-[13px];
@@ -706,16 +753,20 @@ async function handleLogout() {
   content: "";
   @apply absolute -left-1 top-1/2 h-2 w-2 -translate-y-1/2 rotate-45 rounded-[1px] bg-fg;
 }
-.flyout-enter-active,
-.flyout-leave-active {
+.flyout-enter-active {
   transition:
     opacity 140ms ease,
-    transform 160ms cubic-bezier(0.2, 0, 0, 1);
+    transform 260ms var(--ease-spring-soft);
+}
+.flyout-leave-active {
+  transition:
+    opacity 100ms ease,
+    transform 100ms ease;
 }
 .flyout-enter-from,
 .flyout-leave-to {
   opacity: 0;
-  transform: translateX(-4px);
+  transform: translateX(-6px) scale(0.96);
 }
 
 @keyframes nav-indicator-in {

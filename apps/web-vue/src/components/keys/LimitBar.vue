@@ -53,7 +53,7 @@ const pctText = computed(() => (ratio.value === null ? "" : `${Math.round(ratio.
       aria-valuemax="100"
       :aria-label="label"
     >
-      <div class="h-full rounded-full transition-[width] duration-700 ease-out" :class="barClass[tone]" :style="{ width }" />
+      <div class="h-full origin-left animate-grow-x rounded-full transition-[width] duration-700 ease-out" :class="barClass[tone]" :style="{ width }" />
     </div>
   </div>
 </template>

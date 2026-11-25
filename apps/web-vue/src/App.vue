@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { RouterView, useRoute, useRouter } from "vue-router";
 import AnnouncementPopup from "./components/AnnouncementPopup.vue";
 import AppShell from "./components/AppShell.vue";
+import RouteProgress from "./components/ui/RouteProgress.vue";
 import ToastHost from "./components/ui/ToastHost.vue";
 import { syncDocumentTitle } from "./router";
 import { useAnnouncementStore } from "./stores/announcements";
@@ -52,27 +53,19 @@ onBeforeUnmount(() => document.removeEventListener("visibilitychange", onVisible
 </script>
 
 <template>
+  <RouteProgress />
   <RouterView v-if="isBare" v-slot="{ Component, route: r }">
-    <Transition
-      mode="out-in"
-      enter-active-class="transition duration-200 ease-out"
-      enter-from-class="opacity-0"
-      leave-active-class="transition duration-100 ease-in"
-      leave-to-class="opacity-0"
-    >
+    <Transition name="route" mode="out-in">
       <component :is="Component" :key="r.path" />
     </Transition>
   </RouterView>
   <AppShell v-else>
+    <!-- The wrapper fades as a whole; .route-stagger then cascades the view's sections in. -->
     <RouterView v-slot="{ Component, route: r }">
-      <Transition
-        mode="out-in"
-        enter-active-class="transition duration-200 ease-out"
-        enter-from-class="opacity-0 translate-y-1"
-        leave-active-class="transition duration-100 ease-in"
-        leave-to-class="opacity-0"
-      >
-        <component :is="Component" :key="r.path" />
+      <Transition name="route" mode="out-in">
+        <div :key="r.path" class="route-stagger">
+          <component :is="Component" />
+        </div>
       </Transition>
     </RouterView>
   </AppShell>
