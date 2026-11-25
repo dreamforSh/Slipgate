@@ -1,4 +1,12 @@
-import type { DashboardRange, UsageLogItem, UsageSeriesPoint, UsageTotals } from "@slipgate/contracts";
+import {
+  USAGE_STATS_HOURLY_MAX_MS,
+  type DashboardRange,
+  type UsageLogItem,
+  type UsageRankBy,
+  type UsageSeriesPoint,
+  type UsageStatsResponse,
+  type UsageTotals,
+} from "@slipgate/contracts";
 import { dashboardWindow, type DashboardWindow } from "../dashboard.ts";
 
 /**
@@ -446,5 +454,172 @@ export function reduceOpsUsage(
       statusCode: l.statusCode,
       durationMs: l.durationMs,
     })),
+  };
+}
+
+/* ------------------------------------------------------------------------------------------ */
+/* Admin usage statistics: the usage page's charts over its own filters                       */
+/* ------------------------------------------------------------------------------------------ */
+
+/** Widest window the usage page charts; an earlier start is moved up to this many days before the end. */
+export const USAGE_STATS_MAX_DAYS = 400;
+/** Window when the filters give no start. */
+export const USAGE_STATS_DEFAULT_DAYS = 30;
+/** Default bucket size: hourly up to two days (an hourly ask is honoured up to USAGE_STATS_HOURLY_MAX_MS). */
+const USAGE_STATS_AUTO_HOURLY_MS = 2 * DAY_MS;
+/** Models and groups listed (the page sorts them by its own metric). */
+export const USAGE_STATS_BREAKDOWN_LIMIT = 200;
+/**
+ * Longest the Postgres statistics read may run: it is exact over every matching row of a window
+ * of up to USAGE_STATS_MAX_DAYS, so a wide unfiltered window on a busy install can be heavy.
+ */
+export const USAGE_STATS_TIMEOUT_MS = 15_000;
+
+export interface UsageStatsPlan {
+  sinceMs: number;
+  untilMs: number;
+  granularity: "hour" | "day";
+  bucketMs: number;
+  /** Local start of the first bucket (at or before sinceMs). */
+  startMs: number;
+  bucketCount: number;
+  /** The requested start was moved up to USAGE_STATS_MAX_DAYS before the end. */
+  clamped: boolean;
+}
+
+/** Window and buckets for the usage page's charts (`tzOffsetMinutes` as Date#getTimezoneOffset). */
+export function usageStatsPlan(input: {
+  sinceIso?: string;
+  untilIso?: string;
+  granularity?: "hour" | "day";
+  nowMs: number;
+  tzOffsetMinutes: number;
+}): UsageStatsPlan {
+  const until = input.untilIso ? Date.parse(input.untilIso) : Number.NaN;
+  const untilMs = Number.isFinite(until) ? Math.min(until, input.nowMs) : input.nowMs;
+  const since = input.sinceIso ? Date.parse(input.sinceIso) : Number.NaN;
+  const wanted = Number.isFinite(since) ? since : untilMs - USAGE_STATS_DEFAULT_DAYS * DAY_MS;
+  const earliest = untilMs - USAGE_STATS_MAX_DAYS * DAY_MS;
+  const sinceMs = Math.min(Math.max(wanted, earliest), untilMs);
+  const span = untilMs - sinceMs;
+  const hourly =
+    input.granularity === "hour" ? span <= USAGE_STATS_HOURLY_MAX_MS : input.granularity === undefined && span <= USAGE_STATS_AUTO_HOURLY_MS;
+  const bucketMs = hourly ? HOUR_MS : DAY_MS;
+  const offsetMs = input.tzOffsetMinutes * MINUTE_MS;
+  const startMs = Math.floor((sinceMs - offsetMs) / bucketMs) * bucketMs + offsetMs;
+  return {
+    sinceMs,
+    untilMs,
+    granularity: hourly ? "hour" : "day",
+    bucketMs,
+    startMs,
+    bucketCount: Math.max(1, Math.ceil((untilMs - startMs) / bucketMs)),
+    clamped: wanted < earliest,
+  };
+}
+
+export interface UsageStatsAggregate {
+  totals: UsageSums;
+  /** Keyed by bucket index (0 .. plan.bucketCount - 1). */
+  buckets: Map<number, UsageSums>;
+  models: Map<string, UsageSums>;
+  groups: Map<string, UsageSums>;
+  users: Map<string, UsageSums>;
+  groupNames: Map<string, string>;
+  userEmails: Map<string, string>;
+}
+
+export function emptyUsageStatsAggregate(): UsageStatsAggregate {
+  return {
+    totals: emptySums(),
+    buckets: new Map(),
+    models: new Map(),
+    groups: new Map(),
+    users: new Map(),
+    groupNames: new Map(),
+    userEmails: new Map(),
+  };
+}
+
+/** Reference reducer (MemoryOpsStore): `logs` already match the filters and the plan's window. */
+export function reduceUsageStats(
+  plan: UsageStatsPlan,
+  logs: UsageLogItem[],
+  labels: { userEmail: (id: string) => string; groupName: (id: string) => string },
+): UsageStatsAggregate {
+  const agg = emptyUsageStatsAggregate();
+  for (const log of logs) {
+    addLogToSums(agg.totals, log);
+    const idx = Math.floor((Date.parse(log.createdAtIso) - plan.startMs) / plan.bucketMs);
+    if (idx >= 0 && idx < plan.bucketCount) bumpSums(agg.buckets, idx, log);
+    bumpSums(agg.models, log.publicModel, log);
+    bumpSums(agg.groups, log.groupId, log);
+    bumpSums(agg.users, log.userId, log);
+  }
+  for (const id of agg.groups.keys()) agg.groupNames.set(id, labels.groupName(id));
+  for (const id of agg.users.keys()) agg.userEmails.set(id, labels.userEmail(id));
+  return agg;
+}
+
+function statsSums(s: UsageSums) {
+  return {
+    requests: s.requests,
+    errors: s.errors,
+    inputTokens: s.inputTokens,
+    outputTokens: s.outputTokens,
+    cacheReadTokens: s.cacheReadTokens,
+    costNanoUsd: s.costNano.toString(),
+  };
+}
+
+/** Descending by `by`, then tokens, requests and key: a total order, so both stores agree. */
+function rankStats(map: Map<string, UsageSums>, by: UsageRankBy, limit: number): [string, UsageSums][] {
+  const tokens = (s: UsageSums) => s.inputTokens + s.outputTokens;
+  const primary = (a: UsageSums, b: UsageSums) =>
+    by === "cost" ? (b.costNano > a.costNano ? 1 : b.costNano < a.costNano ? -1 : 0) : by === "requests" ? b.requests - a.requests : tokens(b) - tokens(a);
+  return Array.from(map.entries())
+    .filter(([, s]) => s.requests > 0)
+    .sort(([ka, a], [kb, b]) => primary(a, b) || tokens(b) - tokens(a) || b.requests - a.requests || (ka < kb ? -1 : ka > kb ? 1 : 0))
+    .slice(0, limit);
+}
+
+export function finalizeUsageStats(
+  plan: UsageStatsPlan,
+  agg: UsageStatsAggregate,
+  opts: { rankBy: UsageRankBy; rankLimit: number; nowMs: number },
+): UsageStatsResponse {
+  const series: UsageSeriesPoint[] = Array.from({ length: plan.bucketCount }, (_, i) => {
+    const s = agg.buckets.get(i) ?? emptySums();
+    return {
+      startIso: new Date(plan.startMs + i * plan.bucketMs).toISOString(),
+      requests: s.requests,
+      errors: s.errors,
+      inputTokens: s.inputTokens,
+      outputTokens: s.outputTokens,
+      cacheReadTokens: s.cacheReadTokens,
+      costNanoUsd: s.costNano.toString(),
+    };
+  });
+  return {
+    generatedAtIso: new Date(opts.nowMs).toISOString(),
+    sinceIso: new Date(plan.sinceMs).toISOString(),
+    untilIso: new Date(plan.untilMs).toISOString(),
+    clamped: plan.clamped,
+    granularity: plan.granularity,
+    totals: statsSums(agg.totals),
+    series,
+    models: rankStats(agg.models, "tokens", USAGE_STATS_BREAKDOWN_LIMIT).map(([model, s]) => ({ model, ...statsSums(s) })),
+    groups: rankStats(agg.groups, "tokens", USAGE_STATS_BREAKDOWN_LIMIT).map(([groupId, s]) => ({
+      groupId,
+      name: agg.groupNames.get(groupId) ?? "",
+      ...statsSums(s),
+    })),
+    users: rankStats(agg.users, opts.rankBy, opts.rankLimit).map(([userId, s]) => ({
+      userId,
+      email: agg.userEmails.get(userId) ?? "",
+      ...statsSums(s),
+    })),
+    userCount: Array.from(agg.users.values()).filter((s) => s.requests > 0).length,
+    rankBy: opts.rankBy,
   };
 }

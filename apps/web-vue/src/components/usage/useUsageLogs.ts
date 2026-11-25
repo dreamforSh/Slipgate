@@ -218,6 +218,9 @@ export function useUsageLogs(options: { base: string; initial?: Partial<UsageFil
     exporting,
     rangeInvalid,
     hasFilters,
+    /** Value-compared criteria key and the matching query params (the stats panel reuses both). */
+    criteriaKey,
+    params,
     load,
     reset,
     exportCsv,

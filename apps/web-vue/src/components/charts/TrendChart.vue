@@ -86,7 +86,12 @@ const xTicks = computed(() => {
   const every = Math.max(1, Math.ceil(n / want));
   const idx: number[] = [];
   for (let i = 0; i < n; i += every) idx.push(i);
-  if (idx[idx.length - 1] !== n - 1 && n - 1 - idx[idx.length - 1]! >= every / 2) idx.push(n - 1);
+  // The end label is right-anchored and the one before it centred: placing it beside the last
+  // regular tick would overlap long labels ("11/24 10时"), so it takes that tick's place.
+  if (idx[idx.length - 1] !== n - 1) {
+    if (idx.length > 1) idx[idx.length - 1] = n - 1;
+    else idx.push(n - 1);
+  }
   return idx;
 });
 

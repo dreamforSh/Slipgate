@@ -43,6 +43,8 @@ import type {
   OpsUsageQuery,
   ScopedUsageAggregate,
   ScopedUsageQuery,
+  UsageStatsAggregate,
+  UsageStatsPlan,
 } from "./usage_aggregates.ts";
 
 /** What the snapshot needs to know about a user to decide whether their keys may serve. */
@@ -328,6 +330,16 @@ export interface OpsStore {
   /** One page of rows; the COUNT/SUM summary (and exact total) only when `query.summary !== false`. */
   queryUsage(query: UsageQuery, scope?: { managedGroupIds?: string[] }): Promise<UsagePageResponse>;
   exportUsage(query: UsageExportQuery): Promise<UsageRow[]>;
+  /**
+   * The admin usage page's charts: totals, per-bucket, per-model, per-group and per-user sums of
+   * the rows matching `query` inside `plan`'s window (its start replaces `query.sinceIso`).
+   * Postgres reads it in one scan under USAGE_STATS_TIMEOUT_MS (UsageAggregateTimeoutError).
+   */
+  usageStats(
+    query: Omit<UsageQuery, "page" | "pageSize" | "summary">,
+    plan: UsageStatsPlan,
+    scope?: { managedGroupIds?: string[] },
+  ): Promise<UsageStatsAggregate>;
 
   /*
    * ---- Usage aggregates ----

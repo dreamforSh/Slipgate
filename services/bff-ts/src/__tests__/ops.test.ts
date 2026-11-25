@@ -11,6 +11,7 @@ import type {
   PublicSettings,
   RedeemCodeItem,
   UsagePageResponse,
+  UsageStatsResponse,
   UserAnnouncementItem,
   UserSubscriptionItem,
   WalletSummary,
@@ -594,5 +595,84 @@ describe("discovered upstream models", () => {
       }
       net.stop(true);
     }
+  });
+});
+
+describe("admin usage statistics", () => {
+  it("charts the usage list's filters: totals, buckets, model / group / user breakdowns and ranking", async () => {
+    const { call, admin, register, settle } = await bootstrap();
+    const gina = await register("gina.stats@ops.test");
+    const ivy = await register("ivy.stats@ops.test");
+    await settle({ requestId: "s1", userId: gina.id, apiKeyId: "key_g", groupId: "grp_default", costNanoUsd: "1000" });
+    await settle({ requestId: "s2", userId: gina.id, apiKeyId: "key_g", groupId: "grp_default", costNanoUsd: "0", statusCode: 529 });
+    await settle({
+      requestId: "s3",
+      userId: ivy.id,
+      apiKeyId: "key_i",
+      groupId: "grp_default",
+      publicModel: "gpt-5",
+      upstreamModel: "gpt-5",
+      inputTokens: 300,
+      outputTokens: 100,
+      cacheReadTokens: 40,
+      costNanoUsd: "5000",
+    });
+    const since = new Date(Date.now() - 24 * 3_600_000).toISOString();
+    const stats = (q: string) => call<UsageStatsResponse>("GET", `/api/v1/admin/usage/stats?sinceIso=${encodeURIComponent(since)}${q}`, admin);
+
+    const all = await stats("&rankBy=cost");
+    expect(all.status).toBe(200);
+    expect(all.body.granularity).toBe("hour");
+    expect(all.body.clamped).toBe(false);
+    expect(all.body.totals).toMatchObject({ requests: 3, errors: 1, inputTokens: 500, outputTokens: 200, cacheReadTokens: 40, costNanoUsd: "6000" });
+    expect(all.body.series.length).toBeGreaterThanOrEqual(24);
+    expect(all.body.series.length).toBeLessThanOrEqual(25);
+    expect(all.body.series.reduce((n, p) => n + p.requests, 0)).toBe(3);
+    expect(all.body.series.at(-1)!.requests).toBe(3);
+    expect(all.body.models.map((m) => m.model)).toEqual(["gpt-5", "claude-sonnet-5-5"]);
+    expect(all.body.groups).toHaveLength(1);
+    expect(all.body.groups[0]!.groupId).toBe("grp_default");
+    expect(all.body.groups[0]!.name).not.toBe("");
+    expect(all.body.userCount).toBe(2);
+    expect(all.body.rankBy).toBe("cost");
+    expect(all.body.users.map((u) => u.email)).toEqual(["ivy.stats@ops.test", "gina.stats@ops.test"]);
+
+    const byRequests = await stats("&rankBy=requests&rankLimit=1");
+    expect(byRequests.body.users.map((u) => u.email)).toEqual(["gina.stats@ops.test"]);
+    expect(byRequests.body.userCount).toBe(2);
+
+    const oneUser = await stats(`&userId=${gina.id}`);
+    expect(oneUser.body.totals.requests).toBe(2);
+    expect(oneUser.body.models.map((m) => m.model)).toEqual(["claude-sonnet-5-5"]);
+    const errorsOnly = await stats("&outcome=error");
+    expect(errorsOnly.body.totals).toMatchObject({ requests: 1, errors: 1 });
+    const daily = await stats("&granularity=day");
+    expect(daily.body.granularity).toBe("day");
+    expect(daily.body.series.reduce((n, p) => n + p.requests, 0)).toBe(3);
+
+    // A "last 7 days" window computed a moment before the server's now still buckets by hour.
+    const week = await call<UsageStatsResponse>(
+      "GET",
+      `/api/v1/admin/usage/stats?sinceIso=${encodeURIComponent(new Date(Date.now() - 7 * 86_400_000 - 5_000).toISOString())}&granularity=hour`,
+      admin,
+    );
+    expect(week.body.granularity).toBe("hour");
+    expect(week.body.series.length).toBeGreaterThanOrEqual(168);
+    expect(week.body.series.length).toBeLessThanOrEqual(169);
+
+    const defaults = await call<UsageStatsResponse>("GET", "/api/v1/admin/usage/stats", admin);
+    expect(defaults.body.granularity).toBe("day");
+    expect(defaults.body.series.length).toBeGreaterThanOrEqual(30);
+    expect(defaults.body.totals.requests).toBe(3);
+    const wide = await call<UsageStatsResponse>(
+      "GET",
+      `/api/v1/admin/usage/stats?sinceIso=${encodeURIComponent(new Date(Date.now() - 500 * 86_400_000).toISOString())}&granularity=hour`,
+      admin,
+    );
+    expect(wide.body.clamped).toBe(true);
+    expect(wide.body.granularity).toBe("day");
+    expect(wide.body.totals.requests).toBe(3);
+
+    expect((await call("GET", "/api/v1/admin/usage/stats", gina.headers)).status).toBe(403);
   });
 });

@@ -37,6 +37,10 @@
     /* Chart series (dataviz reference palette, validated on these surfaces) */
     --viz-1: 42 120 214;
     --viz-2: 235 104 52;
+    /* Slots 3-5 (aqua, yellow, magenta): below 3:1 on white, so charts using them keep a table view. */
+    --viz-3: 27 175 122;
+    --viz-4: 237 161 0;
+    --viz-5: 232 123 164;
     /* Skeleton shimmer highlight */
     --shimmer: 255 255 255;
     --shimmer-alpha: 0.65;
@@ -77,6 +81,9 @@
     --shadow: 0 0 0;
     --viz-1: 57 135 229;
     --viz-2: 217 89 38;
+    --viz-3: 25 158 112;
+    --viz-4: 201 133 0;
+    --viz-5: 213 81 129;
     --shimmer-alpha: 0.05;
   }
 

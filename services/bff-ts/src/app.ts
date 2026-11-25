@@ -18,6 +18,7 @@ import {
   type SetAccountPrivacyResponse,
   canonicalCredentialText,
   DashboardRangeSchema,
+  DashboardGranularitySchema,
   AuthLoginRequestSchema,
   BulkUpdateApiKeysRequestSchema,
   AuthRegisterRequestSchema,
@@ -2173,9 +2174,10 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
    */
   app.get("/api/v1/admin/dashboard/stats", async (c) => {
     const range = DashboardRangeSchema.catch("7d").parse(c.req.query("range") ?? "7d");
+    const granularity = DashboardGranularitySchema.optional().catch(undefined).parse(c.req.query("granularity"));
     const tzOffsetMinutes = parseTzOffset(c.req.query("tz"));
     const nowMs = Date.now();
-    const win = dashboardWindow(range, nowMs, tzOffsetMinutes);
+    const win = dashboardWindow(range, nowMs, tzOffsetMinutes, granularity);
     const [logs, users, groups, accounts, snapshot] = await Promise.all([
       store.listUsageLogs({ sinceIso: new Date(win.sinceMs).toISOString(), limit: DASHBOARD_MAX_ROWS }),
       store.listUsers(),
@@ -2186,6 +2188,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     return c.json(
       buildDashboardStats({
         range,
+        granularity,
         nowMs,
         tzOffsetMinutes,
         logs,

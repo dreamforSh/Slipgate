@@ -71,11 +71,13 @@ import { StoreError } from "./types.ts";
 import { viewerDayStartMs } from "./user_limits_types.ts";
 import {
   emptyScopedUsageAggregate,
+  emptyUsageStatsAggregate,
   nanoFromText,
   OPS_RECENT_ERRORS,
   SCOPED_USAGE_TIMEOUT_MS,
   scopedUsagePlan,
   UsageAggregateTimeoutError,
+  USAGE_STATS_TIMEOUT_MS,
   type ChannelStatusAggregate,
   type ChannelStatusQuery,
   type OpsGroupSums,
@@ -83,6 +85,8 @@ import {
   type OpsUsageQuery,
   type ScopedUsageAggregate,
   type ScopedUsageQuery,
+  type UsageStatsAggregate,
+  type UsageStatsPlan,
   type UsageSums,
 } from "./usage_aggregates.ts";
 
@@ -2457,6 +2461,61 @@ export class PostgresOpsStore implements OpsStore {
         avgTtftMs: Math.round(s.avg_ttft ?? 0),
       },
     };
+  }
+
+  async usageStats(
+    query: Omit<UsageQuery, "page" | "pageSize" | "summary">,
+    plan: UsageStatsPlan,
+    scope?: { managedGroupIds?: string[] },
+  ): Promise<UsageStatsAggregate> {
+    const sql = this.sql;
+    const where = this.usageWhere({ ...query, sinceIso: new Date(plan.sinceMs).toISOString() }, scope);
+    type StatsRow = SumsRow & {
+      g: number;
+      b: number | null;
+      public_model: string | null;
+      group_id: string | null;
+      user_id: string | null;
+      group_name: string | null;
+      user_email: string | null;
+    };
+    // One scan of the filtered window, five groupings; names joined onto the grouped rows only.
+    const rows = await pgReadWithTimeout(
+      sql,
+      USAGE_STATS_TIMEOUT_MS,
+      (tx) => tx<StatsRow[]>`
+        SELECT s.*, COALESCE(gr.name, '') AS group_name, COALESCE(us.email, '') AS user_email
+          FROM (
+            SELECT GROUPING(x.b, x.public_model, x.group_id, x.user_id)::int AS g, x.b, x.public_model, x.group_id, x.user_id,
+                   ${this.sumsColumns()}
+              FROM (
+                SELECT ${this.bucketOf(plan.startMs, plan.bucketMs)} AS b, l.public_model, l.group_id, l.user_id, l.status_code,
+                       l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cost_nano_usd, l.duration_ms, l.ttft_ms
+                  FROM core.usage_logs l
+                 WHERE ${where}
+              ) x
+             GROUP BY GROUPING SETS ((), (x.b), (x.public_model), (x.group_id), (x.user_id))
+          ) s
+          LEFT JOIN core.groups gr ON gr.id = s.group_id
+          LEFT JOIN commerce.users us ON us.id = s.user_id
+      `,
+    );
+    const agg = emptyUsageStatsAggregate();
+    for (const r of rows) {
+      // GROUPING bits (b, model, group, user), 1 = rolled up: 15 = total, 7 = bucket, 11 = model,
+      // 13 = group, 14 = user.
+      if (r.g === 15) agg.totals = sumsOf(r);
+      else if (r.g === 7 && r.b !== null && r.b >= 0 && r.b < plan.bucketCount) agg.buckets.set(r.b, sumsOf(r));
+      else if (r.g === 11 && r.public_model !== null) agg.models.set(r.public_model, sumsOf(r));
+      else if (r.g === 13 && r.group_id !== null) {
+        agg.groups.set(r.group_id, sumsOf(r));
+        agg.groupNames.set(r.group_id, r.group_name ?? "");
+      } else if (r.g === 14 && r.user_id !== null) {
+        agg.users.set(r.user_id, sumsOf(r));
+        agg.userEmails.set(r.user_id, r.user_email ?? "");
+      }
+    }
+    return agg;
   }
 
   async exportUsage(query: UsageExportQuery): Promise<UsageRow[]> {

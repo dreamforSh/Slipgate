@@ -18,7 +18,8 @@ function isGroupManagerAllowedRequest(method: string, path: string): boolean {
       path === "/api/v1/admin/accounts" ||
       path === "/api/v1/admin/users" ||
       path === "/api/v1/admin/usage" ||
-      path === "/api/v1/admin/usage/query"
+      path === "/api/v1/admin/usage/query" ||
+      path === "/api/v1/admin/usage/stats"
     ) {
       return true;
     }

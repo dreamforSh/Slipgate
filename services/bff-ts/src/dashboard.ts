@@ -2,6 +2,7 @@ import type {
   AccountStatsRange,
   AccountUsageStats,
   AdminDashboardStats,
+  DashboardGranularity,
   DashboardRange,
   GroupItem,
   UpstreamAccount,
@@ -18,6 +19,8 @@ const DAY_MS = 24 * HOUR_MS;
 /** Rows read per dashboard request; beyond this the period totals become a lower bound. */
 export const DASHBOARD_MAX_ROWS = 100_000;
 const BREAKDOWN_LIMIT = 10;
+/** Users charted over time on the dashboard (more lines stop being readable). */
+const USER_SERIES_LIMIT = 5;
 
 export interface DashboardWindow {
   /** Earliest instant whose usage rows the aggregation needs. */
@@ -33,7 +36,12 @@ export interface DashboardWindow {
  * Bucket boundaries in the viewer's local time. `tzOffsetMinutes` follows
  * `Date#getTimezoneOffset()` (UTC minus local, e.g. -480 for UTC+8).
  */
-export function dashboardWindow(range: DashboardRange, nowMs: number, tzOffsetMinutes: number): DashboardWindow {
+export function dashboardWindow(
+  range: DashboardRange,
+  nowMs: number,
+  tzOffsetMinutes: number,
+  granularityHint?: DashboardGranularity,
+): DashboardWindow {
   const offsetMs = tzOffsetMinutes * MINUTE_MS;
   const floorLocal = (ms: number, unit: number) => Math.floor((ms - offsetMs) / unit) * unit + offsetMs;
 
@@ -42,10 +50,12 @@ export function dashboardWindow(range: DashboardRange, nowMs: number, tzOffsetMi
 
   let granularity: "hour" | "day";
   let bucketStarts: number[];
-  if (range === "24h") {
+  if (range === "24h" || (range === "7d" && granularityHint === "hour")) {
+    // 24h is always hourly; 7d may ask for hourly buckets (168 of them).
     granularity = "hour";
+    const hours = range === "24h" ? 24 : 7 * 24;
     const currentHour = floorLocal(nowMs, HOUR_MS);
-    bucketStarts = Array.from({ length: 24 }, (_, i) => currentHour - (23 - i) * HOUR_MS);
+    bucketStarts = Array.from({ length: hours }, (_, i) => currentHour - (hours - 1 - i) * HOUR_MS);
   } else {
     granularity = "day";
     const days = range === "7d" ? 7 : 30;
@@ -126,8 +136,13 @@ export function ranked(map: Map<string, Breakdown>, limit = BREAKDOWN_LIMIT) {
     .map(([key, v]) => ({ key, requests: v.requests, tokens: v.tokens, costNanoUsd: v.cost.toString() }));
 }
 
+/** Accounts expiring within this window count as "expiring soon" (same as the account list). */
+const EXPIRING_SOON_MS = 7 * 24 * 3_600_000;
+
 export interface DashboardInputs {
   range: DashboardRange;
+  /** Requested bucket size (see dashboardWindow). */
+  granularity?: DashboardGranularity;
   nowMs: number;
   tzOffsetMinutes: number;
   /** Usage rows created at or after `dashboardWindow(...).sinceMs`, any order. */
@@ -140,7 +155,7 @@ export interface DashboardInputs {
 }
 
 export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats {
-  const win = dashboardWindow(input.range, input.nowMs, input.tzOffsetMinutes);
+  const win = dashboardWindow(input.range, input.nowMs, input.tzOffsetMinutes, input.granularity);
   const bucketSize = win.granularity === "hour" ? HOUR_MS : DAY_MS;
 
   const today = new TotalsAccumulator();
@@ -151,10 +166,13 @@ export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats
     errors: 0,
     inputTokens: 0,
     outputTokens: 0,
+    cacheReadTokens: 0,
     cost: 0n,
   }));
   const models = new Map<string, Breakdown>();
   const users = new Map<string, Breakdown>();
+  /** Per-user bucket arrays, trimmed to the top users at the end. */
+  const userBuckets = new Map<string, { tokens: number[]; cost: bigint[] }>();
   const groups = new Map<string, Breakdown>();
   const activeToday = new Set<string>();
   let rpm = 0;
@@ -184,7 +202,15 @@ export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats
       if (log.statusCode >= 400) bucket.errors += 1;
       bucket.inputTokens += log.inputTokens;
       bucket.outputTokens += log.outputTokens;
+      bucket.cacheReadTokens += log.cacheReadTokens;
       bucket.cost += BigInt(log.costNanoUsd);
+      let ub = userBuckets.get(log.userId);
+      if (!ub) {
+        ub = { tokens: buckets.map(() => 0), cost: buckets.map(() => 0n) };
+        userBuckets.set(log.userId, ub);
+      }
+      ub.tokens[idx]! += log.inputTokens + log.outputTokens;
+      ub.cost[idx]! += BigInt(log.costNanoUsd);
     }
     bump(models, log.publicModel, log);
     bump(users, log.userId, log);
@@ -200,8 +226,15 @@ export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats
     errors: b.errors,
     inputTokens: b.inputTokens,
     outputTokens: b.outputTokens,
+    cacheReadTokens: b.cacheReadTokens,
     costNanoUsd: b.cost.toString(),
   }));
+
+  const topUsers = ranked(users).map(({ key, ...rest }) => ({ userId: key, email: emailById.get(key) ?? key, ...rest }));
+  const userSeries = topUsers.slice(0, USER_SERIES_LIMIT).flatMap((u) => {
+    const ub = userBuckets.get(u.userId);
+    return ub ? [{ userId: u.userId, email: u.email, tokens: ub.tokens, costNanoUsd: ub.cost.map((c) => c.toString()) }] : [];
+  });
 
   // Effective status: a lapsed subscription counts as expired, a finished cooldown as active.
   const countStatus = (status: UpstreamAccount["status"]) =>
@@ -232,10 +265,17 @@ export function buildDashboardStats(input: DashboardInputs): AdminDashboardStats
       cooldown: countStatus("cooldown"),
       expired: countStatus("expired"),
       failedTests: input.accounts.filter((a) => a.lastTest && !a.lastTest.ok).length,
+      quotaExceeded: input.accounts.filter((a) => a.quota && a.quota.state !== "ok").length,
+      expiringSoon: input.accounts.filter((a) => {
+        if (a.effectiveStatus === "expired" || !a.expiresAtIso) return false;
+        const at = Date.parse(a.expiresAtIso);
+        return Number.isFinite(at) && at > input.nowMs && at - input.nowMs <= EXPIRING_SOON_MS;
+      }).length,
     },
     series,
     models: ranked(models).map(({ key, ...rest }) => ({ model: key, ...rest })),
-    topUsers: ranked(users).map(({ key, ...rest }) => ({ userId: key, email: emailById.get(key) ?? key, ...rest })),
+    topUsers,
+    userSeries,
     groups: ranked(groups).map(({ key, ...rest }) => ({ groupId: key, name: groupNameById.get(key) ?? key, ...rest })),
   };
 }

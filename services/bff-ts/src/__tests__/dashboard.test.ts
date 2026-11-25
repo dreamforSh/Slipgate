@@ -48,8 +48,9 @@ const users: UserProfile[] = [
 const groups = [{ id: "g1", name: "main" }, { id: "g2", name: "vip" }] as GroupItem[];
 
 const accounts = [
-  { status: "active", effectiveStatus: "active", lastTest: { ok: false } },
-  { status: "active", effectiveStatus: "active", lastTest: null },
+  { status: "active", effectiveStatus: "active", lastTest: { ok: false }, quota: { state: "daily_exceeded" } },
+  // Expires in 3 days: expiring soon.
+  { status: "active", effectiveStatus: "active", lastTest: null, expiresAtIso: "2026-11-25T02:30:00Z", quota: { state: "ok" } },
   { status: "paused", effectiveStatus: "paused", lastTest: { ok: true } },
   { status: "cooldown", effectiveStatus: "cooldown", lastTest: null },
   // Stored as active but its subscription lapsed: counted by the effective status.
@@ -132,7 +133,49 @@ describe("buildDashboardStats", () => {
   it("summarizes users, keys and account health", () => {
     expect(stats.users).toEqual({ total: 2, newToday: 1, activeToday: 2 });
     expect(stats.apiKeys).toEqual({ total: 3, enabled: 2 });
-    expect(stats.accounts).toEqual({ total: 5, active: 2, paused: 1, cooldown: 1, expired: 1, failedTests: 1 });
+    expect(stats.accounts).toEqual({
+      total: 5,
+      active: 2,
+      paused: 1,
+      cooldown: 1,
+      expired: 1,
+      failedTests: 1,
+      quotaExceeded: 1,
+      expiringSoon: 1,
+    });
+  });
+});
+
+describe("dashboard charts (sub2api-style)", () => {
+  const logs = [
+    log("2026-11-22T02:29:30Z", { outputTokens: 10, cacheReadTokens: 40 }),
+    log("2026-11-22T01:10:00Z", { costNanoUsd: "2000" }),
+    log("2026-11-21T17:00:00Z", { userId: "u2", inputTokens: 1000, costNanoUsd: "7000" }),
+    log("2026-11-21T10:00:00Z"),
+    log("2026-11-16T01:00:00Z", { cacheReadTokens: 5 }),
+  ];
+  const base = { nowMs: NOW, tzOffsetMinutes: UTC8, logs, truncated: false, users, groups, accounts, apiKeys: [] };
+
+  it("buckets cache-read tokens and charts the top users per bucket", () => {
+    const stats = buildDashboardStats({ ...base, range: "7d" });
+    expect(stats.series[6]?.cacheReadTokens).toBe(40);
+    expect(stats.series[0]?.cacheReadTokens).toBe(5);
+    // u2 leads by tokens, then u1; arrays follow the 7 daily buckets.
+    expect(stats.userSeries.map((u) => u.userId)).toEqual(["u2", "u1"]);
+    expect(stats.userSeries[0]).toMatchObject({ email: "b@x.test" });
+    expect(stats.userSeries[0]!.tokens).toEqual([0, 0, 0, 0, 0, 0, 1050]);
+    expect(stats.userSeries[0]!.costNanoUsd[6]).toBe("7000");
+    expect(stats.userSeries[1]!.tokens).toEqual([150, 0, 0, 0, 0, 150, 260]);
+  });
+
+  it("buckets 7 days by hour on request; 30 days stay daily", () => {
+    const hourly = buildDashboardStats({ ...base, range: "7d", granularity: "hour" });
+    expect(hourly.granularity).toBe("hour");
+    expect(hourly.series).toHaveLength(168);
+    expect(hourly.userSeries[0]!.tokens).toHaveLength(168);
+    expect(hourly.series.reduce((sum, p) => sum + p.requests, 0)).toBe(5);
+    expect(dashboardWindow("30d", NOW, UTC8, "hour").granularity).toBe("day");
+    expect(dashboardWindow("7d", NOW, UTC8, "day").bucketStarts).toHaveLength(7);
   });
 });
 

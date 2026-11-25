@@ -106,6 +106,64 @@ export const UserDashboardStatsSchema = z.object({
 export type UserDashboardStats = z.infer<typeof UserDashboardStatsSchema>;
 
 /* ------------------------------------------------------------------------------------------ */
+/* Admin usage statistics (the usage page's charts and user ranking)                          */
+/* ------------------------------------------------------------------------------------------ */
+
+export const UsageRankBySchema = z.enum(["requests", "tokens", "cost"]);
+export type UsageRankBy = z.infer<typeof UsageRankBySchema>;
+
+/** Users the ranking may list. */
+export const USAGE_RANK_LIMITS = [10, 20, 50, 100] as const;
+
+/**
+ * Widest window the usage charts bucket by hour: 7 days plus an hour of slack, so a "last 7 days"
+ * window whose start the browser computed a moment before the server's now still qualifies.
+ */
+export const USAGE_STATS_HOURLY_MAX_MS = 7 * 86_400_000 + 3_600_000;
+
+/**
+ * The usage list's filters (no paging) plus the chart options. Without `sinceIso` the window is
+ * the 30 days before `untilIso` (or now); a start more than 400 days before the end is moved up.
+ * `granularity` is a hint: hourly buckets only up to USAGE_STATS_HOURLY_MAX_MS (default: hourly up to 2 days).
+ */
+export const UsageStatsQuerySchema = UsageQuerySchema.omit({ page: true, pageSize: true, summary: true }).extend({
+  granularity: z.enum(["hour", "day"]).optional().catch(undefined),
+  rankBy: UsageRankBySchema.catch("tokens").default("tokens"),
+  rankLimit: z.coerce.number().int().min(1).max(100).catch(20).default(20),
+});
+export type UsageStatsQuery = z.infer<typeof UsageStatsQuerySchema>;
+
+const UsageStatsSums = {
+  requests: Count,
+  errors: Count,
+  inputTokens: Count,
+  outputTokens: Count,
+  cacheReadTokens: Count,
+  costNanoUsd: NanoUsd,
+};
+
+export const UsageStatsResponseSchema = z.object({
+  generatedAtIso: z.string(),
+  /** The window actually charted. */
+  sinceIso: z.string(),
+  untilIso: z.string(),
+  /** The requested start was moved up to 400 days before the end. */
+  clamped: z.boolean(),
+  granularity: z.enum(["hour", "day"]),
+  totals: z.object(UsageStatsSums),
+  series: z.array(UsageSeriesPointSchema),
+  /** Every model / group of the window by tokens (at most 200 each); the page re-sorts them. */
+  models: z.array(z.object({ model: z.string(), ...UsageStatsSums })),
+  groups: z.array(z.object({ groupId: z.string(), name: z.string(), ...UsageStatsSums })),
+  /** Top `rankLimit` users by `rankBy`. */
+  users: z.array(z.object({ userId: z.string(), email: z.string(), ...UsageStatsSums })),
+  /** Distinct users with traffic in the window. */
+  userCount: Count,
+  rankBy: UsageRankBySchema,
+});
+export type UsageStatsResponse = z.infer<typeof UsageStatsResponseSchema>;
+
+/* ------------------------------------------------------------------------------------------ */
 /* Public key-usage lookup                                                                    */
 /* ------------------------------------------------------------------------------------------ */
 

@@ -44,6 +44,7 @@ import {
   USAGE_QUERY_MAX_PAGED_ROWS,
   OpsRangeSchema,
   UsageQuerySchema,
+  UsageStatsQuerySchema,
   UserSubscriptionListQuerySchema,
   type KeyUsageLookupResponse,
   type ModelPricingRule,
@@ -68,7 +69,9 @@ import {
 } from "../insights.ts";
 import {
   finalizeScopedUsage,
+  finalizeUsageStats,
   scopedUsagePlan,
+  usageStatsPlan,
   UsageAggregateTimeoutError,
   type ScopedUsage,
   type ScopedUsageQuery,
@@ -1222,6 +1225,26 @@ export function registerOpsRoutes(app: App, ctx: OpsRouteContext): void {
       scope = { managedGroupIds: allowed };
     }
     return c.json(await ops.queryUsage(q, scope));
+  });
+
+  app.get("/api/v1/admin/usage/stats", async (c) => {
+    const claims = c.get("authUser");
+    const { granularity, rankBy, rankLimit, ...filters } = query(c, UsageStatsQuerySchema);
+    let scope: { managedGroupIds?: string[] } | undefined;
+    if (claims.role === "group_manager") {
+      const allowed = claims.managedGroupIds ?? [];
+      if (filters.groupId && !allowed.includes(filters.groupId)) {
+        return c.json({ error: "forbidden", message: "Group is outside your managed scope" }, 403);
+      }
+      scope = { managedGroupIds: allowed };
+    }
+    const nowMs = Date.now();
+    const plan = usageStatsPlan({ ...filters, granularity, nowMs, tzOffsetMinutes: tzOffset(c.req.query("tz")) });
+    try {
+      return c.json(finalizeUsageStats(plan, await ops.usageStats(filters, plan, scope), { rankBy, rankLimit, nowMs }));
+    } catch (err) {
+      return usageTimedOut(c, err);
+    }
   });
 
   app.get("/api/v1/admin/usage/export", async (c) => {

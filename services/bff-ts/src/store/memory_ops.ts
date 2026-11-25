@@ -83,12 +83,15 @@ import {
   reduceChannelStatus,
   reduceOpsUsage,
   reduceScopedUsage,
+  reduceUsageStats,
   type ChannelStatusAggregate,
   type ChannelStatusQuery,
   type OpsUsageAggregate,
   type OpsUsageQuery,
   type ScopedUsageAggregate,
   type ScopedUsageQuery,
+  type UsageStatsAggregate,
+  type UsageStatsPlan,
 } from "./usage_aggregates.ts";
 
 /* ------------------------------------------------------------------------------------------ */
@@ -1755,6 +1758,22 @@ export class MemoryOpsStore implements OpsStore {
     summary.avgDurationMs = durN ? Math.round(durSum / durN) : 0;
     summary.avgTtftMs = ttftN ? Math.round(ttftSum / ttftN) : 0;
     return { items: matched.slice(offset, offset + limit).map((l) => this.toRow(l)), total: matched.length, summary };
+  }
+
+  async usageStats(
+    query: Omit<UsageQuery, "page" | "pageSize" | "summary">,
+    plan: UsageStatsPlan,
+    scope?: { managedGroupIds?: string[] },
+  ): Promise<UsageStatsAggregate> {
+    const q = { ...query, sinceIso: new Date(plan.sinceMs).toISOString() };
+    return reduceUsageStats(
+      plan,
+      this.core.usageLogs.filter((l) => this.matchUsage(l, q, scope)),
+      {
+        userEmail: (id) => this.core.users.get(id)?.email ?? "",
+        groupName: (id) => this.core.groups.get(id)?.name ?? "",
+      },
+    );
   }
 
   async exportUsage(query: UsageExportQuery): Promise<UsageRow[]> {
