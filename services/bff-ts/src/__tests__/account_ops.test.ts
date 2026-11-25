@@ -45,7 +45,9 @@ async function bootstrap(internalToken = "", store?: ControlStore) {
     headers: JSON_HEADERS,
     body: JSON.stringify({ email: "user@ops.test", password: "UserPassword123!" }),
   });
-  const userToken = ((await regRes.json()) as { accessToken: string }).accessToken;
+  const regBody = (await regRes.json()) as { accessToken: string; user?: { id?: string } };
+  const userToken = regBody.accessToken;
+  const userId = regBody.user?.id ?? "usr_ops";
   const user = { ...JSON_HEADERS, Authorization: `Bearer ${userToken}` };
 
   const call = async <T>(method: string, path: string, headers: Record<string, string>, body?: unknown) => {
@@ -84,7 +86,7 @@ async function bootstrap(internalToken = "", store?: ControlStore) {
     return new Map(snap.accounts.map((a) => [a.id, a.status]));
   };
 
-  return { app, admin, user, call, createGroup, createAccount, listAccounts, snapshotStatuses };
+  return { app, admin, user, userId, call, createGroup, createAccount, listAccounts, snapshotStatuses };
 }
 
 describe("account lifecycle", () => {
@@ -697,6 +699,106 @@ describe("API keys carry no plan", () => {
     const snap = (await res.json()) as DataPlaneSyncSnapshot;
     expect(snap.accounts.find((a) => a.id === key.id)?.subscriptionTier).toBe("standard");
     expect(snap.accounts.find((a) => a.id === oauth.id)?.subscriptionTier).toBe("standard");
+  });
+});
+
+describe("account spend quota", () => {
+  it("counts usage against daily / total limits, pauses the account in the snapshot and resets", async () => {
+    const token = "quota-internal-token";
+    // Runs against Postgres when a test preload provides a store factory (quota columns + usage sums).
+    const factory = (globalThis as { __slipgateTestStoreFactory?: () => Promise<ControlStore> }).__slipgateTestStoreFactory;
+    const env = await bootstrap(token, factory ? await factory() : undefined);
+    const { app, admin, call } = env;
+    const g = await env.createGroup("quota-g");
+    const limited = await env.createAccount({
+      name: "limited",
+      groupId: g.id,
+      quotaDailyLimitUsd: "0.000002",
+      quotaTotalLimitUsd: "$0.000005",
+    });
+    const free = await env.createAccount({ name: "free", groupId: g.id });
+    expect(limited.quota).toEqual({
+      dailyLimitNanoUsd: "2000",
+      weeklyLimitNanoUsd: "0",
+      totalLimitNanoUsd: "5000",
+      dailyUsedNanoUsd: "0",
+      weeklyUsedNanoUsd: "0",
+      totalUsedNanoUsd: "0",
+      resetAtIso: null,
+      state: "ok",
+    });
+    expect(free.quota.state).toBe("ok");
+
+    let n = 0;
+    const settle = async (accountId: string) => {
+      n += 1;
+      const res = await app.request("/api/v1/internal/dataplane/settlement", {
+        method: "POST",
+        headers: { ...JSON_HEADERS, "X-Slipgate-Internal-Token": token },
+        body: JSON.stringify({
+          requestId: `req_quota_${n}`,
+          userId: env.userId,
+          apiKeyId: "key_quota",
+          accountId,
+          groupId: g.id,
+          platform: "anthropic",
+          publicModel: "claude-sonnet-4-5",
+          upstreamModel: "claude-sonnet-4-5",
+          ingressCodec: "anthropic_messages",
+          egressCodec: "anthropic_messages",
+          inputTokens: 10,
+          outputTokens: 5,
+          costNanoUsd: "1000",
+          ttftMs: 10,
+          durationMs: 100,
+          statusCode: 200,
+        }),
+      });
+      expect(res.status).toBe(200);
+    };
+    const snapshotStatus = async (id: string) => {
+      const res = await app.request("/api/v1/internal/dataplane/snapshot", { headers: { "X-Slipgate-Internal-Token": token } });
+      return ((await res.json()) as DataPlaneSyncSnapshot).accounts.find((a) => a.id === id)?.status;
+    };
+    const quotaOf = async (id: string) => (await env.listAccounts()).find((a) => a.id === id)!;
+
+    await settle(limited.id);
+    await settle(free.id);
+    expect((await quotaOf(limited.id)).quota).toMatchObject({ dailyUsedNanoUsd: "1000", totalUsedNanoUsd: "1000", state: "ok" });
+    // Unlimited accounts do not sum usage.
+    expect((await quotaOf(free.id)).quota.totalUsedNanoUsd).toBe("0");
+    expect(await snapshotStatus(limited.id)).toBe("active");
+
+    await settle(limited.id);
+    const over = await quotaOf(limited.id);
+    expect(over.quota).toMatchObject({ dailyUsedNanoUsd: "2000", weeklyUsedNanoUsd: "2000", state: "daily_exceeded" });
+    // The stored status is untouched; only the data plane stops scheduling it.
+    expect(over.effectiveStatus).toBe("active");
+    expect(await snapshotStatus(limited.id)).toBe("paused");
+    expect(await snapshotStatus(free.id)).toBe("active");
+
+    // Reset: usage so far stops counting.
+    const reset = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${limited.id}`, admin, { resetQuota: true });
+    expect(reset.status).toBe(200);
+    expect(reset.body.account.quota).toMatchObject({ dailyUsedNanoUsd: "0", totalUsedNanoUsd: "0", state: "ok" });
+    expect(reset.body.account.quota.resetAtIso).not.toBeNull();
+    expect(await snapshotStatus(limited.id)).toBe("active");
+
+    // Bulk edit can set a weekly limit; "0" removes limits; malformed amounts are refused.
+    const bulk = await call<{ success: number }>("POST", "/api/v1/admin/accounts/bulk-update", admin, {
+      accountIds: [limited.id, free.id],
+      patch: { quotaWeeklyLimitUsd: "12.5" },
+    });
+    expect(bulk.status).toBe(200);
+    expect((await quotaOf(free.id)).quota.weeklyLimitNanoUsd).toBe("12500000000");
+    const cleared = await call<{ account: UpstreamAccount }>("PATCH", `/api/v1/admin/accounts/${limited.id}`, admin, {
+      quotaDailyLimitUsd: "0",
+      quotaWeeklyLimitUsd: "0",
+      quotaTotalLimitUsd: "0",
+    });
+    expect(cleared.body.account.quota).toMatchObject({ dailyLimitNanoUsd: "0", weeklyLimitNanoUsd: "0", totalLimitNanoUsd: "0", state: "ok" });
+    expect((await call("PATCH", `/api/v1/admin/accounts/${limited.id}`, admin, { quotaDailyLimitUsd: "-1" })).status).toBe(400);
+    expect((await call("PATCH", `/api/v1/admin/accounts/${limited.id}`, admin, { quotaDailyLimitUsd: "abc" })).status).toBe(400);
   });
 });
 

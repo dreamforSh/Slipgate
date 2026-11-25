@@ -692,7 +692,7 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
    * the prices the BFF bills.
    */
   async function exportEffectiveSnapshot(): Promise<DataPlaneSyncSnapshot> {
-    const [snapshot, access, entitlements, groups, overLimit, rules, moderation] = await Promise.all([
+    const [snapshot, access, entitlements, groups, overLimit, rules, moderation, overQuota] = await Promise.all([
       store.exportDataPlaneSnapshot(),
       store.ops.listUserAccess(),
       store.ops.subscriptionEntitlements(),
@@ -700,7 +700,15 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
       store.listOverLimitKeyIds(),
       pricing.rules(),
       store.moderation.exportDataPlaneModeration(),
+      store.listOverQuotaAccountIds(),
     ]);
+    // Accounts over their spend quota stop scheduling until usage falls back under the limit.
+    if (overQuota.length > 0) {
+      const blocked = new Set(overQuota);
+      snapshot.accounts = snapshot.accounts.map((a) =>
+        blocked.has(a.id) && a.status === "active" ? { ...a, status: "paused" } : a,
+      );
+    }
     const nowMs = Date.now();
     for (const [k, addedMs] of pendingClearedRiskSubjects) {
       if (nowMs - addedMs > PENDING_UNBAN_TTL_MS) pendingClearedRiskSubjects.delete(k);
@@ -754,20 +762,24 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
     };
   };
   const loadLimitedKeyIds = async () => new Set(await store.listLimitedKeyIds());
+  const loadQuotaLimitedAccountIds = async () => new Set(await store.listQuotaLimitedAccountIds());
   const loadPlatformQuotaUserIds = async () => new Set(await store.platformQuotas.listCappedUserIds());
   let groupMeta = cached(30_000, loadGroupMeta);
   let limitedKeyIds = cached(30_000, loadLimitedKeyIds);
+  let quotaLimitedAccountIds = cached(30_000, loadQuotaLimitedAccountIds);
   let platformQuotaUserIds = cached(30_000, loadPlatformQuotaUserIds);
   /** Per-user custom group rates the settlement path bills at (lane U1). */
   const userRates = new UserRateCache(store);
   function refreshSettlementCaches() {
     groupMeta = cached(30_000, loadGroupMeta);
     limitedKeyIds = cached(30_000, loadLimitedKeyIds);
+    quotaLimitedAccountIds = cached(30_000, loadQuotaLimitedAccountIds);
     platformQuotaUserIds = cached(30_000, loadPlatformQuotaUserIds);
     userRates.invalidate();
   }
   /** Per-key / per-subscription / per-platform cap checks after a charged settlement: at most one per second each. */
   const keyCapChecks = new KeyedThrottle(1000);
+  const accountQuotaChecks = new KeyedThrottle(1000);
   const subscriptionCapChecks = new KeyedThrottle(1000);
   const platformQuotaCapChecks = new KeyedThrottle(1000);
 
@@ -1301,6 +1313,12 @@ export function createBffApp(options: BffAppOptions = {}): Hono<AuthEnv> {
         if ((await limitedKeyIds()).has(item.apiKeyId)) {
           await keyCapChecks.request(item.apiKeyId, async () => {
             const state = await store.getApiKeyLimitState(item.apiKeyId);
+            if (state && state !== "ok") scheduleDataPlaneSync();
+          });
+        }
+        if ((await quotaLimitedAccountIds()).has(item.accountId)) {
+          await accountQuotaChecks.request(item.accountId, async () => {
+            const state = await store.getAccountQuotaState(item.accountId);
             if (state && state !== "ok") scheduleDataPlaneSync();
           });
         }

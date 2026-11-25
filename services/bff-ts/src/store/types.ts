@@ -1,5 +1,6 @@
 import type {
   AccountPrivacyMode,
+  AccountQuotaState,
   AccountTestResult,
   AccountUsageSummaryItem,
   ApiKeyItem,
@@ -206,6 +207,11 @@ export interface ControlStore {
   recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void>;
   /** Stores the outcome of the "set privacy" action (see AccountPrivacyModeSchema). */
   recordAccountPrivacy(accountId: string, mode: AccountPrivacyMode, checkedAtIso: string): Promise<void>;
+  /** Accounts with at least one spend-quota limit (the settlement path checks only these). */
+  listQuotaLimitedAccountIds(): Promise<string[]>;
+  /** Accounts that reached a spend-quota limit; the data-plane snapshot sends them as paused. */
+  listOverQuotaAccountIds(): Promise<string[]>;
+  getAccountQuotaState(accountId: string): Promise<AccountQuotaState | null>;
   /** Encrypted credentials for export and fingerprint backfill; every account when `accountIds` is omitted. */
   listAccountSecrets(accountIds?: string[]): Promise<AccountSecretRecord[]>;
   /** Maps each known fingerprint to the id of an account holding it. */

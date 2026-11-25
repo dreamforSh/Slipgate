@@ -501,6 +501,61 @@ export const TempUnschedRulesSchema = z
 /** Cooldown reason the data plane records when a rule fires (`temp_unsched:<description or status>`). */
 export const TEMP_UNSCHED_REASON_PREFIX = "temp_unsched:";
 
+/* ---------------- Account spend quota (sub2api "quota limit") ---------------- */
+
+/** USD amount an admin types for an account quota; "0" = no limit. */
+export const AccountQuotaUsdSchema = z
+  .string()
+  .trim()
+  .regex(/^\$?\d{1,12}(?:\.\d{1,9})?$/, "Expected a USD amount such as 50 or 12.5");
+
+/** Rolling windows of the daily / weekly quota (measured back from now). */
+export const ACCOUNT_QUOTA_DAY_MS = 24 * 3_600_000;
+export const ACCOUNT_QUOTA_WEEK_MS = 7 * ACCOUNT_QUOTA_DAY_MS;
+
+/** Which limit currently stops the account; `ok` = within every limit (or none set). */
+export const AccountQuotaStateSchema = z.enum(["ok", "daily_exceeded", "weekly_exceeded", "total_exceeded"]);
+export type AccountQuotaState = z.infer<typeof AccountQuotaStateSchema>;
+
+const NanoDigitsSchema = z.string().regex(/^\d+$/);
+
+/**
+ * Spend caps on what the account served (the billed cost of its requests), nano-USD; "0" = no limit.
+ * Daily / weekly are rolling 24 h / 7 d windows, total counts everything since `resetAtIso`. Usage
+ * before `resetAtIso` ("reset quota") no longer counts in any window. Reaching any limit takes the
+ * account out of scheduling until usage falls back under it (or the quota is reset / raised).
+ */
+export const AccountQuotaSchema = z.object({
+  dailyLimitNanoUsd: NanoDigitsSchema,
+  weeklyLimitNanoUsd: NanoDigitsSchema,
+  totalLimitNanoUsd: NanoDigitsSchema,
+  dailyUsedNanoUsd: NanoDigitsSchema,
+  weeklyUsedNanoUsd: NanoDigitsSchema,
+  totalUsedNanoUsd: NanoDigitsSchema,
+  resetAtIso: z.string().nullable(),
+  state: AccountQuotaStateSchema,
+});
+export type AccountQuota = z.infer<typeof AccountQuotaSchema>;
+
+type QuotaLimits = Pick<AccountQuota, "dailyLimitNanoUsd" | "weeklyLimitNanoUsd" | "totalLimitNanoUsd">;
+
+/** Whether any of the three limits is set. */
+export function accountQuotaLimited(q: QuotaLimits): boolean {
+  return q.dailyLimitNanoUsd !== "0" || q.weeklyLimitNanoUsd !== "0" || q.totalLimitNanoUsd !== "0";
+}
+
+/** The limit that blocks the account (total, then weekly, then daily), or `ok`. */
+export function accountQuotaState(
+  limits: QuotaLimits,
+  used: { daily: bigint; weekly: bigint; total: bigint },
+): AccountQuotaState {
+  const over = (limit: string, spent: bigint) => limit !== "0" && spent >= BigInt(limit);
+  if (over(limits.totalLimitNanoUsd, used.total)) return "total_exceeded";
+  if (over(limits.weeklyLimitNanoUsd, used.weekly)) return "weekly_exceeded";
+  if (over(limits.dailyLimitNanoUsd, used.daily)) return "daily_exceeded";
+  return "ok";
+}
+
 /** Outcome of the most recent admin connectivity test for an account. */
 export const AccountTestResultSchema = z.object({
   ok: z.boolean(),
@@ -581,6 +636,8 @@ export const UpstreamAccountSchema = z.object({
   /** Last "set privacy" outcome; `null` = never set. */
   privacyMode: AccountPrivacyModeSchema.nullable(),
   privacyCheckedAtIso: z.string().nullable(),
+  /** Spend quota and current usage (see AccountQuotaSchema). */
+  quota: AccountQuotaSchema,
   createdAtIso: z.string(),
 });
 export type UpstreamAccount = z.infer<typeof UpstreamAccountSchema>;
@@ -608,6 +665,10 @@ export const CreateAccountRequestSchema = z.object({
   expiresAtIso: IsoDateTimeSchema.nullable().default(null),
   autoPauseOnExpired: z.boolean().default(true),
   tempUnschedRules: TempUnschedRulesSchema.default([]),
+  /** Spend quota in USD; omitted or "0" = no limit. */
+  quotaDailyLimitUsd: AccountQuotaUsdSchema.optional(),
+  quotaWeeklyLimitUsd: AccountQuotaUsdSchema.optional(),
+  quotaTotalLimitUsd: AccountQuotaUsdSchema.optional(),
 });
 export type CreateAccountRequest = z.infer<typeof CreateAccountRequestSchema>;
 
@@ -634,6 +695,12 @@ export const UpdateAccountRequestSchema = z.object({
   cooldownReason: z.string().trim().max(200).optional(),
   /** Replaces the whole rule list; `[]` clears it. */
   tempUnschedRules: TempUnschedRulesSchema.optional(),
+  /** Spend quota in USD; "0" removes that limit. Changing a limit keeps the usage counted so far. */
+  quotaDailyLimitUsd: AccountQuotaUsdSchema.optional(),
+  quotaWeeklyLimitUsd: AccountQuotaUsdSchema.optional(),
+  quotaTotalLimitUsd: AccountQuotaUsdSchema.optional(),
+  /** "Reset quota": usage up to now stops counting toward every limit. */
+  resetQuota: z.literal(true).optional(),
 });
 export type UpdateAccountRequest = z.infer<typeof UpdateAccountRequestSchema>;
 
@@ -651,6 +718,10 @@ export const AccountBulkPatchSchema = UpdateAccountRequestSchema.pick({
   autoPauseOnExpired: true,
   cooldownUntilIso: true,
   cooldownReason: true,
+  quotaDailyLimitUsd: true,
+  quotaWeeklyLimitUsd: true,
+  quotaTotalLimitUsd: true,
+  resetQuota: true,
 });
 export type AccountBulkPatch = z.infer<typeof AccountBulkPatchSchema>;
 

@@ -46,8 +46,9 @@ export const EXPIRY_TONE: Record<ExpiryState, Tone> = {
 };
 
 /** Schedulable right now (what the data plane will route to). */
-export function isSchedulable(acc: Pick<UpstreamAccount, "effectiveStatus">): boolean {
-  return acc.effectiveStatus === "active";
+/** Active and within its spend quota (an account over quota is sent to the data plane as paused). */
+export function isSchedulable(acc: Pick<UpstreamAccount, "effectiveStatus" | "quota">): boolean {
+  return acc.effectiveStatus === "active" && acc.quota.state === "ok";
 }
 
 /* ---------------- Filters ---------------- */
@@ -61,11 +62,11 @@ export function matchesGroupFilter(acc: Pick<UpstreamAccount, "groupId">, filter
   return acc.groupId === (filter === UNGROUPED_FILTER ? "" : filter);
 }
 
-export type AttentionFilter = "failed_test" | "expiring" | "never_tested" | "missing_exit";
+export type AttentionFilter = "failed_test" | "expiring" | "never_tested" | "missing_exit" | "quota_exceeded";
 /** "Set privacy" state of the accounts it applies to (ChatGPT / Codex and Antigravity OAuth). */
 export type PrivacyFilter = "privacy_unset" | "privacy_set" | "privacy_failed";
 export type StatusFilter = "all" | AccountStatus | AttentionFilter | PrivacyFilter;
-export const ATTENTION_FILTERS: AttentionFilter[] = ["failed_test", "expiring", "never_tested", "missing_exit"];
+export const ATTENTION_FILTERS: AttentionFilter[] = ["failed_test", "expiring", "never_tested", "missing_exit", "quota_exceeded"];
 export const PRIVACY_FILTERS: PrivacyFilter[] = ["privacy_unset", "privacy_set", "privacy_failed"];
 
 /**
@@ -87,6 +88,8 @@ export function matchesStatusFilter(
       return acc.lastTest === null && acc.executionMode !== "vm_slot";
     case "missing_exit":
       return !!hasExit && modeUsesExit(acc.executionMode) && !hasExit(acc.id);
+    case "quota_exceeded":
+      return acc.quota.state !== "ok";
     case "privacy_unset":
       return accountSupportsPrivacy(acc) && !acc.privacyMode;
     case "privacy_set":

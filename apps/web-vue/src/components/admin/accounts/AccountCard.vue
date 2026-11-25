@@ -9,6 +9,7 @@ import AccountExitCell from "./AccountExitCell.vue";
 import AccountStatusCell from "./AccountStatusCell.vue";
 import PlatformTypeBadge from "./PlatformTypeBadge.vue";
 import AccountPrivacyBadge from "./AccountPrivacyBadge.vue";
+import AccountQuotaMeter from "./AccountQuotaMeter.vue";
 import PriorityStepper from "./PriorityStepper.vue";
 import { EXPIRY_TONE, MODE_ICON, expiryState } from "./accountDisplay";
 import { modeUsesExit } from "./exitPool";
@@ -173,6 +174,8 @@ const lastTestClass = computed(() => {
       <UsageMeter label="5h" :bps="acc.window5hUsedBps" />
       <UsageMeter label="7d" :bps="acc.window7dUsedBps" />
     </div>
+    <!-- Spend quota (only when a limit is set) -->
+    <AccountQuotaMeter :quota="acc.quota" class="mt-2.5" />
 
     <!-- Limits + today -->
     <!-- The middle cell sizes to the priority stepper; the other two share the rest -->

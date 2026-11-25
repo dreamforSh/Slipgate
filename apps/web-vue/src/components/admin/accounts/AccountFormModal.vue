@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   allowedSubscriptionTiersForProvider,
@@ -27,6 +27,8 @@ import {
   type SubscriptionTier,
   type UpdateAccountRequest,
   type UpstreamAccount,
+  accountQuotaLimited,
+  parseUsdToNano,
 } from "@slipgate/contracts";
 import PlatformIcon from "../../ui/PlatformIcon.vue";
 import SegmentedControl from "../../ui/SegmentedControl.vue";
@@ -46,7 +48,7 @@ import {
   isoToDateInput,
   isoToDatetimeInput,
 } from "./accountDisplay";
-import { PROVIDER_OPTIONS, accountStatusLabel, executionModeLabel } from "../../../lib/format";
+import { PROVIDER_OPTIONS, accountStatusLabel, executionModeLabel, formatUsd } from "../../../lib/format";
 import { platformShortLabel, platformStyle } from "../../../lib/platformStyle";
 import { useAuthStore } from "../../../stores/auth";
 import { useToastStore } from "../../../stores/toast";
@@ -74,6 +76,8 @@ const props = defineProps<{
   accountNames: ReadonlyMap<string, string>;
   /** Exit nodes and bindings; the exit is bound through slipgate-net after the account is saved. */
   exitPool: ExitPool;
+  /** Edit opened as "re-authorize": scroll to the credentials and explain that they get replaced. */
+  reauth?: boolean;
 }>();
 const emit = defineEmits<{ (e: "update:open", value: boolean): void; (e: "saved"): void }>();
 
@@ -232,6 +236,38 @@ const batchAutoExit = ref(true);
 /** Temporary-unschedulable rules as edited (status / keywords as text). */
 const formRules = ref<EditableRule[]>([]);
 const rulesInvalid = computed(() => formRules.value.some((r) => ruleProblem(r) !== null));
+
+/* Spend quota (USD as typed; "" or 0 = no limit). */
+type QuotaKey = "daily" | "weekly" | "total";
+const QUOTA_KEYS: QuotaKey[] = ["daily", "weekly", "total"];
+const QUOTA_USD = /^\$?\d{1,12}(?:\.\d{1,9})?$/;
+const formQuota = ref<Record<QuotaKey, string>>({ daily: "", weekly: "", total: "" });
+const quotaBad = (key: QuotaKey) => {
+  const v = formQuota.value[key].trim();
+  return v !== "" && !QUOTA_USD.test(v);
+};
+const quotaInvalid = computed(() => QUOTA_KEYS.some(quotaBad));
+/** nano-USD digits of a typed amount ("0" for empty or invalid). */
+function quotaNanoOf(key: QuotaKey): string {
+  const v = formQuota.value[key].trim();
+  return v && QUOTA_USD.test(v) ? parseUsdToNano(v).toString() : "0";
+}
+/** nano-USD digits back to a plain USD string for the input ("" = no limit). */
+function quotaText(nano: string): string {
+  if (nano === "0") return "";
+  const n = BigInt(nano);
+  const whole = n / 1_000_000_000n;
+  const frac = (n % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : whole.toString();
+}
+const QUOTA_FIELD = {
+  daily: "quotaDailyLimitUsd",
+  weekly: "quotaWeeklyLimitUsd",
+  total: "quotaTotalLimitUsd",
+} as const;
+const QUOTA_LIMIT = { daily: "dailyLimitNanoUsd", weekly: "weeklyLimitNanoUsd", total: "totalLimitNanoUsd" } as const;
+const QUOTA_USED = { daily: "dailyUsedNanoUsd", weekly: "weeklyUsedNanoUsd", total: "totalUsedNanoUsd" } as const;
+const quotaCount = computed(() => QUOTA_KEYS.filter((k) => quotaNanoOf(k) !== "0").length);
 const batchPrefix = ref("");
 const batchText = ref("");
 const batchSkipDup = ref(true);
@@ -539,6 +575,11 @@ function loadFrom(src: UpstreamAccount, asCopy: boolean) {
   formAutoPause.value = src.autoPauseOnExpired;
   formCooldownUntil.value = isoToDatetimeInput(src.cooldownUntilIso);
   formRules.value = src.tempUnschedRules.map(toEditable);
+  formQuota.value = {
+    daily: quotaText(src.quota.dailyLimitNanoUsd),
+    weekly: quotaText(src.quota.weeklyLimitNanoUsd),
+    total: quotaText(src.quota.totalLimitNanoUsd),
+  };
 }
 
 function reset() {
@@ -581,6 +622,7 @@ function reset() {
   formAutoPause.value = true;
   formCooldownUntil.value = "";
   formRules.value = [];
+  formQuota.value = { daily: "", weekly: "", total: "" };
   addMethod.value = "oauth";
   formPlatform.value = preset && preset.platform !== "composite" ? preset.platform : "anthropic";
   syncMultiProtoDefaults();
@@ -591,7 +633,17 @@ function reset() {
 watch(
   () => [props.open, props.account?.id, props.template?.id] as const,
   ([open]) => {
-    if (open) reset();
+    if (!open) return;
+    reset();
+    // Re-authorize: bring the credentials (OAuth panel) into view once the modal has laid out.
+    if (props.reauth && props.account) {
+      void nextTick(() =>
+        window.setTimeout(
+          () => document.getElementById("account-form-credentials")?.scrollIntoView({ block: "start" }),
+          220,
+        ),
+      );
+    }
   },
   { immediate: true },
 );
@@ -725,6 +777,9 @@ function baseFields() {
     expiresAtIso: expiresIso.value,
     autoPauseOnExpired: formAutoPause.value,
     tempUnschedRules: formRules.value.map(toRule),
+    ...Object.fromEntries(
+      QUOTA_KEYS.filter((k) => quotaNanoOf(k) !== "0").map((k) => [QUOTA_FIELD[k], formQuota.value[k].trim()]),
+    ),
   };
 }
 
@@ -756,6 +811,9 @@ function buildPatch(acc: UpstreamAccount): UpdateAccountRequest {
   }
   const rules = formRules.value.map(toRule);
   if (!sameRules(rules, acc.tempUnschedRules)) patch.tempUnschedRules = rules;
+  for (const k of QUOTA_KEYS) {
+    if (quotaNanoOf(k) !== acc.quota[QUOTA_LIMIT[k]]) patch[QUOTA_FIELD[k]] = formQuota.value[k].trim() || "0";
+  }
   if (singleSecret.value) patch.credentialSecret = singleSecret.value;
   return patch;
 }
@@ -854,7 +912,7 @@ async function submitBatch() {
 
 const canSubmit = computed(() => {
   // The group is optional: an empty one creates (or moves to) an ungrouped account.
-  if (saving.value || rulesInvalid.value) return false;
+  if (saving.value || rulesInvalid.value || quotaInvalid.value) return false;
   // Switching the account type needs the matching credential; otherwise it may stay as stored.
   if (editing.value) return formName.value.trim().length > 0 && (authKind.value === editing.value.authKind || singleSecret.value.length > 0);
   if (mode.value === "batch") {
@@ -1017,7 +1075,8 @@ const credentialPlaceholder = computed(() => {
       </AccountFormSection>
 
       <!-- 3. Credentials -->
-      <AccountFormSection :title="t('accounts.form.sections.credentials')" icon="key">
+      <AccountFormSection id="account-form-credentials" class="scroll-mt-4" :title="t('accounts.form.sections.credentials')" icon="key">
+        <UiAlert v-if="reauth && editing" tone="info">{{ t("accounts.form.reauthNotice") }}</UiAlert>
         <!-- Credentials: single -->
         <template v-if="editing || mode === 'single'">
           <div
@@ -1432,6 +1491,40 @@ const credentialPlaceholder = computed(() => {
           <input id="account-form-cooldown" v-model="formCooldownUntil" type="datetime-local" class="input font-mono" />
           <p class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.form.cooldownUntilHint") }}</p>
         </div>
+      </AccountFormSection>
+
+      <!-- Spend quota (rolling daily / weekly windows and a total cap) -->
+      <AccountFormSection
+        :title="t('accounts.form.sections.quota')"
+        icon="wallet"
+        :tag="quotaCount ? t('accounts.quota.tagSet', { n: quotaCount }) : t('accounts.form.optional')"
+      >
+        <p class="text-2xs text-fg-subtle">{{ t("accounts.quota.hint") }}</p>
+        <div class="grid gap-4 sm:grid-cols-3">
+          <div v-for="k in QUOTA_KEYS" :key="k">
+            <label class="label" :for="`account-form-quota-${k}`">{{ t(`accounts.quota.${k}Limit`) }}</label>
+            <div class="relative">
+              <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 font-mono text-xs text-fg-subtle">$</span>
+              <input
+                :id="`account-form-quota-${k}`"
+                v-model="formQuota[k]"
+                type="text"
+                inputmode="decimal"
+                autocomplete="off"
+                placeholder="0"
+                class="input pl-6 font-mono"
+                :class="quotaBad(k) ? '!border-danger' : ''"
+                :aria-invalid="quotaBad(k) || undefined"
+              />
+            </div>
+            <p v-if="quotaBad(k)" class="mt-1 text-2xs text-danger">{{ t("accounts.quota.invalid") }}</p>
+            <p v-else-if="editing && accountQuotaLimited(editing.quota) && editing.quota[QUOTA_LIMIT[k]] !== '0'" class="mt-1 text-2xs text-fg-subtle">
+              {{ t("accounts.quota.used", { used: formatUsd(editing.quota[QUOTA_USED[k]]) }) }}
+            </p>
+            <p v-else class="mt-1 text-2xs text-fg-subtle">{{ t(`accounts.quota.${k}Hint`) }}</p>
+          </div>
+        </div>
+        <p v-if="editing && accountQuotaLimited(editing.quota)" class="text-2xs text-fg-subtle">{{ t("accounts.quota.editHint") }}</p>
       </AccountFormSection>
 
       <!-- 6. Temporary-unschedulable rules (applied by slipgate-net to upstream errors) -->

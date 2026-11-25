@@ -1,4 +1,8 @@
 import {
+  ACCOUNT_QUOTA_DAY_MS,
+  ACCOUNT_QUOTA_WEEK_MS,
+  accountQuotaLimited,
+  accountQuotaState,
   effectiveAccountStatus,
   formatNanoUsd,
   parseUsdToNano,
@@ -6,6 +10,8 @@ import {
   effectiveSubscriptionTier,
   subscriptionTierMultiplier,
   type AccountPrivacyMode,
+  type AccountQuota,
+  type AccountQuotaState,
   type AccountTestResult,
   type AccountUsageSummaryItem,
   type ApiKeyItem,
@@ -84,7 +90,12 @@ function cloneRules(rules: readonly TempUnschedRule[]): TempUnschedRule[] {
   return rules.map((r) => ({ ...r, keywords: [...r.keywords] }));
 }
 
-interface InternalAccount extends Omit<UpstreamAccount, "groupName" | "effectiveStatus"> {
+interface InternalAccount extends Omit<UpstreamAccount, "groupName" | "effectiveStatus" | "quota"> {
+  /** Spend quota limits, nano-USD ("0" = none), and the reset floor. */
+  quotaDailyLimitNanoUsd: string;
+  quotaWeeklyLimitNanoUsd: string;
+  quotaTotalLimitNanoUsd: string;
+  quotaResetAtIso: string | null;
   credentialsEnc: Uint8Array;
   credentialFingerprint: string | null;
   window5hResetAtMs: number | null;
@@ -523,10 +534,21 @@ export class MemoryControlStore implements ControlStore {
   }
 
   private toPublicAccount(acc: InternalAccount, nowMs = Date.now()): UpstreamAccount {
-    const { credentialsEnc: _enc, credentialFingerprint: _fp, window5hResetAtMs: _r5, window7dResetAtMs: _r7, ...rest } = acc;
+    const {
+      credentialsEnc: _enc,
+      credentialFingerprint: _fp,
+      window5hResetAtMs: _r5,
+      window7dResetAtMs: _r7,
+      quotaDailyLimitNanoUsd: _qd,
+      quotaWeeklyLimitNanoUsd: _qw,
+      quotaTotalLimitNanoUsd: _qt,
+      quotaResetAtIso: _qr,
+      ...rest
+    } = acc;
     const win = this.effectiveWindowQuotas(acc, nowMs);
     return {
       ...rest,
+      quota: this.accountQuota(acc, nowMs),
       window5hUsedBps: win.window5hUsedBps,
       window7dUsedBps: win.window7dUsedBps,
       lastTest: acc.lastTest ? { ...acc.lastTest } : null,
@@ -594,6 +616,10 @@ export class MemoryControlStore implements ControlStore {
       tempUnschedRules: cloneRules(req.tempUnschedRules),
       privacyMode: null,
       privacyCheckedAtIso: null,
+      quotaDailyLimitNanoUsd: quotaNano(req.quotaDailyLimitUsd) ?? "0",
+      quotaWeeklyLimitNanoUsd: quotaNano(req.quotaWeeklyLimitUsd) ?? "0",
+      quotaTotalLimitNanoUsd: quotaNano(req.quotaTotalLimitUsd) ?? "0",
+      quotaResetAtIso: null,
       createdAtIso: new Date().toISOString(),
     };
     this.accounts.set(id, record);
@@ -636,6 +662,10 @@ export class MemoryControlStore implements ControlStore {
     if (req.expiresAtIso !== undefined) acc.expiresAtIso = normalizeIso(req.expiresAtIso) ?? null;
     if (req.autoPauseOnExpired !== undefined) acc.autoPauseOnExpired = req.autoPauseOnExpired;
     if (req.tempUnschedRules !== undefined) acc.tempUnschedRules = cloneRules(req.tempUnschedRules);
+    acc.quotaDailyLimitNanoUsd = quotaNano(req.quotaDailyLimitUsd) ?? acc.quotaDailyLimitNanoUsd;
+    acc.quotaWeeklyLimitNanoUsd = quotaNano(req.quotaWeeklyLimitUsd) ?? acc.quotaWeeklyLimitNanoUsd;
+    acc.quotaTotalLimitNanoUsd = quotaNano(req.quotaTotalLimitUsd) ?? acc.quotaTotalLimitNanoUsd;
+    if (req.resetQuota) acc.quotaResetAtIso = new Date().toISOString();
     const cooldown = resolveCooldownChange(req);
     if (cooldown.untilIso !== undefined) acc.cooldownUntilIso = cooldown.untilIso;
     if (cooldown.reason !== undefined) acc.cooldownReason = cooldown.reason;
@@ -656,6 +686,62 @@ export class MemoryControlStore implements ControlStore {
   async recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void> {
     const acc = this.accounts.get(accountId);
     if (acc) acc.lastTest = { ...result };
+  }
+
+  /** Quota limits and usage; usage is only summed for accounts that have a limit. */
+  private accountQuota(acc: InternalAccount, nowMs = Date.now()): AccountQuota {
+    const limits = {
+      dailyLimitNanoUsd: acc.quotaDailyLimitNanoUsd,
+      weeklyLimitNanoUsd: acc.quotaWeeklyLimitNanoUsd,
+      totalLimitNanoUsd: acc.quotaTotalLimitNanoUsd,
+    };
+    const used = { daily: 0n, weekly: 0n, total: 0n };
+    if (accountQuotaLimited(limits)) {
+      const floor = acc.quotaResetAtIso ? Date.parse(acc.quotaResetAtIso) : Number.NEGATIVE_INFINITY;
+      for (const log of this.usageLogs) {
+        if (log.accountId !== acc.id) continue;
+        const at = Date.parse(log.createdAtIso);
+        if (at < floor) continue;
+        const cost = BigInt(log.costNanoUsd);
+        used.total += cost;
+        if (at >= nowMs - ACCOUNT_QUOTA_WEEK_MS) used.weekly += cost;
+        if (at >= nowMs - ACCOUNT_QUOTA_DAY_MS) used.daily += cost;
+      }
+    }
+    return {
+      ...limits,
+      dailyUsedNanoUsd: used.daily.toString(),
+      weeklyUsedNanoUsd: used.weekly.toString(),
+      totalUsedNanoUsd: used.total.toString(),
+      resetAtIso: acc.quotaResetAtIso,
+      state: accountQuotaState(limits, used),
+    };
+  }
+
+  private quotaLimitedAccounts(): InternalAccount[] {
+    return Array.from(this.accounts.values()).filter((a) =>
+      accountQuotaLimited({
+        dailyLimitNanoUsd: a.quotaDailyLimitNanoUsd,
+        weeklyLimitNanoUsd: a.quotaWeeklyLimitNanoUsd,
+        totalLimitNanoUsd: a.quotaTotalLimitNanoUsd,
+      }),
+    );
+  }
+
+  async listQuotaLimitedAccountIds(): Promise<string[]> {
+    return this.quotaLimitedAccounts().map((a) => a.id);
+  }
+
+  async listOverQuotaAccountIds(): Promise<string[]> {
+    const nowMs = Date.now();
+    return this.quotaLimitedAccounts()
+      .filter((a) => this.accountQuota(a, nowMs).state !== "ok")
+      .map((a) => a.id);
+  }
+
+  async getAccountQuotaState(accountId: string): Promise<AccountQuotaState | null> {
+    const acc = this.accounts.get(accountId);
+    return acc ? this.accountQuota(acc).state : null;
   }
 
   async recordAccountPrivacy(accountId: string, mode: AccountPrivacyMode, checkedAtIso: string): Promise<void> {
@@ -1228,4 +1314,9 @@ export class MemoryControlStore implements ControlStore {
     }
     return this.mediaTasks.delete(pk);
   }
+}
+
+/** USD quota text ("0" = no limit) to nano-USD digits; `undefined` when not sent. */
+function quotaNano(usd: string | undefined): string | undefined {
+  return usd === undefined ? undefined : parseUsdToNano(usd).toString();
 }

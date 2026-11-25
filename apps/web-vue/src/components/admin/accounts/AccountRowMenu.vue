@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { accountSupportsPrivacy, type UpstreamAccount } from "@slipgate/contracts";
+import { accountQuotaLimited, accountSupportsPrivacy, type UpstreamAccount } from "@slipgate/contracts";
 import UiIcon from "../../ui/UiIcon.vue";
 import { COOLDOWN_PRESETS_HOURS } from "./accountDisplay";
 
@@ -17,7 +17,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "update:open", value: boolean): void;
   (
-    e: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "delete",
+    e: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "reauth" | "reset-quota" | "delete",
     account: UpstreamAccount,
   ): void;
   (e: "cooldown", account: UpstreamAccount, hours: number): void;
@@ -96,8 +96,17 @@ onBeforeUnmount(() => bind(false));
 const canRefresh = computed(() => props.account?.authKind === "oauth");
 /** ChatGPT / Codex training and Antigravity telemetry can be switched off. */
 const canPrivacy = computed(() => !!props.account && accountSupportsPrivacy(props.account));
+/** Interactive OAuth (and setup-token) sign-in exists for these platforms. */
+const REAUTH_PLATFORMS: ReadonlySet<string> = new Set(["anthropic", "codex", "antigravity", "gemini", "qwen"]);
+const canReauth = computed(() => {
+  const acc = props.account;
+  return !!acc && (acc.authKind === "oauth" || acc.authKind === "setup_token") && REAUTH_PLATFORMS.has(acc.platform);
+});
+const canResetQuota = computed(() => !!props.account && accountQuotaLimited(props.account.quota));
 
-function pick(action: "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy") {
+type MenuAction = "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "reauth" | "reset-quota";
+
+function pick(action: MenuAction) {
   const acc = props.account;
   if (!acc) return;
   close();
@@ -123,6 +132,12 @@ function pick(action: "test" | "stats" | "edit" | "duplicate" | "resume" | "refr
       break;
     case "privacy":
       emit("privacy", acc);
+      break;
+    case "reauth":
+      emit("reauth", acc);
+      break;
+    case "reset-quota":
+      emit("reset-quota", acc);
       break;
   }
 }
@@ -182,6 +197,10 @@ const cooldownLabel = (h: number) => t(`accounts.cooldown.h${h}`);
         <UiIcon name="copy" :size="14" />
         {{ t("accounts.row.duplicate") }}
       </button>
+      <button v-if="canReauth" type="button" role="menuitem" class="menu-item" @click="pick('reauth')">
+        <UiIcon name="link" :size="14" />
+        {{ t("accounts.row.reauth") }}
+      </button>
       <button v-if="canRefresh" type="button" role="menuitem" class="menu-item" @click="pick('refresh')">
         <UiIcon name="rotate-ccw" :size="14" />
         {{ t("accounts.row.refreshToken") }}
@@ -189,6 +208,10 @@ const cooldownLabel = (h: number) => t(`accounts.cooldown.h${h}`);
       <button v-if="canPrivacy" type="button" role="menuitem" class="menu-item" @click="pick('privacy')">
         <UiIcon name="shield" :size="14" />
         {{ t("accounts.row.privacy") }}
+      </button>
+      <button v-if="canResetQuota" type="button" role="menuitem" class="menu-item" @click="pick('reset-quota')">
+        <UiIcon name="wallet" :size="14" />
+        {{ t("accounts.row.resetQuota") }}
       </button>
 
       <div v-if="canCooldown || canResume" class="my-1 border-t border-line/70" />

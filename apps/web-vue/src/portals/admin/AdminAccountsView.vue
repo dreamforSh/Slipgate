@@ -7,6 +7,7 @@ import {
   ProviderSchema,
   accountSupportsPrivacy,
   isPrivacyApplied,
+  type AccountAuthKind,
   type AccountBulkResult,
   type AccountPrivacyMode,
   type AccountUsageSummaryItem,
@@ -31,6 +32,7 @@ import AccountTable from "../../components/admin/accounts/AccountTable.vue";
 import {
   ACCOUNT_STATUSES,
   ATTENTION_FILTERS,
+  AUTH_KINDS,
   COLUMN_KEYS,
   COOLDOWN_PRESETS_HOURS,
   DEFAULT_COLUMNS,
@@ -202,6 +204,9 @@ const platformFilter = ref<"all" | Provider>(parseProvider(queryString("platform
 const groupFilter = ref<string>(queryString("groupId") || "all");
 const statusFilter = ref<StatusFilter>(isStatusFilter(queryString("status")) ? (queryString("status") as StatusFilter) : "all");
 const modeFilter = ref<"all" | ExecutionMode>(parseMode(queryString("mode")));
+const parseAuthKind = (v: string): "all" | AccountAuthKind =>
+  (AUTH_KINDS as string[]).includes(v) ? (v as AccountAuthKind) : "all";
+const typeFilter = ref<"all" | AccountAuthKind>(parseAuthKind(queryString("type")));
 
 let searchTimer: number | undefined;
 watch(search, (value) => {
@@ -218,6 +223,7 @@ watch(
     const status = queryString("status");
     statusFilter.value = isStatusFilter(status) ? status : "all";
     modeFilter.value = parseMode(queryString("mode"));
+    typeFilter.value = parseAuthKind(queryString("type"));
     const q = queryString("q");
     if (q !== debouncedSearch.value) {
       search.value = q;
@@ -226,13 +232,14 @@ watch(
   },
 );
 
-watch([debouncedSearch, platformFilter, groupFilter, statusFilter, modeFilter], ([q, platform, groupId, status, mode]) => {
+watch([debouncedSearch, platformFilter, groupFilter, statusFilter, modeFilter, typeFilter], ([q, platform, groupId, status, mode, type]) => {
   const query: Record<string, string> = {};
   if (q) query.q = q;
   if (platform !== "all") query.platform = platform;
   if (groupId !== "all") query.groupId = groupId;
   if (status !== "all") query.status = status;
   if (mode !== "all") query.mode = mode;
+  if (type !== "all") query.type = type;
   const current = JSON.stringify(route.query);
   if (current !== JSON.stringify(query)) void router.replace({ query });
 });
@@ -243,7 +250,8 @@ const hasFilters = computed(
     platformFilter.value !== "all" ||
     groupFilter.value !== "all" ||
     statusFilter.value !== "all" ||
-    modeFilter.value !== "all",
+    modeFilter.value !== "all" ||
+    typeFilter.value !== "all",
 );
 
 function clearFilters() {
@@ -253,6 +261,7 @@ function clearFilters() {
   groupFilter.value = "all";
   statusFilter.value = "all";
   modeFilter.value = "all";
+  typeFilter.value = "all";
 }
 
 const searchHaystack = computed(
@@ -271,6 +280,7 @@ const baseFiltered = computed(() => {
   const nowMs = now.value;
   return accounts.value.filter((a) => {
     if (platformFilter.value !== "all" && a.platform !== platformFilter.value) return false;
+    if (typeFilter.value !== "all" && a.authKind !== typeFilter.value) return false;
     if (!matchesGroupFilter(a, groupFilter.value)) return false;
     if (!matchesStatusFilter(a, statusFilter.value, nowMs, exitReady.value ? hasExit : undefined)) return false;
     return !q || (searchHaystack.value.get(a.id) ?? "").includes(q);
@@ -300,7 +310,7 @@ const pagedAccounts = computed(() =>
   filteredAccounts.value.slice((page.value - 1) * effectivePageSize.value, page.value * effectivePageSize.value),
 );
 
-watch([debouncedSearch, platformFilter, groupFilter, statusFilter, modeFilter, effectivePageSize], () => {
+watch([debouncedSearch, platformFilter, groupFilter, statusFilter, modeFilter, typeFilter, effectivePageSize], () => {
   page.value = 1;
 });
 watch(pageCount, (count) => {
@@ -691,20 +701,37 @@ async function onBulkEdited(result: AccountBulkResult) {
 const formOpen = ref(false);
 const formAccount = ref<UpstreamAccount | null>(null);
 const formTemplate = ref<UpstreamAccount | null>(null);
+/** The edit form was opened from "Re-authorize". */
+const formReauth = ref(false);
 
 function openCreate() {
   formAccount.value = null;
   formTemplate.value = null;
+  formReauth.value = false;
   formOpen.value = true;
 }
 function openEdit(acc: UpstreamAccount) {
   formAccount.value = acc;
   formTemplate.value = null;
+  formReauth.value = false;
   formOpen.value = true;
+}
+/** Re-authorize: the edit form opened at its credentials (OAuth sign-in replaces the stored credential). */
+function openReauth(acc: UpstreamAccount) {
+  formAccount.value = acc;
+  formTemplate.value = null;
+  formReauth.value = true;
+  formOpen.value = true;
+}
+
+async function resetQuota(acc: UpstreamAccount) {
+  const updated = await patchAccount(acc, { resetQuota: true }, t("accounts.quota.resetFailed"));
+  if (updated) toast.success(t("accounts.quota.resetDone", { name: acc.name }));
 }
 function openDuplicate(acc: UpstreamAccount) {
   formAccount.value = null;
   formTemplate.value = acc;
+  formReauth.value = false;
   formOpen.value = true;
 }
 
@@ -978,6 +1005,10 @@ onMounted(() => {
           <option value="all">{{ t("accounts.filters.allGroups") }}</option>
           <option :value="UNGROUPED_FILTER">{{ t("accounts.ungrouped") }}</option>
           <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
+        </UiSelect>
+        <UiSelect v-model="typeFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('accounts.filters.allTypes')">
+          <option value="all">{{ t("accounts.filters.allTypes") }}</option>
+          <option v-for="k in AUTH_KINDS" :key="k" :value="k">{{ t(`accounts.authKinds.${k}`) }}</option>
         </UiSelect>
         <UiSelect v-model="statusFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('common.status')">
           <option value="all">{{ t("accounts.filters.allStatuses") }}</option>
@@ -1259,6 +1290,8 @@ onMounted(() => {
       @resume="resumeAccount"
       @refresh="refreshToken"
       @privacy="setPrivacy"
+      @reauth="openReauth"
+      @reset-quota="resetQuota"
       @delete="removeAccount"
     />
 
@@ -1270,6 +1303,7 @@ onMounted(() => {
       :default-group-id="defaultGroupId"
       :account-names="accountNames"
       :exit-pool="exitPool"
+      :reauth="formReauth"
       @saved="refreshPool(true)"
     />
     <AccountStatsDrawer v-model:open="statsOpen" :account="statsAccount" :now="now" />

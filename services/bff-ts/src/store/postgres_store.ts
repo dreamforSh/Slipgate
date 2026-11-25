@@ -2,6 +2,7 @@ import postgres from "postgres";
 import {
   AccountAuthKindSchema,
   AccountPrivacyModeSchema,
+  accountQuotaState,
   effectiveAccountStatus,
   formatNanoUsd,
   parseUsdToNano,
@@ -11,6 +12,8 @@ import {
   effectiveSubscriptionTier,
   subscriptionTierMultiplier,
   type AccountPrivacyMode,
+  type AccountQuota,
+  type AccountQuotaState,
   type AccountTestResult,
   type AccountUsageSummaryItem,
   type ApiKeyItem,
@@ -465,7 +468,11 @@ export class PostgresControlStore implements ControlStore {
           ADD COLUMN IF NOT EXISTS credential_fingerprint TEXT,
           ADD COLUMN IF NOT EXISTS temp_unsched_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
           ADD COLUMN IF NOT EXISTS privacy_mode TEXT,
-          ADD COLUMN IF NOT EXISTS privacy_checked_at TIMESTAMPTZ;
+          ADD COLUMN IF NOT EXISTS privacy_checked_at TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS quota_daily_limit_nano_usd NUMERIC(39,0) NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS quota_weekly_limit_nano_usd NUMERIC(39,0) NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS quota_total_limit_nano_usd NUMERIC(39,0) NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS quota_reset_at TIMESTAMPTZ;
 
       -- The group is optional: NULL = ungrouped (the FK still guards non-null ids).
       ALTER TABLE core.accounts ALTER COLUMN group_id DROP NOT NULL;
@@ -1259,6 +1266,13 @@ export class PostgresControlStore implements ControlStore {
         last_test_message: string | null;
         privacy_mode: string | null;
         privacy_checked_at: Date | null;
+        quota_reset_at: Date | null;
+        q_daily: string;
+        q_weekly: string;
+        q_total: string;
+        u_daily: string;
+        u_weekly: string;
+        u_total: string;
         created_at: Date;
       }[]
     >`
@@ -1293,10 +1307,18 @@ export class PostgresControlStore implements ControlStore {
         a.last_test_message,
         a.privacy_mode,
         a.privacy_checked_at,
+        a.quota_reset_at,
+        a.quota_daily_limit_nano_usd::text AS q_daily,
+        a.quota_weekly_limit_nano_usd::text AS q_weekly,
+        a.quota_total_limit_nano_usd::text AS q_total,
+        qu.daily::text AS u_daily,
+        qu.weekly::text AS u_weekly,
+        qu.total::text AS u_total,
         a.created_at
       FROM core.accounts a
       LEFT JOIN core.groups g ON g.id = a.group_id
       LEFT JOIN core.account_window_quotas q ON q.account_id = a.id
+      LEFT JOIN LATERAL ${this.quotaUsageLateral()} ON TRUE
       WHERE (${filter.groupId ?? null}::text IS NULL OR a.group_id = ${filter.groupId ?? null})
         AND (${filter.executionMode ?? null}::text IS NULL OR a.execution_mode = ${filter.executionMode ?? null})
         AND (${filter.accountId ?? null}::text IS NULL OR a.id = ${filter.accountId ?? null})
@@ -1347,6 +1369,7 @@ export class PostgresControlStore implements ControlStore {
         tempUnschedRules: parseTempUnschedRules(r.temp_unsched_rules),
         privacyMode: AccountPrivacyModeSchema.nullable().catch(null).parse(r.privacy_mode),
         privacyCheckedAtIso: r.privacy_checked_at ? toIso(r.privacy_checked_at) : null,
+        quota: quotaFromRow(r),
         createdAtIso: toIso(r.created_at),
       };
     });
@@ -1365,7 +1388,8 @@ export class PostgresControlStore implements ControlStore {
         INSERT INTO core.accounts (
           id, name, notes, group_id, platform, execution_mode, auth_kind, subscription_tier,
           credentials_enc, credential_preview, credential_fingerprint, max_concurrency, priority, status,
-          expires_at, auto_pause_on_expired, temp_unsched_rules
+          expires_at, auto_pause_on_expired, temp_unsched_rules,
+          quota_daily_limit_nano_usd, quota_weekly_limit_nano_usd, quota_total_limit_nano_usd
         )
         VALUES (
           ${id},
@@ -1384,7 +1408,10 @@ export class PostgresControlStore implements ControlStore {
           ${req.status},
           ${toDateOrNull(req.expiresAtIso)},
           ${req.autoPauseOnExpired},
-          ${this.sql.json(req.tempUnschedRules as unknown as postgres.JSONValue)}
+          ${this.sql.json(req.tempUnschedRules as unknown as postgres.JSONValue)},
+          ${quotaNano(req.quotaDailyLimitUsd) ?? "0"}::numeric,
+          ${quotaNano(req.quotaWeeklyLimitUsd) ?? "0"}::numeric,
+          ${quotaNano(req.quotaTotalLimitUsd) ?? "0"}::numeric
         )
       `;
       const created = await this.getAccount(id);
@@ -1453,6 +1480,10 @@ export class PostgresControlStore implements ControlStore {
             END,
             temp_unsched_reason = COALESCE(${cooldown.reason ?? null}, temp_unsched_reason),
             temp_unsched_rules = COALESCE(${rulesJson}::jsonb, temp_unsched_rules),
+            quota_daily_limit_nano_usd = COALESCE(${quotaNano(req.quotaDailyLimitUsd) ?? null}::numeric, quota_daily_limit_nano_usd),
+            quota_weekly_limit_nano_usd = COALESCE(${quotaNano(req.quotaWeeklyLimitUsd) ?? null}::numeric, quota_weekly_limit_nano_usd),
+            quota_total_limit_nano_usd = COALESCE(${quotaNano(req.quotaTotalLimitUsd) ?? null}::numeric, quota_total_limit_nano_usd),
+            quota_reset_at = CASE WHEN ${req.resetQuota === true}::boolean THEN NOW() ELSE quota_reset_at END,
             credentials_enc = COALESCE(${secretBuf}, credentials_enc),
             credential_preview = COALESCE(${credential?.preview ?? null}, credential_preview),
             credential_fingerprint = COALESCE(${credential?.fingerprint ?? null}, credential_fingerprint),
@@ -1477,6 +1508,80 @@ export class PostgresControlStore implements ControlStore {
     if (rows.length === 0) {
       throw new StoreError("not_found", `Account ${accountId} not found`);
     }
+  }
+
+  /**
+   * Spend-quota usage of the outer `core.accounts a` row: daily / weekly / total sums since the reset
+   * floor. Accounts without a limit sum nothing, and the scan only reaches back as far as the widest
+   * limit needs (the total limit needs everything since the reset), on idx_core_usage_logs_account_time.
+   */
+  private quotaUsageLateral(): postgres.Fragment {
+    return this.sql`(
+      SELECT
+        COALESCE(SUM(u.cost_nano_usd) FILTER (WHERE u.created_at >= NOW() - INTERVAL '24 hours'), 0) AS daily,
+        COALESCE(SUM(u.cost_nano_usd) FILTER (WHERE u.created_at >= NOW() - INTERVAL '7 days'), 0) AS weekly,
+        COALESCE(SUM(u.cost_nano_usd), 0) AS total
+      FROM core.usage_logs u
+      WHERE u.account_id = a.id
+        AND (a.quota_daily_limit_nano_usd > 0 OR a.quota_weekly_limit_nano_usd > 0 OR a.quota_total_limit_nano_usd > 0)
+        AND u.created_at >= GREATEST(
+          COALESCE(a.quota_reset_at, '-infinity'::timestamptz),
+          CASE
+            WHEN a.quota_total_limit_nano_usd > 0 THEN '-infinity'::timestamptz
+            WHEN a.quota_weekly_limit_nano_usd > 0 THEN NOW() - INTERVAL '7 days'
+            ELSE NOW() - INTERVAL '24 hours'
+          END
+        )
+    ) qu`;
+  }
+
+  private async queryQuotaStates(where: postgres.Fragment): Promise<{ id: string; state: AccountQuotaState }[]> {
+    const rows = await this.sql<
+      {
+        id: string;
+        quota_reset_at: Date | null;
+        q_daily: string;
+        q_weekly: string;
+        q_total: string;
+        u_daily: string;
+        u_weekly: string;
+        u_total: string;
+      }[]
+    >`
+      SELECT
+        a.id,
+        a.quota_reset_at,
+        a.quota_daily_limit_nano_usd::text AS q_daily,
+        a.quota_weekly_limit_nano_usd::text AS q_weekly,
+        a.quota_total_limit_nano_usd::text AS q_total,
+        qu.daily::text AS u_daily,
+        qu.weekly::text AS u_weekly,
+        qu.total::text AS u_total
+      FROM core.accounts a
+      LEFT JOIN LATERAL ${this.quotaUsageLateral()} ON TRUE
+      WHERE (a.quota_daily_limit_nano_usd > 0 OR a.quota_weekly_limit_nano_usd > 0 OR a.quota_total_limit_nano_usd > 0)
+        AND ${where}
+    `;
+    return rows.map((r) => ({ id: r.id, state: quotaFromRow(r).state }));
+  }
+
+  async listQuotaLimitedAccountIds(): Promise<string[]> {
+    const rows = await this.sql<{ id: string }[]>`
+      SELECT id FROM core.accounts
+       WHERE quota_daily_limit_nano_usd > 0 OR quota_weekly_limit_nano_usd > 0 OR quota_total_limit_nano_usd > 0
+    `;
+    return rows.map((r) => r.id);
+  }
+
+  async listOverQuotaAccountIds(): Promise<string[]> {
+    return (await this.queryQuotaStates(this.sql`TRUE`)).filter((r) => r.state !== "ok").map((r) => r.id);
+  }
+
+  async getAccountQuotaState(accountId: string): Promise<AccountQuotaState | null> {
+    const exists = await this.sql<{ id: string }[]>`SELECT id FROM core.accounts WHERE id = ${accountId}`;
+    if (exists.length === 0) return null;
+    const rows = await this.queryQuotaStates(this.sql`a.id = ${accountId}`);
+    return rows[0]?.state ?? "ok";
   }
 
   async recordAccountPrivacy(accountId: string, mode: AccountPrivacyMode, checkedAtIso: string): Promise<void> {
@@ -2782,4 +2887,39 @@ export class PostgresControlStore implements ControlStore {
     `;
     return rows.length > 0;
   }
+}
+
+/** USD quota text ("0" = no limit) to nano-USD digits; `undefined` when not sent. */
+function quotaNano(usd: string | undefined): string | undefined {
+  return usd === undefined ? undefined : parseUsdToNano(usd).toString();
+}
+
+/** NUMERIC text (sums print without a fraction, but keep only the integer part regardless). */
+function nanoDigits(value: string | null | undefined): string {
+  return BigInt((value ?? "0").split(".")[0] || "0").toString();
+}
+
+function quotaFromRow(r: {
+  quota_reset_at: Date | null;
+  q_daily: string;
+  q_weekly: string;
+  q_total: string;
+  u_daily: string | null;
+  u_weekly: string | null;
+  u_total: string | null;
+}): AccountQuota {
+  const limits = {
+    dailyLimitNanoUsd: nanoDigits(r.q_daily),
+    weeklyLimitNanoUsd: nanoDigits(r.q_weekly),
+    totalLimitNanoUsd: nanoDigits(r.q_total),
+  };
+  const used = { daily: BigInt(nanoDigits(r.u_daily)), weekly: BigInt(nanoDigits(r.u_weekly)), total: BigInt(nanoDigits(r.u_total)) };
+  return {
+    ...limits,
+    dailyUsedNanoUsd: used.daily.toString(),
+    weeklyUsedNanoUsd: used.weekly.toString(),
+    totalUsedNanoUsd: used.total.toString(),
+    resetAtIso: r.quota_reset_at ? r.quota_reset_at.toISOString() : null,
+    state: accountQuotaState(limits, used),
+  };
 }
