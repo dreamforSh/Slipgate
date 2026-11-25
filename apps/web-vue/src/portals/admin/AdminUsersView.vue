@@ -51,6 +51,7 @@ import { usePersistentState } from "../../composables/usePersistentState";
 import { apiJson, errorText, toQuery } from "../../lib/api";
 import { formatCompact, formatDateShort, formatDateTime, formatRelative } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t } = useI18n();
 const { capText } = useLimitText();
@@ -628,13 +629,13 @@ onMounted(() => {
             :placeholder="t('adminUsers.filters.searchPlaceholder')"
           />
         </label>
-        <select v-model="roleFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('adminUsers.table.role')">
+        <UiSelect v-model="roleFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('adminUsers.table.role')">
           <option value="">{{ t("adminUsers.filters.allRoles") }}</option>
           <option v-if="isAdmin" value="admin">{{ t("adminUsers.roles.admin") }}</option>
           <option value="group_manager">{{ t("adminUsers.roles.group_manager") }}</option>
           <option value="user">{{ t("adminUsers.roles.user") }}</option>
-        </select>
-        <select
+        </UiSelect>
+        <UiSelect
           v-model="statusFilter"
           class="select input-sm w-auto min-w-[8rem]"
           :aria-label="t('adminUsers.table.status')"
@@ -642,8 +643,8 @@ onMounted(() => {
           <option value="">{{ t("adminUsers.filters.allStatuses") }}</option>
           <option value="active">{{ t("adminUsers.statuses.active") }}</option>
           <option value="suspended">{{ t("adminUsers.statuses.suspended") }}</option>
-        </select>
-        <select
+        </UiSelect>
+        <UiSelect
           v-model="groupFilter"
           class="select input-sm w-auto min-w-[8rem] max-w-[12rem]"
           :class="groupFilter ? '!border-accent/50 text-accent' : ''"
@@ -652,8 +653,8 @@ onMounted(() => {
         >
           <option value="">{{ t("userLimits.filters.allGroups") }}</option>
           <option v-for="g in exclusiveGroups" :key="g.id" :value="g.id">{{ g.name }}</option>
-        </select>
-        <select
+        </UiSelect>
+        <UiSelect
           v-model="keyGroupFilter"
           class="select input-sm w-auto min-w-[8rem] max-w-[12rem]"
           :class="keyGroupFilter ? '!border-accent/50 text-accent' : ''"
@@ -662,7 +663,7 @@ onMounted(() => {
         >
           <option value="">{{ t("userLimits.filters.allKeyGroups") }}</option>
           <option v-for="g in allGroups" :key="g.id" :value="g.id">{{ g.name }}</option>
-        </select>
+        </UiSelect>
         <button v-if="hasFilters" type="button" class="btn btn-ghost btn-sm" @click="resetFilters">
           <UiIcon name="x" :size="13" />
           {{ t("adminUsers.filters.clear") }}
@@ -670,9 +671,9 @@ onMounted(() => {
         <label class="flex items-center gap-1.5 sm:ml-auto">
           <UiIcon name="arrow-down" :size="13" class="text-fg-subtle" />
           <span class="sr-only">{{ t("adminUsers.filters.sort") }}</span>
-          <select v-model="sort" class="select input-sm w-auto min-w-[9.5rem]">
+          <UiSelect v-model="sort" class="select input-sm w-auto min-w-[9.5rem]">
             <option v-for="opt in sortOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-          </select>
+          </UiSelect>
         </label>
         <ColumnPicker v-model:hidden="hiddenColumns" :columns="columnOptions" :defaults="DEFAULT_HIDDEN" />
       </div>

@@ -30,6 +30,7 @@ import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import { useNow } from "../../composables/useNow";
 import { apiJson, errorText, toQuery } from "../../lib/api";
 import { formatCompact, formatDateShort, formatDateTime, formatRelative } from "../../lib/format";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t, te } = useI18n();
 const route = useRoute();
@@ -385,7 +386,7 @@ onMounted(() => {
             :placeholder="t('subscriptions.filters.searchPlaceholder')"
           />
         </label>
-        <select
+        <UiSelect
           v-model="statusFilter"
           class="select input-sm w-auto min-w-[8rem]"
           :aria-label="t('subscriptions.table.status')"
@@ -394,11 +395,11 @@ onMounted(() => {
           <option value="active">{{ t("subscriptions.statuses.active") }}</option>
           <option value="expired">{{ t("subscriptions.statuses.expired") }}</option>
           <option value="revoked">{{ t("subscriptions.statuses.revoked") }}</option>
-        </select>
-        <select v-model="groupFilter" class="select input-sm w-auto min-w-[10rem]" :aria-label="t('subscriptions.table.group')">
+        </UiSelect>
+        <UiSelect v-model="groupFilter" class="select input-sm w-auto min-w-[10rem]" :aria-label="t('subscriptions.table.group')">
           <option value="">{{ t("subscriptions.filters.allGroups") }}</option>
           <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
-        </select>
+        </UiSelect>
       </div>
 
       <!-- Bulk bar -->

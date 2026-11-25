@@ -48,6 +48,7 @@ import { PROVIDER_OPTIONS, accountStatusLabel, executionModeLabel } from "../../
 import { platformShortLabel, platformStyle } from "../../../lib/platformStyle";
 import { useAuthStore } from "../../../stores/auth";
 import { useToastStore } from "../../../stores/toast";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Create (single or batch), edit and "duplicate as new" for upstream accounts. Sections follow the
@@ -966,19 +967,19 @@ const credentialPlaceholder = computed(() => {
             >
               <div v-if="accountModeOptions.length > 1">
                 <label class="label" for="account-form-acct-mode">{{ t("accounts.form.accountMode") }}</label>
-                <select id="account-form-acct-mode" v-model="formAccountMode" class="select">
+                <UiSelect id="account-form-acct-mode" v-model="formAccountMode" class="select">
                   <option v-for="m in accountModeOptions" :key="m.mode" :value="m.mode">
                     {{ t(`accounts.form.accountModes.${m.mode}`) }}
                   </option>
-                </select>
+                </UiSelect>
               </div>
               <div v-if="apiProtocolOptions.length > 1">
                 <label class="label" for="account-form-api-proto">{{ t("accounts.form.apiProtocol") }}</label>
-                <select id="account-form-api-proto" v-model="formApiProtocol" class="select">
+                <UiSelect id="account-form-api-proto" v-model="formApiProtocol" class="select">
                   <option v-for="p in apiProtocolOptions" :key="p" :value="p">
                     {{ t(`accounts.form.apiProtocols.${p}`) }}
                   </option>
-                </select>
+                </UiSelect>
               </div>
             </div>
             <div>
@@ -1105,15 +1106,15 @@ const credentialPlaceholder = computed(() => {
         <div class="grid gap-4" :class="!isApiKey && tierOptions.length ? 'sm:grid-cols-2' : ''">
           <div v-if="!isApiKey && tierOptions.length">
             <label class="label" for="account-form-tier">{{ t("accounts.form.tier") }}</label>
-            <select id="account-form-tier" v-model="formTier" class="select" @change="onTierChange">
+            <UiSelect id="account-form-tier" v-model="formTier" class="select" @change="onTierChange">
               <option v-for="opt in tierOptions" :key="opt.tier" :value="opt.tier">{{ opt.label }}</option>
-            </select>
+            </UiSelect>
           </div>
           <div>
             <label class="label" for="account-form-mode">{{ t("accounts.form.mode") }}</label>
-            <select id="account-form-mode" v-model="formMode" class="select">
+            <UiSelect id="account-form-mode" v-model="formMode" class="select">
               <option v-for="m in EXECUTION_MODES" :key="m" :value="m">{{ executionModeLabel(m) }}</option>
-            </select>
+            </UiSelect>
           </div>
         </div>
 
@@ -1129,16 +1130,16 @@ const credentialPlaceholder = computed(() => {
           </div>
           <div v-if="editing" class="col-span-2 sm:col-span-1">
             <label class="label" for="account-form-status">{{ t("accounts.form.status") }}</label>
-            <select id="account-form-status" v-model="formStatus" class="select">
+            <UiSelect id="account-form-status" v-model="formStatus" class="select">
               <option v-for="s in ACCOUNT_STATUSES" :key="s" :value="s">{{ accountStatusLabel(s) }}</option>
-            </select>
+            </UiSelect>
           </div>
           <div v-else class="col-span-2 sm:col-span-1">
             <label class="label" for="account-form-initial">{{ t("accounts.form.initialStatus") }}</label>
-            <select id="account-form-initial" v-model="formInitialStatus" class="select">
+            <UiSelect id="account-form-initial" v-model="formInitialStatus" class="select">
               <option value="active">{{ t("accounts.form.startActive") }}</option>
               <option value="paused">{{ t("accounts.form.startPaused") }}</option>
-            </select>
+            </UiSelect>
           </div>
         </div>
         <div v-if="editing && (formStatus === 'cooldown' || formCooldownUntil)">
@@ -1181,7 +1182,7 @@ const credentialPlaceholder = computed(() => {
               <PlatformIcon v-if="selectedGroup" :platform="selectedGroup.platform" :size="15" />
               <UiIcon v-else name="layers" :size="15" />
             </span>
-            <select id="account-form-group" v-model="formGroupId" class="select min-w-0 flex-1">
+            <UiSelect id="account-form-group" v-model="formGroupId" class="select min-w-0 flex-1">
               <option value="">{{ t("accounts.form.noGroup") }}</option>
               <optgroup v-if="platformGroups.length" :label="t('accounts.form.groupsOfPlatform', { platform: platformShortLabel(formPlatform) })">
                 <option v-for="g in platformGroups" :key="g.id" :value="g.id">{{ groupLabel(g) }}</option>
@@ -1189,7 +1190,7 @@ const credentialPlaceholder = computed(() => {
               <optgroup v-if="compositeGroups.length" :label="t('accounts.form.compositeGroups')">
                 <option v-for="g in compositeGroups" :key="g.id" :value="g.id">{{ groupLabel(g) }}</option>
               </optgroup>
-            </select>
+            </UiSelect>
           </div>
           <p class="mt-1 text-2xs leading-relaxed text-fg-subtle">
             {{ formGroupId ? t("accounts.form.groupHint") : t("accounts.form.noGroupHint") }}

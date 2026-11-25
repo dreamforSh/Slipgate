@@ -68,6 +68,7 @@ import {
   formatUsd,
 } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t } = useI18n();
 const route = useRoute();
@@ -783,16 +784,16 @@ onMounted(() => {
             :aria-label="t('common.search')"
           />
         </label>
-        <select v-model="platformFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('accounts.form.platform')">
+        <UiSelect v-model="platformFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('accounts.form.platform')">
           <option value="all">{{ t("accounts.filters.allPlatforms") }}</option>
           <option v-for="p in PROVIDER_OPTIONS" :key="p.value" :value="p.value">{{ p.label }}</option>
-        </select>
-        <select v-model="groupFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('accounts.form.group')">
+        </UiSelect>
+        <UiSelect v-model="groupFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('accounts.form.group')">
           <option value="all">{{ t("accounts.filters.allGroups") }}</option>
           <option :value="UNGROUPED_FILTER">{{ t("accounts.ungrouped") }}</option>
           <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
-        </select>
-        <select v-model="statusFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('common.status')">
+        </UiSelect>
+        <UiSelect v-model="statusFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('common.status')">
           <option value="all">{{ t("accounts.filters.allStatuses") }}</option>
           <optgroup :label="t('accounts.filters.statusGroup')">
             <option v-for="s in ACCOUNT_STATUSES" :key="s" :value="s">{{ accountStatusLabel(s) }}</option>
@@ -800,11 +801,11 @@ onMounted(() => {
           <optgroup :label="t('accounts.filters.attentionGroup')">
             <option v-for="f in ATTENTION_FILTERS" :key="f" :value="f">{{ t(`accounts.filters.attention.${f}`) }}</option>
           </optgroup>
-        </select>
+        </UiSelect>
         <div v-if="viewMode === 'card'" class="flex items-center gap-1">
-          <select v-model="sort.key" class="select input-sm w-auto" :aria-label="t('accounts.sort.label')">
+          <UiSelect v-model="sort.key" class="select input-sm w-auto" :aria-label="t('accounts.sort.label')">
             <option v-for="k in SORT_KEYS" :key="k" :value="k">{{ t(`accounts.sort.${k}`) }}</option>
-          </select>
+          </UiSelect>
           <button
             type="button"
             class="btn btn-secondary btn-icon btn-sm"
@@ -967,14 +968,14 @@ onMounted(() => {
             <span class="text-xs text-fg-muted">
               {{ t("accounts.pagination.summary", { page, pages: pageCount, total: filteredAccounts.length }) }}
             </span>
-            <select
+            <UiSelect
               v-if="viewMode === 'table'"
               v-model.number="pageSize"
               class="select input-sm w-auto"
               :aria-label="t('accounts.list.pageSize', { n: pageSize })"
             >
               <option v-for="n in PAGE_SIZES" :key="n" :value="n">{{ t("accounts.list.pageSize", { n }) }}</option>
-            </select>
+            </UiSelect>
           </div>
           <div v-if="pageCount > 1" class="flex items-center gap-1.5">
             <button type="button" class="btn btn-secondary btn-sm" :disabled="page <= 1" @click="page -= 1">

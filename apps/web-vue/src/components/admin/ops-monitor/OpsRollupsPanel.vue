@@ -27,6 +27,7 @@ import UiAlert from "../../ui/UiAlert.vue";
 import UiCard from "../../ui/UiCard.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const props = defineProps<{
   now: number;
@@ -261,18 +262,18 @@ async function runCleanup(dryRun: boolean) {
         <div class="space-y-4">
           <div class="flex flex-wrap items-end gap-3">
             <FormField :label="t('security.ops.rollups.daysRange')" class="w-32">
-              <select v-model.number="backfillDays" class="input text-xs">
+              <UiSelect v-model.number="backfillDays" class="input text-xs">
                 <option :value="7">7d</option>
                 <option :value="30">30d</option>
                 <option :value="90">90d</option>
-              </select>
+              </UiSelect>
             </FormField>
             <FormField :label="t('security.ops.rollups.granularityLabel')" class="w-40">
-              <select v-model="backfillGranularity" class="input text-xs">
+              <UiSelect v-model="backfillGranularity" class="input text-xs">
                 <option value="both">{{ t("security.ops.rollups.both") }}</option>
                 <option value="hourly">{{ t("security.ops.rollups.hourly") }}</option>
                 <option value="daily">{{ t("security.ops.rollups.daily") }}</option>
-              </select>
+              </UiSelect>
             </FormField>
             <button type="button" class="btn btn-secondary btn-sm" :disabled="runningBackfill" @click="runBackfill">
               <UiIcon :name="runningBackfill ? 'loader' : 'play'" :size="14" :spin="runningBackfill" />

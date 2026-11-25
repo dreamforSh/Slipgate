@@ -52,6 +52,7 @@ import {
   type TextFilterKey,
   type TextFilters,
 } from "./systemLogUtil";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Stored system log entries: filters, time window, pagination, auto-refresh / live tail, the
@@ -612,7 +613,7 @@ const errorRing = "!border-danger focus:!ring-danger/20";
               @keydown.enter.prevent="applyTextNow"
             />
           </label>
-          <select v-model="levelChoice" class="select input-sm w-auto min-w-[8.5rem]" :aria-label="t('systemLogs.filters.level')">
+          <UiSelect v-model="levelChoice" class="select input-sm w-auto min-w-[8.5rem]" :aria-label="t('systemLogs.filters.level')">
             <option value="">{{ t("systemLogs.filters.allLevels") }}</option>
             <optgroup :label="t('systemLogs.filters.levelMinGroup')">
               <option v-for="o in levelOptions.min" :key="o.value" :value="o.value">{{ o.label }}</option>
@@ -620,11 +621,11 @@ const errorRing = "!border-danger focus:!ring-danger/20";
             <optgroup :label="t('systemLogs.filters.levelOnlyGroup')">
               <option v-for="o in levelOptions.eq" :key="o.value" :value="o.value">{{ o.label }}</option>
             </optgroup>
-          </select>
-          <select v-model="source" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('systemLogs.filters.source')">
+          </UiSelect>
+          <UiSelect v-model="source" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('systemLogs.filters.source')">
             <option value="">{{ t("systemLogs.filters.allSources") }}</option>
             <option v-for="s in SYSTEM_LOG_SOURCES" :key="s" :value="s">{{ t(`systemLogs.sources.${s}`) }}</option>
-          </select>
+          </UiSelect>
           <button
             type="button"
             class="btn btn-secondary btn-sm"

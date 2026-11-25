@@ -21,6 +21,7 @@ import { formatDateTime, formatNumber, formatRelative } from "../../../lib/forma
 import ListSkeleton from "./ListSkeleton.vue";
 import { describeTargeting, isBrokenTargeting, targetingSentence, useSubscriptionGroups } from "./announcementTargeting";
 import { formatUsdAny, STAGGER_CLASS, stagger, useDebounced } from "./opsUtil";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Read status of one announcement across every account: read / unread, whether the account can
@@ -292,12 +293,12 @@ function initial(r: AnnouncementReadStatusItem): string {
           <div class="scrollbar-hide max-w-full overflow-x-auto">
             <SegmentedControl v-model="readFilter" :options="readOptions" :aria-label="t('annAdmin.readStatus.readFilter.label')" />
           </div>
-          <select v-model="eligibleFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('annAdmin.readStatus.eligibleFilter.label')">
+          <UiSelect v-model="eligibleFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('annAdmin.readStatus.eligibleFilter.label')">
             <option v-for="o in eligibleOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-          </select>
-          <select v-model="sort" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('annAdmin.readStatus.sort.label')">
+          </UiSelect>
+          <UiSelect v-model="sort" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('annAdmin.readStatus.sort.label')">
             <option v-for="o in sortOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-          </select>
+          </UiSelect>
         </div>
       </div>
 

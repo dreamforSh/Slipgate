@@ -33,6 +33,7 @@ import { useNow } from "../../composables/useNow";
 import { usePersistentState } from "../../composables/usePersistentState";
 import { formatDateShort, healthLabel, healthTone, type Tone } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 /**
  * Static IP proxies (SOCKS5 / HTTP / HTTPS), after the linksyncx IP management page. Each IP
@@ -462,12 +463,12 @@ const uncheckedIds = computed(() => rows.value.filter((r) => r.node).map((r) => 
           <input v-model="search" type="search" :placeholder="t('clash.ips.filters.search')" class="input input-sm pl-9" />
         </label>
         <div class="flex flex-wrap items-center gap-2">
-          <select v-model="protocolFilter" class="select input-sm w-36" :aria-label="t('clash.ips.columns.protocol')">
+          <UiSelect v-model="protocolFilter" class="select input-sm w-36" :aria-label="t('clash.ips.columns.protocol')">
             <option v-for="o in protocolOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-          </select>
-          <select v-model="statusFilter" class="select input-sm w-36" :aria-label="t('clash.ips.columns.status')">
+          </UiSelect>
+          <UiSelect v-model="statusFilter" class="select input-sm w-36" :aria-label="t('clash.ips.columns.status')">
             <option v-for="o in statusOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-          </select>
+          </UiSelect>
           <SegmentedControl v-model="viewMode" :options="viewOptions" />
         </div>
       </div>
@@ -613,11 +614,11 @@ const uncheckedIds = computed(() => rows.value.filter((r) => r.node).map((r) => 
             </div>
             <div>
               <label class="label" for="ip-protocol">{{ t("clash.ips.columns.protocol") }}</label>
-              <select id="ip-protocol" v-model="formProtocol" class="select">
+              <UiSelect id="ip-protocol" v-model="formProtocol" class="select">
                 <option value="socks5">SOCKS5</option>
                 <option value="http">HTTP</option>
                 <option value="https">HTTPS</option>
-              </select>
+              </UiSelect>
             </div>
             <div class="grid grid-cols-[minmax(0,1fr)_6.5rem] gap-2">
               <div>
@@ -645,11 +646,11 @@ const uncheckedIds = computed(() => rows.value.filter((r) => r.node).map((r) => 
           <div class="grid gap-4 sm:grid-cols-2">
             <div>
               <label class="label" for="ip-batch-protocol">{{ t("clash.ips.add.defaultProtocol") }}</label>
-              <select id="ip-batch-protocol" v-model="batchProtocol" class="select">
+              <UiSelect id="ip-batch-protocol" v-model="batchProtocol" class="select">
                 <option value="socks5">SOCKS5</option>
                 <option value="http">HTTP</option>
                 <option value="https">HTTPS</option>
-              </select>
+              </UiSelect>
             </div>
             <div>
               <label class="label" for="ip-batch-prefix">{{ t("clash.ips.add.namePrefix") }}</label>

@@ -263,6 +263,21 @@
     background-repeat: no-repeat;
     background-size: 0.95rem;
   }
+  /* UiSelect: a button trigger in .select clothing, an icon chevron that flips while open, and a
+     teleported listbox built on .menu-panel. */
+  .select-trigger {
+    @apply relative flex cursor-pointer items-center gap-2 pr-8 text-left;
+    background-image: none;
+  }
+  .select-trigger[aria-expanded="true"] {
+    @apply border-accent ring-[3px] ring-accent/15;
+  }
+  .select-chevron {
+    @apply pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-fg-subtle transition-transform duration-200 ease-out motion-reduce:transition-none;
+  }
+  .ui-select-option {
+    @apply flex select-none items-center gap-2 rounded-lg px-2.5 transition-colors duration-100;
+  }
   .textarea {
     @apply h-auto min-h-[4.5rem] py-2 leading-relaxed;
   }

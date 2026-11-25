@@ -17,6 +17,7 @@ import UiSwitch from "../../ui/UiSwitch.vue";
 import { EXECUTION_MODES, dateInputFromNow, dateInputToIso } from "./accountDisplay";
 import { executionModeLabel } from "../../../lib/format";
 import { useAuthStore } from "../../../stores/auth";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /** Apply the same settings to many accounts; only ticked fields are sent. */
 const props = defineProps<{
@@ -164,41 +165,41 @@ const rowClass = (on: boolean) =>
       <div :class="rowClass(apply.group)">
         <input id="be-group" v-model="apply.group" type="checkbox" class="checkbox" />
         <label for="be-group" class="text-sm font-medium text-fg">{{ t("accounts.bulkEdit.group") }}</label>
-        <select v-model="groupId" class="select input-sm" :disabled="!apply.group" :aria-label="t('accounts.bulkEdit.group')">
+        <UiSelect v-model="groupId" class="select input-sm" :disabled="!apply.group" :aria-label="t('accounts.bulkEdit.group')">
           <option value="">{{ t("accounts.form.noGroup") }}</option>
           <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
-        </select>
+        </UiSelect>
       </div>
 
       <div :class="rowClass(apply.status)">
         <input id="be-status" v-model="apply.status" type="checkbox" class="checkbox" />
         <label for="be-status" class="text-sm font-medium text-fg">{{ t("accounts.bulkEdit.status") }}</label>
-        <select v-model="status" class="select input-sm" :disabled="!apply.status" :aria-label="t('accounts.bulkEdit.status')">
+        <UiSelect v-model="status" class="select input-sm" :disabled="!apply.status" :aria-label="t('accounts.bulkEdit.status')">
           <option value="active">{{ t("accounts.bulk.enable") }}</option>
           <option value="paused">{{ t("accounts.bulk.pause") }}</option>
-        </select>
+        </UiSelect>
       </div>
 
       <div :class="rowClass(apply.mode)">
         <input id="be-mode" v-model="apply.mode" type="checkbox" class="checkbox" />
         <label for="be-mode" class="text-sm font-medium text-fg">{{ t("accounts.bulkEdit.mode") }}</label>
-        <select v-model="executionMode" class="select input-sm" :disabled="!apply.mode" :aria-label="t('accounts.bulkEdit.mode')">
+        <UiSelect v-model="executionMode" class="select input-sm" :disabled="!apply.mode" :aria-label="t('accounts.bulkEdit.mode')">
           <option v-for="m in EXECUTION_MODES" :key="m" :value="m">{{ executionModeLabel(m) }}</option>
-        </select>
+        </UiSelect>
       </div>
 
       <div v-if="subscriptionAccounts.length" :class="rowClass(apply.tier)">
         <input id="be-tier" v-model="apply.tier" type="checkbox" class="checkbox" :disabled="!sharedTiers.length" />
         <label for="be-tier" class="text-sm font-medium text-fg">{{ t("accounts.bulkEdit.tier") }}</label>
         <div class="min-w-0">
-          <select
+          <UiSelect
             v-model="tier"
             class="select input-sm"
             :disabled="!apply.tier || !sharedTiers.length"
             :aria-label="t('accounts.bulkEdit.tier')"
           >
             <option v-for="opt in sharedTiers" :key="opt.tier" :value="opt.tier">{{ opt.label }}</option>
-          </select>
+          </UiSelect>
           <p v-if="!sharedTiers.length" class="mt-1 text-2xs text-warning">{{ t("accounts.bulkEdit.tierUnavailable") }}</p>
           <p v-else-if="platforms.length > 1" class="mt-1 text-2xs text-fg-subtle">{{ t("accounts.bulkEdit.tierMixed") }}</p>
           <p v-if="sharedTiers.length && apiKeyCount" class="mt-1 text-2xs text-fg-subtle">

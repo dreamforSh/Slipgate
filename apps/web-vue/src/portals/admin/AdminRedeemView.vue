@@ -36,6 +36,7 @@ import UiPagination from "../../components/ui/UiPagination.vue";
 import { apiJson, downloadFile, errorText, toQuery } from "../../lib/api";
 import { formatDateTime, formatNumber, formatRelative, formatUsd, type Tone } from "../../lib/format";
 import { useToastStore } from "../../stores/toast";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t } = useI18n();
 
@@ -374,12 +375,12 @@ onMounted(() => void load());
             :placeholder="t('redeem.admin.list.searchPlaceholder')"
           />
         </label>
-        <select v-model="kindFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('redeem.admin.table.kind')">
+        <UiSelect v-model="kindFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('redeem.admin.table.kind')">
           <option value="all">{{ t("redeem.admin.list.allKinds") }}</option>
           <option value="balance">{{ t("redeem.kinds.balance") }}</option>
           <option value="subscription">{{ t("redeem.kinds.subscription") }}</option>
           <option value="invitation">{{ t("redeem.kinds.invitation") }}</option>
-        </select>
+        </UiSelect>
         <Transition
           enter-active-class="transition duration-200 ease-out"
           enter-from-class="scale-95 opacity-0"

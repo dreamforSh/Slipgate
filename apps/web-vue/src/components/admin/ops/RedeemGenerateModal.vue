@@ -12,6 +12,7 @@ import { apiJson, errorText } from "../../../lib/api";
 import { useToastStore } from "../../../stores/toast";
 import ExpiryPresetField from "./ExpiryPresetField.vue";
 import { normalizeUsdInput, resolveExpiry, type ExpiryPreset } from "./opsUtil";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{
@@ -247,7 +248,7 @@ async function submit() {
         </div>
         <FormField :label="t('redeem.admin.generate.group')" required>
           <span class="relative block">
-            <select
+            <UiSelect
               v-model="form.groupId"
               class="select"
               :class="shown.group ? '!border-danger' : ''"
@@ -257,7 +258,7 @@ async function submit() {
               <option v-for="g in subscriptionGroups" :key="g.id" :value="g.id">
                 {{ g.name }}{{ g.enabled ? "" : ` (${t("common.disabled")})` }}
               </option>
-            </select>
+            </UiSelect>
             <UiIcon
               v-if="groupsLoading"
               name="loader"

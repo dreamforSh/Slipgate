@@ -20,6 +20,7 @@ import {
   SAMPLE_MODELS,
   type RulePreset,
 } from "./pricingUtil";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /** Type a model id → which rule (or built-in tier) prices it, and at what rate. */
 const props = defineProps<{
@@ -140,12 +141,12 @@ function createRule() {
 
       <label v-if="groups.length" class="flex items-center gap-2">
         <span class="shrink-0 text-xs text-fg-subtle">{{ t("pricing.tester.group") }}</span>
-        <select v-model="groupId" class="select input-sm min-w-0 flex-1">
+        <UiSelect v-model="groupId" class="select input-sm min-w-0 flex-1">
           <option value="">{{ t("pricing.preview.noGroup") }}</option>
           <option v-for="g in sortedGroups" :key="g.id" :value="g.id">
             {{ g.name }} · {{ multiplierText(g.rateMultiplier) }}
           </option>
-        </select>
+        </UiSelect>
       </label>
     </div>
 

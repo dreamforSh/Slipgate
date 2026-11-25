@@ -6,6 +6,7 @@ import UiBadge from "../../ui/UiBadge.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import { apiJson, errorText } from "../../../lib/api";
 import { useToastStore } from "../../../stores/toast";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const props = withDefaults(
   defineProps<{
@@ -123,7 +124,7 @@ watch(
           </div>
         </div>
 
-        <select
+        <UiSelect
           v-if="it.type === 'select'"
           :id="`attr-${it.attributeId}`"
           v-model="drafts[it.attributeId]"
@@ -132,7 +133,7 @@ watch(
         >
           <option value="">{{ t("common.none") }}</option>
           <option v-for="opt in it.options" :key="opt" :value="opt">{{ opt }}</option>
-        </select>
+        </UiSelect>
 
         <div
           v-else-if="it.type === 'multiselect'"

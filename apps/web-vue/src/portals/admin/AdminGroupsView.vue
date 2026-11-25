@@ -27,6 +27,7 @@ import { parseLimit, useLimitText } from "../../components/admin/users/limits";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import { PROVIDER_OPTIONS, formatUsd } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t } = useI18n();
 const { capText: limitText } = useLimitText();
@@ -521,13 +522,13 @@ onMounted(() => {
             :placeholder="t('groups.list.searchPlaceholder')"
           />
         </label>
-        <select v-model="platformFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('groups.table.platform')">
+        <UiSelect v-model="platformFilter" class="select input-sm w-auto min-w-[9rem]" :aria-label="t('groups.table.platform')">
           <option value="all">{{ t("groups.filters.allPlatforms") }}</option>
           <option v-for="opt in platformOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-        </select>
-        <select v-model="typeFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('groups.table.type')">
+        </UiSelect>
+        <UiSelect v-model="typeFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('groups.table.type')">
           <option v-for="opt in typeOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-        </select>
+        </UiSelect>
       </div>
 
       <EmptyState v-if="groups.length === 0 && !loading" icon="layers" :title="t('groups.list.empty')">
@@ -696,9 +697,9 @@ onMounted(() => {
         </FormField>
         <FormField :label="t('groups.form.platform')">
           <span class="relative block">
-            <select v-model="form.platform" class="select" :disabled="Boolean(editing)">
+            <UiSelect v-model="form.platform" class="select" :disabled="Boolean(editing)">
               <option v-for="opt in platformOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-            </select>
+            </UiSelect>
             <UiIcon
               v-if="editing"
               name="lock"

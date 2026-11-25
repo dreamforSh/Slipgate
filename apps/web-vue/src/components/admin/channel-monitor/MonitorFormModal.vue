@@ -7,6 +7,7 @@ import { useToastStore } from "../../../stores/toast";
 import FormField from "../../ui/FormField.vue";
 import UiModal from "../../ui/UiModal.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const props = defineProps<{
   open: boolean;
@@ -119,11 +120,11 @@ async function submit() {
 
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <FormField :label="t('adminTools.monitor.synthetic.form.account')">
-          <select v-model="form.accountId" required class="select w-full">
+          <UiSelect v-model="form.accountId" required class="select w-full">
             <option v-for="acc in eligibleAccounts" :key="acc.id" :value="acc.id">
               {{ acc.name }} ({{ acc.platform }})
             </option>
-          </select>
+          </UiSelect>
         </FormField>
 
         <FormField :label="t('adminTools.monitor.synthetic.form.model')">

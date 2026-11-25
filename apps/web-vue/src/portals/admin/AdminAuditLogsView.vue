@@ -19,6 +19,7 @@ import UiPagination from "../../components/ui/UiPagination.vue";
 import { apiJson, errorText, toQuery } from "../../lib/api";
 import { formatDateTime, formatDurationMs, formatNumber, formatRelative } from "../../lib/format";
 import { useToastStore } from "../../stores/toast";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t } = useI18n();
 const toast = useToastStore();
@@ -212,15 +213,15 @@ onMounted(() => void load());
           />
           <input v-model="search" type="search" class="input input-sm pl-8" :placeholder="t('audit.list.searchPlaceholder')" />
         </label>
-        <select v-model="method" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('audit.detail.method')">
+        <UiSelect v-model="method" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('audit.detail.method')">
           <option value="all">{{ t("audit.filters.allMethods") }}</option>
           <option v-for="m in METHODS" :key="m" :value="m">{{ m }}</option>
-        </select>
-        <select v-model="outcome" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('audit.table.status')">
+        </UiSelect>
+        <UiSelect v-model="outcome" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('audit.table.status')">
           <option value="all">{{ t("audit.filters.allOutcomes") }}</option>
           <option value="success">{{ t("audit.filters.success") }}</option>
           <option value="failure">{{ t("audit.filters.failure") }}</option>
-        </select>
+        </UiSelect>
       </div>
 
       <ListSkeleton v-if="!loaded && loading" :rows="8" dense />

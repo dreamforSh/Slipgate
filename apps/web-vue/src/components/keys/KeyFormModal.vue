@@ -28,6 +28,7 @@ import {
   type ExpiryPreset,
   type WindowKey,
 } from "./keyLimits";
+import UiSelect from "../ui/UiSelect.vue";
 
 /**
  * Create (apiKey = null) or edit an API key: limits, expiry, IP rules and rate limits.
@@ -337,14 +338,14 @@ const invalidClass = "!border-danger/60 focus:!ring-danger/20";
           </div>
           <div class="min-w-0">
             <label for="kf-group" class="label">{{ t("user.form.group") }} <span class="text-danger">*</span></label>
-            <select id="kf-group" v-model="form.groupId" class="select" :aria-invalid="(submitted && !form.groupId) || undefined">
+            <UiSelect id="kf-group" v-model="form.groupId" class="select" :aria-invalid="(submitted && !form.groupId) || undefined">
               <option v-if="groupMissing && apiKey" :value="apiKey.groupId" disabled>
                 {{ t("user.keys.groupUnavailable", { name: apiKey.groupName }) }}
               </option>
               <option v-for="g in groups" :key="g.id" :value="g.id">
                 {{ g.name }} · {{ g.platform }}{{ g.rateMultiplier !== 1 ? ` · ×${g.rateMultiplier}` : "" }}
               </option>
-            </select>
+            </UiSelect>
             <p
               v-if="groupRate && groupRate.customRateMultiplier !== null"
               class="mt-1 flex items-center gap-1 text-xs"

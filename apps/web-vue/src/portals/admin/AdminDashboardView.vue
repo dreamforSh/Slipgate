@@ -45,6 +45,7 @@ import {
 } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
 import { useSystemUpdateStore } from "../../stores/systemUpdate";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const auth = useAuthStore();
 const systemUpdate = useSystemUpdateStore();
@@ -727,10 +728,10 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
         >
           <label class="block">
             <span class="label">{{ t("dashboard.routes.group") }}</span>
-            <select v-model="routeGroupId" class="select">
+            <UiSelect v-model="routeGroupId" class="select">
               <option v-if="groups.length === 0" value="grp_default">grp_default</option>
               <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }} ({{ g.id }})</option>
-            </select>
+            </UiSelect>
           </label>
           <label class="block">
             <span class="label">{{ t("dashboard.routes.publicModel") }} <span class="text-danger">*</span></span>
@@ -744,16 +745,16 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
           </label>
           <label class="block">
             <span class="label">{{ t("dashboard.routes.matchType") }}</span>
-            <select v-model="routeMatchType" class="select">
+            <UiSelect v-model="routeMatchType" class="select">
               <option value="exact">{{ t("dashboard.routes.matchExact") }}</option>
               <option value="prefix">{{ t("dashboard.routes.matchPrefix") }}</option>
-            </select>
+            </UiSelect>
           </label>
           <label class="block">
             <span class="label">{{ t("dashboard.routes.targetPlatform") }}</span>
-            <select v-model="routeTargetPlatform" class="select">
+            <UiSelect v-model="routeTargetPlatform" class="select">
               <option v-for="p in PROVIDER_OPTIONS" :key="p.value" :value="p.value">{{ p.label }}</option>
-            </select>
+            </UiSelect>
           </label>
           <label class="block">
             <span class="label">{{ t("dashboard.routes.upstreamModel") }}</span>

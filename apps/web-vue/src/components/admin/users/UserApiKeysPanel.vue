@@ -16,6 +16,7 @@ import UiIcon from "../../ui/UiIcon.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
 import { staggerStyle } from "./userDisplay";
 import { fmtRate, useLimitText } from "./limits";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Any user's API keys with admin actions (Linksyncx UserApiKeysModal): rebind the group (an
@@ -116,10 +117,9 @@ async function patch(k: ApiKeyItem, body: AdminUpdateApiKeyRequest, action: stri
   }
 }
 
-async function changeGroup(k: ApiKeyItem, ev: Event) {
-  const el = ev.target as HTMLSelectElement;
-  const next = el.value;
-  el.value = k.groupId; // snap back until the server confirms
+/** UiSelect stays on `k.groupId` (controlled) until the server confirms and the list reloads. */
+async function changeGroup(k: ApiKeyItem, value: unknown) {
+  const next = String(value ?? "");
   if (!next || next === k.groupId) return;
   const res = await patch(k, { groupId: next }, t("userLimits.keys.groupFailed"));
   if (!res) return;
@@ -230,8 +230,8 @@ const enabledCount = computed(() => items.value.filter((k) => k.enabled).length)
           <label class="min-w-0">
             <span class="mb-1 block text-2xs text-fg-subtle">{{ t("userLimits.keys.group") }}</span>
             <span class="relative block">
-              <select
-                :value="k.groupId"
+              <UiSelect
+                :model-value="k.groupId"
                 :disabled="busy.has(k.id)"
                 class="select input-sm"
                 :aria-label="t('userLimits.keys.groupFor', { key: k.name })"
@@ -241,7 +241,7 @@ const enabledCount = computed(() => items.value.filter((k) => k.enabled).length)
                   {{ t("userLimits.keys.currentUnavailable", { name: k.groupName }) }}
                 </option>
                 <option v-for="g in selectable" :key="g.id" :value="g.id">{{ optionLabel(g) }}</option>
-              </select>
+              </UiSelect>
             </span>
           </label>
           <KeyUsageCell :item="k" />

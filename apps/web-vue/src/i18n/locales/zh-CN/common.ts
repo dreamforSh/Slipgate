@@ -19,6 +19,8 @@ export default {
     enabled: "已启用",
     disabled: "已禁用",
     search: "搜索",
+    selectSearch: "筛选选项…",
+    selectNoMatch: "没有匹配的选项",
     all: "全部",
     none: "无",
     unknown: "未知",

@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import SegmentedControl from "../ui/SegmentedControl.vue";
 import UiIcon from "../ui/UiIcon.vue";
 import { USAGE_RANGES, toDatetimeLocal, type UsageFilters, type UsageRange } from "./useUsageLogs";
+import UiSelect from "../ui/UiSelect.vue";
 
 /** Time window, group, model, outcome and (admin) user / (self) API-key filters. */
 defineProps<{
@@ -89,16 +90,16 @@ function inputValue(ev: Event): string {
     </div>
 
     <div class="mt-3 flex flex-wrap items-center gap-2">
-      <select
+      <UiSelect
         v-if="mode === 'user' && apiKeys"
         class="select input-sm w-auto min-w-[9rem] max-w-full"
         :aria-label="t('usageLogs.filters.apiKey')"
-        :value="model.apiKeyId"
-        @change="set('apiKeyId', inputValue($event))"
+        :model-value="model.apiKeyId"
+        @change="set('apiKeyId', String($event))"
       >
         <option value="">{{ t("usageLogs.filters.allKeys") }}</option>
         <option v-for="k in apiKeys" :key="k.id" :value="k.id">{{ k.name }} · {{ k.groupName }}</option>
-      </select>
+      </UiSelect>
       <label v-if="mode === 'admin'" class="relative min-w-[10rem] flex-1 sm:max-w-[14rem]">
         <span class="sr-only">{{ t("usageLogs.filters.userId") }}</span>
         <UiIcon name="user" :size="13" class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-subtle" />
@@ -111,15 +112,15 @@ function inputValue(ev: Event): string {
           @input="set('userId', inputValue($event))"
         />
       </label>
-      <select
+      <UiSelect
         class="select input-sm w-auto min-w-[8.5rem] max-w-full"
         :aria-label="t('usageLogs.filters.group')"
-        :value="model.groupId"
-        @change="set('groupId', inputValue($event))"
+        :model-value="model.groupId"
+        @change="set('groupId', String($event))"
       >
         <option value="">{{ t("usageLogs.filters.allGroups") }}</option>
         <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
-      </select>
+      </UiSelect>
       <label class="relative min-w-[10rem] flex-1 sm:max-w-[14rem]">
         <span class="sr-only">{{ t("usageLogs.filters.model") }}</span>
         <UiIcon name="cpu" :size="13" class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-subtle" />
@@ -132,16 +133,16 @@ function inputValue(ev: Event): string {
           @input="set('model', inputValue($event))"
         />
       </label>
-      <select
+      <UiSelect
         class="select input-sm w-auto min-w-[7.5rem]"
         :aria-label="t('usageLogs.filters.outcome')"
-        :value="model.outcome"
-        @change="set('outcome', inputValue($event) as UsageFilters['outcome'])"
+        :model-value="model.outcome"
+        @change="set('outcome', $event as UsageFilters['outcome'])"
       >
         <option value="">{{ t("usageLogs.filters.allOutcomes") }}</option>
         <option value="success">{{ t("usageLogs.filters.success") }}</option>
         <option value="error">{{ t("usageLogs.filters.error") }}</option>
-      </select>
+      </UiSelect>
       <button
         v-if="hasFilters"
         type="button"

@@ -23,6 +23,7 @@ import UiCard from "../../ui/UiCard.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UiModal from "../../ui/UiModal.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const props = defineProps<{
   mode: "moderation" | "events";
@@ -560,17 +561,17 @@ async function runTestPrompt() {
             <input v-model.number="ruleForm.priority" type="number" min="1" max="10000" class="input font-mono text-xs" />
           </FormField>
           <FormField :label="t('security.risk.moderation.kindLabel')">
-            <select v-model="ruleForm.kind" class="input text-xs">
+            <UiSelect v-model="ruleForm.kind" class="input text-xs">
               <option value="keyword">{{ t("security.risk.moderation.kinds.keyword") }}</option>
               <option value="regex">{{ t("security.risk.moderation.kinds.regex") }}</option>
-            </select>
+            </UiSelect>
           </FormField>
           <FormField :label="t('security.risk.moderation.ruleCols.action')">
-            <select v-model="ruleForm.action" class="input text-xs">
+            <UiSelect v-model="ruleForm.action" class="input text-xs">
               <option value="block">{{ t("security.risk.moderation.actions.block") }}</option>
               <option value="strike">{{ t("security.risk.moderation.actions.strike") }}</option>
               <option value="log_only">{{ t("security.risk.moderation.actions.log_only") }}</option>
-            </select>
+            </UiSelect>
           </FormField>
         </div>
 

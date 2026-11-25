@@ -11,6 +11,7 @@ import { formatUsd } from "../../../lib/format";
 import { useAuthStore } from "../../../stores/auth";
 import EmailChipsInput from "./EmailChipsInput.vue";
 import { CAP_WINDOWS, type CapWindow } from "./subscriptionDisplay";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Assign (or extend) a subscription group for many users by email. Per-user failures come
@@ -159,12 +160,12 @@ async function submit() {
       </UiAlert>
 
       <FormField :label="t('subscriptions.assign.group')" required>
-        <select v-model="groupId" required class="select">
+        <UiSelect v-model="groupId" required class="select">
           <option value="" disabled>{{ t("subscriptions.assign.groupPlaceholder") }}</option>
           <option v-for="g in groups" :key="g.id" :value="g.id">
             {{ g.name }}{{ g.enabled ? "" : ` · ${t("common.disabled")}` }}
           </option>
-        </select>
+        </UiSelect>
       </FormField>
       <FormField :label="t('subscriptions.assign.validity')" required>
         <input

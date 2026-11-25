@@ -25,6 +25,7 @@ import { useNow } from "../../composables/useNow";
 import { apiJson, errorText, toQuery } from "../../lib/api";
 import { formatDateTime, formatNumber, formatRelative, formatUsd, type Tone } from "../../lib/format";
 import { useToastStore } from "../../stores/toast";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const API_LIMIT = 200;
 
@@ -484,13 +485,13 @@ onMounted(() => {
     <!-- Tab 3: Withdrawals & Transfers -->
     <UiCard v-else icon="wallet" :title="t('payments.admin.rebates.tabs.withdrawals')" flush>
       <div class="flex flex-wrap items-center gap-2 border-b border-line/70 px-5 py-3">
-        <select v-model="withdrawalFilter" class="input input-sm w-44">
+        <UiSelect v-model="withdrawalFilter" class="input input-sm w-44">
           <option value="all">{{ t("payments.admin.rebates.withdrawals.all") }}</option>
           <option value="pending">{{ t("affiliate.pool.statuses.pending") }}</option>
           <option value="approved">{{ t("affiliate.pool.statuses.approved") }}</option>
           <option value="paid">{{ t("affiliate.pool.statuses.paid") }}</option>
           <option value="rejected">{{ t("affiliate.pool.statuses.rejected") }}</option>
-        </select>
+        </UiSelect>
       </div>
 
       <ListSkeleton v-if="!withdrawalsLoaded && withdrawalsLoading" />

@@ -22,6 +22,7 @@ import UiModal from "../ui/UiModal.vue";
 import UiSwitch from "../ui/UiSwitch.vue";
 import PlanCard, { type PlanCardPlan } from "./PlanCard.vue";
 import { creditNanoForMinor, currencySymbol, parseFiatInput, planBonusPct } from "./paymentUtil";
+import UiSelect from "../ui/UiSelect.vue";
 
 /** Create / edit a purchasable plan. PUT and POST both send the full body. */
 const props = defineProps<{
@@ -276,10 +277,10 @@ const inputError = "!border-danger focus:!ring-danger/20";
             <p v-if="shown('price')" class="mt-1 text-xs text-danger">{{ shown("price") }}</p>
           </FormField>
           <FormField :label="t('payments.admin.plans.editor.currency')">
-            <select v-model="form.currency" class="select">
+            <UiSelect v-model="form.currency" class="select">
               <option value="CNY">{{ t("payments.currencies.CNY") }}</option>
               <option value="USD">{{ t("payments.currencies.USD") }}</option>
-            </select>
+            </UiSelect>
           </FormField>
         </div>
 
@@ -330,10 +331,10 @@ const inputError = "!border-danger focus:!ring-danger/20";
             </UiAlert>
             <div class="grid gap-4 sm:grid-cols-2">
               <FormField :label="t('payments.admin.plans.editor.group')" required>
-                <select v-model="form.groupId" class="select" :class="shown('group') ? inputError : ''" :disabled="groupOptions.length === 0">
+                <UiSelect v-model="form.groupId" class="select" :class="shown('group') ? inputError : ''" :disabled="groupOptions.length === 0">
                   <option value="" disabled>{{ t("payments.admin.plans.editor.groupPlaceholder") }}</option>
                   <option v-for="g in groupOptions" :key="g.id" :value="g.id">{{ g.name }}</option>
-                </select>
+                </UiSelect>
                 <p v-if="shown('group')" class="mt-1 text-xs text-danger">{{ shown("group") }}</p>
               </FormField>
               <FormField :label="t('payments.admin.plans.editor.validity')" required>

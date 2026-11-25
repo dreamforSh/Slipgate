@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Retention in days: common presets, or a custom whole number of days (1–3650). The model may
@@ -38,8 +39,8 @@ watch(
 
 const selection = computed(() => (custom.value ? "custom" : String(Number(props.modelValue))));
 
-function onSelect(ev: Event) {
-  const value = (ev.target as HTMLSelectElement).value;
+function onSelect(next: unknown) {
+  const value = String(next);
   if (value === "custom") {
     custom.value = true;
     return;
@@ -69,17 +70,17 @@ const errorRing = "!border-danger focus:!ring-danger/20";
 
 <template>
   <div class="flex min-w-0 flex-wrap items-center gap-2">
-    <select
+    <UiSelect
       :id="id"
       class="select w-auto min-w-[9rem] flex-1 sm:flex-none"
-      :value="selection"
+      :model-value="selection"
       :disabled="disabled"
       :class="invalid && !custom ? errorRing : ''"
       @change="onSelect"
     >
       <option v-for="d in PRESETS" :key="d" :value="String(d)">{{ t("systemLogs.retention.days", { n: d }, d) }}</option>
       <option value="custom">{{ t("systemLogs.retention.custom") }}</option>
-    </select>
+    </UiSelect>
     <Transition
       enter-active-class="transition duration-200 ease-out motion-reduce:transition-none"
       leave-active-class="transition duration-150 ease-in motion-reduce:transition-none"

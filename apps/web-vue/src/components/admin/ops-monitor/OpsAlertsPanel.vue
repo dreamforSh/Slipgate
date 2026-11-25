@@ -29,6 +29,7 @@ import UiIcon from "../../ui/UiIcon.vue";
 import UiModal from "../../ui/UiModal.vue";
 import UiPagination from "../../ui/UiPagination.vue";
 import UiSwitch from "../../ui/UiSwitch.vue";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const props = defineProps<{
   now: number;
@@ -464,12 +465,12 @@ onMounted(() => {
     <!-- Events card -->
     <UiCard icon="bell" :title="t('security.ops.alerts.eventsTitle')" flush>
       <template #actions>
-        <select v-model="eventStatusFilter" class="select input-sm w-auto">
+        <UiSelect v-model="eventStatusFilter" class="select input-sm w-auto">
           <option value="">{{ t("security.ops.alerts.allStatuses") }}</option>
           <option value="firing">{{ t("security.ops.alerts.eventStatuses.firing") }}</option>
           <option value="silenced">{{ t("security.ops.alerts.eventStatuses.silenced") }}</option>
           <option value="resolved">{{ t("security.ops.alerts.eventStatuses.resolved") }}</option>
-        </select>
+        </UiSelect>
       </template>
 
       <EmptyState
@@ -606,16 +607,16 @@ onMounted(() => {
 
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <FormField :label="t('security.ops.alerts.form.metric')">
-            <select v-model="ruleForm.metric" class="select w-full">
+            <UiSelect v-model="ruleForm.metric" class="select w-full">
               <option v-for="m in ALERT_METRICS" :key="m" :value="m">
                 {{ t(`security.ops.alerts.metrics.${m}`) }}
               </option>
-            </select>
+            </UiSelect>
           </FormField>
           <FormField :label="t('security.ops.alerts.form.operator')">
-            <select v-model="ruleForm.operator" class="select w-full">
+            <UiSelect v-model="ruleForm.operator" class="select w-full">
               <option v-for="op in ALERT_OPERATORS" :key="op" :value="op">{{ op }}</option>
-            </select>
+            </UiSelect>
           </FormField>
           <FormField :label="t('security.ops.alerts.form.threshold')">
             <input v-model.number="ruleForm.threshold" type="number" step="any" min="0" required class="input w-full" />
@@ -630,11 +631,11 @@ onMounted(() => {
             <input v-model.number="ruleForm.cooldownMinutes" type="number" min="0" max="10080" required class="input w-full" />
           </FormField>
           <FormField :label="t('security.ops.alerts.ruleCols.severity')">
-            <select v-model="ruleForm.severity" class="select w-full">
+            <UiSelect v-model="ruleForm.severity" class="select w-full">
               <option v-for="sev in ALERT_SEVERITIES" :key="sev" :value="sev">
                 {{ t(`security.ops.alerts.severities.${sev}`) }}
               </option>
-            </select>
+            </UiSelect>
           </FormField>
         </div>
 
@@ -665,10 +666,10 @@ onMounted(() => {
     <UiModal v-model:open="silenceModalOpen" :title="t('security.ops.alerts.newSilence')" width="sm">
       <form class="space-y-4 p-5" @submit.prevent="saveSilence">
         <FormField :label="t('security.ops.alerts.silenceCols.scope')">
-          <select v-model="silenceForm.ruleId" class="select w-full">
+          <UiSelect v-model="silenceForm.ruleId" class="select w-full">
             <option value="">{{ t("security.ops.alerts.globalSilence") }}</option>
             <option v-for="r in rules" :key="r.id" :value="r.id">{{ r.name }}</option>
-          </select>
+          </UiSelect>
         </FormField>
 
         <FormField :label="t('security.ops.alerts.form.silenceMinutes')">

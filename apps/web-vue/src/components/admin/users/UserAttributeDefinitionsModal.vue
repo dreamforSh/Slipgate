@@ -8,6 +8,7 @@ import UiIcon from "../../ui/UiIcon.vue";
 import UiModal from "../../ui/UiModal.vue";
 import { apiJson, errorText } from "../../../lib/api";
 import { useToastStore } from "../../../stores/toast";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const open = defineModel<boolean>("open", { required: true });
 const emit = defineEmits<{ (e: "changed"): void }>();
@@ -207,11 +208,11 @@ watch(open, (isOpen) => {
             <input v-model="form.name" type="text" required maxlength="80" class="input" />
           </FormField>
           <FormField :label="t('adminUsers.attributes.fields.type')">
-            <select v-model="form.type" class="select">
+            <UiSelect v-model="form.type" class="select">
               <option v-for="tp in TYPE_OPTIONS" :key="tp" :value="tp">
                 {{ t(`adminUsers.attributes.types.${tp}`) }}
               </option>
-            </select>
+            </UiSelect>
           </FormField>
           <FormField :label="t('adminUsers.attributes.fields.sortOrder')">
             <input v-model.number="form.sortOrder" type="number" class="input font-mono" />

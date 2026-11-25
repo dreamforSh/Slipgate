@@ -14,6 +14,7 @@ import ExpiryPicker from "./ExpiryPicker.vue";
 import IpListField from "./IpListField.vue";
 import UsdInput from "./UsdInput.vue";
 import { WINDOWS, parseIpList, resolveExpiry, usdField, type ExpiryPreset, type WindowKey } from "./keyLimits";
+import UiSelect from "../ui/UiSelect.vue";
 
 /** Applies one patch to many keys (POST /bulk); only ticked fields are sent. */
 const props = defineProps<{ keys: ApiKeyItem[]; groups: GroupItem[] }>();
@@ -201,11 +202,11 @@ async function submit() {
 
       <BulkField id="bk-t-group" v-model:checked="tick.group" icon="layers" :label="t('user.bulk.fields.group')">
         <label for="bk-group" class="sr-only">{{ t("user.bulk.fields.group") }}</label>
-        <select id="bk-group" v-model="form.groupId" class="select">
+        <UiSelect id="bk-group" v-model="form.groupId" class="select">
           <option v-for="g in groups" :key="g.id" :value="g.id">
             {{ g.name }} · {{ g.platform }}{{ g.rateMultiplier !== 1 ? ` · ×${g.rateMultiplier}` : "" }}
           </option>
-        </select>
+        </UiSelect>
       </BulkField>
 
       <BulkField id="bk-t-enabled" v-model:checked="tick.enabled" icon="play" :label="t('user.bulk.fields.enabled')">

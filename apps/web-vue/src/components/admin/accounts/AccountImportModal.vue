@@ -23,6 +23,7 @@ import { EXECUTION_MODES, MODE_ICON } from "./accountDisplay";
 import { accountStatusLabel, executionModeLabel, formatDateShort } from "../../../lib/format";
 import { useAuthStore } from "../../../stores/auth";
 import { useToastStore } from "../../../stores/toast";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Bulk import from a Slipgate backup, a sub2api / linksyncx data export, or CLIProxyAPI (CPA)
@@ -475,10 +476,10 @@ function startOver() {
       <div v-if="parsed?.drafts.length" class="grid gap-4 sm:grid-cols-2">
         <label class="block min-w-0">
           <span class="label">{{ t("accounts.import.targetGroup") }}</span>
-          <select v-model="targetGroupId" class="select">
+          <UiSelect v-model="targetGroupId" class="select">
             <option value="">{{ t("accounts.form.noGroup") }}</option>
             <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}</option>
-          </select>
+          </UiSelect>
           <span v-if="!targetGroupId" class="mt-1 block text-2xs leading-relaxed text-fg-subtle">{{ t("accounts.import.noGroupHint") }}</span>
         </label>
         <div class="flex flex-col justify-end gap-2 pb-1">
@@ -501,15 +502,15 @@ function startOver() {
         </div>
         <label v-if="showSubscriptionMode" class="block min-w-0">
           <span class="label">{{ t("accounts.import.subscriptionMode") }}</span>
-          <select v-model="subscriptionMode" class="select">
+          <UiSelect v-model="subscriptionMode" class="select">
             <option v-for="m in EXECUTION_MODES" :key="m" :value="m">{{ executionModeLabel(m) }}</option>
-          </select>
+          </UiSelect>
         </label>
         <label v-if="showApiKeyMode" class="block min-w-0">
           <span class="label">{{ t("accounts.import.apiKeyMode") }}</span>
-          <select v-model="apiKeyMode" class="select">
+          <UiSelect v-model="apiKeyMode" class="select">
             <option v-for="m in EXECUTION_MODES" :key="m" :value="m">{{ executionModeLabel(m) }}</option>
-          </select>
+          </UiSelect>
         </label>
       </div>
 

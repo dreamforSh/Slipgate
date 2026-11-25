@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 import UiIcon from "./UiIcon.vue";
+import UiSelect from "./UiSelect.vue";
 
 const props = withDefaults(
   defineProps<{
@@ -45,8 +46,8 @@ function go(p: number) {
   if (next !== props.page) emit("update:page", next);
 }
 
-function onSize(ev: Event) {
-  emit("update:pageSize", Number((ev.target as HTMLSelectElement).value));
+function onSize(value: unknown) {
+  emit("update:pageSize", Number(value));
   emit("update:page", 1);
 }
 </script>
@@ -57,9 +58,9 @@ function onSize(ev: Event) {
       <span class="tabular-nums">{{ t("pagination.range", { from, to, total }) }}</span>
       <label class="flex items-center gap-1.5">
         <span class="sr-only">{{ t("pagination.pageSize") }}</span>
-        <select class="select input-sm h-7 w-auto py-0 pr-7 text-xs" :value="pageSize" :disabled="disabled" @change="onSize">
+        <UiSelect class="select input-sm h-7 w-auto py-0 pr-7 text-xs" :model-value="pageSize" :disabled="disabled" @change="onSize">
           <option v-for="s in pageSizes" :key="s" :value="s">{{ t("pagination.perPage", { n: s }) }}</option>
-        </select>
+        </UiSelect>
       </label>
     </div>
     <nav class="flex items-center gap-1" :aria-label="t('pagination.label')">

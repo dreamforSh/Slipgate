@@ -31,6 +31,7 @@ import { useNow } from "../../composables/useNow";
 import { usePersistentState } from "../../composables/usePersistentState";
 import { healthLabel, healthTone } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t, te } = useI18n();
 const auth = useAuthStore();
@@ -789,7 +790,7 @@ onMounted(() => {
             </datalist>
           </FormField>
           <FormField :label="t('clash.bindings.node')" required>
-            <select v-model="bindNodeId" required class="select">
+            <UiSelect v-model="bindNodeId" required class="select">
               <template v-for="group in [{ key: 'clash', label: t('clash.bindings.groupClash'), list: clashNodes }, { key: 'ip', label: t('clash.bindings.groupStatic'), list: staticNodes }]" :key="group.key">
                 <optgroup v-if="group.list.length" :label="group.label">
                   <option v-for="n in group.list" :key="n.nodeId" :value="n.nodeId">
@@ -803,12 +804,12 @@ onMounted(() => {
                   </option>
                 </optgroup>
               </template>
-            </select>
+            </UiSelect>
           </FormField>
           <FormField :label="t('clash.bindings.profile')">
-            <select v-model="bindProfileId" class="select">
+            <UiSelect v-model="bindProfileId" class="select">
               <option v-for="p in profiles" :key="p.id" :value="p.id">{{ p.name }}</option>
-            </select>
+            </UiSelect>
           </FormField>
           <label class="flex cursor-pointer items-start gap-2.5 rounded-lg border border-line bg-surface-2/40 px-3 py-2.5">
             <input v-model="bindShadow" type="checkbox" class="checkbox mt-0.5" />
@@ -1028,18 +1029,18 @@ onMounted(() => {
             />
           </FormField>
           <FormField :label="t('clash.profileForm.preset')">
-            <select v-model="tlsPreset" class="select">
+            <UiSelect v-model="tlsPreset" class="select">
               <option v-for="preset in PRESET_OPTIONS" :key="preset" :value="preset">{{ presetLabel(preset) }}</option>
-            </select>
+            </UiSelect>
           </FormField>
           <FormField label="ALPN">
             <input v-model="tlsAlpnRaw" type="text" placeholder="h2,http/1.1" class="input font-mono text-xs" />
           </FormField>
           <FormField :label="t('clash.profileForm.os')">
-            <select v-model="tlsOsHint" class="select">
+            <UiSelect v-model="tlsOsHint" class="select">
               <option value="">{{ t("clash.profileForm.anyOs") }}</option>
               <option v-for="os in OS_OPTIONS" :key="os.value" :value="os.value">{{ os.label }}</option>
-            </select>
+            </UiSelect>
           </FormField>
         </div>
 

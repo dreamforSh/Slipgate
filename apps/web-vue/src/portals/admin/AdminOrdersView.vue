@@ -32,6 +32,7 @@ import UiPagination from "../../components/ui/UiPagination.vue";
 import { apiJson, toQuery } from "../../lib/api";
 import { formatDateTime, formatRelative, formatUsd } from "../../lib/format";
 import { useToastStore } from "../../stores/toast";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t, channelLabel, providerLabel, statusLabel, itemLabel, deliveredText, amountText, kindLabel } = usePaymentLabels();
 const route = useRoute();
@@ -405,14 +406,14 @@ const statusOptions = computed(() => ORDER_STATUSES.map((s) => ({ value: s, labe
             :placeholder="t('payments.admin.orders.searchPlaceholder')"
           />
         </label>
-        <select v-model="statusFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('payments.admin.orders.table.status')">
+        <UiSelect v-model="statusFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('payments.admin.orders.table.status')">
           <option value="all">{{ t("payments.admin.orders.allStatuses") }}</option>
           <option v-for="opt in statusOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-        </select>
-        <select v-model="providerFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('payments.admin.orders.table.channel')">
+        </UiSelect>
+        <UiSelect v-model="providerFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('payments.admin.orders.table.channel')">
           <option value="all">{{ t("payments.admin.orders.allProviders") }}</option>
           <option v-for="p in PROVIDERS" :key="p" :value="p">{{ providerLabel(p) }}</option>
-        </select>
+        </UiSelect>
         <Transition
           enter-active-class="transition duration-200 ease-out motion-reduce:transition-none"
           enter-from-class="scale-95 opacity-0"

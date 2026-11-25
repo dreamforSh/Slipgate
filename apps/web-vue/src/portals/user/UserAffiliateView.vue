@@ -18,6 +18,7 @@ import { useNow } from "../../composables/useNow";
 import { apiJson, errorText } from "../../lib/api";
 import { formatDateShort, formatDateTime, formatRelative, formatUsd, type Tone } from "../../lib/format";
 import { useToastStore } from "../../stores/toast";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 interface Invitee {
   email: string;
@@ -666,13 +667,13 @@ const enter = "animate-slide-up motion-reduce:animate-none";
           </p>
         </FormField>
         <FormField :label="t('affiliate.pool.method')" required>
-          <select v-model="withdrawForm.payoutMethod" class="input">
+          <UiSelect v-model="withdrawForm.payoutMethod" class="input">
             <option value="alipay">{{ t("affiliate.pool.methods.alipay") }}</option>
             <option value="wxpay">{{ t("affiliate.pool.methods.wxpay") }}</option>
             <option value="bank">{{ t("affiliate.pool.methods.bank") }}</option>
             <option value="usdt">{{ t("affiliate.pool.methods.usdt") }}</option>
             <option value="other">{{ t("affiliate.pool.methods.other") }}</option>
-          </select>
+          </UiSelect>
         </FormField>
         <FormField :label="t('affiliate.pool.account')" required>
           <input

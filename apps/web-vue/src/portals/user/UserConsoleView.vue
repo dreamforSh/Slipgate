@@ -32,6 +32,7 @@ import { useUserGroupRates } from "../../composables/useUserGroupRates";
 import { apiJson, errorText } from "../../lib/api";
 import { formatDateTime, formatNumber, formatRelative } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t } = useI18n();
 const auth = useAuthStore();
@@ -466,14 +467,14 @@ onMounted(() => {
           <UiIcon name="search" :size="14" class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-subtle" />
           <input v-model="search" type="search" class="input input-sm pl-8" :placeholder="t('user.filters.searchPlaceholder')" />
         </label>
-        <select v-model="groupFilter" class="select input-sm w-auto min-w-[8rem] max-w-[12rem]" :aria-label="t('user.keys.group')">
+        <UiSelect v-model="groupFilter" class="select input-sm w-auto min-w-[8rem] max-w-[12rem]" :aria-label="t('user.keys.group')">
           <option value="">{{ t("user.filters.allGroups") }}</option>
           <option v-for="g in groupOptions" :key="g.id" :value="g.id">{{ g.name }}</option>
-        </select>
-        <select v-model="statusFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('common.status')">
+        </UiSelect>
+        <UiSelect v-model="statusFilter" class="select input-sm w-auto min-w-[8rem]" :aria-label="t('common.status')">
           <option value="">{{ t("user.filters.allStatuses") }}</option>
           <option v-for="s in statusOptions" :key="s.value" :value="s.value">{{ s.label }} ({{ s.count }})</option>
-        </select>
+        </UiSelect>
         <button v-if="hasFilters" type="button" class="btn btn-ghost btn-sm" @click="resetFilters">
           <UiIcon name="x" :size="13" />
           {{ t("user.filters.clear") }}

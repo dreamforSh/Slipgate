@@ -27,6 +27,7 @@ import {
   type TargetingDraft,
 } from "./announcementTargeting";
 import { isoToLocalInput, localInputToIso, type AnnouncementEditorMode } from "./opsUtil";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /** Create / edit / duplicate an announcement with a Markdown editor and live preview. */
 const props = defineProps<{ open: boolean; mode: AnnouncementEditorMode; item: AnnouncementItem | null }>();
@@ -313,20 +314,20 @@ async function submit() {
               class="pointer-events-none absolute left-3 top-1/2 h-2 w-2 -translate-y-1/2 rounded-full"
               :class="levelDot[form.level]"
             />
-            <select v-model="form.level" class="select pl-7">
+            <UiSelect v-model="form.level" class="select pl-7">
               <option v-for="o in levelOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-            </select>
+            </UiSelect>
           </span>
         </FormField>
         <FormField :label="t('annAdmin.editor.status')">
-          <select v-model="form.status" class="select">
+          <UiSelect v-model="form.status" class="select">
             <option v-for="o in statusOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-          </select>
+          </UiSelect>
         </FormField>
         <FormField :label="t('annAdmin.editor.audience')">
-          <select v-model="form.audience" class="select">
+          <UiSelect v-model="form.audience" class="select">
             <option v-for="o in audienceOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-          </select>
+          </UiSelect>
         </FormField>
       </div>
 

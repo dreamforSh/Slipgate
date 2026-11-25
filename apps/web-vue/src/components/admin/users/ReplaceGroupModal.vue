@@ -9,6 +9,7 @@ import UiIcon from "../../ui/UiIcon.vue";
 import UiModal from "../../ui/UiModal.vue";
 import { displayName } from "./userDisplay";
 import { fmtRate, useLimitText } from "./limits";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Moves a user from one group to an exclusive one (Linksyncx GroupReplaceModal): every key in
@@ -121,11 +122,11 @@ async function submit() {
 
       <template v-else>
         <FormField :label="t('userLimits.replace.from')" required>
-          <select v-model="fromId" class="select" required>
+          <UiSelect v-model="fromId" class="select" required>
             <option v-for="s in sources" :key="s.id" :value="s.id">
               {{ groupLabel(s.group, s.id) }}{{ keys ? ` — ${t("userLimits.replace.keysIn", { n: keyCount(s.id) })}` : "" }}
             </option>
-          </select>
+          </UiSelect>
         </FormField>
 
         <div class="flex justify-center text-fg-subtle" aria-hidden="true">
@@ -133,10 +134,10 @@ async function submit() {
         </div>
 
         <FormField :label="t('userLimits.replace.to')" required>
-          <select v-model="toId" class="select" required :disabled="targets.length === 0">
+          <UiSelect v-model="toId" class="select" required :disabled="targets.length === 0">
             <option value="" disabled>{{ targets.length ? t("userLimits.replace.pick") : t("userLimits.replace.noTargets") }}</option>
             <option v-for="g in targets" :key="g.id" :value="g.id">{{ groupLabel(g, g.id) }}</option>
-          </select>
+          </UiSelect>
           <span class="hint block">{{ t("userLimits.replace.toHint") }}</span>
         </FormField>
 

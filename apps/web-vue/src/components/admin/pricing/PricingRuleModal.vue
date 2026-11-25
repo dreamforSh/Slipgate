@@ -33,6 +33,7 @@ import {
   TOKENS_MAX,
   type RulePreset,
 } from "./pricingUtil";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /** Create / edit a pricing rule, with a live cost preview for a sample request. */
 const props = defineProps<{
@@ -571,12 +572,12 @@ async function submit() {
             </label>
             <label v-if="groups.length" class="col-span-2 block min-w-0">
               <span class="mb-1 block text-2xs font-medium text-fg-subtle">{{ t("pricing.preview.group") }}</span>
-              <select v-model="sample.groupId" class="select input-sm">
+              <UiSelect v-model="sample.groupId" class="select input-sm">
                 <option value="">{{ t("pricing.preview.noGroup") }}</option>
                 <option v-for="g in sortedGroups" :key="g.id" :value="g.id">
                   {{ g.name }} · {{ multiplierText(g.rateMultiplier) }}
                 </option>
-              </select>
+              </UiSelect>
             </label>
           </div>
 

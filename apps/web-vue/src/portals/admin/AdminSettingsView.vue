@@ -62,6 +62,7 @@ import UiTabs from "../../components/ui/UiTabs.vue";
 import { apiJson, errorText } from "../../lib/api";
 import { usePortalStore } from "../../stores/portal";
 import { useToastStore } from "../../stores/toast";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t } = useI18n();
 const route = useRoute();
@@ -1274,10 +1275,10 @@ const stagger = (i: number) => ({ animationDelay: `${Math.min(i, 5) * 60}ms`, an
                   :hint="t('settings.registration.trialSubGroupHint')"
                   :dirty="isDirty('defaultSignupSubGroupId')"
                 >
-                  <select id="set-signup-sub-group" v-model="form.defaultSignupSubGroupId" class="select">
+                  <UiSelect id="set-signup-sub-group" v-model="form.defaultSignupSubGroupId" class="select">
                     <option value="">{{ t("settings.registration.trialSubNone") }}</option>
                     <option v-for="g in subscriptionGroups" :key="g.id" :value="g.id">{{ g.name }}</option>
-                  </select>
+                  </UiSelect>
                 </SettingField>
                 <SettingField
                   input-id="set-signup-sub-days"
@@ -1586,10 +1587,10 @@ const stagger = (i: number) => ({ animationDelay: `${Math.min(i, 5) * 60}ms`, an
                   :hint="t('settings.referral.creditModeHint')"
                   :dirty="isDirty('affiliateCreditMode')"
                 >
-                  <select id="set-aff-credit-mode" v-model="form.affiliateCreditMode" class="input">
+                  <UiSelect id="set-aff-credit-mode" v-model="form.affiliateCreditMode" class="input">
                     <option value="wallet">{{ t("settings.referral.creditModeOptions.wallet") }}</option>
                     <option value="commission_pool">{{ t("settings.referral.creditModeOptions.commission_pool") }}</option>
-                  </select>
+                  </UiSelect>
                 </SettingField>
 
                 <SettingField

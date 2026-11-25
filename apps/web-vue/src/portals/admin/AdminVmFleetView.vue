@@ -25,6 +25,7 @@ import UsageMeter from "../../components/ui/UsageMeter.vue";
 import { useFeedbackToasts } from "../../composables/useFeedbackToasts";
 import { RUNTIME_PROFILE_TONE, formatUnixMs, healthLabel, healthTone, hostStatusLabel, slotStateLabel } from "../../lib/format";
 import { useAuthStore } from "../../stores/auth";
+import UiSelect from "../../components/ui/UiSelect.vue";
 
 const { t } = useI18n();
 const auth = useAuthStore();
@@ -658,15 +659,15 @@ onBeforeUnmount(() => {
                 </div>
               </td>
               <td>
-                <select
-                  :value="slot.telemetryMode"
+                <UiSelect
+                  :model-value="slot.telemetryMode"
                   class="select input-sm w-28"
                   :aria-label="t('vms.slots.telemetryPolicy')"
                   :disabled="busy"
-                  @change="updateSlotTelemetry(slot, ($event.target as HTMLSelectElement).value as TelemetryMode)"
+                  @change="updateSlotTelemetry(slot, $event as TelemetryMode)"
                 >
                   <option v-for="opt in telemetryOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-                </select>
+                </UiSelect>
                 <p class="mt-1 text-2xs text-fg-subtle">
                   {{ t("vms.slots.promptLine", { mode: cleanseLabel(slot.cleanseMode) }) }}
                 </p>
@@ -882,14 +883,14 @@ onBeforeUnmount(() => {
             />
           </FormField>
           <FormField :label="t('vms.provision.node')">
-            <select v-model="provClusterNodeId" class="select">
+            <UiSelect v-model="provClusterNodeId" class="select">
               <option v-for="n in nodeList()" :key="n.id" :value="n.id">
                 {{ t("vms.nodes.option", { name: n.name, id: n.id, arch: n.arch }) }}
               </option>
-            </select>
+            </UiSelect>
           </FormField>
           <FormField :label="t('vms.provision.egress')">
-            <select v-model="provClashNodeId" class="select">
+            <UiSelect v-model="provClashNodeId" class="select">
               <option value="">{{ t("vms.provision.egressAuto") }}</option>
               <option v-for="cn in clashNodes" :key="cn.nodeId" :value="cn.nodeId">
                 {{
@@ -900,7 +901,7 @@ onBeforeUnmount(() => {
                   })
                 }}
               </option>
-            </select>
+            </UiSelect>
           </FormField>
         </div>
 
@@ -908,14 +909,14 @@ onBeforeUnmount(() => {
           <p class="text-2xs font-medium uppercase tracking-wider text-fg-subtle">{{ t("vms.provision.runtimeSection") }}</p>
           <div class="grid gap-4 sm:grid-cols-2">
             <FormField :label="t('vms.provision.runtime')">
-              <select v-model="provRuntimeProfile" class="select">
+              <UiSelect v-model="provRuntimeProfile" class="select">
                 <option v-for="opt in runtimeOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-              </select>
+              </UiSelect>
             </FormField>
             <FormField :label="t('vms.provision.hypervisor')">
-              <select v-model="provHypervisor" class="select">
+              <UiSelect v-model="provHypervisor" class="select">
                 <option v-for="opt in hypervisorOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-              </select>
+              </UiSelect>
             </FormField>
           </div>
           <div class="grid gap-4 sm:grid-cols-3">
@@ -935,14 +936,14 @@ onBeforeUnmount(() => {
           <p class="text-2xs font-medium uppercase tracking-wider text-fg-subtle">{{ t("vms.provision.policySection") }}</p>
           <div class="grid gap-4 sm:grid-cols-2">
             <FormField :label="t('vms.provision.telemetry')">
-              <select v-model="provTelemetry" class="select">
+              <UiSelect v-model="provTelemetry" class="select">
                 <option v-for="opt in telemetryOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-              </select>
+              </UiSelect>
             </FormField>
             <FormField :label="t('vms.provision.cleanse')">
-              <select v-model="provCleanse" class="select">
+              <UiSelect v-model="provCleanse" class="select">
                 <option v-for="opt in cleanseOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-              </select>
+              </UiSelect>
             </FormField>
           </div>
         </div>
@@ -972,10 +973,10 @@ onBeforeUnmount(() => {
         </div>
         <div class="grid grid-cols-2 gap-3">
           <FormField :label="t('vms.nodeForm.arch')">
-            <select v-model="nodeArch" class="select">
+            <UiSelect v-model="nodeArch" class="select">
               <option value="amd64">amd64</option>
               <option value="arm64">arm64</option>
-            </select>
+            </UiSelect>
           </FormField>
           <div>
             <span class="label">{{ t("vms.nodeForm.kvm") }}</span>
@@ -1097,11 +1098,11 @@ onBeforeUnmount(() => {
           <h3 class="text-sm font-semibold text-fg">{{ t("vms.detail.migrateTitle") }}</h3>
           <div class="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem_auto] sm:items-end">
             <FormField :label="t('vms.detail.targetNode')">
-              <select v-model="migTargetNode" class="select">
+              <UiSelect v-model="migTargetNode" class="select">
                 <option v-for="n in nodeList()" :key="n.id" :value="n.id">
                   {{ t("vms.nodes.optionShort", { name: n.name, id: n.id }) }}
                 </option>
-              </select>
+              </UiSelect>
             </FormField>
             <FormField :label="t('vms.detail.targetMemory')">
               <input v-model.number="migTargetMem" type="number" min="512" step="512" class="input font-mono" />

@@ -20,6 +20,7 @@ import {
   type DraftIssues,
   type TargetingDraft,
 } from "./announcementTargeting";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Targeting rule editor: "everyone in the audience" or OR-ed condition groups whose conditions
@@ -241,10 +242,10 @@ const chipBase =
                   >
                     <label class="block shrink-0 sm:w-36">
                       <span class="sr-only">{{ t("annAdmin.targeting.conditionType") }}</span>
-                      <select v-model="c.type" class="select input-sm">
+                      <UiSelect v-model="c.type" class="select input-sm">
                         <option value="subscription">{{ t("annAdmin.targeting.types.subscription") }}</option>
                         <option value="balance">{{ t("annAdmin.targeting.types.balance") }}</option>
-                      </select>
+                      </UiSelect>
                     </label>
 
                     <!-- Subscription groups -->
@@ -326,9 +327,9 @@ const chipBase =
                     <div v-else class="flex min-w-0 flex-1 gap-2">
                       <label class="block w-28 shrink-0 sm:w-36">
                         <span class="sr-only">{{ t("annAdmin.targeting.operator") }}</span>
-                        <select v-model="c.operator" class="select input-sm">
+                        <UiSelect v-model="c.operator" class="select input-sm">
                           <option v-for="o in operatorOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-                        </select>
+                        </UiSelect>
                       </label>
                       <label class="relative block min-w-0 flex-1">
                         <span class="sr-only">{{ t("annAdmin.targeting.amount") }}</span>

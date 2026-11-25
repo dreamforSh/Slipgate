@@ -19,6 +19,7 @@ import {
   type AutoTestResponse,
   type AutoTestStatus,
 } from "./toolsTypes";
+import UiSelect from "../../ui/UiSelect.vue";
 
 /**
  * Scheduled account tests: settings form, last/next run and "run now" (polls every 2s while a
@@ -330,9 +331,9 @@ onBeforeUnmount(() => {
 
         <label class="block min-w-0">
           <span class="label">{{ t("adminTools.monitor.schedule.interval") }}</span>
-          <select v-model.number="draft.intervalMinutes" class="select" :disabled="saving">
+          <UiSelect v-model.number="draft.intervalMinutes" class="select" :disabled="saving">
             <option v-for="opt in intervalOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-          </select>
+          </UiSelect>
         </label>
 
         <div class="min-w-0">

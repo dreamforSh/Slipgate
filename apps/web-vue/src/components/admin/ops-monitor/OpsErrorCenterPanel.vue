@@ -26,6 +26,7 @@ import UiDrawer from "../../ui/UiDrawer.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import UiPagination from "../../ui/UiPagination.vue";
 import { statusTone } from "./opsFormat";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const props = defineProps<{
   range: OpsRange;
@@ -275,14 +276,14 @@ onMounted(() => {
     <UiCard icon="alert" :title="t('security.ops.tabs.errors')" flush>
       <template #actions>
         <div class="flex flex-wrap items-center gap-2">
-          <select v-model="filters.phase" class="select input-sm w-auto" :aria-label="t('security.ops.requestErrors.filters.phase')">
+          <UiSelect v-model="filters.phase" class="select input-sm w-auto" :aria-label="t('security.ops.requestErrors.filters.phase')">
             <option value="">{{ t("security.ops.requestErrors.filters.allPhases") }}</option>
             <option v-for="ph in REQUEST_ERROR_PHASES" :key="ph" :value="ph">
               {{ t(`security.ops.requestErrors.phases.${ph}`) }}
             </option>
-          </select>
+          </UiSelect>
 
-          <select
+          <UiSelect
             v-model="filters.statusClass"
             class="select input-sm w-auto"
             :aria-label="t('security.ops.requestErrors.filters.statusClass')"
@@ -291,9 +292,9 @@ onMounted(() => {
             <option value="5xx">{{ t("security.ops.requestErrors.filters.status5xx") }}</option>
             <option value="4xx">{{ t("security.ops.requestErrors.filters.status4xx") }}</option>
             <option value="upstream">{{ t("security.ops.requestErrors.filters.statusUpstream") }}</option>
-          </select>
+          </UiSelect>
 
-          <select
+          <UiSelect
             v-model="filters.resolved"
             class="select input-sm w-auto"
             :aria-label="t('security.ops.requestErrors.filters.resolved')"
@@ -301,7 +302,7 @@ onMounted(() => {
             <option value="all">{{ t("security.ops.requestErrors.filters.allStates") }}</option>
             <option value="open">{{ t("security.ops.requestErrors.filters.open") }}</option>
             <option value="resolved">{{ t("security.ops.requestErrors.filters.onlyResolved") }}</option>
-          </select>
+          </UiSelect>
 
           <form class="flex items-center gap-1.5" @submit.prevent="applySearch">
             <div class="relative">

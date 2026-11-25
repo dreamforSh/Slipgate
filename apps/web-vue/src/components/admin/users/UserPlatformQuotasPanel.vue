@@ -20,6 +20,7 @@ import UiBadge from "../../ui/UiBadge.vue";
 import UiIcon from "../../ui/UiIcon.vue";
 import { nanoToUsdInput, normalizeUsdInput } from "../ops/opsUtil";
 import { useLimitText } from "./limits";
+import UiSelect from "../../ui/UiSelect.vue";
 
 const props = defineProps<{ user: AdminUserItem; active: boolean }>();
 const emit = defineEmits<{ (e: "saved"): void }>();
@@ -212,9 +213,9 @@ function windowRows(item: UserPlatformQuotaItem) {
       <div class="grid gap-3 sm:grid-cols-2">
         <div>
           <label class="label">{{ t("userLimits.quotas.platform") }}</label>
-          <select v-model="form.platform" class="select input-sm">
+          <UiSelect v-model="form.platform" class="select input-sm">
             <option v-for="p in platformOptions" :key="p.value" :value="p.value">{{ p.label }}</option>
-          </select>
+          </UiSelect>
         </div>
         <div>
           <label class="label">{{ t("userLimits.quotas.daily") }}</label>

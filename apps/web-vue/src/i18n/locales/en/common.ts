@@ -20,6 +20,8 @@ const en: typeof zh = {
     enabled: "Enabled",
     disabled: "Disabled",
     search: "Search",
+    selectSearch: "Filter options…",
+    selectNoMatch: "No matching options",
     all: "All",
     none: "None",
     unknown: "Unknown",
