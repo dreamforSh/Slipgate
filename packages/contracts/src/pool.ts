@@ -845,6 +845,8 @@ export const ACCOUNT_TEST_HISTORY_LIMIT = 50;
 export const AccountTestRunSchema = z.object({
   id: z.string(),
   accountId: z.string(),
+  /** The scheduled test plan that ran it; null for console and automatic tests. */
+  planId: z.string().nullable(),
   atIso: z.string(),
   source: AccountTestSourceSchema,
   kind: AccountTestKindSchema,
@@ -886,23 +888,80 @@ export const AccountModelsResponseSchema = z.object({
 });
 export type AccountModelsResponse = z.infer<typeof AccountModelsResponseSchema>;
 
-/** Per-account scheduled test (sub2api "定时测试"); runs whatever the account's status. */
-export const AccountTestScheduleSchema = z.object({
-  enabled: z.boolean(),
-  intervalMinutes: z.number().int().min(5).max(1440),
-  /** Empty = the platform's default test model. */
-  model: z.string().trim().max(128).default(""),
-  /** After a passing test, end the account's cooldown (temporary unschedulable state). */
-  autoRecover: z.boolean().default(false),
-});
-export type AccountTestSchedule = z.infer<typeof AccountTestScheduleSchema>;
+/** Most scheduled test plans one account may have. */
+export const ACCOUNT_TEST_PLANS_PER_ACCOUNT = 10;
+/** Bounds of a plan's kept results (sub2api max_results; default 50). */
+export const ACCOUNT_TEST_PLAN_RESULTS_MAX = 500;
+export const ACCOUNT_TEST_PLAN_RESULTS_DEFAULT = 50;
 
-export const AccountTestScheduleItemSchema = AccountTestScheduleSchema.extend({
-  accountId: z.string(),
-  lastRunAtIso: z.string().nullable(),
-  nextRunAtIso: z.string().nullable(),
+/**
+ * The editable part of a scheduled test plan (sub2api "定时测试计划"): a text test of the account
+ * whenever the cron expression fires, whatever the account's status. An account may have several.
+ */
+const accountTestPlanFields = {
+  /** Empty = the platform's default test model. */
+  model: z.string().trim().max(128),
+  /**
+   * Five-field cron (minute hour day-of-month month day-of-week; `*`, lists, ranges, steps, names,
+   * 7 = Sunday) or @hourly / @daily / @weekly / @monthly / @yearly, evaluated in `timezone`.
+   */
+  cronExpr: z.string().trim().min(1).max(120),
+  /** IANA time zone of the cron expression, e.g. Asia/Shanghai. */
+  timezone: z.string().trim().min(1).max(64),
+  enabled: z.boolean(),
+  /** Results kept for this plan; older ones are pruned as new ones arrive. */
+  maxResults: z.number().int().min(1).max(ACCOUNT_TEST_PLAN_RESULTS_MAX),
+  /** After a passing test, end the account's cooldown (temporary unschedulable state). */
+  autoRecover: z.boolean(),
+};
+
+/** `POST /api/v1/admin/accounts/:id/test-plans`. */
+export const CreateAccountTestPlanRequestSchema = z.object({
+  model: accountTestPlanFields.model.default(""),
+  cronExpr: accountTestPlanFields.cronExpr,
+  timezone: accountTestPlanFields.timezone.default("UTC"),
+  enabled: accountTestPlanFields.enabled.default(true),
+  maxResults: accountTestPlanFields.maxResults.default(ACCOUNT_TEST_PLAN_RESULTS_DEFAULT),
+  autoRecover: accountTestPlanFields.autoRecover.default(false),
 });
-export type AccountTestScheduleItem = z.infer<typeof AccountTestScheduleItemSchema>;
+export type CreateAccountTestPlanRequest = z.infer<typeof CreateAccountTestPlanRequestSchema>;
+
+/** `PATCH /api/v1/admin/account-test-plans/:planId`: only the fields sent change. */
+export const UpdateAccountTestPlanRequestSchema = z.object(accountTestPlanFields).partial();
+export type UpdateAccountTestPlanRequest = z.infer<typeof UpdateAccountTestPlanRequestSchema>;
+
+export const AccountTestPlanSchema = z.object({
+  id: z.string(),
+  accountId: z.string(),
+  ...accountTestPlanFields,
+  lastRunAtIso: z.string().nullable(),
+  /** Outcome of the last run; null before the first one. */
+  lastOk: z.boolean().nullable(),
+  lastMessage: z.string(),
+  /** Next time the cron expression fires; null while disabled. */
+  nextRunAtIso: z.string().nullable(),
+  createdAtIso: z.string(),
+  updatedAtIso: z.string(),
+});
+export type AccountTestPlan = z.infer<typeof AccountTestPlanSchema>;
+
+export const AccountTestPlansResponseSchema = z.object({ items: z.array(AccountTestPlanSchema) });
+export type AccountTestPlansResponse = z.infer<typeof AccountTestPlansResponseSchema>;
+
+/** Most upcoming runs `GET /api/v1/admin/account-test-plans/cron-preview` returns. */
+export const ACCOUNT_TEST_PLAN_PREVIEW_MAX = 5;
+
+/**
+ * `GET /api/v1/admin/account-test-plans/cron-preview?cronExpr=…&timezone=…&count=…`: checks an
+ * unsaved expression exactly as saving would and lists its next runs (UTC ISO, oldest first).
+ */
+export const AccountTestPlanCronPreviewSchema = z.object({
+  valid: z.boolean(),
+  error: z.enum(["invalid_cron", "invalid_timezone"]).nullable(),
+  message: z.string(),
+  runsIso: z.array(z.string()),
+});
+export type AccountTestPlanCronPreview = z.infer<typeof AccountTestPlanCronPreviewSchema>;
 
 /** One impersonated client in the CLI fingerprint report (`GET /api/v1/admin/cli-fingerprint`). */
 export const CliFingerprintToolSchema = z.object({

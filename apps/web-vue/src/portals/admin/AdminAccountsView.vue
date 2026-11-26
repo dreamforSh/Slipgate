@@ -10,7 +10,7 @@ import {
   type AccountAuthKind,
   type AccountBulkResult,
   type AccountPrivacyMode,
-  type AccountTestScheduleItem,
+  type AccountTestPlan,
   type AccountUsageSummaryItem,
   type AccountUsageSummaryResponse,
   type ExecutionMode,
@@ -30,7 +30,7 @@ import AccountImportModal from "../../components/admin/accounts/AccountImportMod
 import AccountRowMenu from "../../components/admin/accounts/AccountRowMenu.vue";
 import AccountStatsDrawer from "../../components/admin/accounts/AccountStatsDrawer.vue";
 import AccountTable from "../../components/admin/accounts/AccountTable.vue";
-import AccountTestScheduleModal from "../../components/admin/accounts/AccountTestScheduleModal.vue";
+import AccountTestPlansModal from "../../components/admin/accounts/AccountTestPlansModal.vue";
 import AccountExitModal from "../../components/admin/accounts/AccountExitModal.vue";
 import CliFingerprintModal from "../../components/admin/accounts/CliFingerprintModal.vue";
 import {
@@ -386,11 +386,13 @@ function filterBy(status: StatusFilter) {
 
 /* ---------------- Scheduled tests and CLI fingerprints ---------------- */
 
-const testSchedules = ref<Map<string, AccountTestScheduleItem>>(new Map());
-/** Enabled schedules → interval (minutes), for the list indicators. */
-const scheduledMinutes = computed(
-  () => new Map([...testSchedules.value.values()].filter((s) => s.enabled).map((s) => [s.accountId, s.intervalMinutes])),
-);
+const testPlans = ref<AccountTestPlan[]>([]);
+/** Accounts with enabled scheduled test plans → how many, for the list indicators. */
+const scheduledPlans = computed(() => {
+  const out = new Map<string, number>();
+  for (const p of testPlans.value) if (p.enabled) out.set(p.accountId, (out.get(p.accountId) ?? 0) + 1);
+  return out;
+});
 const scheduleOpen = ref(false);
 const scheduleAccount = ref<UpstreamAccount | null>(null);
 function openSchedule(acc: UpstreamAccount) {
@@ -418,7 +420,7 @@ async function refreshPool(silent = false) {
       auth.apiFetch("/api/v1/admin/groups"),
       auth.apiFetch("/api/v1/admin/accounts"),
       auth.apiFetch(`/api/v1/admin/accounts/usage-today?tz=${tz}`).catch(() => null),
-      auth.apiFetch("/api/v1/admin/account-test-schedules").catch(() => null),
+      auth.apiFetch("/api/v1/admin/account-test-plans").catch(() => null),
       // Best-effort like usage: without slipgate-net the exit column just reads "—".
       exitPool.load(),
     ]);
@@ -437,8 +439,7 @@ async function refreshPool(silent = false) {
       todayUsage.value = new Map(body.items.map((i) => [i.accountId, i]));
     }
     if (sRes?.ok) {
-      const body = (await sRes.json()) as { items: AccountTestScheduleItem[] };
-      testSchedules.value = new Map(body.items.map((i) => [i.accountId, i]));
+      testPlans.value = ((await sRes.json()) as { items: AccountTestPlan[] }).items;
     }
   } catch (err) {
     if (!silent) errorMessage.value = err instanceof Error ? err.message : t("accounts.errors.loadFailed");
@@ -1240,7 +1241,7 @@ onMounted(() => {
         :busy="busyIds"
         :exit-pool="exitPool"
         :exit-ready="exitReady"
-        :scheduled="scheduledMinutes"
+        :scheduled="scheduledPlans"
         @exit="openExit"
         @toggle-select="toggleOne"
         @toggle-page="togglePage"
@@ -1267,7 +1268,7 @@ onMounted(() => {
           :exit-binding="exitBindingOf(acc)"
           :exit-node="exitNodeOf(acc)"
           :exit-ready="exitReady"
-          :scheduled-minutes="scheduledMinutes.get(acc.id) ?? null"
+          :scheduled-plans="scheduledPlans.get(acc.id) ?? 0"
           @exit="openExit(acc)"
           @toggle-select="toggleOne(acc.id)"
           @filter-group="groupFilter = $event || UNGROUPED_FILTER"
@@ -1326,7 +1327,7 @@ onMounted(() => {
       @reset-quota="resetQuota"
       @schedule="openSchedule"
       @exit="openExit"
-      :schedule="menuAccount ? (testSchedules.get(menuAccount.id) ?? null) : null"
+      :scheduled-plans="menuAccount ? (scheduledPlans.get(menuAccount.id) ?? 0) : 0"
       :exit-ready="exitReady"
       @delete="removeAccount"
     />
@@ -1343,12 +1344,7 @@ onMounted(() => {
       @saved="refreshPool(true)"
     />
     <AccountStatsDrawer v-model:open="statsOpen" :account="statsAccount" :now="now" />
-    <AccountTestScheduleModal
-      v-model:open="scheduleOpen"
-      :account="scheduleAccount"
-      :schedule="scheduleAccount ? (testSchedules.get(scheduleAccount.id) ?? null) : null"
-      @changed="refreshPool(true)"
-    />
+    <AccountTestPlansModal v-model:open="scheduleOpen" :account="scheduleAccount" @changed="refreshPool(true)" />
     <CliFingerprintModal v-model:open="cliOpen" />
     <AccountExitModal v-model:open="exitOpen" :account="exitAccount" :pool="exitPool" @saved="refreshPool(true)" />
     <AccountTestModal v-model:open="testOpen" :account="testTarget" @tested="refreshPool(true)" />

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { ACCOUNT_TEST_HISTORY_LIMIT, type AccountTestRun, type UpstreamAccount } from "@slipgate/contracts";
 import { AccountTestTally } from "../account_test_runs.ts";
 import { createBffApp } from "../app.ts";
-import { AccountAutoTester } from "../autotest.ts";
+import { AccountAutoTester, intervalToCron } from "../autotest.ts";
 import { MemoryControlStore } from "../store/memory_store.ts";
 import type { ControlStore } from "../store/types.ts";
 
@@ -196,6 +196,7 @@ describe("account test history", () => {
     const base = Date.parse("2026-11-20T00:00:00Z");
     const run = (accountId: string, i: number) => ({
       accountId,
+      planId: null,
       atIso: new Date(base + i * 1000).toISOString(),
       source: "auto" as const,
       kind: "text" as const,
@@ -225,19 +226,88 @@ describe("account test history", () => {
     expect(await store.listAccountTestRuns(b.id)).toHaveLength(1);
   });
 
-  it("records scheduled tests with their source", async () => {
+  it("runs due plans once, keeps each plan's results to its maxResults and migrates legacy schedules", async () => {
     const { store, createAccount } = await bootstrap("");
-    const acc = await createAccount("sched");
-    const fetchImpl = (async () =>
-      new Response(sse([{ type: "start", model: "gpt-4o-mini" }, { type: "done", success: false, status: 401, code: "invalid_api_key", message: "bad key" }]), {
-        headers: { "Content-Type": "text/event-stream" },
-      })) as unknown as typeof fetch;
+    const acc = await createAccount("plans");
+    const other = await createAccount("other");
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return new Response(
+        sse([
+          { type: "start", model: "gpt-4o-mini" },
+          { type: "done", success: false, status: 401, code: "invalid_api_key", message: "bad key" },
+        ]),
+        { headers: { "Content-Type": "text/event-stream" } },
+      );
+    }) as unknown as typeof fetch;
     const tester = new AccountAutoTester(store, () => ({ url: "http://net.invalid", token: "t" }), fetchImpl);
-    await tester.saveSchedule(acc.id, { enabled: true, intervalMinutes: 60, model: "", autoRecover: false });
-    const out = await tester.runSchedule(acc.id);
-    expect(out.result).toMatchObject({ ok: false, message: "bad key" });
-    const runs = await store.listAccountTestRuns(acc.id);
-    expect(runs).toHaveLength(1);
-    expect(runs[0]).toMatchObject({ source: "scheduled", kind: "text", ok: false, status: 401, code: "invalid_api_key", message: "bad key" });
+
+    // A legacy "every 5 minutes" schedule becomes a cron plan on first use, then the blob is emptied.
+    await store.ops.setBlob("account_test_schedules", {
+      [other.id]: { enabled: true, intervalMinutes: 5, model: "m-legacy", autoRecover: true, lastRunAtIso: null },
+    });
+    const migrated = await tester.listPlans(other.id);
+    expect(migrated).toHaveLength(1);
+    expect(migrated[0]).toMatchObject({ cronExpr: "*/5 * * * *", timezone: "UTC", model: "m-legacy", autoRecover: true, enabled: true });
+    expect(await store.ops.getBlob("account_test_schedules")).toEqual({});
+    expect(await tester.listPlans(other.id)).toHaveLength(1);
+    expect([5, 7, 45, 60, 90, 300, 1440].map(intervalToCron)).toEqual([
+      "*/5 * * * *",
+      "*/6 * * * *",
+      "0 * * * *",
+      "0 * * * *",
+      "0 */2 * * *",
+      "0 */6 * * *", // 5 h ties between 4 and 6: the less frequent wins
+      "0 0 * * *",
+    ]);
+
+    const plan = await tester.createPlan(acc.id, {
+      model: "",
+      cronExpr: "*/5 * * * *",
+      timezone: "UTC",
+      enabled: true,
+      maxResults: 2,
+      autoRecover: false,
+    });
+    const idle = await tester.createPlan(acc.id, { model: "", cronExpr: "0 0 1 1 *", timezone: "UTC", enabled: true, maxResults: 50, autoRecover: false });
+    expect(plan.nextRunAtIso).not.toBeNull();
+
+    // Nothing is due before the next run; at it, the plan runs once and moves to the following one.
+    const due = Date.parse(plan.nextRunAtIso!);
+    expect(await tester.runDuePlans(due - 1000)).toBe(0);
+    calls = 0;
+    expect(await tester.runDuePlans(due + 1000)).toBe(2); // the migrated plan (same */5 rhythm) is due too
+    expect(calls).toBe(2);
+    expect(await tester.runDuePlans(due + 2000)).toBe(0);
+    const after = (await store.getAccountTestPlan(plan.id))!;
+    expect(Date.parse(after.nextRunAtIso!)).toBe(due + 5 * 60_000);
+    expect(after).toMatchObject({ lastOk: false, lastMessage: "bad key" });
+    expect((await store.getAccountTestPlan(idle.id))!.lastRunAtIso).toBeNull();
+
+    // A claim is exclusive: a second runner with the old next run loses.
+    expect(await store.claimAccountTestPlan(plan.id, plan.nextRunAtIso!, null)).toBe(false);
+
+    // Each plan keeps its own maxResults; manual runs are kept separately.
+    for (let i = 0; i < 3; i++) await tester.runPlan(plan.id);
+    const planRuns = await store.listAccountTestPlanRuns(plan.id);
+    expect(planRuns).toHaveLength(2);
+    expect(planRuns.every((r) => r.planId === plan.id && r.source === "scheduled" && r.code === "invalid_api_key")).toBe(true);
+    const later = new Date(Date.parse(planRuns[0]!.atIso) + 1000).toISOString();
+    await store.recordAccountTestRun({ ...planRuns[0]!, atIso: later, planId: null, source: "manual" });
+    expect((await store.listAccountTestRuns(acc.id)).map((r) => r.source)).toEqual(["manual", "scheduled", "scheduled"]);
+
+    // Disabling clears the next run; the scheduler leaves it alone.
+    const off = await tester.updatePlan(plan.id, { enabled: false });
+    expect(off.nextRunAtIso).toBeNull();
+    expect(await tester.runDuePlans(due + 3_600_000)).toBe(1); // only the migrated plan
+
+    // Deleting a plan takes its runs; deleting the account takes its plans.
+    expect(await tester.deletePlan(plan.id)).toBe(true);
+    expect(await store.listAccountTestPlanRuns(plan.id)).toHaveLength(0);
+    expect((await store.listAccountTestRuns(acc.id)).map((r) => r.source)).toEqual(["manual"]);
+    await store.deleteAccount(acc.id);
+    expect(await store.listAccountTestPlans(acc.id)).toHaveLength(0);
+    expect(await store.getAccountTestPlan(idle.id)).toBeNull();
   });
 });

@@ -1,8 +1,11 @@
 import type {
   AccountPrivacyMode,
   AccountQuotaState,
+  AccountTestPlan,
   AccountTestResult,
   AccountTestRun,
+  CreateAccountTestPlanRequest,
+  UpdateAccountTestPlanRequest,
   AccountUsageSummaryItem,
   ApiKeyItem,
   CreateAccountRequest,
@@ -207,12 +210,35 @@ export interface ControlStore {
   deleteAccount(accountId: string): Promise<void>;
   recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void>;
   /**
-   * Appends a test to the account's history, keeping its newest ACCOUNT_TEST_HISTORY_LIMIT runs;
-   * not_found for an unknown account.
+   * Appends a test to the account's history and prunes: a plan's runs to that plan's maxResults,
+   * other runs to the account's newest ACCOUNT_TEST_HISTORY_LIMIT. not_found for an unknown account
+   * (or a plan deleted meanwhile).
    */
   recordAccountTestRun(run: Omit<AccountTestRun, "id">): Promise<AccountTestRun>;
-  /** The account's test history, newest first (at most ACCOUNT_TEST_HISTORY_LIMIT). */
+  /** The account's test history (any source and plan), newest first (at most ACCOUNT_TEST_HISTORY_LIMIT). */
   listAccountTestRuns(accountId: string, limit?: number): Promise<AccountTestRun[]>;
+  /** One plan's runs, newest first (at most ACCOUNT_TEST_PLAN_RESULTS_MAX). */
+  listAccountTestPlanRuns(planId: string, limit?: number): Promise<AccountTestRun[]>;
+
+  /* Scheduled test plans (several per account; cron + time zone; see AccountTestPlanSchema). */
+  /** All plans, or one account's, oldest first. */
+  listAccountTestPlans(accountId?: string): Promise<AccountTestPlan[]>;
+  getAccountTestPlan(planId: string): Promise<AccountTestPlan | null>;
+  /** not_found for an unknown account; conflict past ACCOUNT_TEST_PLANS_PER_ACCOUNT. */
+  createAccountTestPlan(accountId: string, req: CreateAccountTestPlanRequest, nextRunAtIso: string | null): Promise<AccountTestPlan>;
+  /** Applies the sent fields and the recomputed next run; not_found for an unknown plan. */
+  updateAccountTestPlan(planId: string, req: UpdateAccountTestPlanRequest, nextRunAtIso: string | null): Promise<AccountTestPlan>;
+  /** Deletes the plan and its runs; false when it did not exist. */
+  deleteAccountTestPlan(planId: string): Promise<boolean>;
+  /** Enabled plans whose next run is due at `nowIso`, soonest first. */
+  listDueAccountTestPlans(nowIso: string, limit: number): Promise<AccountTestPlan[]>;
+  /**
+   * Moves a due plan to its next run before it executes; false when its next run is no longer
+   * `expectedNextRunAtIso` (another runner claimed it, or it was edited or disabled meanwhile).
+   */
+  claimAccountTestPlan(planId: string, expectedNextRunAtIso: string, nextRunAtIso: string | null): Promise<boolean>;
+  /** Stores a run's outcome on the plan (last run time, pass / fail, message). */
+  recordAccountTestPlanResult(planId: string, atIso: string, ok: boolean, message: string): Promise<void>;
   /** Stores the outcome of the "set privacy" action (see AccountPrivacyModeSchema). */
   recordAccountPrivacy(accountId: string, mode: AccountPrivacyMode, checkedAtIso: string): Promise<void>;
   /** Accounts with at least one spend-quota limit (the settlement path checks only these). */

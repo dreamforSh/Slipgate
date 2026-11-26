@@ -9,9 +9,10 @@ import { formatDateTime, formatDurationMs, formatRelative } from "../../../lib/f
 
 /**
  * An account's test history (sub2api "测试结果"): console, scheduled and automatic tests of every
- * kind, newest first. The parent calls `reload()` after a test it ran finishes.
+ * kind, newest first; with `planId`, only that scheduled test plan's results (kept to `retention`).
+ * The parent calls `reload()` after a test it ran finishes.
  */
-const props = defineProps<{ accountId: string | null }>();
+const props = defineProps<{ accountId: string | null; planId?: string | null; retention?: number }>();
 const emit = defineEmits<{ (e: "count", n: number): void }>();
 
 const { t, te } = useI18n();
@@ -29,7 +30,11 @@ async function reload() {
   loading.value = true;
   error.value = "";
   try {
-    const res = await apiJson<AccountTestRunsResponse>(`/api/v1/admin/accounts/${encodeURIComponent(id)}/test-runs`);
+    const res = await apiJson<AccountTestRunsResponse>(
+      props.planId
+        ? `/api/v1/admin/account-test-plans/${encodeURIComponent(props.planId)}/runs`
+        : `/api/v1/admin/accounts/${encodeURIComponent(id)}/test-runs`,
+    );
     if (mine !== seq) return;
     runs.value = res.items;
     loaded.value = true;
@@ -43,7 +48,7 @@ async function reload() {
 }
 
 watch(
-  () => props.accountId,
+  () => [props.accountId, props.planId] as const,
   () => {
     runs.value = [];
     loaded.value = false;
@@ -85,7 +90,7 @@ function outcomeOf(r: AccountTestRun): string {
     <div class="flex flex-wrap items-center justify-between gap-2">
       <p class="text-xs text-fg-muted">
         <template v-if="runs.length">{{ t("accounts.test.history.summary", { total: runs.length, ok: passed }) }} · </template>
-        {{ t("accounts.test.history.retention", { n: ACCOUNT_TEST_HISTORY_LIMIT }) }}
+        {{ t("accounts.test.history.retention", { n: retention ?? ACCOUNT_TEST_HISTORY_LIMIT }) }}
       </p>
       <button type="button" class="btn btn-ghost btn-sm" :disabled="loading || !accountId" @click="reload">
         <UiIcon name="refresh" :size="13" :spin="loading" />
@@ -116,7 +121,7 @@ function outcomeOf(r: AccountTestRun): string {
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span class="text-xs font-medium text-fg" :title="formatDateTime(r.atIso)">{{ formatRelative(r.atIso, now) }}</span>
-            <UiBadge :tone="sourceTone[r.source]">{{ t(`accounts.test.history.sources.${r.source}`) }}</UiBadge>
+            <UiBadge v-if="!planId" :tone="sourceTone[r.source]">{{ t(`accounts.test.history.sources.${r.source}`) }}</UiBadge>
             <UiBadge tone="neutral">{{ t(`accounts.test.kinds.${r.kind}`) }}</UiBadge>
             <span v-if="r.model" class="min-w-0 truncate font-mono text-2xs text-fg-muted" :title="r.model">{{ r.model }}</span>
             <span class="ml-auto shrink-0 font-mono text-2xs tabular-nums text-fg-subtle">

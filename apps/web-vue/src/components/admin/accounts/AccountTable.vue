@@ -41,7 +41,7 @@ const props = defineProps<{
   exitPool: ExitPool;
   /** The exit pool reflects slipgate-net (not standalone samples, not a failed load). */
   exitReady: boolean;
-  /** Accounts with an enabled scheduled test → interval in minutes. */
+  /** Accounts with enabled scheduled test plans → how many. */
   scheduled?: ReadonlyMap<string, number>;
 }>();
 

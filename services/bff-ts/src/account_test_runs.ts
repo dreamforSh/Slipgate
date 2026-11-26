@@ -104,14 +104,15 @@ export class AccountTestTally {
     };
   }
 
-  /** The history entry of this test. */
-  run(accountId: string, source: AccountTestSource): NewAccountTestRun {
+  /** The history entry of this test (`planId`: the scheduled test plan that ran it). */
+  run(accountId: string, source: AccountTestSource, planId: string | null = null): NewAccountTestRun {
     const res = this.result();
     const e = this.end;
     const text = this.text.trim();
     const output = text || (this.kind === "video" && this.mediaCount === 0 ? this.lastNote : "");
     return {
       accountId,
+      planId,
       atIso: res.atIso,
       source,
       kind: this.kind,
@@ -142,9 +143,11 @@ export function failedTestRun(
   model: string,
   message: string,
   code = "",
+  planId: string | null = null,
 ): NewAccountTestRun {
   return {
     accountId,
+    planId,
     atIso: new Date().toISOString(),
     source,
     kind,

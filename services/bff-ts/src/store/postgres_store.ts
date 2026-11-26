@@ -1,6 +1,8 @@
 import postgres from "postgres";
 import {
   ACCOUNT_TEST_HISTORY_LIMIT,
+  ACCOUNT_TEST_PLANS_PER_ACCOUNT,
+  ACCOUNT_TEST_PLAN_RESULTS_MAX,
   AccountAuthKindSchema,
   AccountPrivacyModeSchema,
   accountQuotaState,
@@ -17,6 +19,9 @@ import {
   type AccountQuotaState,
   type AccountTestResult,
   type AccountTestRun,
+  type UpdateAccountTestPlanRequest,
+  type CreateAccountTestPlanRequest,
+  type AccountTestPlan,
   type AccountUsageSummaryItem,
   type ApiKeyItem,
   type CreateAccountRequest,
@@ -534,6 +539,33 @@ export class PostgresControlStore implements ControlStore {
       );
       CREATE INDEX IF NOT EXISTS idx_core_account_test_runs_account_at
           ON core.account_test_runs (account_id, at DESC);
+
+      -- Scheduled account test plans (migrations/core/0024_account_test_plans.sql).
+      CREATE TABLE IF NOT EXISTS core.account_test_plans (
+          id            TEXT PRIMARY KEY,
+          account_id    TEXT NOT NULL REFERENCES core.accounts(id) ON DELETE CASCADE,
+          model         TEXT NOT NULL DEFAULT '',
+          cron_expr     TEXT NOT NULL,
+          timezone      TEXT NOT NULL DEFAULT 'UTC',
+          enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+          max_results   INTEGER NOT NULL DEFAULT 50,
+          auto_recover  BOOLEAN NOT NULL DEFAULT FALSE,
+          last_run_at   TIMESTAMPTZ,
+          last_ok       BOOLEAN,
+          last_message  TEXT NOT NULL DEFAULT '',
+          next_run_at   TIMESTAMPTZ,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_core_account_test_plans_account
+          ON core.account_test_plans (account_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_core_account_test_plans_due
+          ON core.account_test_plans (next_run_at) WHERE enabled;
+
+      ALTER TABLE core.account_test_runs
+          ADD COLUMN IF NOT EXISTS plan_id TEXT REFERENCES core.account_test_plans(id) ON DELETE CASCADE;
+      CREATE INDEX IF NOT EXISTS idx_core_account_test_runs_plan_at
+          ON core.account_test_runs (plan_id, at DESC) WHERE plan_id IS NOT NULL;
 
       -- No index builds on core.usage_logs here: this batch runs in one implicit transaction
       -- before the BFF listens, so scanning a large partition would block settlements.
@@ -1637,28 +1669,43 @@ export class PostgresControlStore implements ControlStore {
       await this.sql.begin(async (tx) => {
         await tx`
           INSERT INTO core.account_test_runs
-            (id, account_id, at, source, kind, ok, model, status, duration_ms, ttft_ms, code, message,
+            (id, account_id, plan_id, at, source, kind, ok, model, status, duration_ms, ttft_ms, code, message,
              output, media_count, dimensions)
           VALUES
-            (${id}, ${run.accountId}, ${new Date(run.atIso)}, ${run.source}, ${run.kind}, ${run.ok}, ${run.model},
-             ${run.status}, ${run.durationMs}, ${run.ttftMs}, ${run.code}, ${run.message}, ${run.output},
+            (${id}, ${run.accountId}, ${run.planId}, ${new Date(run.atIso)}, ${run.source}, ${run.kind}, ${run.ok},
+             ${run.model}, ${run.status}, ${run.durationMs}, ${run.ttftMs}, ${run.code}, ${run.message}, ${run.output},
              ${run.mediaCount}, ${run.dimensions})
         `;
-        // Keep the newest runs only (the index walks this account's rows newest first).
-        await tx`
-          DELETE FROM core.account_test_runs
-          WHERE account_id = ${run.accountId}
-            AND id NOT IN (
-              SELECT id FROM core.account_test_runs
-              WHERE account_id = ${run.accountId}
-              ORDER BY at DESC, id DESC
-              LIMIT ${ACCOUNT_TEST_HISTORY_LIMIT}
-            )
-        `;
+        // Keep the newest runs of the run's scope: its plan (to the plan's max_results), or the
+        // account's runs outside any plan (to ACCOUNT_TEST_HISTORY_LIMIT).
+        if (run.planId) {
+          await tx`
+            DELETE FROM core.account_test_runs
+            WHERE plan_id = ${run.planId}
+              AND id NOT IN (
+                SELECT id FROM core.account_test_runs
+                WHERE plan_id = ${run.planId}
+                ORDER BY at DESC, id DESC
+                LIMIT COALESCE((SELECT max_results FROM core.account_test_plans WHERE id = ${run.planId}), ${ACCOUNT_TEST_HISTORY_LIMIT})
+              )
+          `;
+        } else {
+          await tx`
+            DELETE FROM core.account_test_runs
+            WHERE account_id = ${run.accountId}
+              AND plan_id IS NULL
+              AND id NOT IN (
+                SELECT id FROM core.account_test_runs
+                WHERE account_id = ${run.accountId} AND plan_id IS NULL
+                ORDER BY at DESC, id DESC
+                LIMIT ${ACCOUNT_TEST_HISTORY_LIMIT}
+              )
+          `;
+        }
       });
     } catch (err) {
       if ((err as { code?: string }).code === "23503") {
-        throw new StoreError("not_found", `Account ${run.accountId} not found`);
+        throw new StoreError("not_found", run.planId ? `Account ${run.accountId} or test plan ${run.planId} not found` : `Account ${run.accountId} not found`);
       }
       throw err;
     }
@@ -1667,49 +1714,112 @@ export class PostgresControlStore implements ControlStore {
 
   async listAccountTestRuns(accountId: string, limit = ACCOUNT_TEST_HISTORY_LIMIT): Promise<AccountTestRun[]> {
     const n = Math.max(1, Math.min(ACCOUNT_TEST_HISTORY_LIMIT, Math.floor(limit)));
-    const rows = await this.sql<
-      {
-        id: string;
-        account_id: string;
-        at: Date;
-        source: string;
-        kind: string;
-        ok: boolean;
-        model: string;
-        status: number;
-        duration_ms: number;
-        ttft_ms: number | null;
-        code: string;
-        message: string;
-        output: string;
-        media_count: number;
-        dimensions: number | null;
-      }[]
-    >`
-      SELECT id, account_id, at, source, kind, ok, model, status, duration_ms, ttft_ms, code, message, output,
-             media_count, dimensions
+    const rows = await this.sql<TestRunRow[]>`
+      SELECT ${this.sql.unsafe(TEST_RUN_COLUMNS)}
       FROM core.account_test_runs
       WHERE account_id = ${accountId}
       ORDER BY at DESC, id DESC
       LIMIT ${n}
     `;
-    return rows.map((r) => ({
-      id: r.id,
-      accountId: r.account_id,
-      atIso: new Date(r.at).toISOString(),
-      source: r.source as AccountTestRun["source"],
-      kind: r.kind as AccountTestRun["kind"],
-      ok: r.ok,
-      model: r.model,
-      status: Number(r.status),
-      durationMs: Number(r.duration_ms),
-      ttftMs: r.ttft_ms === null ? null : Number(r.ttft_ms),
-      code: r.code,
-      message: r.message,
-      output: r.output,
-      mediaCount: Number(r.media_count),
-      dimensions: r.dimensions === null ? null : Number(r.dimensions),
-    }));
+    return rows.map(testRunFromRow);
+  }
+
+  async listAccountTestPlanRuns(planId: string, limit = ACCOUNT_TEST_PLAN_RESULTS_MAX): Promise<AccountTestRun[]> {
+    const n = Math.max(1, Math.min(ACCOUNT_TEST_PLAN_RESULTS_MAX, Math.floor(limit)));
+    const rows = await this.sql<TestRunRow[]>`
+      SELECT ${this.sql.unsafe(TEST_RUN_COLUMNS)}
+      FROM core.account_test_runs
+      WHERE plan_id = ${planId}
+      ORDER BY at DESC, id DESC
+      LIMIT ${n}
+    `;
+    return rows.map(testRunFromRow);
+  }
+
+  async listAccountTestPlans(accountId?: string): Promise<AccountTestPlan[]> {
+    const rows = accountId === undefined
+      ? await this.sql<TestPlanRow[]>`SELECT * FROM core.account_test_plans ORDER BY created_at, id`
+      : await this.sql<TestPlanRow[]>`SELECT * FROM core.account_test_plans WHERE account_id = ${accountId} ORDER BY created_at, id`;
+    return rows.map(testPlanFromRow);
+  }
+
+  async getAccountTestPlan(planId: string): Promise<AccountTestPlan | null> {
+    const rows = await this.sql<TestPlanRow[]>`SELECT * FROM core.account_test_plans WHERE id = ${planId}`;
+    return rows[0] ? testPlanFromRow(rows[0]) : null;
+  }
+
+  async createAccountTestPlan(accountId: string, req: CreateAccountTestPlanRequest, nextRunAtIso: string | null): Promise<AccountTestPlan> {
+    const id = `atp_${crypto.randomUUID()}`;
+    let rows: TestPlanRow[];
+    try {
+      rows = await this.sql<TestPlanRow[]>`
+        INSERT INTO core.account_test_plans
+          (id, account_id, model, cron_expr, timezone, enabled, max_results, auto_recover, next_run_at)
+        SELECT ${id}, ${accountId}, ${req.model}, ${req.cronExpr}, ${req.timezone}, ${req.enabled}, ${req.maxResults},
+               ${req.autoRecover}, ${nextRunAtIso ? new Date(nextRunAtIso) : null}
+        WHERE (SELECT COUNT(*) FROM core.account_test_plans WHERE account_id = ${accountId}) < ${ACCOUNT_TEST_PLANS_PER_ACCOUNT}
+        RETURNING *
+      `;
+    } catch (err) {
+      if ((err as { code?: string }).code === "23503") throw new StoreError("not_found", `Account ${accountId} not found`);
+      throw err;
+    }
+    if (!rows[0]) {
+      throw new StoreError("conflict", `An account can have at most ${ACCOUNT_TEST_PLANS_PER_ACCOUNT} test plans`);
+    }
+    return testPlanFromRow(rows[0]);
+  }
+
+  async updateAccountTestPlan(planId: string, req: UpdateAccountTestPlanRequest, nextRunAtIso: string | null): Promise<AccountTestPlan> {
+    const rows = await this.sql<TestPlanRow[]>`
+      UPDATE core.account_test_plans SET
+        model = COALESCE(${req.model ?? null}, model),
+        cron_expr = COALESCE(${req.cronExpr ?? null}, cron_expr),
+        timezone = COALESCE(${req.timezone ?? null}, timezone),
+        enabled = COALESCE(${req.enabled ?? null}::boolean, enabled),
+        max_results = COALESCE(${req.maxResults ?? null}::integer, max_results),
+        auto_recover = COALESCE(${req.autoRecover ?? null}::boolean, auto_recover),
+        next_run_at = ${nextRunAtIso ? new Date(nextRunAtIso) : null},
+        updated_at = NOW()
+      WHERE id = ${planId}
+      RETURNING *
+    `;
+    if (!rows[0]) throw new StoreError("not_found", `Test plan ${planId} not found`);
+    return testPlanFromRow(rows[0]);
+  }
+
+  async deleteAccountTestPlan(planId: string): Promise<boolean> {
+    // Its runs go with it (plan_id ON DELETE CASCADE).
+    const rows = await this.sql<{ id: string }[]>`DELETE FROM core.account_test_plans WHERE id = ${planId} RETURNING id`;
+    return rows.length > 0;
+  }
+
+  async listDueAccountTestPlans(nowIso: string, limit: number): Promise<AccountTestPlan[]> {
+    const rows = await this.sql<TestPlanRow[]>`
+      SELECT * FROM core.account_test_plans
+      WHERE enabled AND next_run_at <= ${new Date(nowIso)}
+      ORDER BY next_run_at
+      LIMIT ${Math.max(0, Math.floor(limit))}
+    `;
+    return rows.map(testPlanFromRow);
+  }
+
+  async claimAccountTestPlan(planId: string, expectedNextRunAtIso: string, nextRunAtIso: string | null): Promise<boolean> {
+    const rows = await this.sql<{ id: string }[]>`
+      UPDATE core.account_test_plans
+      SET next_run_at = ${nextRunAtIso ? new Date(nextRunAtIso) : null}
+      WHERE id = ${planId} AND enabled AND next_run_at = ${new Date(expectedNextRunAtIso)}
+      RETURNING id
+    `;
+    return rows.length > 0;
+  }
+
+  async recordAccountTestPlanResult(planId: string, atIso: string, ok: boolean, message: string): Promise<void> {
+    await this.sql`
+      UPDATE core.account_test_plans
+      SET last_run_at = ${new Date(atIso)}, last_ok = ${ok}, last_message = ${message}
+      WHERE id = ${planId}
+    `;
   }
 
   async listAccountSecrets(accountIds?: string[]): Promise<AccountSecretRecord[]> {
@@ -3025,5 +3135,85 @@ function quotaFromRow(r: {
     totalUsedNanoUsd: used.total.toString(),
     resetAtIso: r.quota_reset_at ? r.quota_reset_at.toISOString() : null,
     state: accountQuotaState(limits, used),
+  };
+}
+
+const TEST_RUN_COLUMNS =
+  "id, account_id, plan_id, at, source, kind, ok, model, status, duration_ms, ttft_ms, code, message, output, media_count, dimensions";
+
+interface TestRunRow {
+  id: string;
+  account_id: string;
+  plan_id: string | null;
+  at: Date;
+  source: string;
+  kind: string;
+  ok: boolean;
+  model: string;
+  status: number;
+  duration_ms: number;
+  ttft_ms: number | null;
+  code: string;
+  message: string;
+  output: string;
+  media_count: number;
+  dimensions: number | null;
+}
+
+function testRunFromRow(r: TestRunRow): AccountTestRun {
+  return {
+    id: r.id,
+    accountId: r.account_id,
+    planId: r.plan_id,
+    atIso: new Date(r.at).toISOString(),
+    source: r.source as AccountTestRun["source"],
+    kind: r.kind as AccountTestRun["kind"],
+    ok: r.ok,
+    model: r.model,
+    status: Number(r.status),
+    durationMs: Number(r.duration_ms),
+    ttftMs: r.ttft_ms === null ? null : Number(r.ttft_ms),
+    code: r.code,
+    message: r.message,
+    output: r.output,
+    mediaCount: Number(r.media_count),
+    dimensions: r.dimensions === null ? null : Number(r.dimensions),
+  };
+}
+
+interface TestPlanRow {
+  id: string;
+  account_id: string;
+  model: string;
+  cron_expr: string;
+  timezone: string;
+  enabled: boolean;
+  max_results: number;
+  auto_recover: boolean;
+  last_run_at: Date | null;
+  last_ok: boolean | null;
+  last_message: string;
+  next_run_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+function testPlanFromRow(r: TestPlanRow): AccountTestPlan {
+  const iso = (d: Date | null) => (d ? new Date(d).toISOString() : null);
+  return {
+    id: r.id,
+    accountId: r.account_id,
+    model: r.model,
+    cronExpr: r.cron_expr,
+    timezone: r.timezone,
+    enabled: r.enabled,
+    maxResults: Number(r.max_results),
+    autoRecover: r.auto_recover,
+    lastRunAtIso: iso(r.last_run_at),
+    lastOk: r.last_ok,
+    lastMessage: r.last_message,
+    nextRunAtIso: iso(r.next_run_at),
+    createdAtIso: new Date(r.created_at).toISOString(),
+    updatedAtIso: new Date(r.updated_at).toISOString(),
   };
 }

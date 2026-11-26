@@ -114,8 +114,8 @@ describe("account auto-test", () => {
   });
 });
 
-describe("per-account scheduled tests", () => {
-  it("stores schedules, runs one now and ends a cooldown on success when auto-recover is on", async () => {
+describe("per-account test plans", () => {
+  it("creates several cron plans per account, previews, runs one now and ends a cooldown when auto-recover is on", async () => {
     const app = createBffApp({
       store: storeFactory ? await storeFactory() : undefined,
       jwtSecret: "autotest-jwt-secret-32-bytes-minimum",
@@ -144,56 +144,127 @@ describe("per-account scheduled tests", () => {
           ...extra,
         })
       ).body.account;
-    const cooled = await make("sched-cooled");
-    const broken = await make("sched-broken");
-    const vm = await make("sched-vm", { executionMode: "vm_slot", authKind: "vm_cli_seed", credentialSecret: "mock://seed" });
+    const cooled = await make("plan-cooled");
+    const broken = await make("plan-broken");
+    const vm = await make("plan-vm", { executionMode: "vm_slot", authKind: "vm_cli_seed", credentialSecret: "mock://seed" });
     failing.add(broken.id);
-    // Put both into a cooldown (a temporary unschedulable deadline).
     const until = new Date(Date.now() + 3_600_000).toISOString();
     for (const id of [cooled.id, broken.id]) {
       expect((await call("PATCH", `/api/v1/admin/accounts/${id}`, admin, { cooldownUntilIso: until, cooldownReason: "upstream_http_429" })).status).toBe(200);
     }
 
-    // Validation and VM refusal.
-    expect((await call("PUT", `/api/v1/admin/accounts/${cooled.id}/test-schedule`, admin, { enabled: true, intervalMinutes: 1 })).status).toBe(400);
-    expect((await call("PUT", `/api/v1/admin/accounts/${vm.id}/test-schedule`, admin, { enabled: true, intervalMinutes: 30 })).status).toBe(400);
-    expect((await call("PUT", "/api/v1/admin/accounts/acc_missing/test-schedule", admin, { enabled: true, intervalMinutes: 30 })).status).toBe(404);
+    // Validation: cron, time zone, retention bounds, VM accounts, unknown accounts.
+    const plans = (id: string) => `/api/v1/admin/accounts/${id}/test-plans`;
+    expect((await call("POST", plans(cooled.id), admin, { cronExpr: "every minute" })).status).toBe(400);
+    expect((await call("POST", plans(cooled.id), admin, { cronExpr: "*/5 * * * *", timezone: "Mars/Olympus" })).status).toBe(400);
+    expect((await call("POST", plans(cooled.id), admin, { cronExpr: "*/5 * * * *", maxResults: 0 })).status).toBe(400);
+    expect((await call("POST", plans(vm.id), admin, { cronExpr: "*/5 * * * *" })).status).toBe(400);
+    expect((await call("POST", plans("acc_missing"), admin, { cronExpr: "*/5 * * * *" })).status).toBe(404);
+    expect((await call("GET", plans("acc_missing"), admin)).status).toBe(404);
 
-    const saved = await call<{ item: { accountId: string; intervalMinutes: number; autoRecover: boolean; nextRunAtIso: string | null } }>(
-      "PUT",
-      `/api/v1/admin/accounts/${cooled.id}/test-schedule`,
+    // Live preview of an unsaved expression.
+    const preview = await call<{ valid: boolean; runsIso: string[]; error: string | null }>(
+      "GET",
+      "/api/v1/admin/account-test-plans/cron-preview?cronExpr=" + encodeURIComponent("0 9 * * 1") + "&timezone=Asia/Shanghai&count=3",
       admin,
-      { enabled: true, intervalMinutes: 30, model: "claude-sonnet-5-5", autoRecover: true },
     );
-    expect(saved.status).toBe(200);
-    expect(saved.body.item).toMatchObject({ accountId: cooled.id, intervalMinutes: 30, autoRecover: true });
-    expect(saved.body.item.nextRunAtIso).not.toBeNull();
-    await call("PUT", `/api/v1/admin/accounts/${broken.id}/test-schedule`, admin, { enabled: true, intervalMinutes: 60, autoRecover: true });
-    const list = await call<{ items: { accountId: string }[] }>("GET", "/api/v1/admin/account-test-schedules", admin);
-    expect(list.body.items.map((i) => i.accountId).sort()).toEqual([cooled.id, broken.id].sort());
+    expect(preview.body.valid).toBe(true);
+    expect(preview.body.runsIso).toHaveLength(3);
+    // 09:00 in Shanghai is 01:00 UTC, on Mondays.
+    for (const iso of preview.body.runsIso) {
+      expect(new Date(iso).getUTCHours()).toBe(1);
+      expect(new Date(iso).getUTCDay()).toBe(1);
+    }
+    expect(
+      (await call<{ valid: boolean; error: string }>("GET", "/api/v1/admin/account-test-plans/cron-preview?cronExpr=61+*+*+*+*", admin)).body,
+    ).toMatchObject({ valid: false, error: "invalid_cron" });
+
+    // Two plans on one account, one on another.
+    type Plan = {
+      id: string;
+      accountId: string;
+      cronExpr: string;
+      timezone: string;
+      enabled: boolean;
+      maxResults: number;
+      autoRecover: boolean;
+      model: string;
+      nextRunAtIso: string | null;
+      lastRunAtIso: string | null;
+      lastOk: boolean | null;
+      lastMessage: string;
+    };
+    const hourly = await call<{ item: Plan }>("POST", plans(cooled.id), admin, {
+      cronExpr: "0 * * * *",
+      model: "claude-sonnet-5-5",
+      autoRecover: true,
+      timezone: "Asia/Shanghai",
+    });
+    expect(hourly.status).toBe(201);
+    expect(hourly.body.item).toMatchObject({
+      accountId: cooled.id,
+      cronExpr: "0 * * * *",
+      timezone: "Asia/Shanghai",
+      enabled: true,
+      maxResults: 50,
+      autoRecover: true,
+      lastOk: null,
+    });
+    expect(new Date(hourly.body.item.nextRunAtIso!).getUTCMinutes()).toBe(0);
+    const nightly = await call<{ item: Plan }>("POST", plans(cooled.id), admin, { cronExpr: "@daily", maxResults: 7, enabled: false });
+    expect(nightly.body.item).toMatchObject({ enabled: false, maxResults: 7, nextRunAtIso: null, timezone: "UTC", model: "" });
+    await call("POST", plans(broken.id), admin, { cronExpr: "*/30 * * * *", autoRecover: true });
+    expect((await call<{ items: Plan[] }>("GET", plans(cooled.id), admin)).body.items.map((p) => p.cronExpr)).toEqual(["0 * * * *", "@daily"]);
+    expect((await call<{ items: Plan[] }>("GET", "/api/v1/admin/account-test-plans", admin)).body.items).toHaveLength(3);
+
+    // Editing: enabling computes a next run, a bad expression is refused, unknown plans 404.
+    const edited = await call<{ item: Plan }>("PATCH", `/api/v1/admin/account-test-plans/${nightly.body.item.id}`, admin, { enabled: true });
+    expect(edited.body.item).toMatchObject({ enabled: true, cronExpr: "@daily", maxResults: 7 });
+    expect(new Date(edited.body.item.nextRunAtIso!).getUTCHours()).toBe(0);
+    expect((await call("PATCH", `/api/v1/admin/account-test-plans/${nightly.body.item.id}`, admin, { cronExpr: "* * *" })).status).toBe(400);
+    expect((await call("PATCH", "/api/v1/admin/account-test-plans/atp_missing", admin, { enabled: false })).status).toBe(404);
 
     // Run now: the passing account leaves its cooldown, the failing one stays in it.
-    const ran = await call<{ result: { ok: boolean }; recovered: boolean; item: { lastRunAtIso: string | null } }>(
+    const ran = await call<{ result: { ok: boolean }; recovered: boolean; item: Plan }>(
       "POST",
-      `/api/v1/admin/accounts/${cooled.id}/test-schedule/run`,
+      `/api/v1/admin/account-test-plans/${hourly.body.item.id}/run`,
       admin,
     );
     expect(ran.status).toBe(200);
-    expect(ran.body).toMatchObject({ result: { ok: true }, recovered: true });
+    expect(ran.body).toMatchObject({ result: { ok: true }, recovered: true, item: { lastOk: true } });
     expect(ran.body.item.lastRunAtIso).not.toBeNull();
-    const ranBad = await call<{ result: { ok: boolean }; recovered: boolean }>("POST", `/api/v1/admin/accounts/${broken.id}/test-schedule/run`, admin);
-    expect(ranBad.body).toMatchObject({ result: { ok: false }, recovered: false });
+    expect(ran.body.item.nextRunAtIso).toBe(hourly.body.item.nextRunAtIso);
+    const brokenPlan = (await call<{ items: Plan[] }>("GET", plans(broken.id), admin)).body.items[0]!;
+    const ranBad = await call<{ result: { ok: boolean }; recovered: boolean; item: Plan }>(
+      "POST",
+      `/api/v1/admin/account-test-plans/${brokenPlan.id}/run`,
+      admin,
+    );
+    expect(ranBad.body).toMatchObject({ result: { ok: false }, recovered: false, item: { lastOk: false, lastMessage: "upstream 401" } });
     const accounts = (await call<{ accounts: UpstreamAccount[] }>("GET", "/api/v1/admin/accounts", admin)).body.accounts;
     const byId = new Map(accounts.map((a) => [a.id, a]));
     expect(byId.get(cooled.id)?.effectiveStatus).toBe("active");
-    expect(byId.get(cooled.id)?.cooldownUntilIso).toBeNull();
     expect(byId.get(broken.id)?.effectiveStatus).toBe("cooldown");
     expect(byId.get(broken.id)?.lastTest?.ok).toBe(false);
 
-    // Delete; a second delete is a 404.
-    expect((await call("DELETE", `/api/v1/admin/accounts/${cooled.id}/test-schedule`, admin)).status).toBe(200);
-    expect((await call("DELETE", `/api/v1/admin/accounts/${cooled.id}/test-schedule`, admin)).status).toBe(404);
-    const after = await call<{ items: { accountId: string }[] }>("GET", "/api/v1/admin/account-test-schedules", admin);
-    expect(after.body.items.map((i) => i.accountId)).toEqual([broken.id]);
+    // The run is in the plan's results and the account's history, with its plan id.
+    const runs = await call<{ items: { planId: string | null; source: string; ok: boolean }[] }>(
+      "GET",
+      `/api/v1/admin/account-test-plans/${hourly.body.item.id}/runs`,
+      admin,
+    );
+    expect(runs.body.items).toEqual([expect.objectContaining({ planId: hourly.body.item.id, source: "scheduled", ok: true })]);
+    const history = await call<{ items: { planId: string | null }[] }>("GET", `/api/v1/admin/accounts/${cooled.id}/test-runs`, admin);
+    expect(history.body.items[0]?.planId).toBe(hourly.body.item.id);
+
+    // At most ten plans per account.
+    for (let i = 0; i < 8; i++) expect((await call("POST", plans(cooled.id), admin, { cronExpr: `${i} 3 * * *` })).status).toBe(201);
+    expect((await call("POST", plans(cooled.id), admin, { cronExpr: "0 4 * * *" })).status).toBe(409);
+
+    // Delete takes the plan's results with it; a second delete is a 404.
+    expect((await call("DELETE", `/api/v1/admin/account-test-plans/${hourly.body.item.id}`, admin)).status).toBe(200);
+    expect((await call("DELETE", `/api/v1/admin/account-test-plans/${hourly.body.item.id}`, admin)).status).toBe(404);
+    expect((await call("GET", `/api/v1/admin/account-test-plans/${hourly.body.item.id}/runs`, admin)).status).toBe(404);
+    expect((await call<{ items: unknown[] }>("GET", `/api/v1/admin/accounts/${cooled.id}/test-runs`, admin)).body.items).toHaveLength(0);
   });
 });

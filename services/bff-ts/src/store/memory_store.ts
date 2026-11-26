@@ -1,5 +1,7 @@
 import {
   ACCOUNT_TEST_HISTORY_LIMIT,
+  ACCOUNT_TEST_PLANS_PER_ACCOUNT,
+  ACCOUNT_TEST_PLAN_RESULTS_MAX,
   ACCOUNT_QUOTA_DAY_MS,
   ACCOUNT_QUOTA_WEEK_MS,
   accountQuotaLimited,
@@ -15,6 +17,9 @@ import {
   type AccountQuotaState,
   type AccountTestResult,
   type AccountTestRun,
+  type UpdateAccountTestPlanRequest,
+  type CreateAccountTestPlanRequest,
+  type AccountTestPlan,
   type AccountUsageSummaryItem,
   type ApiKeyItem,
   type CreateAccountRequest,
@@ -140,8 +145,10 @@ export class MemoryControlStore implements ControlStore {
   private readonly idempotencyKeys = new Set<string>();
   private readonly groups = new Map<string, InternalGroup>();
   private readonly accounts = new Map<string, InternalAccount>();
-  /** Test history per account, newest first (ACCOUNT_TEST_HISTORY_LIMIT each). */
+  /** Test history per account, newest first (plan runs pruned per plan, others to ACCOUNT_TEST_HISTORY_LIMIT). */
   private readonly accountTestRuns = new Map<string, AccountTestRun[]>();
+  /** Scheduled test plans by id. */
+  private readonly accountTestPlans = new Map<string, AccountTestPlan>();
   private readonly apiKeys = new Map<string, InternalApiKey>();
   private readonly routes = new Map<string, StoredCompositeRoute>();
   /** Settlement id -> the usage row it recorded (billing idempotency, see recordTurnSettlement). */
@@ -686,6 +693,7 @@ export class MemoryControlStore implements ControlStore {
       throw new StoreError("not_found", `Account ${accountId} not found`);
     }
     this.accountTestRuns.delete(accountId);
+    for (const [id, plan] of this.accountTestPlans) if (plan.accountId === accountId) this.accountTestPlans.delete(id);
   }
 
   async recordAccountTestResult(accountId: string, result: AccountTestResult): Promise<void> {
@@ -697,12 +705,110 @@ export class MemoryControlStore implements ControlStore {
     if (!this.accounts.has(run.accountId)) {
       throw new StoreError("not_found", `Account ${run.accountId} not found`);
     }
+    const plan = run.planId ? this.accountTestPlans.get(run.planId) : undefined;
+    if (run.planId && !plan) {
+      throw new StoreError("not_found", `Test plan ${run.planId} not found`);
+    }
     const saved: AccountTestRun = { id: `atr_${crypto.randomUUID()}`, ...run };
-    const list = this.accountTestRuns.get(run.accountId) ?? [];
-    list.unshift(saved);
-    list.length = Math.min(list.length, ACCOUNT_TEST_HISTORY_LIMIT);
-    this.accountTestRuns.set(run.accountId, list);
+    const list = [saved, ...(this.accountTestRuns.get(run.accountId) ?? [])];
+    // Prune the scope the run belongs to: its plan (to maxResults), or the account's other runs.
+    const keep = plan ? plan.maxResults : ACCOUNT_TEST_HISTORY_LIMIT;
+    let seen = 0;
+    this.accountTestRuns.set(
+      run.accountId,
+      list.filter((r) => r.planId !== run.planId || ++seen <= keep),
+    );
     return { ...saved };
+  }
+
+  async listAccountTestPlanRuns(planId: string, limit = ACCOUNT_TEST_PLAN_RESULTS_MAX): Promise<AccountTestRun[]> {
+    const plan = this.accountTestPlans.get(planId);
+    if (!plan) return [];
+    const n = Math.max(1, Math.min(ACCOUNT_TEST_PLAN_RESULTS_MAX, Math.floor(limit)));
+    return (this.accountTestRuns.get(plan.accountId) ?? [])
+      .filter((r) => r.planId === planId)
+      .slice(0, n)
+      .map((r) => ({ ...r }));
+  }
+
+  async listAccountTestPlans(accountId?: string): Promise<AccountTestPlan[]> {
+    return [...this.accountTestPlans.values()]
+      .filter((p) => accountId === undefined || p.accountId === accountId)
+      // Map order is creation order; the stable sort only matters for plans loaded out of order.
+      .sort((a, b) => a.createdAtIso.localeCompare(b.createdAtIso))
+      .map((p) => ({ ...p }));
+  }
+
+  async getAccountTestPlan(planId: string): Promise<AccountTestPlan | null> {
+    const plan = this.accountTestPlans.get(planId);
+    return plan ? { ...plan } : null;
+  }
+
+  async createAccountTestPlan(accountId: string, req: CreateAccountTestPlanRequest, nextRunAtIso: string | null): Promise<AccountTestPlan> {
+    if (!this.accounts.has(accountId)) {
+      throw new StoreError("not_found", `Account ${accountId} not found`);
+    }
+    const count = [...this.accountTestPlans.values()].filter((p) => p.accountId === accountId).length;
+    if (count >= ACCOUNT_TEST_PLANS_PER_ACCOUNT) {
+      throw new StoreError("conflict", `An account can have at most ${ACCOUNT_TEST_PLANS_PER_ACCOUNT} test plans`);
+    }
+    const now = new Date().toISOString();
+    const plan: AccountTestPlan = {
+      id: `atp_${crypto.randomUUID()}`,
+      accountId,
+      ...req,
+      lastRunAtIso: null,
+      lastOk: null,
+      lastMessage: "",
+      nextRunAtIso,
+      createdAtIso: now,
+      updatedAtIso: now,
+    };
+    this.accountTestPlans.set(plan.id, plan);
+    return { ...plan };
+  }
+
+  async updateAccountTestPlan(planId: string, req: UpdateAccountTestPlanRequest, nextRunAtIso: string | null): Promise<AccountTestPlan> {
+    const plan = this.accountTestPlans.get(planId);
+    if (!plan) throw new StoreError("not_found", `Test plan ${planId} not found`);
+    const defined = Object.fromEntries(Object.entries(req).filter(([, v]) => v !== undefined));
+    const next: AccountTestPlan = { ...plan, ...defined, nextRunAtIso, updatedAtIso: new Date().toISOString() };
+    this.accountTestPlans.set(planId, next);
+    return { ...next };
+  }
+
+  async deleteAccountTestPlan(planId: string): Promise<boolean> {
+    const plan = this.accountTestPlans.get(planId);
+    if (!plan) return false;
+    this.accountTestPlans.delete(planId);
+    const runs = this.accountTestRuns.get(plan.accountId);
+    if (runs) this.accountTestRuns.set(plan.accountId, runs.filter((r) => r.planId !== planId));
+    return true;
+  }
+
+  async listDueAccountTestPlans(nowIso: string, limit: number): Promise<AccountTestPlan[]> {
+    const now = Date.parse(nowIso);
+    return [...this.accountTestPlans.values()]
+      .filter((p) => p.enabled && p.nextRunAtIso !== null && Date.parse(p.nextRunAtIso) <= now)
+      .sort((a, b) => Date.parse(a.nextRunAtIso!) - Date.parse(b.nextRunAtIso!))
+      .slice(0, Math.max(0, limit))
+      .map((p) => ({ ...p }));
+  }
+
+  async claimAccountTestPlan(planId: string, expectedNextRunAtIso: string, nextRunAtIso: string | null): Promise<boolean> {
+    const plan = this.accountTestPlans.get(planId);
+    if (!plan || !plan.enabled || plan.nextRunAtIso === null) return false;
+    if (Date.parse(plan.nextRunAtIso) !== Date.parse(expectedNextRunAtIso)) return false;
+    plan.nextRunAtIso = nextRunAtIso;
+    return true;
+  }
+
+  async recordAccountTestPlanResult(planId: string, atIso: string, ok: boolean, message: string): Promise<void> {
+    const plan = this.accountTestPlans.get(planId);
+    if (!plan) return;
+    plan.lastRunAtIso = atIso;
+    plan.lastOk = ok;
+    plan.lastMessage = message;
   }
 
   async listAccountTestRuns(accountId: string, limit = ACCOUNT_TEST_HISTORY_LIMIT): Promise<AccountTestRun[]> {

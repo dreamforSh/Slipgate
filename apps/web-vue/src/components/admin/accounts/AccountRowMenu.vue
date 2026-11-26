@@ -4,7 +4,6 @@ import { useI18n } from "vue-i18n";
 import {
   accountQuotaLimited,
   accountSupportsPrivacy,
-  type AccountTestScheduleItem,
   type UpstreamAccount,
 } from "@slipgate/contracts";
 import UiIcon from "../../ui/UiIcon.vue";
@@ -18,8 +17,8 @@ const props = defineProps<{
   open: boolean;
   account: UpstreamAccount | null;
   anchor: HTMLElement | null;
-  /** The account's scheduled test, if any (shown next to the menu item). */
-  schedule?: AccountTestScheduleItem | null;
+  /** How many enabled scheduled test plans the account has (shown next to the menu item). */
+  scheduledPlans?: number;
   /** Exits can be changed (slipgate-net attached and the pool loaded). */
   exitReady?: boolean;
 }>();
@@ -115,17 +114,8 @@ const canResetQuota = computed(() => !!props.account && accountQuotaLimited(prop
 
 type MenuAction = "test" | "stats" | "edit" | "duplicate" | "resume" | "refresh" | "privacy" | "reauth" | "reset-quota" | "schedule" | "exit";
 
-/** "every 30 min" style label of an enabled schedule; "" otherwise. */
-const scheduleLabel = computed(() => {
-  const s = props.schedule;
-  if (!s?.enabled) return "";
-  const m = s.intervalMinutes;
-  return m % 1440 === 0
-    ? t("accounts.schedule.everyDays", { n: m / 1440 })
-    : m % 60 === 0
-      ? t("accounts.schedule.everyHours", { n: m / 60 })
-      : t("accounts.schedule.everyMinutes", { n: m });
-});
+/** "2 plans" when the account has enabled scheduled test plans; "" otherwise. */
+const scheduleLabel = computed(() => (props.scheduledPlans ? t("accounts.schedule.plansLabel", { n: props.scheduledPlans }) : ""));
 
 function pick(action: MenuAction) {
   const acc = props.account;
